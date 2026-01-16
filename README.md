@@ -14,6 +14,9 @@
 
 [DOCUMENTATION](DOCS.md) | [PERFORMANCE](PERF.md)
 
+> [!IMPORTANT]
+> active development is continuing: there is no stable version yet
+
 ### Why Tgin?
 - Load balancing: distributes Telegram updates evenly across multiple bot instances
 
@@ -86,13 +89,14 @@ Simple configuration in the ron
 - Collect analytics
 - Cache for bot
 - Support userbots
+- Tests for Bot
 
 
 
 ### Main Goal
 **Provide a complete infrastructure toolkit for building scalable, high-load Telegram bots with microservices architecture and production-ready support**
 
-### Profit
+### Performance
 
 <table>
   <tr>
