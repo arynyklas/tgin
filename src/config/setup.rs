@@ -1,16 +1,16 @@
 use crate::base::{RouteableComponent, UpdaterComponent};
-use crate::lb::{roundrobin::RoundRobinLB, all::AllLB};
+use crate::config::schema::{RouteConfig, TginConfig, UpdateConfig};
+use crate::lb::{all::AllLB, roundrobin::RoundRobinLB};
 use crate::route::longpull::LongPollRoute;
 use crate::route::webhook::WebhookRoute;
 use crate::update::longpull::LongPollUpdate;
-use crate::update::webhook::{WebhookUpdate};
-use crate::config::schema::{TginConfig, UpdateConfig,RouteConfig};
+use crate::update::webhook::WebhookUpdate;
 
-use std::sync::Arc;
 use std::fs;
+use std::sync::Arc;
 
-use std::env;
 use regex::Regex;
+use std::env;
 
 pub fn load_config(path: &str) -> TginConfig {
     let content = fs::read_to_string(path).expect("Failed to read config file");
@@ -19,20 +19,20 @@ pub fn load_config(path: &str) -> TginConfig {
     ron::from_str(&processed_content).expect("Failed to parse RON config")
 }
 
-
 fn substitute_env_vars(input: &str) -> String {
     let re = Regex::new(r"\$\{(\w+)\}").unwrap();
 
     re.replace_all(input, |caps: &regex::Captures| {
         let var_name = &caps[1];
-        
+
         match env::var(var_name) {
             Ok(val) => val,
             Err(_) => {
                 panic!("Environment variable '${}' is not set", var_name);
             }
         }
-    }).to_string()
+    })
+    .to_string()
 }
 
 pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent>> {
@@ -40,18 +40,22 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
 
     for cfg in configs {
         match cfg {
-            UpdateConfig::LongPollUpdate { token, url, default_timeout_sleep, error_timeout_sleep } => {
+            UpdateConfig::LongPollUpdate {
+                token,
+                url,
+                default_timeout_sleep,
+                error_timeout_sleep,
+            } => {
                 let mut up = LongPollUpdate::new(token);
                 if let Some(u) = url {
-                    up.set_url(u); 
+                    up.set_url(u);
                 }
-                up.set_timeouts(default_timeout_sleep, error_timeout_sleep); 
+                up.set_timeouts(default_timeout_sleep, error_timeout_sleep);
                 result.push(Box::new(up));
             }
             UpdateConfig::WebhookUpdate { path, registration } => {
                 let mut up = WebhookUpdate::new(path);
-                if let Some(reg) = registration {
-                }
+                if let Some(reg) = registration {}
                 result.push(Box::new(up));
             }
         }
@@ -61,27 +65,19 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
 
 pub fn build_route(cfg: RouteConfig) -> Arc<dyn RouteableComponent> {
     match cfg {
-        RouteConfig::LongPollRoute { path } => {
-            Arc::new(LongPollRoute::new(path))
-        }
-        RouteConfig::WebhookRoute { url } => {
-            Arc::new(WebhookRoute::new(url))
-        }
-        
+        RouteConfig::LongPollRoute { path } => Arc::new(LongPollRoute::new(path)),
+        RouteConfig::WebhookRoute { url } => Arc::new(WebhookRoute::new(url)),
+
         RouteConfig::RoundRobinLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
-                .into_iter()
-                .map(build_route) 
-                .collect();
-            
+            let built_routes: Vec<Arc<dyn RouteableComponent>> =
+                routes.into_iter().map(build_route).collect();
+
             Arc::new(RoundRobinLB::new(built_routes))
         }
-        
+
         RouteConfig::AllLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
-                .into_iter()
-                .map(build_route) 
-                .collect();
+            let built_routes: Vec<Arc<dyn RouteableComponent>> =
+                routes.into_iter().map(build_route).collect();
 
             Arc::new(AllLB::new(built_routes))
         }

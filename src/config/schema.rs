@@ -59,15 +59,11 @@ pub enum RouteStrategyConfig {
     AllLB { routes: Vec<RouteConfig> },
 }
 
-
-
-
-
 #[derive(Deserialize, Debug)]
 pub enum RouteConfig {
     LongPollRoute { path: String },
     WebhookRoute { url: String },
-    
+
     RoundRobinLB { routes: Vec<RouteConfig> },
     AllLB { routes: Vec<RouteConfig> },
 }

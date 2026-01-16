@@ -1,9 +1,7 @@
-use crate::base::{Routeable, Serverable, Printable};
+use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::{Value, json};
-
-
+use serde_json::{json, Value};
 
 pub struct WebhookRoute {
     client: Client,
@@ -48,16 +46,12 @@ impl Printable for WebhookRoute {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, body_json};
+    use wiremock::matchers::{body_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-
-    
     #[tokio::test]
     async fn test_process_sends_correct_post_request() {
         let mock_server = MockServer::start().await;
@@ -74,23 +68,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
         let mut route = WebhookRoute::new(mock_server.uri());
         route.set_client(client);
 
         route.process(payload).await;
-        
     }
-
 
     #[tokio::test]
     async fn test_process_does_not_panic_on_network_error() {
         let route = WebhookRoute::new("http://localhost:9999/invalid".to_string());
-        
+
         let payload = json!({"test": "data"});
         route.process(payload).await;
     }
@@ -105,5 +94,4 @@ mod tests {
         assert_eq!(json_info["type"], "webhook");
         assert_eq!(json_info["options"]["url"], url);
     }
-
 }

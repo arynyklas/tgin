@@ -1,10 +1,9 @@
-
-use crate::base::{Routeable, RouteableComponent, Serverable, Printable};
+use crate::base::{Printable, Routeable, RouteableComponent, Serverable};
 
 use crate::api::message::AddRouteType;
 
+use axum::Router;
 use tokio::sync::mpsc::Sender;
-use axum::{Router};
 
 use tokio::sync::RwLock;
 
@@ -15,7 +14,7 @@ use crate::dynamic::longpoll_registry::LONGPOLL_REGISTRY;
 
 use async_trait::async_trait;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub struct RoundRobinLB {
     routes: RwLock<Vec<Arc<dyn RouteableComponent>>>,
@@ -25,7 +24,7 @@ pub struct RoundRobinLB {
 impl RoundRobinLB {
     pub fn new(routes: Vec<Arc<dyn RouteableComponent>>) -> Self {
         Self {
-            routes:RwLock::new(routes),
+            routes: RwLock::new(routes),
             current: AtomicUsize::new(0),
         }
     }
@@ -43,32 +42,27 @@ impl Routeable for RoundRobinLB {
 
         let route = routes[index].clone();
 
-        drop(routes); 
+        drop(routes);
 
         route.process(update).await;
-
     }
 
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()>{
+    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
         let mut routes = self.routes.write().await;
 
         match route {
-            AddRouteType::Longpull(route_arc) => {
-                match LONGPOLL_REGISTRY.write() {
-                    Ok(mut registry) => {
-                        registry.insert(route_arc.path.clone(), route_arc.clone());
-                        routes.push(route_arc); 
-                        Ok(())
-                    }
-                    Err(_) => {
-                        Err(())
-                    }
+            AddRouteType::Longpull(route_arc) => match LONGPOLL_REGISTRY.write() {
+                Ok(mut registry) => {
+                    registry.insert(route_arc.path.clone(), route_arc.clone());
+                    routes.push(route_arc);
+                    Ok(())
                 }
+                Err(_) => Err(()),
             },
             AddRouteType::Webhook(route) => {
-                routes.push(route); 
+                routes.push(route);
                 Ok(())
-            },
+            }
         }
     }
 }
@@ -96,7 +90,6 @@ impl Printable for RoundRobinLB {
         text
     }
 
-
     async fn json_struct(&self) -> Value {
         let routes = self.routes.read().await;
         let mut routes_json: Vec<Value> = Vec::new();
@@ -112,9 +105,6 @@ impl Printable for RoundRobinLB {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,9 +113,9 @@ mod tests {
 
     async fn test_empty_routes_does_not_panic() {
         let lb = RoundRobinLB::new(vec![]);
-        
+
         lb.process(json!({"update_id": 1})).await;
-        
+
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
     }
@@ -135,10 +125,7 @@ mod tests {
         let route1 = Arc::new(MockCallsRoute::new("A"));
         let route2 = Arc::new(MockCallsRoute::new("B"));
 
-        let lb = RoundRobinLB::new(vec![
-            route1.clone(),
-            route2.clone(),
-        ]);
+        let lb = RoundRobinLB::new(vec![route1.clone(), route2.clone()]);
 
         for i in 0..4 {
             lb.process(json!({"id": i})).await;
@@ -150,7 +137,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_round_robin_ordering() {
-        
         let r1 = Arc::new(MockCallsRoute::new("1"));
         let r2 = Arc::new(MockCallsRoute::new("2"));
         let r3 = Arc::new(MockCallsRoute::new("3"));
@@ -185,8 +171,10 @@ mod tests {
 
         assert_eq!(output["type"], "load-balancer");
         assert_eq!(output["name"], "round-robin");
-        
-        let routes_arr = output["routes"].as_array().expect("routes should be an array");
+
+        let routes_arr = output["routes"]
+            .as_array()
+            .expect("routes should be an array");
         assert_eq!(routes_arr.len(), 2);
         assert_eq!(routes_arr[0]["id"], "alpha");
         assert_eq!(routes_arr[1]["id"], "beta");
@@ -201,15 +189,15 @@ mod tests {
         assert_eq!(r1.count().await, 1);
 
         let r2 = Arc::new(MockCallsRoute::new("dynamic"));
-        
+
         let add_res = lb.add_route(AddRouteType::Webhook(r2.clone())).await;
         assert!(add_res.is_ok());
 
         let json_out = lb.json_struct().await;
         assert_eq!(json_out["routes"].as_array().unwrap().len(), 2);
 
-        lb.process(json!(2)).await; 
-        
+        lb.process(json!(2)).await;
+
         assert_eq!(r2.count().await, 1);
     }
 }

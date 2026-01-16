@@ -1,15 +1,15 @@
-use crate::base::{Routeable, Serverable, Printable};
+use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
 
 use std::collections::VecDeque;
 
-use axum::{extract::Form, routing::post, Json, Router}; 
+use axum::{extract::Form, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout as tokio_timeout;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -20,10 +20,9 @@ pub struct GetUpdatesParams {
     pub timeout: Option<u64>,
     #[serde(default)]
     pub limit: Option<u64>,
-    
 }
 
-#[derive(Clone)] 
+#[derive(Clone)]
 pub struct LongPollRoute {
     updates: Arc<Mutex<VecDeque<Value>>>,
     notify: Arc<Notify>,
@@ -39,8 +38,7 @@ impl LongPollRoute {
         }
     }
 
-    pub async fn handle_request(&self, params: GetUpdatesParams) -> Json<Value>{
-
+    pub async fn handle_request(&self, params: GetUpdatesParams) -> Json<Value> {
         let updates = self.updates.clone();
         let notify = self.notify.clone();
 
@@ -53,7 +51,6 @@ impl LongPollRoute {
                 let mut lock = updates.lock().await;
 
                 if !lock.is_empty() {
-
                     let mut batch = Vec::new();
 
                     let limit = params.limit.unwrap_or(1000) as usize;
@@ -70,9 +67,8 @@ impl LongPollRoute {
                         "ok": true,
                         "result": batch
                     }));
-
                 }
-            } 
+            }
 
             if timeout_sec == 0 || start_time.elapsed() >= duration {
                 return Json(json!({
@@ -87,7 +83,6 @@ impl LongPollRoute {
     }
 }
 
-
 #[async_trait]
 impl Routeable for LongPollRoute {
     async fn process(&self, update: Value) {
@@ -100,23 +95,18 @@ impl Routeable for LongPollRoute {
 #[async_trait]
 impl Serverable for LongPollRoute {
     async fn set_server(&self, router: Router<Sender<Value>>) -> Router<Sender<Value>> {
-        let this = self.clone(); 
+        let this = self.clone();
         let path = self.path.clone();
 
         let handler = move |Form(params): Form<GetUpdatesParams>| {
             let this = this.clone();
-            
-            async move {
-                this.handle_request(params).await
-            }
+
+            async move { this.handle_request(params).await }
         };
 
         router.route(&path, post(handler))
     }
 }
-
-
-
 
 #[async_trait]
 impl Printable for LongPollRoute {
@@ -133,9 +123,6 @@ impl Printable for LongPollRoute {
         })
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -162,7 +149,7 @@ mod tests {
         route.process(json!({"update_id": 2})).await;
 
         let response = route.handle_request(default_params()).await;
-        
+
         let body: Value = serde_json::to_value(response.0).unwrap();
         let results = body.get("result").unwrap().as_array().unwrap();
 
@@ -200,9 +187,9 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_empty_queue() {
         let route = LongPollRoute::new("/test".to_string());
-        
+
         let start = tokio::time::Instant::now();
-        
+
         let params = GetUpdatesParams {
             timeout: Some(1),
             ..default_params()
@@ -246,7 +233,7 @@ mod tests {
     async fn test_axum_server_integration() {
         let path = "/bot123/getUpdates";
         let route = LongPollRoute::new(path.to_string());
-        
+
         route.process(json!({"ok": true})).await;
 
         let app = Router::new();
@@ -262,22 +249,23 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let app = app.with_state(tx);
 
-
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
 
         assert_eq!(body_json["result"].as_array().unwrap().len(), 1);
     }
-    
+
     #[tokio::test]
     async fn test_printable_json_struct() {
         let route = LongPollRoute::new("/my/path".to_string());
         let json = route.json_struct().await;
-        
+
         assert_eq!(json["type"], "longpoll");
         assert_eq!(json["options"]["path"], "/my/path");
     }

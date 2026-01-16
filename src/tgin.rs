@@ -1,6 +1,6 @@
-use crate::base::{RouteableComponent, Serverable, UpdaterComponent};
 use crate::api::message::ApiMessage;
 use crate::api::router::Api;
+use crate::base::{RouteableComponent, Serverable, UpdaterComponent};
 
 use axum::Router;
 use serde_json::Value;
@@ -14,7 +14,6 @@ use std::net::SocketAddr;
 use tokio::runtime::Builder;
 
 use crate::dynamic::handler::dynamic_handler;
-
 
 pub struct Tgin {
     updates: Vec<Box<dyn UpdaterComponent>>,
@@ -42,7 +41,7 @@ impl Tgin {
             server_port,
             ssl_cert: None,
             ssl_key: None,
-            api: None
+            api: None,
         }
     }
 
@@ -73,13 +72,10 @@ impl Tgin {
             println!("\nRUTE TO\n");
 
             println!("{}", &self.route.print().await);
-
         });
 
         runtime.block_on(self.run_async());
     }
-
-
 
     pub async fn run_async(self) {
         let (tx, mut rx) = mpsc::channel::<Value>(1000000);
@@ -95,11 +91,10 @@ impl Tgin {
 
             router = self.route.set_server(router).await;
 
-            
             if let Some(ref api) = api {
                 router = api.set_server(router).await;
             }
-            
+
             let app = router.with_state(tx.clone());
 
             let app = if api.is_some() {
@@ -141,8 +136,6 @@ impl Tgin {
 
         drop(tx);
 
-
-
         match api {
             None => {
                 while let Some(update) = rx.recv().await {
@@ -151,44 +144,36 @@ impl Tgin {
                         route_clone.process(update).await;
                     });
                 }
-            },
+            }
 
+            Some(mut api) => loop {
+                tokio::select! {
+                    Some(api) = api.rx.recv() => {
+                    match api {
+                            ApiMessage::GetRoutes(tx_response) => {
+                                let _ = tx_response.send(self.route.json_struct().await);
+                            }
 
-            Some(mut api) => {
-
-                loop {
-                    tokio::select! {
-                        Some(api) = api.rx.recv() => {
-                        match api {
-                                ApiMessage::GetRoutes(tx_response) => {
-                                    let _ = tx_response.send(self.route.json_struct().await);
-                                }
-
-                                ApiMessage::AddRoute{route, sublevel} => {
-                                    let _ = sublevel;
-                                    let self_route = self.route.clone();
-                                    match self_route.add_route(route).await {
-                                        Err(_) => {},
-                                        Ok(_) => {}
-                                    }
+                            ApiMessage::AddRoute{route, sublevel} => {
+                                let _ = sublevel;
+                                let self_route = self.route.clone();
+                                match self_route.add_route(route).await {
+                                    Err(_) => {},
+                                    Ok(_) => {}
                                 }
                             }
-                        },
-
-                        Some(update) = rx.recv() => {
-                            let route_clone = self.route.clone();
-                            tokio::spawn(async move {
-                                route_clone.process(update).await;
-                            });
                         }
+                    },
 
+                    Some(update) = rx.recv() => {
+                        let route_clone = self.route.clone();
+                        tokio::spawn(async move {
+                            route_clone.process(update).await;
+                        });
                     }
-                }
 
-            }
+                }
+            },
         }
     }
-
-
-
 }

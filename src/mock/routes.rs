@@ -1,12 +1,10 @@
 #![cfg(test)]
 
+use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex};
-use crate::base::{Routeable, RouteableComponent, Printable, Serverable};
-use tokio::sync::mpsc::Sender;
-use axum::Router;
+use tokio::sync::{Mutex};
 
 pub struct MockCallsRoute {
     pub id: String,
@@ -15,12 +13,12 @@ pub struct MockCallsRoute {
 
 impl MockCallsRoute {
     pub fn new(id: &str) -> Self {
-        Self { 
-            id: id.to_string(), 
-            calls: Arc::new(Mutex::new(vec![])) 
+        Self {
+            id: id.to_string(),
+            calls: Arc::new(Mutex::new(vec![])),
         }
     }
-    
+
     pub async fn count(&self) -> usize {
         self.calls.lock().await.len()
     }
@@ -48,6 +46,4 @@ impl Printable for MockCallsRoute {
 }
 
 #[async_trait]
-impl Serverable for MockCallsRoute {
-}
-
+impl Serverable for MockCallsRoute {}

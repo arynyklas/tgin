@@ -1,6 +1,5 @@
-
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use tokio::sync::mpsc::Sender;
 
@@ -10,12 +9,11 @@ use crate::update::base::Updater;
 
 use crate::api::message::AddRouteType;
 
-
 #[async_trait]
 pub trait Routeable: Send + Sync {
     async fn process(&self, update: Value);
 
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()>{
+    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
         drop(route);
         Err(())
     }
@@ -28,18 +26,17 @@ pub trait Serverable {
 }
 #[async_trait]
 pub trait Printable {
-    async fn print(&self) -> String { "".into() }
+    async fn print(&self) -> String {
+        "".into()
+    }
 
-    async fn json_struct(&self) -> Value { 
-        json!({
-
-        })
+    async fn json_struct(&self) -> Value {
+        json!({})
     }
 }
 
 pub trait UpdaterComponent: Updater + Serverable + Printable + Send + Sync {}
 impl<T: Updater + Serverable + Printable> UpdaterComponent for T {}
 
-pub trait RouteableComponent: Routeable + Serverable + Printable + Send + Sync{}
+pub trait RouteableComponent: Routeable + Serverable + Printable + Send + Sync {}
 impl<T: Routeable + Serverable + Printable> RouteableComponent for T {}
-

@@ -1,8 +1,7 @@
+use crate::base::{Printable, Routeable, RouteableComponent, Serverable};
 
-use crate::base::{Routeable, RouteableComponent, Serverable, Printable};
-
+use axum::Router;
 use tokio::sync::{mpsc::Sender, RwLock};
-use axum::{Router};
 
 use std::sync::Arc;
 
@@ -11,10 +10,10 @@ use crate::dynamic::longpoll_registry::LONGPOLL_REGISTRY;
 
 use async_trait::async_trait;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub struct AllLB {
-    routes: RwLock<Vec<Arc<dyn RouteableComponent>>>
+    routes: RwLock<Vec<Arc<dyn RouteableComponent>>>,
 }
 
 impl AllLB {
@@ -39,29 +38,22 @@ impl Routeable for AllLB {
         }
     }
 
-
-
-
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()>{
+    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
         let mut routes = self.routes.write().await;
 
         match route {
-            AddRouteType::Longpull(route_arc) => {
-                match LONGPOLL_REGISTRY.write() {
-                    Ok(mut registry) => {
-                        registry.insert(route_arc.path.clone(), route_arc.clone());
-                        routes.push(route_arc); 
-                        Ok(())
-                    }
-                    Err(_) => {
-                        Err(())
-                    }
+            AddRouteType::Longpull(route_arc) => match LONGPOLL_REGISTRY.write() {
+                Ok(mut registry) => {
+                    registry.insert(route_arc.path.clone(), route_arc.clone());
+                    routes.push(route_arc);
+                    Ok(())
                 }
+                Err(_) => Err(()),
             },
             AddRouteType::Webhook(route) => {
-                routes.push(route); 
+                routes.push(route);
                 Ok(())
-            },
+            }
         }
     }
 }
@@ -102,15 +94,7 @@ impl Printable for AllLB {
             "routes": routes_json
         })
     }
-
-
 }
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -121,9 +105,9 @@ mod tests {
     #[tokio::test]
     async fn test_empty_routes_does_not_panic() {
         let lb = AllLB::new(vec![]);
-        
+
         lb.process(json!({"update_id": 1})).await;
-        
+
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
     }
@@ -133,10 +117,7 @@ mod tests {
         let route1 = Arc::new(MockCallsRoute::new("A"));
         let route2 = Arc::new(MockCallsRoute::new("B"));
 
-        let lb = AllLB::new(vec![
-            route1.clone(),
-            route2.clone(),
-        ]);
+        let lb = AllLB::new(vec![route1.clone(), route2.clone()]);
 
         lb.process(json!({"msg": "hello"})).await;
 
@@ -199,7 +180,7 @@ mod tests {
 
         lb.process(json!(2)).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        
+
         assert_eq!(r1.count().await, 2);
         assert_eq!(r2.count().await, 1);
     }
