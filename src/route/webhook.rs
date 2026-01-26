@@ -26,6 +26,10 @@ impl Routeable for WebhookRoute {
     async fn process(&self, update: Value) {
         let _ = self.client.post(&self.url).json(&update).send().await;
     }
+
+    fn diff_value(&self) -> Option<&str> {
+        Some(&self.url)
+    }
 }
 
 impl Serverable for WebhookRoute {}

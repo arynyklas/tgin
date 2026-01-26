@@ -5,19 +5,19 @@ use tokio;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
-use crate::api::message::{AddRouteType, ApiMessage};
-use crate::api::schemas::{AddRoute, RouteType};
+use crate::api::message::{AddRouteType, ApiMessage, RmRoute};
+use crate::api::schemas::{AddRouteSch, AddRouteTypeSch, RmRouteSch, RmRouteTypeSch};
 
 use crate::route::longpull::LongPollRoute;
 use crate::route::webhook::WebhookRoute;
 
-pub async fn add_route(State(tx): State<Sender<ApiMessage>>, Json(data): Json<AddRoute>) {
+pub async fn add_route(State(tx): State<Sender<ApiMessage>>, Json(data): Json<AddRouteSch>) {
     let route = match data.typee {
-        RouteType::Longpull(route) => {
+        AddRouteTypeSch::Longpull(route) => {
             let update = LongPollRoute::new(route.path);
             AddRouteType::Longpull(Arc::new(update))
         }
-        RouteType::Webhook(route) => {
+        AddRouteTypeSch::Webhook(route) => {
             let update = WebhookRoute::new(route.url);
             AddRouteType::Webhook(Arc::new(update))
         }
@@ -42,4 +42,19 @@ pub async fn get_routes(
         Ok(json) => Ok(Json::from(json)),
         Err(_) => Err(http::StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+pub async fn remove_route(State(tx): State<Sender<ApiMessage>>, Json(data): Json<RmRouteSch>) {
+    let route = match data.typee {
+        RmRouteTypeSch::Longpull(r) => RmRoute {
+            path: Some(r.path),
+            url: None,
+        },
+        RmRouteTypeSch::Webhook(r) => RmRoute {
+            path: None,
+            url: Some(r.url),
+        },
+    };
+
+    let _ = tx.send(ApiMessage::RmRoute(route)).await;
 }

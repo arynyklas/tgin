@@ -7,3 +7,6 @@ target
 *.egg-info
 build
 .DS_Store
+
+test.py
+/dest

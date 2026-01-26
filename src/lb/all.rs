@@ -5,7 +5,7 @@ use tokio::sync::{mpsc::Sender, RwLock};
 
 use std::sync::Arc;
 
-use crate::api::message::AddRouteType;
+use crate::api::message::{AddRouteType, RmRoute};
 use crate::dynamic::longpoll_registry::LONGPOLL_REGISTRY;
 
 use async_trait::async_trait;
@@ -54,6 +54,35 @@ impl Routeable for AllLB {
                 routes.push(route);
                 Ok(())
             }
+        }
+    }
+
+    async fn remove_route(&self, route: RmRoute) -> Result<(), ()> {
+        let mut routes = self.routes.write().await;
+        let initial_len = routes.len();
+
+        let target = if let Some(url) = &route.url {
+            url
+        } else if let Some(path) = &route.path {
+            if let Ok(mut registry) = LONGPOLL_REGISTRY.write() {
+                registry.remove(path);
+            }
+            path
+        } else {
+            return Err(());
+        };
+
+        routes.retain(|r| r.diff_value() != Some(&target));
+
+        if routes.len() < initial_len {
+            Ok(())
+        } else {
+            for i in routes.iter() {
+                if i.diff_value().is_none() {
+                    i.remove_route(route.clone()).await;
+                };
+            }
+            Ok(())
         }
     }
 }

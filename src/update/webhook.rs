@@ -4,7 +4,12 @@ use crate::update::base::Updater;
 use crate::utils::defaults::TELEGRAM_TOKEN_REGEX;
 
 use async_trait::async_trait;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use serde_json::{json, Value};
 
 use reqwest::Client;
@@ -44,8 +49,15 @@ impl RegistrationWebhookConfig {
     }
 }
 
+#[derive(Clone)]
+struct WebhookState {
+    tx: Sender<Value>,
+    secret_token: Option<String>,
+}
+
 pub struct WebhookUpdate {
     path: String,
+    secret_token: Option<String>,
     registration: Option<RegistrationWebhookConfig>,
 }
 
@@ -53,8 +65,13 @@ impl WebhookUpdate {
     pub fn new(path: String) -> Self {
         Self {
             path,
+            secret_token: None,
             registration: None,
         }
+    }
+
+    pub fn set_secret_token(&mut self, token: String) {
+        self.secret_token = Some(token);
     }
 
     pub async fn register_webhook(&self, config: &RegistrationWebhookConfig) {
@@ -98,12 +115,30 @@ impl Updater for WebhookUpdate {
 #[async_trait]
 impl Serverable for WebhookUpdate {
     async fn set_server(&self, router: Router<Sender<Value>>) -> Router<Sender<Value>> {
-        router.route(&self.path, post(handler))
-    }
-}
+        let path = self.path.clone();
+        let secret = self.secret_token.clone();
 
-async fn handler(State(tx): State<Sender<Value>>, Json(update): Json<Value>) {
-    let _ = tx.send(update).await;
+        let handler_func = move |State(tx): State<Sender<Value>>,
+                                 headers: HeaderMap,
+                                 Json(update): Json<Value>| {
+            let secret = secret.clone();
+            async move {
+                if let Some(sec) = secret {
+                    if let Some(header_val) = headers.get("x-telegram-bot-api-secret-token") {
+                        if header_val.to_str().unwrap_or("") != sec {
+                            return StatusCode::UNAUTHORIZED;
+                        }
+                    } else {
+                        return StatusCode::UNAUTHORIZED;
+                    }
+                }
+                let _ = tx.send(update).await;
+                StatusCode::OK
+            }
+        };
+
+        router.route(&path, post(handler_func))
+    }
 }
 
 #[async_trait]

@@ -40,6 +40,8 @@ pub enum UpdateConfig {
     WebhookUpdate {
         path: String,
         registration: Option<RegistrationWebhookConfig>,
+        #[serde(default)]
+        secret_token: Option<String>,
     },
 }
 

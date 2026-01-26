@@ -31,7 +31,10 @@ impl Serverable for Api {
     async fn set_server(&self, main_router: Router<Sender<Value>>) -> Router<Sender<Value>> {
         let router = Router::new()
             .route("/routes", get(methods::get_routes))
-            .route("/route", post(methods::add_route))
+            .route(
+                "/route",
+                post(methods::add_route).delete(methods::remove_route),
+            )
             .with_state(self.tx.clone());
 
         main_router.nest(&self.base_path, router)

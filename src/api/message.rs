@@ -16,4 +16,11 @@ pub enum AddRouteType {
 pub enum ApiMessage {
     AddRoute { route: AddRouteType, sublevel: i8 },
     GetRoutes(Sender<Value>),
+    RmRoute(RmRoute),
+}
+
+#[derive(Clone)]
+pub struct RmRoute {
+    pub url: Option<String>,
+    pub path: Option<String>,
 }

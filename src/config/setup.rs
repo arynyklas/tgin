@@ -53,9 +53,16 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
                 up.set_timeouts(default_timeout_sleep, error_timeout_sleep);
                 result.push(Box::new(up));
             }
-            UpdateConfig::WebhookUpdate { path, registration } => {
+            UpdateConfig::WebhookUpdate {
+                path,
+                registration,
+                secret_token,
+            } => {
                 let mut up = WebhookUpdate::new(path);
-                if let Some(reg) = registration {}
+                if let Some(_reg) = registration {}
+                if let Some(token) = secret_token {
+                    up.set_secret_token(token);
+                }
                 result.push(Box::new(up));
             }
         }

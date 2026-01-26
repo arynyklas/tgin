@@ -7,13 +7,22 @@ use axum::Router;
 
 use crate::update::base::Updater;
 
-use crate::api::message::AddRouteType;
+use crate::api::message::{AddRouteType, RmRoute};
 
 #[async_trait]
 pub trait Routeable: Send + Sync {
     async fn process(&self, update: Value);
 
+    fn diff_value(&self) -> Option<&str> {
+        None
+    }
+
     async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
+        drop(route);
+        Err(())
+    }
+
+    async fn remove_route(&self, route: RmRoute) -> Result<(), ()> {
         drop(route);
         Err(())
     }

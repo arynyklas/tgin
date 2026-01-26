@@ -162,6 +162,16 @@ impl Tgin {
                                     Ok(_) => {}
                                 }
                             }
+
+                            ApiMessage::RmRoute(route) => {
+                                let self_route = self.route.clone();
+                                tokio::spawn(async move {
+                                    match self_route.remove_route(route).await {
+                                        Ok(_) => {},
+                                        Err(_) => {},
+                                    }
+                                });
+                            }
                         }
                     },
 

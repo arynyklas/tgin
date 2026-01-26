@@ -90,6 +90,10 @@ impl Routeable for LongPollRoute {
         lock.push_back(update);
         self.notify.notify_waiters();
     }
+
+    fn diff_value(&self) -> Option<&str> {
+        Some(&self.path)
+    }
 }
 
 #[async_trait]

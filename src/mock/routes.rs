@@ -4,7 +4,7 @@ use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::{Mutex};
+use tokio::sync::Mutex;
 
 pub struct MockCallsRoute {
     pub id: String,
