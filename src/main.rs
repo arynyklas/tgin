@@ -11,6 +11,7 @@ mod api;
 
 use crate::config::setup::{build_route, build_updates, load_config};
 use crate::tgin::Tgin;
+use crate::utils::http::build_shared_client;
 
 use clap::{Arg, Command};
 
@@ -37,13 +38,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
 
     let conf = load_config(config_path);
-    let inputs = build_updates(conf.updates);
-    let lb = build_route(conf.route);
+
+    // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
+    // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,
+    // RegistrationWebhookConfig, dynamically added routes via the API) shares
+    // the same connection pool, DNS resolver, and TLS state.
+    let http_client = build_shared_client();
+
+    let inputs = build_updates(conf.updates, &http_client);
+    let lb = build_route(conf.route, &http_client);
 
     let mut tgin = Tgin::new(inputs, lb, conf.dark_threads, conf.server_port);
 
     if let Some(api) = conf.api {
-        let api = api::router::Api::new(api.base_path);
+        let api = api::router::Api::new(api.base_path, http_client.clone());
         tgin.set_api(api);
     }
 

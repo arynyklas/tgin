@@ -79,7 +79,7 @@ impl Routeable for AllLB {
         } else {
             for i in routes.iter() {
                 if i.diff_value().is_none() {
-                    i.remove_route(route.clone()).await;
+                    let _ = i.remove_route(route.clone()).await;
                 };
             }
             Ok(())

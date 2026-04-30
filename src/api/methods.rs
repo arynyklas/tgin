@@ -1,4 +1,5 @@
-use axum::{extract::State, http, response::IntoResponse, Json};
+use axum::{extract::State, http, response::IntoResponse, Extension, Json};
+use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio;
@@ -11,14 +12,18 @@ use crate::api::schemas::{AddRouteSch, AddRouteTypeSch, RmRouteSch, RmRouteTypeS
 use crate::route::longpull::LongPollRoute;
 use crate::route::webhook::WebhookRoute;
 
-pub async fn add_route(State(tx): State<Sender<ApiMessage>>, Json(data): Json<AddRouteSch>) {
+pub async fn add_route(
+    State(tx): State<Sender<ApiMessage>>,
+    Extension(client): Extension<Client>,
+    Json(data): Json<AddRouteSch>,
+) {
     let route = match data.typee {
         AddRouteTypeSch::Longpull(route) => {
             let update = LongPollRoute::new(route.path);
             AddRouteType::Longpull(Arc::new(update))
         }
         AddRouteTypeSch::Webhook(route) => {
-            let update = WebhookRoute::new(route.url);
+            let update = WebhookRoute::new(route.url, client);
             AddRouteType::Webhook(Arc::new(update))
         }
     };

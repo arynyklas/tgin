@@ -1,7 +1,8 @@
 use axum::{
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
+use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -17,12 +18,22 @@ pub struct Api {
     base_path: String,
     tx: Sender<ApiMessage>,
     pub rx: Receiver<ApiMessage>,
+    /// Shared `reqwest::Client` injected into routes built by `add_route`.
+    /// Stored here (rather than constructed at handler time) so dynamically
+    /// added `WebhookRoute`s share the process-wide connection pool / TLS
+    /// state with statically configured ones.
+    client: Client,
 }
 
 impl Api {
-    pub fn new(base_path: String) -> Self {
+    pub fn new(base_path: String, client: Client) -> Self {
         let (tx, rx) = mpsc::channel::<ApiMessage>(100);
-        Self { base_path, tx, rx }
+        Self {
+            base_path,
+            tx,
+            rx,
+            client,
+        }
     }
 }
 
@@ -35,6 +46,7 @@ impl Serverable for Api {
                 "/route",
                 post(methods::add_route).delete(methods::remove_route),
             )
+            .layer(Extension(self.client.clone()))
             .with_state(self.tx.clone());
 
         main_router.nest(&self.base_path, router)
