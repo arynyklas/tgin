@@ -12,6 +12,8 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use subtle::ConstantTimeEq;
+
 use reqwest::Client;
 
 use tokio::sync::mpsc::Sender;
@@ -74,6 +76,10 @@ impl WebhookUpdate {
         self.secret_token = Some(token);
     }
 
+    pub fn set_registration(&mut self, config: RegistrationWebhookConfig) {
+        self.registration = Some(config);
+    }
+
     pub async fn register_webhook(&self, config: &RegistrationWebhookConfig) {
         let full_url = format!("{}{}", config.public_ip.trim_end_matches('/'), self.path);
 
@@ -124,16 +130,31 @@ impl Serverable for WebhookUpdate {
             let secret = secret.clone();
             async move {
                 if let Some(sec) = secret {
-                    if let Some(header_val) = headers.get("x-telegram-bot-api-secret-token") {
-                        if header_val.to_str().unwrap_or("") != sec {
-                            return StatusCode::UNAUTHORIZED;
-                        }
-                    } else {
+                    let provided = headers
+                        .get("x-telegram-bot-api-secret-token")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("");
+                    let provided_bytes = provided.as_bytes();
+                    let expected_bytes = sec.as_bytes();
+                    let len_eq = provided_bytes.len() == expected_bytes.len();
+                    // Compare same-length buffers (zero-padded to expected len) so that
+                    // a length mismatch still goes through ct_eq and doesn't short-circuit
+                    // by length alone. The final `&` with `len_eq` rejects length mismatches.
+                    let mut padded = vec![0u8; expected_bytes.len()];
+                    let copy_len = provided_bytes.len().min(expected_bytes.len());
+                    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
+                    let bytes_eq: bool = padded.ct_eq(expected_bytes).into();
+                    if !(len_eq && bytes_eq) {
                         return StatusCode::UNAUTHORIZED;
                     }
                 }
-                let _ = tx.send(update).await;
-                StatusCode::OK
+                match tx.send(update).await {
+                    Ok(()) => StatusCode::OK,
+                    // Channel closed: the dispatcher is gone (shutdown). Telling Telegram
+                    // 200 here would silently drop the update because Telegram never re-
+                    // delivers an acknowledged update. 503 makes it retry.
+                    Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+                }
             }
         };
 
@@ -224,5 +245,76 @@ mod tests {
 
         assert_eq!(received["update_id"], 999);
         assert_eq!(received["message"]["text"], "Hello via Webhook");
+    }
+
+    /// When the dispatcher channel is closed, returning 200 to Telegram would silently
+    /// drop the update -- Telegram never re-delivers an acknowledged update. The handler
+    /// MUST surface that as 503 so Telegram retries.
+    #[tokio::test]
+    async fn test_handler_returns_503_on_closed_channel() {
+        let updater = WebhookUpdate::new("/bot/update".to_string());
+
+        let (tx, rx) = mpsc::channel(10);
+        // Drop the receiver before any request arrives -- channel is now closed for
+        // sends. The handler captured `tx` via Router::with_state.
+        drop(rx);
+
+        let app = updater.set_server(Router::new()).await.with_state(tx);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/bot/update")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Secret-token check: missing / wrong header -> 401, correct header -> 200.
+    /// Covers the constant-time comparison swap; previously this path was uncovered.
+    #[tokio::test]
+    async fn test_handler_secret_token_check() {
+        let secret = "shared-secret".to_string();
+        let mut updater = WebhookUpdate::new("/bot/update".to_string());
+        updater.set_secret_token(secret.clone());
+        let updater = updater;
+
+        let send = |header: Option<&'static str>| {
+            let updater = &updater;
+            async move {
+                let (tx, mut rx) = mpsc::channel(10);
+                let app = updater.set_server(Router::new()).await.with_state(tx);
+
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/bot/update")
+                    .header("content-type", "application/json");
+                if let Some(h) = header {
+                    builder = builder.header("x-telegram-bot-api-secret-token", h);
+                }
+                let request = builder
+                    .body(Body::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+                    .unwrap();
+
+                let status = app.oneshot(request).await.unwrap().status();
+                // Drain so the channel doesn't accumulate across calls.
+                let _ = rx.try_recv();
+                status
+            }
+        };
+
+        assert_eq!(send(None).await, StatusCode::UNAUTHORIZED, "missing header");
+        assert_eq!(send(Some("wrong")).await, StatusCode::UNAUTHORIZED, "wrong secret");
+        // Length-mismatch case (shorter than expected) -- exercises the padded ct_eq path.
+        assert_eq!(send(Some("shared")).await, StatusCode::UNAUTHORIZED, "too short");
+        // Length-mismatch case (longer than expected) -- exercises the padded ct_eq path.
+        assert_eq!(
+            send(Some("shared-secret-extra")).await,
+            StatusCode::UNAUTHORIZED,
+            "too long"
+        );
+        assert_eq!(send(Some("shared-secret")).await, StatusCode::OK, "correct secret");
     }
 }
