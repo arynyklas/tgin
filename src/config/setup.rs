@@ -114,7 +114,7 @@ mod tests {
             registration: Some(SchemaRegistration {
                 public_ip: "https://example.invalid".to_string(),
                 set_webhook_url: None,
-                token: "123:ABC".to_string(),
+                token: "12345678:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345".to_string(),
             }),
             secret_token: None,
         }];
@@ -126,6 +126,12 @@ mod tests {
         assert!(
             banner.contains("REGISTRATED ON"),
             "registration block was discarded; banner was {banner:?}"
+        );
+        // The token shape matches TELEGRAM_TOKEN_REGEX, so the banner must not leak
+        // the secret half of the bot token.
+        assert!(
+            !banner.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),
+            "token was not redacted in banner: {banner:?}"
         );
     }
 

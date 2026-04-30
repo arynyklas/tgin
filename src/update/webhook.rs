@@ -209,7 +209,7 @@ mod tests {
         reg_config.set_webhook_url(format!("{}/setWebhook", mock_server.uri()));
 
         let mut updater = WebhookUpdate::new("/webhook".to_string());
-        updater.registration = Some(reg_config);
+        updater.set_registration(reg_config);
 
         let (tx, _) = mpsc::channel(1);
 
