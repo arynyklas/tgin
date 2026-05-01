@@ -9,6 +9,8 @@ mod utils;
 
 mod api;
 
+use std::process::ExitCode;
+
 use crate::config::setup::{build_route, build_updates, load_config};
 use crate::tgin::Tgin;
 use crate::utils::http::build_shared_client;
@@ -18,7 +20,18 @@ use clap::{Arg, Command};
 #[cfg(test)]
 mod mock;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Top-level entry. Operators see a single rendered error line (or block) on
+/// stderr and a non-zero exit code — never a Rust stack trace from a
+/// startup-time panic. Stack traces are not for operators.
+fn main() -> ExitCode {
+    if let Err(err) = run() {
+        eprintln!("tgin: {err}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Command::new("tgin")
         .about("tgin is a telegram bot routing layer")
         .arg(
@@ -35,9 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path: &str = matches
         .get_one::<String>("file")
         .map(|s| s.as_str())
-        .unwrap();
+        .expect("clap default guarantees a value");
 
-    let conf = load_config(config_path);
+    let conf = load_config(config_path)?;
 
     // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
     // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,
