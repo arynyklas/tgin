@@ -78,7 +78,13 @@ impl Tgin {
     }
 
     pub async fn run_async(self) {
-        let (tx, mut rx) = mpsc::channel::<Value>(1000000);
+        // Bounded buffer: a small queue is flow control. The previous
+        // 1_000_000-slot channel was not — it was a runway for OOM that
+        // hid downstream slowness from producers until memory ran out.
+        // With a bounded buffer, a slow downstream backpressures producers
+        // (LongPoll stops calling `getUpdates`; webhook handlers hold open)
+        // and overload becomes immediately visible.
+        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
 
         let api = self.api;
 
@@ -134,62 +140,314 @@ impl Tgin {
             });
         }
 
+        // Drop the dispatcher's own sender so the channel closes cleanly
+        // once every producer task ends — that signals workers to drain and
+        // exit.
         drop(tx);
+
+        // N long-lived consumers replace the previous `spawn`-per-update
+        // pattern. Each worker loops on `rx.recv()` and `await`s
+        // `route.process(...)` directly: the routing tree is the unit of
+        // concurrency, not the individual update. This caps in-flight work
+        // at `dark_threads` regardless of arrival rate, so a slow downstream
+        // can no longer grow the task pool unboundedly.
+        //
+        // The receiver is shared via a `tokio::sync::Mutex`. The lock is
+        // held only across `recv().await` (a single tokio primitive op);
+        // contention is brief and bounded by N. While one worker is parked
+        // in `recv`, the other N-1 can be processing — the mutex serialises
+        // _picking_ items, not _doing_ work.
+        let worker_count = self.dark_threads.max(1);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let rx = rx.clone();
+            let route = self.route.clone();
+            workers.push(tokio::spawn(async move {
+                loop {
+                    let next = {
+                        let mut guard = rx.lock().await;
+                        guard.recv().await
+                    };
+                    match next {
+                        Some(update) => {
+                            // Wrap once: every downstream consumer
+                            // (round-robin pick, broadcast spawn, leaf
+                            // process) shares the same `Arc<Value>` and pays
+                            // only an atomic ref-count bump.
+                            route.process(Arc::new(update)).await;
+                        }
+                        None => return,
+                    }
+                }
+            }));
+        }
 
         match api {
             None => {
-                while let Some(update) = rx.recv().await {
-                    // Wrap once at ingress — every downstream consumer
-                    // (round-robin pick, broadcast spawn, leaf process)
-                    // shares the same `Arc<Value>` and pays only an
-                    // atomic ref-count bump, never a deep clone.
-                    let update = Arc::new(update);
-                    let route_clone = self.route.clone();
-                    tokio::spawn(async move {
-                        route_clone.process(update).await;
-                    });
+                // Workers exit when the channel closes (every ingress
+                // producer dropped its `Sender` clone). Wait for clean
+                // drain so the runtime doesn't tear down mid-dispatch.
+                for w in workers {
+                    let _ = w.await;
                 }
             }
 
-            Some(mut api) => loop {
-                tokio::select! {
-                    Some(api) = api.rx.recv() => {
-                    match api {
-                            ApiMessage::GetRoutes(tx_response) => {
-                                let _ = tx_response.send(self.route.json_struct().await);
-                            }
-
-                            ApiMessage::AddRoute{route, sublevel} => {
-                                let _ = sublevel;
-                                let self_route = self.route.clone();
-                                match self_route.add_route(route).await {
-                                    Err(_) => {},
-                                    Ok(_) => {}
-                                }
-                            }
-
-                            ApiMessage::RmRoute(target) => {
-                                let self_route = self.route.clone();
-                                tokio::spawn(async move {
-                                    match self_route.remove_route(target).await {
-                                        Ok(_) => {},
-                                        Err(_) => {},
-                                    }
-                                });
-                            }
+            Some(mut api) => {
+                // Control plane runs alongside the worker pool. Updates do
+                // not flow through this loop anymore — workers own the
+                // update channel.
+                while let Some(api_msg) = api.rx.recv().await {
+                    match api_msg {
+                        ApiMessage::GetRoutes(tx_response) => {
+                            let _ = tx_response.send(self.route.json_struct().await);
                         }
-                    },
 
-                    Some(update) = rx.recv() => {
-                        let update = Arc::new(update);
-                        let route_clone = self.route.clone();
-                        tokio::spawn(async move {
-                            route_clone.process(update).await;
-                        });
+                        ApiMessage::AddRoute { route, sublevel } => {
+                            let _ = sublevel;
+                            let _ = self.route.add_route(route).await;
+                        }
+
+                        ApiMessage::RmRoute(target) => {
+                            let self_route = self.route.clone();
+                            tokio::spawn(async move {
+                                let _ = self_route.remove_route(target).await;
+                            });
+                        }
                     }
-
                 }
-            },
+
+                for w in workers {
+                    let _ = w.await;
+                }
+            }
         }
+    }
+}
+
+/// Bounded capacity for the update mpsc. Sized to absorb short bursts
+/// without giving slow downstreams a runway to OOM. The previous
+/// 1_000_000-slot buffer was a buffer, not flow control; with this cap,
+/// producers see backpressure immediately when the worker pool falls
+/// behind.
+const UPDATE_CHANNEL_CAPACITY: usize = 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::{Printable, Routeable, Serverable};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    /// Counts processed updates. Records the maximum number of
+    /// `process` calls observed in flight at the same time so a test can
+    /// assert that work actually parallelises across workers.
+    struct ConcurrencyProbe {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        completed: AtomicUsize,
+        gate: Notify,
+        release: AtomicUsize,
+    }
+
+    impl ConcurrencyProbe {
+        fn new() -> Self {
+            Self {
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                gate: Notify::new(),
+                release: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Routeable for ConcurrencyProbe {
+        async fn process(&self, _update: Arc<Value>) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+
+            // Park each call on a shared `Notify` until the test releases
+            // it. `release` tracks how many notifies have been issued so a
+            // late arrival can short-circuit instead of deadlocking.
+            loop {
+                if self.release.load(Ordering::SeqCst) > 0 {
+                    self.release.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+                self.gate.notified().await;
+            }
+
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Serverable for ConcurrencyProbe {}
+    impl Printable for ConcurrencyProbe {}
+
+    /// `dark_threads` workers must run `process` concurrently \u2014 the new
+    /// design replaces unbounded `tokio::spawn` with a fixed worker pool,
+    /// so this is the test that proves the pool actually parallelises and
+    /// is not, e.g., serialised by the receiver mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_workers_process_in_parallel() {
+        let probe = Arc::new(ConcurrencyProbe::new());
+        let route_dyn: Arc<dyn RouteableComponent> = probe.clone();
+
+        let workers_n = 4;
+        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let workers = spawn_workers(rx, route_dyn, workers_n);
+
+        for i in 0..workers_n {
+            tx.send(json!({ "update_id": i })).await.unwrap();
+        }
+
+        // Spin until every worker is parked in `process` simultaneously.
+        // Bound the wait so a regression to a serialising design fails
+        // the test instead of hanging it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while probe.in_flight.load(Ordering::SeqCst) < workers_n {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "only {} workers reached `process` concurrently; expected {}",
+                    probe.in_flight.load(Ordering::SeqCst),
+                    workers_n
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            probe.max_in_flight.load(Ordering::SeqCst),
+            workers_n,
+            "max in-flight should equal worker count"
+        );
+
+        probe.release.store(workers_n, Ordering::SeqCst);
+        probe.gate.notify_waiters();
+        drop(tx);
+        for w in workers {
+            let _ = w.await;
+        }
+    }
+
+
+    /// End-to-end through the public dispatch surface: spawn the worker
+    /// pool via a test-only helper that mirrors `run_async` and assert
+    /// that all updates land at the route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_workers_drain_all_updates_and_exit_on_close() {
+        use crate::mock::routes::MockCallsRoute;
+
+        let route = Arc::new(MockCallsRoute::new("sink"));
+        let route_dyn: Arc<dyn RouteableComponent> = route.clone();
+
+        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let workers = spawn_workers(rx, route_dyn.clone(), 4);
+
+        for i in 0..32 {
+            tx.send(json!({ "update_id": i })).await.unwrap();
+        }
+        drop(tx);
+
+        for w in workers {
+            w.await.unwrap();
+        }
+
+        assert_eq!(route.count().await, 32);
+    }
+
+    /// Capacity is small enough that a stalled worker pool backpressures
+    /// the producer immediately, instead of accepting unbounded buffering.
+    /// Concretely: with N workers all parked in `process`, the (N+CAP)+1th
+    /// `try_send` must fail with `Full`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bounded_capacity_surfaces_backpressure() {
+        let probe = Arc::new(ConcurrencyProbe::new());
+        let route_dyn: Arc<dyn RouteableComponent> = probe.clone();
+
+        let workers_n = 2;
+        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let workers = spawn_workers(rx, route_dyn, workers_n);
+
+        // Fill the channel: workers are blocked on `gate`, so anything we
+        // send beyond `worker_count + capacity` must be rejected.
+        let mut accepted = 0usize;
+        loop {
+            match tx.try_send(json!({ "update_id": accepted })) {
+                Ok(()) => accepted += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(e) => panic!("unexpected send error: {:?}", e),
+            }
+            if accepted > UPDATE_CHANNEL_CAPACITY + workers_n + 16 {
+                panic!(
+                    "channel never reported Full after {} sends; capacity is unbounded?",
+                    accepted
+                );
+            }
+        }
+
+        // Channel is bounded — backpressure surfaced. The exact count is
+        // `capacity + items currently held by workers`, which is at most
+        // `UPDATE_CHANNEL_CAPACITY + workers_n`. We allow equality on the
+        // upper bound to tolerate scheduling races on which side observed
+        // the slot first.
+        assert!(
+            accepted <= UPDATE_CHANNEL_CAPACITY + workers_n,
+            "accepted {} sends but capacity should be {} + {} workers",
+            accepted,
+            UPDATE_CHANNEL_CAPACITY,
+            workers_n
+        );
+        assert!(
+            accepted >= UPDATE_CHANNEL_CAPACITY,
+            "accepted {} sends but capacity is {}",
+            accepted,
+            UPDATE_CHANNEL_CAPACITY
+        );
+
+        // Release every parked worker so the test shuts down cleanly.
+        probe.release.store(accepted, Ordering::SeqCst);
+        probe.gate.notify_waiters();
+        drop(tx);
+        for w in workers {
+            let _ = w.await;
+        }
+    }
+
+    /// Test-only mirror of the worker-spawning logic in `run_async`.
+    /// Exists so unit tests can drive the dispatch surface without
+    /// standing up a full `Tgin` (which would also require ingress
+    /// adapters, an axum router, and a port).
+    fn spawn_workers(
+        rx: mpsc::Receiver<Value>,
+        route: Arc<dyn RouteableComponent>,
+        worker_count: usize,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        (0..worker_count.max(1))
+            .map(|_| {
+                let rx = rx.clone();
+                let route = route.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let next = {
+                            let mut guard = rx.lock().await;
+                            guard.recv().await
+                        };
+                        match next {
+                            Some(update) => {
+                                route.process(Arc::new(update)).await;
+                            }
+                            None => return,
+                        }
+                    }
+                })
+            })
+            .collect()
     }
 }
