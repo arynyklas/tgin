@@ -2,7 +2,7 @@ use axum::http::{header::CONTENT_TYPE, Method};
 use axum::{extract::Request, Json};
 use serde_json::{json, Value};
 
-use crate::dynamic::longpoll_registry::LONGPOLL_REGISTRY;
+use crate::dynamic::longpoll_registry;
 
 use crate::route::longpull::GetUpdatesParams;
 
@@ -60,10 +60,7 @@ pub async fn dynamic_handler(request: Request) -> Json<Value> {
         }
     };
 
-    let route = {
-        let registry = LONGPOLL_REGISTRY.read().expect("Registry lock poisoned");
-        registry.get(&path).cloned()
-    };
+    let route = longpoll_registry::get(&path);
 
     if let Some(route) = route {
         return route.handle_request(params).await;
