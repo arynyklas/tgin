@@ -100,11 +100,11 @@ Simple configuration in the ron
 
 <table>
   <tr>
-    <td><img src="tests/performance/diagram/loss.png" alt="Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/median.png" alt="Median Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/loss.png" alt="Loss Rate" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/median.png" alt="Median Latency" width="500"></td>
   </tr>
   <tr>
-    <td><img src="tests/performance/diagram/mean.png" alt="Mean Latency" width="500"></td>
-    <td><img src="tests/performance/diagram/max.png" alt="Max Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/mean.png" alt="Mean Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/max.png" alt="Max Latency" width="500"></td>
   </tr>
 </table>
