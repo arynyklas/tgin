@@ -1,4 +1,5 @@
-use crate::base::{Printable, Routeable, Serverable};
+use crate::base::{Printable, RouteId, Routeable, Serverable};
+use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -26,18 +27,18 @@ impl WebhookRoute {
 
 #[async_trait]
 impl Routeable for WebhookRoute {
-    async fn process(&self, update: Value) {
+    async fn process(&self, update: Arc<Value>) {
         let _ = self
             .client
             .post(&self.url)
-            .json(&update)
+            .json(&*update)
             .timeout(self.request_timeout)
             .send()
             .await;
     }
 
-    fn diff_value(&self) -> Option<&str> {
-        Some(&self.url)
+    fn id(&self) -> Option<RouteId> {
+        Some(RouteId::Url(self.url.clone()))
     }
 }
 
@@ -87,7 +88,7 @@ mod tests {
 
         let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
 
-        route.process(payload).await;
+        route.process(Arc::new(payload)).await;
     }
 
     #[tokio::test]
@@ -99,7 +100,7 @@ mod tests {
         );
 
         let payload = json!({"test": "data"});
-        route.process(payload).await;
+        route.process(Arc::new(payload)).await;
     }
 
     #[tokio::test]
@@ -135,7 +136,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        route.process(json!({"update_id": 1})).await;
+        route.process(Arc::new(json!({"update_id": 1}))).await;
         let elapsed = start.elapsed();
 
         // Comfortable headroom over the 100ms cap, well under the 5s downstream delay.

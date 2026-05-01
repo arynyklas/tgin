@@ -139,6 +139,11 @@ impl Tgin {
         match api {
             None => {
                 while let Some(update) = rx.recv().await {
+                    // Wrap once at ingress — every downstream consumer
+                    // (round-robin pick, broadcast spawn, leaf process)
+                    // shares the same `Arc<Value>` and pays only an
+                    // atomic ref-count bump, never a deep clone.
+                    let update = Arc::new(update);
                     let route_clone = self.route.clone();
                     tokio::spawn(async move {
                         route_clone.process(update).await;
@@ -163,10 +168,10 @@ impl Tgin {
                                 }
                             }
 
-                            ApiMessage::RmRoute(route) => {
+                            ApiMessage::RmRoute(target) => {
                                 let self_route = self.route.clone();
                                 tokio::spawn(async move {
-                                    match self_route.remove_route(route).await {
+                                    match self_route.remove_route(target).await {
                                         Ok(_) => {},
                                         Err(_) => {},
                                     }
@@ -176,6 +181,7 @@ impl Tgin {
                     },
 
                     Some(update) = rx.recv() => {
+                        let update = Arc::new(update);
                         let route_clone = self.route.clone();
                         tokio::spawn(async move {
                             route_clone.process(update).await;
