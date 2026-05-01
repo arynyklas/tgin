@@ -1,0 +1,17 @@
+[project]
+name = "tgin-diagram"
+version = "0.1.0"
+description = "Plot tgin benchmark results from results.csv"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "ty",
+]
+
+[tool.uv]
+package = false

@@ -21,10 +21,10 @@ In Webhook mode, 5 workers at 10000 RPS maintain a mean latency of approximately
 In Longpoll mode, TGIN functions as an in-memory buffer: during traffic spikes, incoming requests are queued rather than dropped. This ensures zero data loss, with latency increasing temporarily as the backlog is processed.
 
 
-![Loss Rate %](tests/performance/diagram/loss.png)
-![Median Latency Ms](tests/performance/diagram/median.png)
-![Mean Latency Ms](tests/performance/diagram/mean.png)
-![Max Latency Ms](tests/performance/diagram/max.png)
+![Loss Rate %](tests/performance/diagram/generated/loss.png)
+![Median Latency Ms](tests/performance/diagram/generated/median.png)
+![Mean Latency Ms](tests/performance/diagram/generated/mean.png)
+![Max Latency Ms](tests/performance/diagram/generated/max.png)
 
 
 ## How to setup
@@ -41,5 +41,5 @@ cd tgin/tests/performance
 
 # Update diagram's
 cd diagram
-go run main.go
+uv run main.py
 ```
