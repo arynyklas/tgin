@@ -6,7 +6,7 @@ use tokio::sync::{mpsc::Sender, RwLock};
 use std::sync::Arc;
 
 use crate::api::message::{AddRouteType, RmRoute};
-use crate::dynamic::longpoll_registry::LONGPOLL_REGISTRY;
+use crate::dynamic::longpoll_registry;
 
 use async_trait::async_trait;
 
@@ -42,14 +42,11 @@ impl Routeable for AllLB {
         let mut routes = self.routes.write().await;
 
         match route {
-            AddRouteType::Longpull(route_arc) => match LONGPOLL_REGISTRY.write() {
-                Ok(mut registry) => {
-                    registry.insert(route_arc.path.clone(), route_arc.clone());
-                    routes.push(route_arc);
-                    Ok(())
-                }
-                Err(_) => Err(()),
-            },
+            AddRouteType::Longpull(route_arc) => {
+                longpoll_registry::insert(route_arc.path.clone(), route_arc.clone());
+                routes.push(route_arc);
+                Ok(())
+            }
             AddRouteType::Webhook(route) => {
                 routes.push(route);
                 Ok(())
@@ -64,9 +61,7 @@ impl Routeable for AllLB {
         let target = if let Some(url) = &route.url {
             url
         } else if let Some(path) = &route.path {
-            if let Ok(mut registry) = LONGPOLL_REGISTRY.write() {
-                registry.remove(path);
-            }
+            longpoll_registry::remove(path);
             path
         } else {
             return Err(());
