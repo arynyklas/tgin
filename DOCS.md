@@ -62,8 +62,8 @@ Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`):
 - **`LongPollRoute { path }`**  
   Exposes a `/bot`-style endpoint that downstream bots can poll. Updates are buffered in memory until a client calls the route using an HTTP-request (`application/x-www-form-urlencoded`) with Telegram-compatible `offset`/`timeout` parameters. `offset` filtering follows Telegram semantics so multiple bots can safely read from the buffer.
 
-- **`WebhookRoute { url }`**  
-  Push-based forwarder: every update triggers an HTTP POST with the original JSON payload to the target `url` (e.g., `http://internal-bot:8080/bot`). HTTP errors are ignored after logging, so ensure downstream services are resilient.
+- **`WebhookRoute { url, request_timeout_ms? }`**  
+  Push-based forwarder: every update triggers an HTTP POST with the original JSON payload to the target `url` (e.g., `http://internal-bot:8080/bot`). HTTP errors are ignored after logging, so ensure downstream services are resilient. `request_timeout_ms` (optional, default `10000`) caps each outbound POST so a slow downstream cannot park a routing slot indefinitely; lower it (e.g. `2000`) when downstreams are expected to be fast and you want backpressure to surface quickly.
 
 ### Load balancers
 Load balancers compose multiple routes.
@@ -88,7 +88,7 @@ Routes are nested under `base_path` and share the same listener as your ingress 
 | Endpoint | Method | Body | Description |
 | -------- | ------ | ---- | ----------- |
 | `/api/routes` | GET | — | Returns the current routing tree as JSON (source: `Routeable::json_struct`). |
-| `/api/route` | POST | `{ "type": "...", "path/url": "...", "sublevel": 0 }` | Adds a new route dynamically. `type` accepts `Webhook` or `Longpull`. `sublevel` is reserved for future hierarchical insertion (currently a placeholder). |
+| `/api/route` | POST | `{ "type": "...", "path/url": "...", "sublevel": 0, "request_timeout_ms": <ms>? }` | Adds a new route dynamically. `type` accepts `Webhook` or `Longpull`. `request_timeout_ms` is optional and only meaningful for `Webhook` routes (defaults to `10000`). `sublevel` is reserved for future hierarchical insertion (currently a placeholder). |
 
 Example request:
 ```bash

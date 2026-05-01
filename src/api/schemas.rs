@@ -8,6 +8,10 @@ fn default_sublevel() -> i8 {
 pub struct AddWebhookRouteSch {
     #[serde(default)]
     pub url: String,
+    /// Per-request timeout (milliseconds) for outbound POSTs to this
+    /// downstream. Omit to use `WebhookRoute::DEFAULT_REQUEST_TIMEOUT`.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]

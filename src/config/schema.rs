@@ -71,9 +71,25 @@ pub struct RegistrationWebhookConfig {
 }
 #[derive(Deserialize, Debug)]
 pub enum RouteConfig {
-    LongPollRoute { path: String },
-    WebhookRoute { url: String },
+    LongPollRoute {
+        path: String,
+    },
+    WebhookRoute {
+        url: String,
+        /// Per-request deadline (in milliseconds) for forwarding an update to
+        /// this downstream. Defaults to `WebhookRoute`'s `DEFAULT_REQUEST_TIMEOUT`.
+        #[serde(default = "default_webhook_request_timeout_ms")]
+        request_timeout_ms: u64,
+    },
 
-    RoundRobinLB { routes: Vec<RouteConfig> },
-    AllLB { routes: Vec<RouteConfig> },
+    RoundRobinLB {
+        routes: Vec<RouteConfig>,
+    },
+    AllLB {
+        routes: Vec<RouteConfig>,
+    },
+}
+
+fn default_webhook_request_timeout_ms() -> u64 {
+    crate::route::webhook::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64
 }

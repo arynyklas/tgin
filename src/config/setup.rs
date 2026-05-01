@@ -8,6 +8,7 @@ use crate::update::webhook::{RegistrationWebhookConfig as RuntimeRegistration, W
 
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use regex::Regex;
 use reqwest::Client;
@@ -88,7 +89,14 @@ pub fn build_updates(configs: Vec<UpdateConfig>, client: &Client) -> Vec<Box<dyn
 pub fn build_route(cfg: RouteConfig, client: &Client) -> Arc<dyn RouteableComponent> {
     match cfg {
         RouteConfig::LongPollRoute { path } => Arc::new(LongPollRoute::new(path)),
-        RouteConfig::WebhookRoute { url } => Arc::new(WebhookRoute::new(url, client.clone())),
+        RouteConfig::WebhookRoute {
+            url,
+            request_timeout_ms,
+        } => Arc::new(WebhookRoute::new(
+            url,
+            client.clone(),
+            Duration::from_millis(request_timeout_ms),
+        )),
 
         RouteConfig::RoundRobinLB { routes } => {
             let built_routes: Vec<Arc<dyn RouteableComponent>> = routes

@@ -4,21 +4,23 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Per-request deadline for forwarding an update to a downstream bot. A bot
-/// that does not ack within this window is treated as failed for the purpose
-/// of this dispatch — the update is dropped (we never re-deliver to a webhook
-/// route, by design) and the dispatcher moves on so one slow downstream cannot
-/// stall the channel.
-const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default per-request deadline for forwarding an update to a downstream bot.
+/// A bot that does not ack within this window is treated as failed for the
+/// purpose of this dispatch — the update is dropped (we never re-deliver to a
+/// webhook route, by design) and the dispatcher moves on so one slow
+/// downstream cannot stall the channel. Override per route via
+/// `RouteConfig::WebhookRoute { request_timeout_ms }` or the management API.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebhookRoute {
     client: Client,
     url: String,
+    request_timeout: Duration,
 }
 
 impl WebhookRoute {
-    pub fn new(url: String, client: Client) -> Self {
-        Self { client, url }
+    pub fn new(url: String, client: Client, request_timeout: Duration) -> Self {
+        Self { client, url, request_timeout }
     }
 }
 
@@ -29,7 +31,7 @@ impl Routeable for WebhookRoute {
             .client
             .post(&self.url)
             .json(&update)
-            .timeout(WEBHOOK_REQUEST_TIMEOUT)
+            .timeout(self.request_timeout)
             .send()
             .await;
     }
@@ -83,14 +85,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let route = WebhookRoute::new(mock_server.uri(), test_client());
+        let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
 
         route.process(payload).await;
     }
 
     #[tokio::test]
     async fn test_process_does_not_panic_on_network_error() {
-        let route = WebhookRoute::new("http://localhost:9999/invalid".to_string(), test_client());
+        let route = WebhookRoute::new(
+            "http://localhost:9999/invalid".to_string(),
+            test_client(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
 
         let payload = json!({"test": "data"});
         route.process(payload).await;
@@ -99,11 +105,43 @@ mod tests {
     #[tokio::test]
     async fn test_printable_implementation() {
         let url = "http://my-bot.com/webhook";
-        let route = WebhookRoute::new(url.to_string(), test_client());
+        let route = WebhookRoute::new(url.to_string(), test_client(), DEFAULT_REQUEST_TIMEOUT);
 
         assert_eq!(route.print().await, format!("webhook: {}", url));
         let json_info = route.json_struct().await;
         assert_eq!(json_info["type"], "webhook");
         assert_eq!(json_info["options"]["url"], url);
+    }
+
+    /// A downstream that holds the request open longer than the configured
+    /// per-request timeout MUST cause `process` to give up and return inside the
+    /// timeout window. Without this guarantee a single slow bot would park a
+    /// routing slot for the full default 10 s and starve the dispatcher.
+    #[tokio::test]
+    async fn test_process_honors_per_request_timeout() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let route = WebhookRoute::new(
+            mock_server.uri(),
+            test_client(),
+            Duration::from_millis(100),
+        );
+
+        let start = std::time::Instant::now();
+        route.process(json!({"update_id": 1})).await;
+        let elapsed = start.elapsed();
+
+        // Comfortable headroom over the 100ms cap, well under the 5s downstream delay.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "process did not honor the per-request timeout (elapsed {elapsed:?})",
+        );
     }
 }
