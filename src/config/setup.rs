@@ -10,6 +10,7 @@ use std::fs;
 use std::sync::Arc;
 
 use regex::Regex;
+use reqwest::Client;
 use std::env;
 
 pub fn load_config(path: &str) -> TginConfig {
@@ -35,7 +36,11 @@ fn substitute_env_vars(input: &str) -> String {
     .to_string()
 }
 
-pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent>> {
+/// Build the runtime ingress adapters. The `client` is the process-wide
+/// shared `reqwest::Client`; every adapter that issues outbound HTTP gets a
+/// clone (cheap — `Client` is `Arc`-internal) so they share the connection
+/// pool, DNS resolver, and TLS state.
+pub fn build_updates(configs: Vec<UpdateConfig>, client: &Client) -> Vec<Box<dyn UpdaterComponent>> {
     let mut result: Vec<Box<dyn UpdaterComponent>> = Vec::new();
 
     for cfg in configs {
@@ -45,12 +50,15 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
                 url,
                 default_timeout_sleep,
                 error_timeout_sleep,
+                long_poll_timeout,
+                long_poll_limit,
             } => {
-                let mut up = LongPollUpdate::new(token);
+                let mut up = LongPollUpdate::new(token, client.clone());
                 if let Some(u) = url {
                     up.set_url(u);
                 }
                 up.set_timeouts(default_timeout_sleep, error_timeout_sleep);
+                up.set_long_poll_params(long_poll_timeout, long_poll_limit);
                 result.push(Box::new(up));
             }
             UpdateConfig::WebhookUpdate {
@@ -60,7 +68,8 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
             } => {
                 let mut up = WebhookUpdate::new(path);
                 if let Some(reg) = registration {
-                    let mut runtime = RuntimeRegistration::new(reg.token, reg.public_ip);
+                    let mut runtime =
+                        RuntimeRegistration::new(reg.token, reg.public_ip, client.clone());
                     if let Some(url) = reg.set_webhook_url {
                         runtime.set_webhook_url(url);
                     }
@@ -76,21 +85,25 @@ pub fn build_updates(configs: Vec<UpdateConfig>) -> Vec<Box<dyn UpdaterComponent
     result
 }
 
-pub fn build_route(cfg: RouteConfig) -> Arc<dyn RouteableComponent> {
+pub fn build_route(cfg: RouteConfig, client: &Client) -> Arc<dyn RouteableComponent> {
     match cfg {
         RouteConfig::LongPollRoute { path } => Arc::new(LongPollRoute::new(path)),
-        RouteConfig::WebhookRoute { url } => Arc::new(WebhookRoute::new(url)),
+        RouteConfig::WebhookRoute { url } => Arc::new(WebhookRoute::new(url, client.clone())),
 
         RouteConfig::RoundRobinLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> =
-                routes.into_iter().map(build_route).collect();
+            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
+                .into_iter()
+                .map(|r| build_route(r, client))
+                .collect();
 
             Arc::new(RoundRobinLB::new(built_routes))
         }
 
         RouteConfig::AllLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> =
-                routes.into_iter().map(build_route).collect();
+            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
+                .into_iter()
+                .map(|r| build_route(r, client))
+                .collect();
 
             Arc::new(AllLB::new(built_routes))
         }
@@ -102,6 +115,7 @@ pub fn build_route(cfg: RouteConfig) -> Arc<dyn RouteableComponent> {
 mod tests {
     use super::*;
     use crate::config::schema::RegistrationWebhookConfig as SchemaRegistration;
+    use crate::utils::http::build_shared_client;
 
     /// `build_updates` MUST forward the parsed `registration` block into the runtime
     /// `WebhookUpdate`. We can't poke at the private `registration` field from here,
@@ -119,7 +133,8 @@ mod tests {
             secret_token: None,
         }];
 
-        let built = build_updates(cfg);
+        let client = build_shared_client();
+        let built = build_updates(cfg, &client);
         assert_eq!(built.len(), 1);
 
         let banner = built[0].print().await;
@@ -146,7 +161,8 @@ mod tests {
             secret_token: None,
         }];
 
-        let built = build_updates(cfg);
+        let client = build_shared_client();
+        let built = build_updates(cfg, &client);
         let banner = built[0].print().await;
         assert!(
             !banner.contains("REGISTRATED ON"),

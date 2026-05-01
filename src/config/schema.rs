@@ -36,6 +36,12 @@ pub enum UpdateConfig {
         default_timeout_sleep: u64,
         #[serde(default = "default_timeout")]
         error_timeout_sleep: u64,
+        /// Server-side hold for `getUpdates` (Telegram caps at 50). Default: 30.
+        #[serde(default = "default_long_poll_timeout")]
+        long_poll_timeout: u64,
+        /// Max updates per `getUpdates` response (Telegram caps at 100). Default: 100.
+        #[serde(default = "default_long_poll_limit")]
+        long_poll_limit: u64,
     },
     WebhookUpdate {
         path: String,
@@ -49,18 +55,20 @@ fn default_timeout() -> u64 {
     100
 }
 
+fn default_long_poll_timeout() -> u64 {
+    30
+}
+
+fn default_long_poll_limit() -> u64 {
+    100
+}
+
 #[derive(Deserialize, Debug)]
 pub struct RegistrationWebhookConfig {
     pub public_ip: String,
     pub set_webhook_url: Option<String>,
     pub token: String,
 }
-#[derive(Deserialize, Debug)]
-pub enum RouteStrategyConfig {
-    RoundRobinLB { routes: Vec<RouteConfig> },
-    AllLB { routes: Vec<RouteConfig> },
-}
-
 #[derive(Deserialize, Debug)]
 pub enum RouteConfig {
     LongPollRoute { path: String },

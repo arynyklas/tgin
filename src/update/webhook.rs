@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use subtle::ConstantTimeEq;
 
@@ -29,32 +30,18 @@ pub struct RegistrationWebhookConfig {
 }
 
 impl RegistrationWebhookConfig {
-    pub fn new(token: String, public_ip: String) -> Self {
+    pub fn new(token: String, public_ip: String, client: Client) -> Self {
         Self {
             public_ip,
-            client: Client::new(),
+            client,
             set_webhook_url: format!("https://api.telegram.org/bot{}/setWebhook", token),
             token_regex: Regex::new(TELEGRAM_TOKEN_REGEX).unwrap(),
         }
     }
 
-    pub fn set_client(&mut self, client: Client) {
-        self.client = client;
-    }
-
     pub fn set_webhook_url(&mut self, set_webhook_url: String) {
         self.set_webhook_url = set_webhook_url;
     }
-
-    pub fn set_regex_token(&mut self, regex: Regex) {
-        self.token_regex = regex;
-    }
-}
-
-#[derive(Clone)]
-struct WebhookState {
-    tx: Sender<Value>,
-    secret_token: Option<String>,
 }
 
 pub struct WebhookUpdate {
@@ -89,6 +76,7 @@ impl WebhookUpdate {
             .client
             .post(&config.set_webhook_url)
             .json(&params)
+            .timeout(Duration::from_secs(10))
             .send()
             .await
         {
@@ -201,10 +189,9 @@ mod tests {
         let my_ip = "https://my-server.com";
         let token = "TOKEN123";
 
-        let mut reg_config = RegistrationWebhookConfig::new(token.to_string(), my_ip.to_string());
-
         let client = Client::builder().no_proxy().build().unwrap();
-        reg_config.set_client(client);
+        let mut reg_config =
+            RegistrationWebhookConfig::new(token.to_string(), my_ip.to_string(), client);
 
         reg_config.set_webhook_url(format!("{}/setWebhook", mock_server.uri()));
 

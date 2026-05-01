@@ -2,6 +2,14 @@ use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Per-request deadline for forwarding an update to a downstream bot. A bot
+/// that does not ack within this window is treated as failed for the purpose
+/// of this dispatch — the update is dropped (we never re-deliver to a webhook
+/// route, by design) and the dispatcher moves on so one slow downstream cannot
+/// stall the channel.
+const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebhookRoute {
     client: Client,
@@ -9,22 +17,21 @@ pub struct WebhookRoute {
 }
 
 impl WebhookRoute {
-    pub fn new(url: String) -> Self {
-        Self {
-            client: Client::new(),
-            url,
-        }
-    }
-
-    pub fn set_client(&mut self, client: Client) {
-        self.client = client;
+    pub fn new(url: String, client: Client) -> Self {
+        Self { client, url }
     }
 }
 
 #[async_trait]
 impl Routeable for WebhookRoute {
     async fn process(&self, update: Value) {
-        let _ = self.client.post(&self.url).json(&update).send().await;
+        let _ = self
+            .client
+            .post(&self.url)
+            .json(&update)
+            .timeout(WEBHOOK_REQUEST_TIMEOUT)
+            .send()
+            .await;
     }
 
     fn diff_value(&self) -> Option<&str> {
@@ -56,6 +63,10 @@ mod tests {
     use wiremock::matchers::{body_json, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn test_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
     #[tokio::test]
     async fn test_process_sends_correct_post_request() {
         let mock_server = MockServer::start().await;
@@ -72,17 +83,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-
-        let mut route = WebhookRoute::new(mock_server.uri());
-        route.set_client(client);
+        let route = WebhookRoute::new(mock_server.uri(), test_client());
 
         route.process(payload).await;
     }
 
     #[tokio::test]
     async fn test_process_does_not_panic_on_network_error() {
-        let route = WebhookRoute::new("http://localhost:9999/invalid".to_string());
+        let route = WebhookRoute::new("http://localhost:9999/invalid".to_string(), test_client());
 
         let payload = json!({"test": "data"});
         route.process(payload).await;
@@ -91,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn test_printable_implementation() {
         let url = "http://my-bot.com/webhook";
-        let route = WebhookRoute::new(url.to_string());
+        let route = WebhookRoute::new(url.to_string(), test_client());
 
         assert_eq!(route.print().await, format!("webhook: {}", url));
         let json_info = route.json_struct().await;
