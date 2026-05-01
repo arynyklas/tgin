@@ -6,8 +6,9 @@ use tokio;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
-use crate::api::message::{AddRouteType, ApiMessage, RmRoute};
+use crate::api::message::{AddRouteType, ApiMessage};
 use crate::api::schemas::{AddRouteSch, AddRouteTypeSch, RmRouteSch, RmRouteTypeSch};
+use crate::base::RouteId;
 
 use crate::route::longpull::LongPollRoute;
 use crate::route::webhook::{WebhookRoute, DEFAULT_REQUEST_TIMEOUT};
@@ -55,16 +56,10 @@ pub async fn get_routes(
 }
 
 pub async fn remove_route(State(tx): State<Sender<ApiMessage>>, Json(data): Json<RmRouteSch>) {
-    let route = match data.typee {
-        RmRouteTypeSch::Longpull(r) => RmRoute {
-            path: Some(r.path),
-            url: None,
-        },
-        RmRouteTypeSch::Webhook(r) => RmRoute {
-            path: None,
-            url: Some(r.url),
-        },
+    let target = match data.typee {
+        RmRouteTypeSch::Longpull(r) => RouteId::Path(r.path),
+        RmRouteTypeSch::Webhook(r) => RouteId::Url(r.url),
     };
 
-    let _ = tx.send(ApiMessage::RmRoute(route)).await;
+    let _ = tx.send(ApiMessage::RmRoute(target)).await;
 }

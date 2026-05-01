@@ -1,4 +1,4 @@
-use crate::base::{Printable, Routeable, Serverable};
+use crate::base::{Printable, RouteId, Routeable, Serverable};
 use async_trait::async_trait;
 
 use std::collections::VecDeque;
@@ -85,14 +85,19 @@ impl LongPollRoute {
 
 #[async_trait]
 impl Routeable for LongPollRoute {
-    async fn process(&self, update: Value) {
+    async fn process(&self, update: Arc<Value>) {
+        // Reuse the inner Value when we are the sole owner — single-
+        // consumer paths (`RoundRobinLB` → `LongPollRoute`) clone zero
+        // bytes; broadcast paths (`AllLB` → multiple `LongPollRoute`s)
+        // each pay one `Value` clone, same as before.
+        let update = Arc::try_unwrap(update).unwrap_or_else(|arc| (*arc).clone());
         let mut lock = self.updates.lock().await;
         lock.push_back(update);
         self.notify.notify_waiters();
     }
 
-    fn diff_value(&self) -> Option<&str> {
-        Some(&self.path)
+    fn id(&self) -> Option<RouteId> {
+        Some(RouteId::Path(self.path.clone()))
     }
 }
 
@@ -149,8 +154,8 @@ mod tests {
     async fn test_basic_process_and_retrieve() {
         let route = LongPollRoute::new("/bot/updates".to_string());
 
-        route.process(json!({"update_id": 1})).await;
-        route.process(json!({"update_id": 2})).await;
+        route.process(Arc::new(json!({"update_id": 1}))).await;
+        route.process(Arc::new(json!({"update_id": 2}))).await;
 
         let response = route.handle_request(default_params()).await;
 
@@ -167,7 +172,7 @@ mod tests {
         let route = LongPollRoute::new("/test".to_string());
 
         for i in 0..10 {
-            route.process(json!({"id": i})).await;
+            route.process(Arc::new(json!({"id": i}))).await;
         }
         // Запрашиваем только 4
         let params = GetUpdatesParams {
@@ -224,7 +229,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        route.process(json!({"msg": "hello"})).await;
+        route.process(Arc::new(json!({"msg": "hello"}))).await;
         let response = handle.await.unwrap();
         let body: Value = serde_json::to_value(response.0).unwrap();
         let results = body.get("result").unwrap().as_array().unwrap();
@@ -238,7 +243,7 @@ mod tests {
         let path = "/bot123/getUpdates";
         let route = LongPollRoute::new(path.to_string());
 
-        route.process(json!({"ok": true})).await;
+        route.process(Arc::new(json!({"ok": true}))).await;
 
         let app = Router::new();
         let app = route.set_server(app).await;

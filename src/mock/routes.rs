@@ -30,8 +30,11 @@ impl MockCallsRoute {
 
 #[async_trait]
 impl Routeable for MockCallsRoute {
-    async fn process(&self, update: Value) {
-        self.calls.lock().await.push(update);
+    async fn process(&self, update: Arc<Value>) {
+        // Tests inspect captured Values; clone the inner Value once on
+        // capture so the recorded history is independent of the Arc's
+        // ownership chain.
+        self.calls.lock().await.push((*update).clone());
     }
 }
 
