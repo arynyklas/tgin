@@ -10,7 +10,8 @@ use crate::api::message::{AddRouteType, ApiMessage, RmRoute};
 use crate::api::schemas::{AddRouteSch, AddRouteTypeSch, RmRouteSch, RmRouteTypeSch};
 
 use crate::route::longpull::LongPollRoute;
-use crate::route::webhook::WebhookRoute;
+use crate::route::webhook::{WebhookRoute, DEFAULT_REQUEST_TIMEOUT};
+use std::time::Duration;
 
 pub async fn add_route(
     State(tx): State<Sender<ApiMessage>>,
@@ -23,7 +24,11 @@ pub async fn add_route(
             AddRouteType::Longpull(Arc::new(update))
         }
         AddRouteTypeSch::Webhook(route) => {
-            let update = WebhookRoute::new(route.url, client);
+            let timeout = route
+                .request_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+            let update = WebhookRoute::new(route.url, client, timeout);
             AddRouteType::Webhook(Arc::new(update))
         }
     };
