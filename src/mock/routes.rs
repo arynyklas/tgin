@@ -2,13 +2,16 @@
 
 use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct MockCallsRoute {
     pub id: String,
-    pub calls: Arc<Mutex<Vec<Value>>>,
+    /// Raw wire bytes captured at every `process` call. Tests that need
+    /// structured access parse via [`MockCallsRoute::get_calls_as_values`].
+    pub calls: Arc<Mutex<Vec<Bytes>>>,
 }
 
 impl MockCallsRoute {
@@ -24,17 +27,21 @@ impl MockCallsRoute {
     }
 
     pub async fn get_calls(&self) -> Vec<Value> {
-        self.calls.lock().await.clone()
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .map(|b| serde_json::from_slice(b).expect("MockCallsRoute received non-JSON payload"))
+            .collect()
     }
 }
 
 #[async_trait]
 impl Routeable for MockCallsRoute {
-    async fn process(&self, update: Arc<Value>) {
-        // Tests inspect captured Values; clone the inner Value once on
-        // capture so the recorded history is independent of the Arc's
-        // ownership chain.
-        self.calls.lock().await.push((*update).clone());
+    async fn process(&self, update: Bytes) {
+        // Capture the bytes verbatim so tests assert against the same wire
+        // payload that downstreams would receive.
+        self.calls.lock().await.push(update);
     }
 }
 

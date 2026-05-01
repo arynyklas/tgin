@@ -2,8 +2,8 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
+use bytes::Bytes;
 use reqwest::Client;
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -39,7 +39,7 @@ impl Api {
 
 #[async_trait]
 impl Serverable for Api {
-    async fn set_server(&self, main_router: Router<Sender<Value>>) -> Router<Sender<Value>> {
+    async fn set_server(&self, main_router: Router<Sender<Bytes>>) -> Router<Sender<Bytes>> {
         let router = Router::new()
             .route("/routes", get(methods::get_routes))
             .route(

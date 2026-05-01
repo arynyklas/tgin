@@ -3,11 +3,13 @@ use crate::update::base::Updater;
 use crate::utils::defaults::TELEGRAM_TOKEN_REGEX;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use rand::Rng;
 use regex::Regex;
 use reqwest::header::RETRY_AFTER;
 use reqwest::{header::HeaderMap, Client, StatusCode};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
 
@@ -80,7 +82,7 @@ impl LongPollUpdate {
 
 #[async_trait]
 impl Updater for LongPollUpdate {
-    async fn start(&self, tx: Sender<Value>) {
+    async fn start(&self, tx: Sender<Bytes>) {
         let mut offset: i64 = 0;
         let backoff_base_ms = self.error_timeout_sleep.max(BACKOFF_FLOOR_MS);
         let mut backoff_ms = backoff_base_ms;
@@ -137,8 +139,22 @@ impl Updater for LongPollUpdate {
                 continue;
             }
 
-            let json = match response.json::<Value>().await {
-                Ok(j) => j,
+            // Read the response body as raw bytes; do NOT build a
+            // `serde_json::Value` tree. The router's job is to forward
+            // each update's wire JSON unchanged, so we keep the bytes and
+            // only parse enough to walk the `result` array.
+            let body = match response.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("longpull body read error ({}): {:?}", redacted_url, err);
+                    sleep(jittered(backoff_ms)).await;
+                    backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
+                    continue;
+                }
+            };
+
+            let parsed: PollResponse = match serde_json::from_slice(&body) {
+                Ok(p) => p,
                 Err(err) => {
                     eprintln!("longpull JSON parse error ({}): {:?}", redacted_url, err);
                     sleep(jittered(backoff_ms)).await;
@@ -147,19 +163,31 @@ impl Updater for LongPollUpdate {
                 }
             };
 
-            // Successful 2xx parse → reset backoff.
+            // Successful 2xx parse \u2192 reset backoff.
             backoff_ms = backoff_base_ms;
 
-            if let Some(result) = json.get("result").and_then(|r| r.as_array()) {
-                for update in result {
-                    if let Some(id) = update.get("update_id").and_then(|i| i.as_i64()) {
-                        offset = id + 1;
-                        // `tx.send(...).await` is the natural backpressure: if
-                        // the dispatcher is gone (channel closed), exit.
-                        if tx.send(update.clone()).await.is_err() {
-                            return;
-                        }
+            for raw in parsed.result {
+                // The raw text is the original wire bytes for this update.
+                // Extract `update_id` (one tiny parse) for offset bookkeeping,
+                // then forward the bytes downstream untouched. Per-update
+                // cost: one `Bytes` allocation + memcpy of the update size.
+                let raw_str = raw.get();
+                let id = match serde_json::from_str::<UpdateIdOnly>(raw_str) {
+                    Ok(x) => x.update_id,
+                    Err(err) => {
+                        eprintln!(
+                            "longpull update missing update_id ({}): {:?}",
+                            redacted_url, err
+                        );
+                        continue;
                     }
+                };
+                offset = id + 1;
+                let update_bytes = Bytes::copy_from_slice(raw_str.as_bytes());
+                // `tx.send(...).await` is the natural backpressure: if
+                // the dispatcher is gone (channel closed), exit.
+                if tx.send(update_bytes).await.is_err() {
+                    return;
                 }
             }
 
@@ -168,6 +196,24 @@ impl Updater for LongPollUpdate {
             }
         }
     }
+}
+
+/// Minimal shape for the Bot API `getUpdates` response. We borrow each
+/// element of `result` as a `Box<RawValue>` so its original wire bytes
+/// are preserved verbatim and forwarded to downstream routes without
+/// re-serialization.
+#[derive(Deserialize)]
+struct PollResponse {
+    #[serde(default)]
+    result: Vec<Box<RawValue>>,
+}
+
+/// One-field projection used to read `update_id` out of an already-
+/// serialized update. Exists only for offset bookkeeping; the rest of
+/// the update is forwarded as opaque bytes.
+#[derive(Deserialize)]
+struct UpdateIdOnly {
+    update_id: i64,
 }
 
 /// Double `current_ms` and clamp at `cap_ms`.
@@ -213,6 +259,7 @@ impl Printable for LongPollUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -269,6 +316,7 @@ mod tests {
             .await
             .expect("Timed out waiting for update 1")
             .expect("Channel closed unexpectedly");
+        let update1: Value = serde_json::from_slice(&update1).unwrap();
         assert_eq!(update1["update_id"], 100);
         assert_eq!(update1["message"]["text"], "test1");
 
@@ -276,6 +324,7 @@ mod tests {
             .await
             .expect("Timed out waiting for update 2")
             .expect("Channel closed unexpectedly");
+        let update2: Value = serde_json::from_slice(&update2).unwrap();
         assert_eq!(update2["update_id"], 101);
 
         handle.abort();
@@ -336,6 +385,7 @@ mod tests {
             .await
             .expect("Timed out waiting for post-5xx update")
             .expect("Channel closed unexpectedly");
+        let update: Value = serde_json::from_slice(&update).unwrap();
         assert_eq!(update["update_id"], 7);
         assert!(
             calls.load(Ordering::SeqCst) >= 3,
@@ -399,6 +449,7 @@ mod tests {
             .await
             .expect("Timed out waiting for post-429 update")
             .expect("Channel closed unexpectedly");
+        let update: Value = serde_json::from_slice(&update).unwrap();
         assert_eq!(update["update_id"], 9);
 
         let elapsed = started.elapsed();

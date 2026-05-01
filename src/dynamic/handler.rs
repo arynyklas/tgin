@@ -1,12 +1,13 @@
-use axum::http::{header::CONTENT_TYPE, Method};
-use axum::{extract::Request, Json};
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::{header::CONTENT_TYPE, Method, Response};
 use serde_json::{json, Value};
 
 use crate::dynamic::longpoll_registry;
 
 use crate::route::longpull::GetUpdatesParams;
 
-pub async fn dynamic_handler(request: Request) -> Json<Value> {
+pub async fn dynamic_handler(request: Request) -> Response<Body> {
     let (parts, body) = request.into_parts();
 
     let method = parts.method;
@@ -17,7 +18,7 @@ pub async fn dynamic_handler(request: Request) -> Json<Value> {
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(_) => {
-            return Json(json!({
+            return error_response(json!({
                 "ok": false,
                 "error_code": 400,
                 "description": "failed to read request body"
@@ -26,7 +27,7 @@ pub async fn dynamic_handler(request: Request) -> Json<Value> {
     };
 
     if method != Method::POST {
-        return Json(json!({
+        return error_response(json!({
             "ok": false,
             "error_code": 405,
             "description": "method not allowed"
@@ -42,7 +43,7 @@ pub async fn dynamic_handler(request: Request) -> Json<Value> {
         match serde_json::from_slice(&body_bytes) {
             Ok(p) => p,
             Err(_) => {
-                return Json(json!({
+                return error_response(json!({
                     "ok": false,
                     "error_code": 400,
                     "description": "invalid json body"
@@ -66,9 +67,21 @@ pub async fn dynamic_handler(request: Request) -> Json<Value> {
         return route.handle_request(params).await;
     }
 
-    Json(json!({
+    error_response(json!({
         "ok": false,
         "error_code": 404,
         "description": format!("Path {} not found in dynamic registry", path)
     }))
+}
+
+/// Telegram-shaped error envelope. The HTTP status is 200 (matches the
+/// existing behaviour where the "error" lives inside the JSON body, not
+/// in the HTTP status — this is what Telegram clients expect from the Bot
+/// API).
+fn error_response(value: Value) -> Response<Body> {
+    let body = serde_json::to_vec(&value).expect("static json! never fails to serialize");
+    Response::builder()
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static headers and Bytes body always build a valid Response")
 }

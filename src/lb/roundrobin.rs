@@ -3,6 +3,7 @@ use crate::base::{Printable, RouteId, Routeable, RouteableComponent, Serverable}
 use crate::api::message::AddRouteType;
 
 use axum::Router;
+use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
 
 use arc_swap::ArcSwap;
@@ -41,7 +42,7 @@ impl RoundRobinLB {
 
 #[async_trait]
 impl Routeable for RoundRobinLB {
-    async fn process(&self, update: Arc<Value>) {
+    async fn process(&self, update: Bytes) {
         let routes = self.routes.load();
         if routes.is_empty() {
             // Static config rejects empty LBs at startup, but the API can
@@ -134,7 +135,7 @@ impl Routeable for RoundRobinLB {
 
 #[async_trait]
 impl Serverable for RoundRobinLB {
-    async fn set_server(&self, mut router: Router<Sender<Value>>) -> Router<Sender<Value>> {
+    async fn set_server(&self, mut router: Router<Sender<Bytes>>) -> Router<Sender<Bytes>> {
         let routes = self.routes.load_full();
         for route in routes.iter() {
             router = route.set_server(router).await;
@@ -175,11 +176,15 @@ mod tests {
     use super::*;
     use crate::mock::routes::MockCallsRoute;
 
+    fn update_bytes(value: Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).unwrap())
+    }
+
     #[tokio::test]
     async fn test_empty_routes_does_not_panic() {
         let lb = RoundRobinLB::new(vec![]);
 
-        lb.process(Arc::new(json!({"update_id": 1}))).await;
+        lb.process(update_bytes(json!({"update_id": 1}))).await;
 
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
@@ -193,7 +198,7 @@ mod tests {
         let lb = RoundRobinLB::new(vec![route1.clone(), route2.clone()]);
 
         for i in 0..4 {
-            lb.process(Arc::new(json!({"id": i}))).await;
+            lb.process(update_bytes(json!({"id": i}))).await;
         }
 
         assert_eq!(route1.count().await, 2);
@@ -208,20 +213,20 @@ mod tests {
 
         let lb = RoundRobinLB::new(vec![r1.clone(), r2.clone(), r3.clone()]);
 
-        lb.process(Arc::new(json!("msg1"))).await;
+        lb.process(update_bytes(json!("msg1"))).await;
         let c1 = r1.get_calls().await;
         assert_eq!(c1.len(), 1);
         assert_eq!(c1[0], "msg1");
         assert_eq!(r2.count().await, 0);
         assert_eq!(r3.count().await, 0);
 
-        lb.process(Arc::new(json!("msg2"))).await;
+        lb.process(update_bytes(json!("msg2"))).await;
         assert_eq!(r2.count().await, 1);
 
-        lb.process(Arc::new(json!("msg3"))).await;
+        lb.process(update_bytes(json!("msg3"))).await;
         assert_eq!(r3.count().await, 1);
 
-        lb.process(Arc::new(json!("msg4"))).await;
+        lb.process(update_bytes(json!("msg4"))).await;
         assert_eq!(r1.count().await, 2);
     }
 
@@ -250,7 +255,7 @@ mod tests {
         let r1 = Arc::new(MockCallsRoute::new("static"));
         let lb = RoundRobinLB::new(vec![r1.clone()]);
 
-        lb.process(Arc::new(json!(1))).await;
+        lb.process(update_bytes(json!(1))).await;
         assert_eq!(r1.count().await, 1);
 
         let r2 = Arc::new(MockCallsRoute::new("dynamic"));
@@ -261,7 +266,7 @@ mod tests {
         let json_out = lb.json_struct().await;
         assert_eq!(json_out["routes"].as_array().unwrap().len(), 2);
 
-        lb.process(Arc::new(json!(2))).await;
+        lb.process(update_bytes(json!(2))).await;
 
         assert_eq!(r2.count().await, 1);
     }
@@ -288,7 +293,7 @@ mod tests {
         assert!(rm.is_ok());
 
         // Now empty — must not panic and must return promptly.
-        lb.process(Arc::new(json!({"update_id": 7}))).await;
+        lb.process(update_bytes(json!({"update_id": 7}))).await;
 
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
@@ -347,7 +352,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for i in 0..1000 {
-            lb.process(Arc::new(json!({"id": i}))).await;
+            lb.process(update_bytes(json!({"id": i}))).await;
         }
         writer.await.unwrap();
 
