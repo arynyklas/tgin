@@ -1,104 +1,120 @@
-```
- __                          
-/\ \__         __            
-\ \ ,_\    __ /\_\    ___    
- \ \ \/  /'_ `\/\ \ /' _ `\  
-  \ \ \_/\ \L\ \ \ \/\ \/\ \ 
-   \ \__\ \____ \ \_\ \_\ \_\
-    \/__/\/___L\ \/_/\/_/\/_/
-           /\____/           
-           \_/__/
+# tgin
+
+```text
+ __                          
+/\ \__         __            
+\ \ ,_\    __ /\_\    ___    
+ \ \ \/  /'_ `\/\ \ /' _ `\  
+  \ \ \_/\ \L\ \ \ \/\ \/\ \ 
+   \ \__\ \____ \ \_\ \_\ \_\
+    \/__/\/___L\ \/_/\/_/\/_/
+           /\____/           
+           \_/__/
 ```
 
-#### dedicated routing layer for Telegram bot infrastructure that enables efficient distribution of incoming updates across multiple bot instances. Think of it as NGINX for Telegram's Bot API ecosystem
+<p align="center"><strong>tgin</strong> <em>— a dedicated infrastructure layer for highly loaded Telegram bots.</em><br>Think NGINX, but for the Telegram Bot API.</p>
 
-[DOCUMENTATION](DOCS.md) | [PERFORMANCE](PERF.md)
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+  <a href="https://github.com/arynyklas/tgin/releases"><img src="https://img.shields.io/github/v/release/arynyklas/tgin" alt="release"></a>
+  <a href="DOCS.md"><img src="https://img.shields.io/badge/docs-latest-brightgreen" alt="docs"></a>
+  <a href="PERF.md"><img src="https://img.shields.io/badge/benchmarks-PERF.md-orange" alt="benchmarks"></a>
+</p>
+
+tgin distributes incoming Telegram updates between multiple bot instances. It was built for teams scaling Telegram bots into a microservices-style deployment.
 
 > [!IMPORTANT]
-> active development is continuing: there is no stable version yet
+> Active development is ongoing — there is no stable release yet.
 
-### Why Tgin?
-- Load balancing: distributes Telegram updates evenly across multiple bot instances
+## Contents
 
-- Protocol flexibility: Supports both webhook and longpoll methods for receiving and sending updates
+- [Why tgin](#why-tgin)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Documentation](#documentation)
+- [Performance](#performance)
+- [Roadmap](#roadmap)
+- [Goal](#goal)
 
-- Framework integration: works with any Telegram bot framework 
+## Why tgin
 
-- Scalability: enables horizontal scaling by adding more bot instances without code changes
+- **Load balancing** — distributes Telegram updates across multiple bot instances.
+- **Protocol flexibility** — long poll and webhook on both ingress and egress, in any combination.
+- **Framework-agnostic** — works with any Telegram bot framework on the downstream side.
+- **Horizontal scaling** — add bot instances without touching their code.
+- **Zero-downtime deployments** — restart or replace downstream bots without dropping updates.
+- **Microservices-friendly** — fan updates out to specialized services in a distributed setup.
+- **Production-ready primitives** — health monitoring, retries, and failover handling baked in.
 
-- Zero-downtime deployments: update or restart bot instances without interrupting service
+## Architecture
 
-- Microservices support: route updates to specialized bot services in a distributed architecture
-
-- Production reliability: includes health monitoring, automatic retries, and failover handling
-
-### Architecture Overview
+```mermaid
+graph TD
+    Telegram[Telegram Bot API] -->|Update| TGIN[tgin router]
+    TGIN -->|Route /bot1| Instance1[Bot Instance 1]
+    TGIN -->|Route /bot2| Instance2[Bot Instance 2]
+    TGIN -->|...| InstanceN[Bot Instance N]
 ```
-Telegram Bot API
-     ↓  Webhook / LongPoll 
-    TGIN
-     ↓  Webhook / LongPoll 
-Bot Instance 1  |  Bot Instance 2  |  Bot Instance N 
-```
 
+Updates arrive over a long-poll or webhook ingress, traverse a tree of routes and load balancers, and land on one or more downstream bots. See [DOCS.md](DOCS.md) for the full data flow and configuration reference.
 
-### Quick start
-```
-# Clone the repository
-git clone https://github.com/chesnokpeter/tgin.git
+## Quick start
+
+Requires a stable Rust toolchain (edition 2021 — see `Cargo.toml`).
+
+### 1. Clone and build
+
+```bash
+git clone https://github.com/arynyklas/tgin.git
 cd tgin
-
-# Build the project
 cargo build --release
-
-# Start with config
-./target/release/tgin -f tgin.ron
 ```
 
-### Configuration
-Simple configuration in the ron 
-``` tgin.ron
-// tgin.ron
+### 2. Configure `tgin.ron`
+
+```ron
 (
     dark_threads: 6,
     server_port: Some(3000),
-
     updates: [
         LongPollUpdate(
             token: "${TOKEN}",
-        )
+        ),
     ],
-
     route: RoundRobinLB(
         routes: [
-            LongPollRoute(path: "/bot1/getUpdates"),
+            LongPollRoute(path: "/test-bot/getUpdates"),
             WebhookRoute(url: "http://127.0.0.1:8080/bot2"),
-        ]
-    )
-
+        ],
+    ),
 )
 ```
 
-### Future features
-- Complete API
-- More tests / Performance tests
-- Perfect logging
-- Anti-DDoS guard
-- Message-brokers support 
-- Microservices-style
-- Collect analytics
-- Cache for bot
-- Support userbots
-- Tests for Bot
+`${VAR}` placeholders are substituted from the process environment before parsing; missing variables abort startup.
 
+### 3. Run
 
+```bash
+TOKEN=123456:ABC ./target/release/tgin -f tgin.ron
+```
 
-### Main Goal
-**Provide a complete infrastructure toolkit for building scalable, high-load Telegram bots with microservices architecture and production-ready support**
+Or run the bundled docker-compose example:
 
-### Performance
+```bash
+cd examples/simple
+TOKEN=... docker compose up --build
+```
 
-Headline scale-out runs — full charts (overhead + per-metric breakdowns for both transports) live in [PERF.md](PERF.md).
+## Documentation
+
+- [DOCS.md](DOCS.md) — configuration reference, runtime behavior, HTTP management API, TLS setup.
+- [PERF.md](PERF.md) — benchmark methodology and latest numbers.
+- [examples/simple](examples/simple) — minimal docker-compose deployment with two long-poll bots and one webhook bot.
+- [integrations/pytgin](integrations/pytgin) — Python `aiogram` shim that reroutes `getUpdates` through tgin.
+
+## Performance
+
+Headline scale-out runs — full charts (overhead and per-metric breakdowns for both transports) live in [PERF.md](PERF.md).
 
 <table>
   <tr>
@@ -116,3 +132,20 @@ Headline scale-out runs — full charts (overhead + per-metric breakdowns for bo
     <td><img src="tests/performance/diagram/generated/longpoll-scale-median.png" alt="Long-poll Median Latency" width="500"></td>
   </tr>
 </table>
+
+## Roadmap
+
+- [ ] Complete management API
+- [ ] Expanded test and performance coverage
+- [ ] Structured, production-grade logging
+- [ ] Anti-DDoS guard
+- [ ] Message-broker support
+- [ ] First-class microservices patterns
+- [ ] Analytics collection
+- [ ] Per-bot caching layer
+- [ ] Userbot support
+- [ ] End-to-end bot tests
+
+## Goal
+
+Provide a complete infrastructure toolkit for building scalable, high-load Telegram bots with a microservices architecture and production-ready support.
