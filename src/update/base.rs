@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use serde_json::Value;
+use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
 
 #[async_trait]
 pub trait Updater: Send + Sync {
-    async fn start(&self, tx: Sender<Value>);
+    async fn start(&self, tx: Sender<Bytes>);
 }

@@ -1,6 +1,7 @@
 use crate::base::{Printable, RouteId, Routeable, Serverable};
-use std::sync::Arc;
 use async_trait::async_trait;
+use bytes::Bytes;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -27,11 +28,16 @@ impl WebhookRoute {
 
 #[async_trait]
 impl Routeable for WebhookRoute {
-    async fn process(&self, update: Arc<Value>) {
+    async fn process(&self, update: Bytes) {
+        // Forward the raw bytes verbatim. No `.json(&value)` round-trip:
+        // re-serializing here would discard byte-for-byte fidelity (key
+        // ordering, number normalisation) and add a `Value` allocation
+        // and a serializer pass on every dispatch.
         let _ = self
             .client
             .post(&self.url)
-            .json(&*update)
+            .header(CONTENT_TYPE, "application/json")
+            .body(update)
             .timeout(self.request_timeout)
             .send()
             .await;
@@ -88,7 +94,7 @@ mod tests {
 
         let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
 
-        route.process(Arc::new(payload)).await;
+        route.process(Bytes::from(serde_json::to_vec(&payload).unwrap())).await;
     }
 
     #[tokio::test]
@@ -100,7 +106,7 @@ mod tests {
         );
 
         let payload = json!({"test": "data"});
-        route.process(Arc::new(payload)).await;
+        route.process(Bytes::from(serde_json::to_vec(&payload).unwrap())).await;
     }
 
     #[tokio::test]
@@ -136,7 +142,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        route.process(Arc::new(json!({"update_id": 1}))).await;
+        route.process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap())).await;
         let elapsed = start.elapsed();
 
         // Comfortable headroom over the 100ms cap, well under the 5s downstream delay.

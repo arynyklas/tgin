@@ -1,6 +1,5 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::{json, Value};
 
 use tokio::sync::mpsc::Sender;
@@ -33,12 +32,12 @@ pub enum RouteId {
 pub trait Routeable: Send + Sync {
     /// Dispatch one update through this node.
     ///
-    /// The update is shared via `Arc` so a broadcast load balancer can hand
-    /// the same value to N children with one `Arc` clone per child instead
-    /// of one deep `Value` clone per child. Single-consumer leaves (e.g.
-    /// `LongPollRoute` reached through a `RoundRobinLB`) can recover an
-    /// owned `Value` via `Arc::try_unwrap` with no clone.
-    async fn process(&self, update: Arc<Value>);
+    /// The update is the original wire JSON, carried as `Bytes` so the
+    /// router never re-parses or re-serializes it. Cloning is one atomic
+    /// ref-count bump, so a broadcast load balancer hands the same payload
+    /// to N children with no per-child copy and no `serde_json::Value`
+    /// allocation.
+    async fn process(&self, update: Bytes);
 
     /// Identity of this route, or `None` for inner nodes (load balancers).
     fn id(&self) -> Option<RouteId> {
@@ -57,7 +56,7 @@ pub trait Routeable: Send + Sync {
 }
 #[async_trait]
 pub trait Serverable {
-    async fn set_server(&self, server: Router<Sender<Value>>) -> Router<Sender<Value>> {
+    async fn set_server(&self, server: Router<Sender<Bytes>>) -> Router<Sender<Bytes>> {
         server
     }
 }

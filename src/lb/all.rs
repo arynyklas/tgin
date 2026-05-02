@@ -1,6 +1,7 @@
 use crate::base::{Printable, RouteId, Routeable, RouteableComponent, Serverable};
 
 use axum::Router;
+use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
 
 use arc_swap::ArcSwap;
@@ -32,7 +33,7 @@ impl AllLB {
 
 #[async_trait]
 impl Routeable for AllLB {
-    async fn process(&self, update: Arc<Value>) {
+    async fn process(&self, update: Bytes) {
         let routes = self.routes.load();
         if routes.is_empty() {
             // Static config rejects empty LBs at startup, but the API can
@@ -45,9 +46,10 @@ impl Routeable for AllLB {
         }
         for route in routes.iter() {
             let route = route.clone();
-            // One ref-count bump per child instead of a deep Value clone:
-            // each spawned dispatcher receives the same shared `Arc<Value>`.
-            let update = Arc::clone(&update);
+            // `Bytes::clone` is one atomic ref-count bump per child:
+            // every spawned dispatcher receives the same shared payload
+            // with no per-child copy.
+            let update = update.clone();
 
             tokio::spawn(async move {
                 route.process(update).await;
@@ -116,7 +118,7 @@ impl Routeable for AllLB {
 
 #[async_trait]
 impl Serverable for AllLB {
-    async fn set_server(&self, mut router: Router<Sender<Value>>) -> Router<Sender<Value>> {
+    async fn set_server(&self, mut router: Router<Sender<Bytes>>) -> Router<Sender<Bytes>> {
         let routes = self.routes.load_full();
         for route in routes.iter() {
             router = route.set_server(router).await;
@@ -158,11 +160,15 @@ mod tests {
     use crate::mock::routes::MockCallsRoute;
     use std::time::Duration;
 
+    fn update_bytes(value: Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).unwrap())
+    }
+
     #[tokio::test]
     async fn test_empty_routes_does_not_panic() {
         let lb = AllLB::new(vec![]);
 
-        lb.process(Arc::new(json!({"update_id": 1}))).await;
+        lb.process(update_bytes(json!({"update_id": 1}))).await;
 
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
@@ -175,7 +181,7 @@ mod tests {
 
         let lb = AllLB::new(vec![route1.clone(), route2.clone()]);
 
-        lb.process(Arc::new(json!({"msg": "hello"}))).await;
+        lb.process(update_bytes(json!({"msg": "hello"}))).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -195,9 +201,9 @@ mod tests {
 
         let lb = AllLB::new(vec![r1.clone(), r2.clone(), r3.clone()]);
 
-        lb.process(Arc::new(json!("m1"))).await;
-        lb.process(Arc::new(json!("m2"))).await;
-        lb.process(Arc::new(json!("m3"))).await;
+        lb.process(update_bytes(json!("m1"))).await;
+        lb.process(update_bytes(json!("m2"))).await;
+        lb.process(update_bytes(json!("m3"))).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -223,7 +229,7 @@ mod tests {
         let r1 = Arc::new(MockCallsRoute::new("static"));
         let lb = AllLB::new(vec![r1.clone()]);
 
-        lb.process(Arc::new(json!(1))).await;
+        lb.process(update_bytes(json!(1))).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(r1.count().await, 1);
 
@@ -234,7 +240,7 @@ mod tests {
         let json_out = lb.json_struct().await;
         assert_eq!(json_out["routes"].as_array().unwrap().len(), 2);
 
-        lb.process(Arc::new(json!(2))).await;
+        lb.process(update_bytes(json!(2))).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert_eq!(r1.count().await, 2);

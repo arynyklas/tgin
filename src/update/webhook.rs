@@ -8,9 +8,10 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
-    Json, Router,
+    Router,
 };
-use serde_json::{json, Value};
+use bytes::Bytes;
+use serde_json::json;
 use std::time::Duration;
 
 use subtle::ConstantTimeEq;
@@ -94,7 +95,7 @@ impl WebhookUpdate {
 
 #[async_trait]
 impl Updater for WebhookUpdate {
-    async fn start(&self, _tx: Sender<Value>) {
+    async fn start(&self, _tx: Sender<Bytes>) {
         if let Some(config) = &self.registration {
             self.register_webhook(config).await;
         } else {
@@ -108,13 +109,19 @@ impl Updater for WebhookUpdate {
 
 #[async_trait]
 impl Serverable for WebhookUpdate {
-    async fn set_server(&self, router: Router<Sender<Value>>) -> Router<Sender<Value>> {
+    async fn set_server(&self, router: Router<Sender<Bytes>>) -> Router<Sender<Bytes>> {
         let path = self.path.clone();
         let secret = self.secret_token.clone();
 
-        let handler_func = move |State(tx): State<Sender<Value>>,
+        // Capture the request body as raw `Bytes` instead of parsing
+        // `Json<Value>`: Telegram already produced valid JSON; the
+        // router's job is to forward those bytes verbatim. Saves one
+        // deep parse on every webhook hit. Downstreams that expect
+        // structured JSON pay one parse on their side, the same as
+        // they always have.
+        let handler_func = move |State(tx): State<Sender<Bytes>>,
                                  headers: HeaderMap,
-                                 Json(update): Json<Value>| {
+                                 body: Bytes| {
             let secret = secret.clone();
             async move {
                 if let Some(sec) = secret {
@@ -136,7 +143,7 @@ impl Serverable for WebhookUpdate {
                         return StatusCode::UNAUTHORIZED;
                     }
                 }
-                match tx.send(update).await {
+                match tx.send(body).await {
                     Ok(()) => StatusCode::OK,
                     // Channel closed: the dispatcher is gone (shutdown). Telling Telegram
                     // 200 here would silently drop the update because Telegram never re-
@@ -229,6 +236,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let received = rx.recv().await.expect("Channel should receive update");
+        let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
 
         assert_eq!(received["update_id"], 999);
         assert_eq!(received["message"]["text"], "Hello via Webhook");

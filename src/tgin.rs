@@ -3,7 +3,7 @@ use crate::api::router::Api;
 use crate::base::{RouteableComponent, Serverable, UpdaterComponent};
 
 use axum::Router;
-use serde_json::Value;
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
@@ -84,12 +84,12 @@ impl Tgin {
         // With a bounded buffer, a slow downstream backpressures producers
         // (LongPoll stops calling `getUpdates`; webhook handlers hold open)
         // and overload becomes immediately visible.
-        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
 
         let api = self.api;
 
         if let Some(port) = self.server_port {
-            let mut router: Router<Sender<Value>> = Router::new();
+            let mut router: Router<Sender<Bytes>> = Router::new();
 
             for provider in &self.updates {
                 router = provider.set_server(router).await;
@@ -171,11 +171,10 @@ impl Tgin {
                     };
                     match next {
                         Some(update) => {
-                            // Wrap once: every downstream consumer
-                            // (round-robin pick, broadcast spawn, leaf
-                            // process) shares the same `Arc<Value>` and pays
-                            // only an atomic ref-count bump.
-                            route.process(Arc::new(update)).await;
+                            // `Bytes::clone` inside the routing tree is
+                            // one atomic op; no `Value` allocation, no
+                            // re-serialization on egress.
+                            route.process(update).await;
                         }
                         None => return,
                     }
@@ -237,7 +236,7 @@ mod tests {
     use super::*;
     use crate::base::{Printable, Routeable, Serverable};
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -266,7 +265,7 @@ mod tests {
 
     #[async_trait]
     impl Routeable for ConcurrencyProbe {
-        async fn process(&self, _update: Arc<Value>) {
+        async fn process(&self, _update: Bytes) {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
 
@@ -299,11 +298,11 @@ mod tests {
         let route_dyn: Arc<dyn RouteableComponent> = probe.clone();
 
         let workers_n = 4;
-        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
         let workers = spawn_workers(rx, route_dyn, workers_n);
 
         for i in 0..workers_n {
-            tx.send(json!({ "update_id": i })).await.unwrap();
+            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
         }
 
         // Spin until every worker is parked in `process` simultaneously.
@@ -346,11 +345,11 @@ mod tests {
         let route = Arc::new(MockCallsRoute::new("sink"));
         let route_dyn: Arc<dyn RouteableComponent> = route.clone();
 
-        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
         let workers = spawn_workers(rx, route_dyn.clone(), 4);
 
         for i in 0..32 {
-            tx.send(json!({ "update_id": i })).await.unwrap();
+            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
         }
         drop(tx);
 
@@ -371,14 +370,14 @@ mod tests {
         let route_dyn: Arc<dyn RouteableComponent> = probe.clone();
 
         let workers_n = 2;
-        let (tx, rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
         let workers = spawn_workers(rx, route_dyn, workers_n);
 
         // Fill the channel: workers are blocked on `gate`, so anything we
         // send beyond `worker_count + capacity` must be rejected.
         let mut accepted = 0usize;
         loop {
-            match tx.try_send(json!({ "update_id": accepted })) {
+            match tx.try_send(update_bytes(json!({ "update_id": accepted }))) {
                 Ok(()) => accepted += 1,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
                 Err(e) => panic!("unexpected send error: {:?}", e),
@@ -424,7 +423,7 @@ mod tests {
     /// standing up a full `Tgin` (which would also require ingress
     /// adapters, an axum router, and a port).
     fn spawn_workers(
-        rx: mpsc::Receiver<Value>,
+        rx: mpsc::Receiver<Bytes>,
         route: Arc<dyn RouteableComponent>,
         worker_count: usize,
     ) -> Vec<tokio::task::JoinHandle<()>> {
@@ -441,7 +440,7 @@ mod tests {
                         };
                         match next {
                             Some(update) => {
-                                route.process(Arc::new(update)).await;
+                                route.process(update).await;
                             }
                             None => return,
                         }
@@ -449,5 +448,10 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    /// Helper for tests that want a `Bytes` payload from a `serde_json::Value`.
+    fn update_bytes(value: Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).unwrap())
     }
 }

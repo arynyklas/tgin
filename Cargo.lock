@@ -1632,6 +1632,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "bytes",
  "clap",
  "http-body-util",
  "lazy_static",
