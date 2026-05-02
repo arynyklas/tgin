@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -49,7 +50,18 @@ const CSV_COLUMNS: &[&str] = &[
     "p95_ms",
     "p99_ms",
     "max_ms",
+    "get_updates_calls",
+    "empty_get_updates_calls",
+    "max_get_updates_batch",
+    "mean_get_updates_batch",
 ];
+
+/// Telegram caps `getUpdates?limit=` at 100. Mirroring this prevents the fake
+/// API from returning batches that production never sees.
+const TELEGRAM_GET_UPDATES_LIMIT_MAX: usize = 100;
+/// Telegram caps `getUpdates?timeout=` at 50. The fake API enforces the same
+/// upper bound so a misconfigured client cannot hold a request open forever.
+const TELEGRAM_GET_UPDATES_TIMEOUT_MAX_SECS: u64 = 50;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum BenchMode {
@@ -110,6 +122,33 @@ struct Args {
     /// instead of letting it manifest as runaway scheduler memory.
     #[arg(long, default_value_t = 10_000)]
     max_in_flight: usize,
+    /// Bot token used for the longpoll update stream. Both producers (the
+    /// generator) and consumers (tgin / aiogram bots) are expected to point at
+    /// this token; mismatched tokens make the consumer poll an empty stream.
+    #[arg(long, default_value = "123:test")]
+    longpoll_token: String,
+}
+
+/// Per-token long-poll buffer. Models Telegram's getUpdates retention: updates
+/// stay on the stream until a later request acknowledges them via `offset`.
+struct UpdateStream {
+    updates: Mutex<VecDeque<QueuedUpdate>>,
+    notify: Notify,
+}
+
+impl UpdateStream {
+    fn new() -> Self {
+        Self {
+            updates: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QueuedUpdate {
+    update_id: i64,
+    payload: Value,
 }
 
 struct BenchState {
@@ -119,8 +158,58 @@ struct BenchState {
     received_count: AtomicUsize,
     send_errors_count: AtomicUsize,
     http_errors_count: AtomicUsize,
-    lp_queue: Mutex<Vec<Value>>,
-    notify: Notify,
+    streams: DashMap<String, Arc<UpdateStream>>,
+    /// Total `getUpdates` requests served, including those that returned empty.
+    get_updates_calls: AtomicUsize,
+    /// Subset of `get_updates_calls` that returned a zero-length batch.
+    empty_get_updates_calls: AtomicUsize,
+    /// Largest non-empty batch returned. Should never exceed
+    /// `TELEGRAM_GET_UPDATES_LIMIT_MAX`.
+    max_get_updates_batch: AtomicUsize,
+    /// Sum of returned batch sizes, used to compute the mean for the report.
+    total_get_updates_batch: AtomicUsize,
+}
+
+impl BenchState {
+    fn new() -> Self {
+        Self {
+            pending: DashMap::new(),
+            histogram: Mutex::new(Histogram::<u64>::new(3).unwrap()),
+            sent_count: AtomicUsize::new(0),
+            received_count: AtomicUsize::new(0),
+            send_errors_count: AtomicUsize::new(0),
+            http_errors_count: AtomicUsize::new(0),
+            streams: DashMap::new(),
+            get_updates_calls: AtomicUsize::new(0),
+            empty_get_updates_calls: AtomicUsize::new(0),
+            max_get_updates_batch: AtomicUsize::new(0),
+            total_get_updates_batch: AtomicUsize::new(0),
+        }
+    }
+
+    /// Get-or-create the stream for `token`. The first call for a given token
+    /// installs an empty stream; subsequent calls return the same `Arc`.
+    fn stream(&self, token: &str) -> Arc<UpdateStream> {
+        if let Some(existing) = self.streams.get(token) {
+            return existing.clone();
+        }
+        self.streams
+            .entry(token.to_string())
+            .or_insert_with(|| Arc::new(UpdateStream::new()))
+            .clone()
+    }
+
+    fn record_batch(&self, batch_len: usize) {
+        self.get_updates_calls.fetch_add(1, Ordering::Relaxed);
+        if batch_len == 0 {
+            self.empty_get_updates_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.total_get_updates_batch
+            .fetch_add(batch_len, Ordering::Relaxed);
+        self.max_get_updates_batch
+            .fetch_max(batch_len, Ordering::Relaxed);
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -150,6 +239,10 @@ struct BenchReport {
     p95_ms: Option<f64>,
     p99_ms: Option<f64>,
     max_ms: Option<f64>,
+    get_updates_calls: usize,
+    empty_get_updates_calls: usize,
+    max_get_updates_batch: usize,
+    mean_get_updates_batch: Option<f64>,
 }
 
 impl BenchReport {
@@ -184,6 +277,10 @@ impl BenchReport {
             format_optional_f64(self.p95_ms),
             format_optional_f64(self.p99_ms),
             format_optional_f64(self.max_ms),
+            self.get_updates_calls.to_string(),
+            self.empty_get_updates_calls.to_string(),
+            self.max_get_updates_batch.to_string(),
+            format_optional_f64(self.mean_get_updates_batch),
         ]
         .join(",")
     }
@@ -229,16 +326,100 @@ impl BenchReport {
             p95_ms: None,
             p99_ms: None,
             max_ms: None,
+            get_updates_calls: 0,
+            empty_get_updates_calls: 0,
+            max_get_updates_batch: 0,
+            mean_get_updates_batch: None,
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default, Debug)]
 struct GetUpdatesParams {
-    #[allow(dead_code)]
     offset: Option<i64>,
-    #[allow(dead_code)]
     timeout: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Apply Telegram-style getUpdates semantics to a single request.
+///
+/// 1. If `offset` is set, drop buffered updates with `update_id < offset`
+///    (acknowledgement). They are gone for good.
+/// 2. Return up to `min(limit, TELEGRAM_GET_UPDATES_LIMIT_MAX)` updates with
+///    `update_id >= offset`. Returned updates are NOT removed from the buffer
+///    — only a later request with a higher offset acknowledges them.
+/// 3. If no updates match, wait up to `timeout` seconds (capped at
+///    `TELEGRAM_GET_UPDATES_TIMEOUT_MAX_SECS`) for a notification, then re-check.
+async fn take_updates_for_request(
+    stream: &UpdateStream,
+    params: &GetUpdatesParams,
+) -> Vec<Value> {
+    let limit = params
+        .limit
+        .unwrap_or(TELEGRAM_GET_UPDATES_LIMIT_MAX)
+        .min(TELEGRAM_GET_UPDATES_LIMIT_MAX)
+        .max(1);
+    let timeout_secs = params
+        .timeout
+        .unwrap_or(0)
+        .min(TELEGRAM_GET_UPDATES_TIMEOUT_MAX_SECS);
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        // Register interest BEFORE we re-check the queue: any notify_one fired
+        // between the queue check and the await still wakes us. Without
+        // `enable()`, the future does not register until first poll, which is
+        // exactly the lost-wakeup window we are trying to close.
+        let notified = stream.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        {
+            let mut queue = stream.updates.lock().await;
+            let batch = collect_batch(&mut queue, params.offset, limit);
+            if !batch.is_empty() {
+                return batch;
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Vec::new();
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, notified.as_mut()).await {
+            Ok(()) => continue,
+            Err(_) => return Vec::new(),
+        }
+    }
+}
+
+/// Drop acknowledged updates and snapshot up to `limit` matching payloads.
+/// Does not remove returned entries — Telegram retains them until a later
+/// offset acknowledges them.
+fn collect_batch(
+    queue: &mut VecDeque<QueuedUpdate>,
+    offset: Option<i64>,
+    limit: usize,
+) -> Vec<Value> {
+    if let Some(offset) = offset {
+        while let Some(front) = queue.front() {
+            if front.update_id < offset {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    let min_id = offset.unwrap_or(i64::MIN);
+    queue
+        .iter()
+        .filter(|u| u.update_id >= min_id)
+        .take(limit)
+        .map(|u| u.payload.clone())
+        .collect()
 }
 
 #[tokio::main]
@@ -250,16 +431,7 @@ async fn main() {
         return;
     }
 
-    let state = Arc::new(BenchState {
-        pending: DashMap::new(),
-        histogram: Mutex::new(Histogram::<u64>::new(3).unwrap()),
-        sent_count: AtomicUsize::new(0),
-        received_count: AtomicUsize::new(0),
-        send_errors_count: AtomicUsize::new(0),
-        http_errors_count: AtomicUsize::new(0),
-        lp_queue: Mutex::new(Vec::new()),
-        notify: Notify::new(),
-    });
+    let state = Arc::new(BenchState::new());
 
     if args.format == OutputFormat::Text {
         println!("🚀 Starting Benchmark ({:?})", args.mode);
@@ -305,6 +477,14 @@ async fn main() {
     let mut sequence: u64 = 0;
     let duration_sec = args.duration;
 
+    // For longpoll mode, all generated updates flow through a single token's
+    // stream. The token MUST match what the consumer (tgin or a direct bot)
+    // polls under, otherwise the consumer reads an empty stream forever.
+    let longpoll_stream = match args.mode {
+        BenchMode::Longpoll => Some(state.stream(&args.longpoll_token)),
+        BenchMode::Webhook => None,
+    };
+
     while start_test.elapsed().as_secs() < duration_sec {
         ticker.tick().await;
 
@@ -321,9 +501,10 @@ async fn main() {
             .unwrap()
             .as_secs();
         update_id_counter += 1;
+        let update_id = update_id_counter as i64;
 
         let update = json!({
-            "update_id": update_id_counter,
+            "update_id": update_id,
             "message": {
                 "message_id": 123,
                 "date": timestamp,
@@ -368,15 +549,20 @@ async fn main() {
                 });
             }
             BenchMode::Longpoll => {
-                let mut q = state.lp_queue.lock().await;
-                q.push(update);
-                // notify_one (not notify_waiters): closes the same lost-wakeup
-                // window that handle_get_updates has between dropping its empty-
-                // check guard and registering the Notified future. With
-                // notify_waiters here, a notification fired while the consumer
-                // is mid-registration is silently dropped and the consumer holds
-                // its request open until the 1 s internal timeout.
-                state.notify.notify_one();
+                let stream = longpoll_stream
+                    .as_ref()
+                    .expect("longpoll stream initialized in Longpoll mode");
+                {
+                    let mut q = stream.updates.lock().await;
+                    q.push_back(QueuedUpdate {
+                        update_id,
+                        payload: update,
+                    });
+                }
+                // notify_one (not notify_waiters): only one waiter per stream
+                // is expected (Telegram requires exclusive long-polling), and
+                // a single batch read can drain multiple updates anyway.
+                stream.notify.notify_one();
             }
         }
     }
@@ -460,19 +646,13 @@ async fn handle_send_message(State(state): State<Arc<BenchState>>, body: Bytes) 
 
 async fn handle_get_updates(
     State(state): State<Arc<BenchState>>,
-    _query: Option<Query<GetUpdatesParams>>,
+    Path(token): Path<String>,
+    query: Option<Query<GetUpdatesParams>>,
 ) -> Json<Value> {
-    let updates = {
-        let mut q = state.lp_queue.lock().await;
-        let batch: Vec<Value> = q.drain(..).collect();
-        batch
-    };
-    if updates.is_empty() {
-        let _ = tokio::time::timeout(Duration::from_secs(1), state.notify.notified()).await;
-        let mut q = state.lp_queue.lock().await;
-        let batch: Vec<Value> = q.drain(..).collect();
-        return Json(json!({ "ok": true, "result": batch }));
-    }
+    let params = query.map(|Query(p)| p).unwrap_or_default();
+    let stream = state.stream(&token);
+    let updates = take_updates_for_request(&stream, &params).await;
+    state.record_batch(updates.len());
     Json(json!({ "ok": true, "result": updates }))
 }
 
@@ -516,6 +696,19 @@ async fn build_report(
         (None, None, None, None, None, None)
     };
 
+    let get_updates_calls = state.get_updates_calls.load(Ordering::Relaxed);
+    let empty_get_updates_calls = state.empty_get_updates_calls.load(Ordering::Relaxed);
+    let max_get_updates_batch = state.max_get_updates_batch.load(Ordering::Relaxed);
+    let total_batch = state.total_get_updates_batch.load(Ordering::Relaxed);
+    let non_empty_calls = get_updates_calls.saturating_sub(empty_get_updates_calls);
+    // Mean is over non-empty calls so empty long-poll waits do not drag the
+    // average down to zero. Empty-call count is reported separately.
+    let mean_get_updates_batch = if non_empty_calls > 0 {
+        Some(total_batch as f64 / non_empty_calls as f64)
+    } else {
+        None
+    };
+
     BenchReport {
         run_id: args.run_id.clone(),
         git_sha: args.git_sha.clone(),
@@ -542,6 +735,10 @@ async fn build_report(
         p95_ms,
         p99_ms,
         max_ms,
+        get_updates_calls,
+        empty_get_updates_calls,
+        max_get_updates_batch,
+        mean_get_updates_batch,
     }
 }
 
@@ -574,6 +771,20 @@ fn print_text_report(report: &BenchReport) {
     print_latency_line("p95", 4, report.p95_ms);
     print_latency_line("p99", 4, report.p99_ms);
     print_latency_line("Max", 4, report.max_ms);
+    if report.get_updates_calls > 0 {
+        println!("------------------------------------------");
+        println!("LONG-POLL BATCHING:");
+        println!("  getUpdates calls:    {}", report.get_updates_calls);
+        println!(
+            "  empty calls:         {}",
+            report.empty_get_updates_calls
+        );
+        println!("  max batch size:      {}", report.max_get_updates_batch);
+        match report.mean_get_updates_batch {
+            Some(mean) => println!("  mean batch size:     {mean:.2}"),
+            None => println!("  mean batch size:     n/a"),
+        }
+    }
     println!("==========================================");
 }
 
@@ -632,6 +843,10 @@ mod tests {
             p95_ms: Some(3.5),
             p99_ms: Some(4.5),
             max_ms: Some(5.0),
+            get_updates_calls: 0,
+            empty_get_updates_calls: 0,
+            max_get_updates_batch: 0,
+            mean_get_updates_batch: None,
         }
     }
 
@@ -691,5 +906,197 @@ mod tests {
     fn report_zero_sent_is_not_a_division_by_zero() {
         let report = BenchReport::from_counts_for_test(0, 0, 0, 0, 0);
         assert_eq!(report.loss_percent, 0.0);
+    }
+
+    fn enqueue_update(stream: &UpdateStream, update_id: i64) {
+        let mut q = stream.updates.try_lock().expect("uncontended in tests");
+        q.push_back(QueuedUpdate {
+            update_id,
+            payload: json!({ "update_id": update_id, "message": { "text": "x" } }),
+        });
+    }
+
+    #[tokio::test]
+    async fn get_updates_caps_limit_at_100() {
+        let state = BenchState::new();
+        let stream = state.stream("tok");
+        for id in 1..=150 {
+            enqueue_update(&stream, id);
+        }
+
+        let params = GetUpdatesParams {
+            offset: None,
+            timeout: None,
+            limit: Some(200),
+        };
+        let batch = take_updates_for_request(&stream, &params).await;
+
+        assert_eq!(batch.len(), TELEGRAM_GET_UPDATES_LIMIT_MAX);
+        assert_eq!(batch[0]["update_id"], 1);
+        assert_eq!(batch[batch.len() - 1]["update_id"], 100);
+    }
+
+    #[tokio::test]
+    async fn get_updates_acknowledges_by_offset() {
+        let state = BenchState::new();
+        let stream = state.stream("tok");
+        for id in 1..=3 {
+            enqueue_update(&stream, id);
+        }
+
+        let params = GetUpdatesParams {
+            offset: Some(3),
+            timeout: None,
+            limit: None,
+        };
+        let batch = take_updates_for_request(&stream, &params).await;
+
+        // offset=3 returns updates with update_id >= 3.
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["update_id"], 3);
+
+        // ids 1 and 2 are acknowledged → permanently dropped from buffer.
+        let q = stream.updates.lock().await;
+        let remaining: Vec<i64> = q.iter().map(|u| u.update_id).collect();
+        assert_eq!(remaining, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn get_updates_keeps_unacknowledged_updates() {
+        let state = BenchState::new();
+        let stream = state.stream("tok");
+        for id in 1..=2 {
+            enqueue_update(&stream, id);
+        }
+
+        // First read with no offset returns both updates...
+        let batch1 = take_updates_for_request(
+            &stream,
+            &GetUpdatesParams {
+                offset: None,
+                timeout: None,
+                limit: None,
+            },
+        )
+        .await;
+        assert_eq!(batch1.len(), 2);
+
+        // ...and the second read still sees them, because the client never
+        // sent a higher offset to acknowledge them.
+        let batch2 = take_updates_for_request(
+            &stream,
+            &GetUpdatesParams {
+                offset: None,
+                timeout: None,
+                limit: None,
+            },
+        )
+        .await;
+        assert_eq!(batch2.len(), 2);
+        assert_eq!(batch2[0]["update_id"], 1);
+        assert_eq!(batch2[1]["update_id"], 2);
+    }
+
+    #[tokio::test]
+    async fn get_updates_returns_empty_after_timeout() {
+        let state = BenchState::new();
+        let stream = state.stream("tok");
+
+        let started = Instant::now();
+        let batch = take_updates_for_request(
+            &stream,
+            &GetUpdatesParams {
+                offset: None,
+                timeout: Some(1),
+                limit: None,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(batch.is_empty());
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected to wait ~1s for timeout, slept {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "timeout grossly exceeded its bound: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_updates_wakes_on_notify() {
+        let state = Arc::new(BenchState::new());
+        let stream = state.stream("tok");
+
+        let producer_state = state.clone();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stream = producer_state.stream("tok");
+            {
+                let mut q = stream.updates.lock().await;
+                q.push_back(QueuedUpdate {
+                    update_id: 42,
+                    payload: json!({ "update_id": 42 }),
+                });
+            }
+            stream.notify.notify_one();
+        });
+
+        let started = Instant::now();
+        let batch = take_updates_for_request(
+            &stream,
+            &GetUpdatesParams {
+                offset: None,
+                timeout: Some(5),
+                limit: None,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        producer.await.unwrap();
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["update_id"], 42);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected wakeup well before the 5s timeout, slept {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_updates_isolates_streams_by_token() {
+        let state = BenchState::new();
+        let a = state.stream("token-a");
+        let b = state.stream("token-b");
+        enqueue_update(&a, 1);
+        enqueue_update(&b, 99);
+
+        let batch_a = take_updates_for_request(&a, &GetUpdatesParams::default()).await;
+        let batch_b = take_updates_for_request(&b, &GetUpdatesParams::default()).await;
+
+        assert_eq!(batch_a.len(), 1);
+        assert_eq!(batch_a[0]["update_id"], 1);
+        assert_eq!(batch_b.len(), 1);
+        assert_eq!(batch_b[0]["update_id"], 99);
+    }
+
+    #[tokio::test]
+    async fn record_batch_tracks_calls_and_max() {
+        let state = BenchState::new();
+
+        state.record_batch(0);
+        state.record_batch(5);
+        state.record_batch(7);
+        state.record_batch(3);
+
+        assert_eq!(state.get_updates_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(state.empty_get_updates_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.max_get_updates_batch.load(Ordering::Relaxed), 7);
+        // Mean batch size is computed from the running total in build_report;
+        // confirm the running sum is the expected 5+7+3=15.
+        assert_eq!(state.total_get_updates_batch.load(Ordering::Relaxed), 15);
     }
 }
