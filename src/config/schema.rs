@@ -52,7 +52,7 @@ pub enum UpdateConfig {
 }
 
 fn default_timeout() -> u64 {
-    100
+    0
 }
 
 fn default_long_poll_timeout() -> u64 {

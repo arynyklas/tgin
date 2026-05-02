@@ -1,31 +1,68 @@
-"""Plot tgin benchmark results from ../results.csv.
+"""Plot tgin benchmark results.
 
-Reads the CSV produced by `tgin-bench` / `benchmark.sh` and emits four PNGs
-(loss, mean, max, median) into ./generated/, plotting each metric vs RPS with
-one line per mode. Rows sharing the same (mode, rps) are averaged.
+Reads the typed CSV schema produced by `tgin-bench` / `benchmark.sh` and emits
+four PNGs (loss, mean, max, median) into ./generated/. Rows are aggregated only
+when their scenario identity matches, and failed runs remain visible in loss
+plots without being plotted as 0 ms latency.
+
+By default, the newest ../results/*.csv run file is plotted. Pass one or more
+CSV paths explicitly to render specific campaigns.
 
 Run from this directory:
-    uv run main.py
+    uv run main.py [../results/<run_id>.csv ...]
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-# CSV column indices (0-based), matching the header in results.csv:
-# mode,rps,sent,recv,errors,loss_%,min_ms,mean_ms,p50_ms,p95_ms,p99_ms,max_ms
-COL_MODE = 0
-COL_RPS = 1
-COL_LOSS = 5
-COL_MEAN_MS = 7
-COL_MEDIAN = 8
-COL_MAX_MS = 11
+REQUIRED_COLUMNS: tuple[str, ...] = (
+    "run_id",
+    "git_sha",
+    "scenario_family",
+    "transport",
+    "route_path",
+    "scenario",
+    "mode",
+    "bot_count",
+    "rps_target",
+    "rps_actual",
+    "duration_seconds",
+    "drain_timeout_seconds",
+    "sent",
+    "received",
+    "send_errors",
+    "http_errors",
+    "pending_end",
+    "loss_percent",
+    "min_ms",
+    "mean_ms",
+    "p50_ms",
+    "p95_ms",
+    "p99_ms",
+    "max_ms",
+)
+
+SERIES_COLUMNS: tuple[str, ...] = (
+    "scenario_family",
+    "transport",
+    "route_path",
+    "scenario",
+    "mode",
+    "bot_count",
+)
+
+LATENCY_METRICS = frozenset(
+    {"min_ms", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"}
+)
 
 # Stable color palette (RGB 0-1) — kept identical to the previous Go script
 # so regenerated plots stay visually consistent with prior outputs.
@@ -44,9 +81,27 @@ COLORS: list[tuple[float, float, float]] = [
     (34 / 255, 139 / 255, 34 / 255),
 ]
 
-# Modes that represent the single-bot baseline; rendered with a thicker line
-# so the comparison against any tgin-clustered configuration stands out.
-EMPHASIZED_MODES = frozenset({"longpull-direct", "webhook-direct"})
+
+@dataclass(frozen=True)
+class ScenarioKey:
+    scenario_family: str
+    transport: str
+    route_path: str
+    scenario: str
+    mode: str
+    bot_count: str
+
+    @classmethod
+    def from_row(cls, row: dict[str, str]) -> ScenarioKey:
+        return cls(*(row[column] for column in SERIES_COLUMNS))
+
+    @property
+    def label(self) -> str:
+        return f"{self.scenario} bots={self.bot_count}"
+
+    @property
+    def is_baseline(self) -> bool:
+        return self.scenario.endswith("-direct")
 
 
 @dataclass
@@ -63,33 +118,93 @@ class _Accum:
         return self.total / self.count
 
 
-def read_csv(path: Path) -> list[list[str]]:
+@dataclass(frozen=True)
+class Series:
+    key: ScenarioKey
+    points: tuple[tuple[float, float], ...]
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
-        return list(csv.reader(f))
+        return _read_csv_rows(f)
 
 
-def _aggregate(
-    records: list[list[str]], val_col: int
-) -> dict[str, list[tuple[float, float]]]:
-    """Return {mode: [(rps, mean_value), ...]} sorted by rps ascending.
+def read_csv_files(paths: list[Path]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for path in paths:
+        records.extend(read_csv(path))
+    return records
 
-    Rows that fail numeric parsing are skipped (matching the prior behavior).
-    """
-    by_mode: dict[str, dict[float, _Accum]] = defaultdict(lambda: defaultdict(_Accum))
 
-    # records[0] is the header row.
-    for row in records[1:]:
-        try:
-            rps = float(row[COL_RPS])
-            val = float(row[val_col])
-        except (ValueError, IndexError):
+def default_csv_paths(performance_dir: Path) -> list[Path]:
+    run_files = sorted(
+        (performance_dir / "results").glob("*.csv"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if run_files:
+        return [run_files[-1]]
+    return [performance_dir / "results.csv"]
+
+
+def _read_csv_rows(lines: Iterable[str]) -> list[dict[str, str]]:
+    reader = csv.DictReader(lines)
+    if reader.fieldnames is None:
+        raise ValueError("results CSV is empty; expected typed tgin-bench header")
+
+    missing = [column for column in REQUIRED_COLUMNS if column not in reader.fieldnames]
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"results CSV is missing required columns: {joined}")
+
+    return [
+        {column: row[column] or "" for column in REQUIRED_COLUMNS} for row in reader
+    ]
+
+
+def _parse_float(row: dict[str, str], column: str) -> float | None:
+    value = row[column].strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_int(row: dict[str, str], column: str) -> int | None:
+    value = row[column].strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _aggregate(records: list[dict[str, str]], metric: str) -> list[Series]:
+    """Return series sorted by label, with points sorted by target RPS."""
+    if metric not in REQUIRED_COLUMNS:
+        raise ValueError(f"unknown benchmark metric: {metric}")
+
+    by_series: dict[ScenarioKey, dict[float, _Accum]] = defaultdict(
+        lambda: defaultdict(_Accum)
+    )
+
+    for row in records:
+        rps = _parse_float(row, "rps_target")
+        value = _parse_float(row, metric)
+        received = _parse_int(row, "received")
+        if rps is None or value is None:
             continue
-        by_mode[row[COL_MODE]][rps].add(val)
+        if metric in LATENCY_METRICS and received == 0:
+            continue
 
-    return {
-        mode: sorted((rps, acc.mean) for rps, acc in rps_map.items())
-        for mode, rps_map in by_mode.items()
-    }
+        by_series[ScenarioKey.from_row(row)][rps].add(value)
+
+    return [
+        Series(key, tuple(sorted((rps, acc.mean) for rps, acc in rps_map.items())))
+        for key, rps_map in sorted(by_series.items(), key=lambda item: item[0].label)
+    ]
 
 
 def create_plot(
@@ -97,10 +212,10 @@ def create_plot(
     title: str,
     x_label: str,
     y_label: str,
-    records: list[list[str]],
-    val_col: int,
+    records: list[dict[str, str]],
+    metric: str,
 ) -> None:
-    data_by_mode = _aggregate(records, val_col)
+    series_list = _aggregate(records, metric)
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.set_title(title, fontsize=20)
@@ -108,13 +223,11 @@ def create_plot(
     ax.set_ylabel(y_label, fontsize=14)
     ax.grid(True)
 
-    # Sort modes lexicographically so color assignment is stable across runs.
-    for i, mode in enumerate(sorted(data_by_mode)):
-        points = data_by_mode[mode]
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
+    for i, series in enumerate(series_list):
+        xs = [point[0] for point in series.points]
+        ys = [point[1] for point in series.points]
         color = COLORS[i % len(COLORS)]
-        linewidth = 6 if mode in EMPHASIZED_MODES else 2
+        linewidth = 6 if series.key.is_baseline else 2
         ax.plot(
             xs,
             ys,
@@ -122,35 +235,57 @@ def create_plot(
             linewidth=linewidth,
             marker="o",
             markersize=6,
-            label=mode,
+            label=series.key.label,
         )
 
-    ax.legend(loc="upper left", fontsize=12, framealpha=0.9)
+    if series_list:
+        ax.legend(loc="upper left", fontsize=12, framealpha=0.9)
     fig.tight_layout()
     fig.savefig(filename, dpi=100)
     plt.close(fig)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Plot typed tgin benchmark CSV results."
+    )
+    parser.add_argument(
+        "csv_paths",
+        nargs="*",
+        type=Path,
+        help="CSV files to render; defaults to newest ../results/*.csv, then ../results.csv",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
     here = Path(__file__).resolve().parent
-    csv_path = here.parent / "results.csv"
-    if not csv_path.exists():
-        print(f"cannot open {csv_path}: file not found", file=sys.stderr)
+    performance_dir = here.parent
+    csv_paths = args.csv_paths or default_csv_paths(performance_dir)
+    missing_paths = [path for path in csv_paths if not path.exists()]
+    if missing_paths:
+        joined = ", ".join(str(path) for path in missing_paths)
+        print(f"cannot open benchmark CSV path(s): {joined}", file=sys.stderr)
         return 1
 
     out_dir = here / "generated"
     out_dir.mkdir(exist_ok=True)
 
-    records = read_csv(csv_path)
+    try:
+        records = read_csv_files(csv_paths)
+    except ValueError as exc:
+        print(f"invalid benchmark results CSV: {exc}", file=sys.stderr)
+        return 1
 
     plots = [
-        ("loss.png", "Loss Rate (%)", "Loss (%)", COL_LOSS),
-        ("mean.png", "Mean Latency (ms)", "Time (ms)", COL_MEAN_MS),
-        ("max.png", "Max Latency (ms)", "Time (ms)", COL_MAX_MS),
-        ("median.png", "Median Latency (ms)", "Time (ms)", COL_MEDIAN),
+        ("loss.png", "Loss Rate (%)", "Loss (%)", "loss_percent"),
+        ("mean.png", "Mean Latency (ms)", "Time (ms)", "mean_ms"),
+        ("max.png", "Max Latency (ms)", "Time (ms)", "max_ms"),
+        ("median.png", "Median Latency (ms)", "Time (ms)", "p50_ms"),
     ]
-    for filename, title, y_label, col in plots:
-        create_plot(out_dir / filename, title, "RPS", y_label, records, col)
+    for filename, title, y_label, metric in plots:
+        create_plot(out_dir / filename, title, "Target RPS", y_label, records, metric)
 
     return 0
 

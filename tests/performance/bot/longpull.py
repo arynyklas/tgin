@@ -68,6 +68,11 @@ async def main() -> None:
 
     bot = Bot(token=TOKEN, session=session)
 
-    await dp.start_polling(bot, polling_timeout=0)
+    # Long-poll the way real bots do: park up to 10 s on getUpdates and let
+    # the server respond as soon as an update is available. polling_timeout=0
+    # short-polls in a tight HTTP loop, which (a) tests a mode no production
+    # bot uses and (b) hides the long-poll wakeup path in tgin's
+    # LongPollRoute under thousands of empty no-op requests per second.
+    await dp.start_polling(bot, polling_timeout=10)
 
 asyncio.run(main())

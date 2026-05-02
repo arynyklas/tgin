@@ -17,6 +17,14 @@ use std::time::Duration;
 use reqwest::Client;
 
 const POOL_MAX_IDLE_PER_HOST: usize = 32;
+/// Evict idle keep-alive connections before the typical server-side keep-alive
+/// timeout (axum/hyper default ~75 s, many proxies 60 s). Without this we
+/// occasionally pick a connection the peer has already closed, hyper surfaces
+/// it as `IncompleteMessage`, and the call site treats it as a network error
+/// — contributing to long-poll tail latency on otherwise-healthy upstreams.
+/// 30 s is well under any reasonable server timeout while still amortising TCP
+/// handshakes across the long-poll cycle.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,6 +36,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn build_shared_client() -> Client {
     Client::builder()
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
         .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
         .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)

@@ -1,111 +1,87 @@
 #!/usr/bin/env bash
 # Written in [Amber](https://amber-lang.com/)
 # version: 0.5.1-alpha
-# We cannot import `bash_version` from `env.ab` because it imports `text.ab` making a circular dependency.
-# This is a workaround to avoid that issue and the import system should be improved in the future.
-file_append__40_v0() {
-    local path=$1
-    local content=$2
-    command_0="$(echo "${content}" >> "${path}")"
-    __status=$?
-    if [ "${__status}" != 0 ]; then
-        ret_file_append40_v0=''
-        return "${__status}"
-    fi
-    ret_file_append40_v0="${command_0}"
-    return 0
+# Amber is not currently available in this workspace; keep this generated script
+# synchronized with benchmark.ab when editing either file.
+set -euo pipefail
+
+usecases=(
+    "webhook-direct" "webhook-tgin" "webhook-tgin-3" "webhook-tgin-4" "webhook-tgin-5" "webhook-tgin-10"
+    "longpull-direct" "longpull-tgin" "longpull-tgin-3" "longpull-tgin-4" "longpull-tgin-5" "longpull-tgin-10"
+)
+rps_values=(500 1000 2000 5000 8000 10000)
+
+duration="${DURATION:-10}"
+run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+git_sha="${GIT_SHA:-$(git rev-parse --short HEAD)}"
+result_dir="${RESULT_DIR:-results}"
+scenario_family="${SCENARIO_FAMILY:-performance}"
+result_path="${RESULT_PATH:-${result_dir}/${run_id}.csv}"
+
+scenario_metadata() {
+    local mode=$1
+
+    case "${mode}" in
+        webhook*)
+            transport="webhook"
+            route_path="/webhook"
+            ;;
+        longpull-direct)
+            transport="longpoll"
+            route_path="/bot123:test/getUpdates"
+            ;;
+        longpull*)
+            transport="longpoll"
+            route_path="/bot*/getUpdates"
+            ;;
+        *)
+            echo "unknown benchmark mode: ${mode}" >&2
+            return 1
+            ;;
+    esac
+
+    case "${mode}" in
+        *-direct)
+            bot_count=1
+            ;;
+        *-tgin)
+            bot_count=2
+            ;;
+        *-tgin-*)
+            bot_count="${mode##*-}"
+            ;;
+        *)
+            echo "cannot infer bot count for benchmark mode: ${mode}" >&2
+            return 1
+            ;;
+    esac
 }
 
-usecases_3=("webhook-direct" "webhook-tgin" "webhook-tgin-3" "webhook-tgin-4" "webhook-tgin-5" "webhook-tgin-10" "longpull-direct" "longpull-tgin" "longpull-tgin-3" "longpull-tgin-4" "longpull-tgin-5" "longpull-tgin-10")
-rps_values_4=(500 1000 2000 5000 8000 10000)
+mkdir -p "${result_dir}"
 make clean
-__status=$?
-if [ "${__status}" != 0 ]; then
-    exit "${__status}"
-fi
 make build
-__status=$?
-if [ "${__status}" != 0 ]; then
-    exit "${__status}"
-fi
-for rps_5 in "${rps_values_4[@]}"; do
-    for mode_6 in "${usecases_3[@]}"; do
-        command_4="$(make ${mode_6} RPS=${rps_5})"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        output_7="${command_4}"
-        command_5="$(echo "${output_7}" | grep "Requests Sent:" | tr -s ' ' | xargs | cut -d ' ' -f 3)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        sent_8="${command_5}"
-        command_6="$(echo "${output_7}" | grep "Responses Recv:" | tr -s ' ' | xargs | cut -d ' ' -f 3)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        recv_9="${command_6}"
-        command_7="$(echo "${output_7}" | grep "Errors (Net):" | tr -s ' ' | xargs | cut -d ' ' -f 3)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        errors_10="${command_7}"
-        command_8="$(echo "${output_7}" | grep "Loss Rate:" | tr -s ' ' | xargs | cut -d ' ' -f 3 | tr -d '%')"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        loss_11="${command_8}"
-        command_9="$(echo "${output_7}" | grep "Min:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        min_12="${command_9}"
-        command_10="$(echo "${output_7}" | grep "Mean:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        mean_13="${command_10}"
-        command_11="$(echo "${output_7}" | grep "p50:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        p50_14="${command_11}"
-        command_12="$(echo "${output_7}" | grep "p95:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        p95_15="${command_12}"
-        command_13="$(echo "${output_7}" | grep "p99:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        p99_16="${command_13}"
-        command_14="$(echo "${output_7}" | grep "Max:" | tr -s ' ' | xargs | cut -d ' ' -f 2)"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        max_17="${command_14}"
-        make clean
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
-        echo "RPS=${rps_5} -> Sent: ${sent_8}, Resv: ${recv_9}, Errors: ${errors_10}, Loss: ${loss_11}%,  Min: ${min_12}ms, Mean: ${mean_13}ms, P50: ${p50_14}ms, P95: ${p95_15}ms, P99: ${p99_16}ms, Max: ${max_17}ms"
-        file_append__40_v0 "results.csv" "${mode_6},${rps_5},${sent_8},${recv_9},${errors_10},${loss_11},${min_12},${mean_13},${p50_14},${p95_15},${p99_16},${max_17}"
-        __status=$?
-        if [ "${__status}" != 0 ]; then
-            exit "${__status}"
-        fi
+
+docker compose up -d bench
+docker compose exec -T bench tgin-bench --format csv-header > "${result_path}"
+docker compose down
+
+for rps in "${rps_values[@]}"; do
+    for mode in "${usecases[@]}"; do
+        scenario_metadata "${mode}"
+        echo "Running ${mode} at ${rps} RPS -> ${result_path}"
+        make "${mode}" \
+            RPS="${rps}" \
+            DURATION="${duration}" \
+            BENCH_FORMAT=csv-row \
+            RUN_ID="${run_id}" \
+            GIT_SHA="${git_sha}" \
+            SCENARIO_FAMILY="${scenario_family}" \
+            TRANSPORT="${transport}" \
+            ROUTE_PATH="${route_path}" \
+            SCENARIO="${mode}" \
+            BOT_COUNT="${bot_count}" \
+            BENCH_OUTPUT="${result_path}"
     done
 done
+
+echo "Wrote benchmark results to ${result_path}"
