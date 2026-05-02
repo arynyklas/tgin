@@ -98,13 +98,21 @@ Simple configuration in the ron
 
 ### Performance
 
+Headline scale-out runs — full charts (overhead + per-metric breakdowns for both transports) live in [PERF.md](PERF.md).
+
 <table>
   <tr>
-    <td><img src="tests/performance/diagram/generated/loss.png" alt="Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/median.png" alt="Median Latency" width="500"></td>
+    <td colspan="2" align="center"><strong>Webhook — tgin scale-out</strong></td>
   </tr>
   <tr>
-    <td><img src="tests/performance/diagram/generated/mean.png" alt="Mean Latency" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/max.png" alt="Max Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-scale-loss.png" alt="Webhook Loss Rate" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-scale-median.png" alt="Webhook Median Latency" width="500"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Long-poll — tgin scale-out</strong></td>
+  </tr>
+  <tr>
+    <td><img src="tests/performance/diagram/generated/longpoll-scale-loss.png" alt="Long-poll Loss Rate" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-scale-median.png" alt="Long-poll Median Latency" width="500"></td>
   </tr>
 </table>

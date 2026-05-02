@@ -21,14 +21,41 @@ In Webhook mode, 5 workers at 10000 RPS maintain a mean latency of approximately
 In Longpoll mode, TGIN functions as an in-memory buffer: during traffic spikes, incoming requests are queued rather than dropped. This ensures zero data loss, with latency increasing temporarily as the backlog is processed.
 
 
-![Loss Rate %](tests/performance/diagram/generated/loss.png)
-![Median Latency Ms](tests/performance/diagram/generated/median.png)
-![Mean Latency Ms](tests/performance/diagram/generated/mean.png)
-![Max Latency Ms](tests/performance/diagram/generated/max.png)
+### Webhook — TGIN routing overhead
+_Equal backend count: direct bot vs. a single bot behind tgin._
+
+![Loss Rate %](tests/performance/diagram/generated/webhook-overhead-loss.png)
+![Median Latency Ms](tests/performance/diagram/generated/webhook-overhead-median.png)
+![Mean Latency Ms](tests/performance/diagram/generated/webhook-overhead-mean.png)
+![Max Latency Ms](tests/performance/diagram/generated/webhook-overhead-max.png)
+
+### Webhook — TGIN scale-out
+_tgin fanning traffic out across 2, 3, 5, and 10 backends._
+
+![Loss Rate %](tests/performance/diagram/generated/webhook-scale-loss.png)
+![Median Latency Ms](tests/performance/diagram/generated/webhook-scale-median.png)
+![Mean Latency Ms](tests/performance/diagram/generated/webhook-scale-mean.png)
+![Max Latency Ms](tests/performance/diagram/generated/webhook-scale-max.png)
+
+### Long-poll — TGIN routing overhead
+_Equal backend count: direct bot vs. a single bot behind tgin._
+
+![Loss Rate %](tests/performance/diagram/generated/longpoll-overhead-loss.png)
+![Median Latency Ms](tests/performance/diagram/generated/longpoll-overhead-median.png)
+![Mean Latency Ms](tests/performance/diagram/generated/longpoll-overhead-mean.png)
+![Max Latency Ms](tests/performance/diagram/generated/longpoll-overhead-max.png)
+
+### Long-poll — TGIN scale-out
+_tgin buffering and distributing updates across 2, 3, 5, and 10 backends._
+
+![Loss Rate %](tests/performance/diagram/generated/longpoll-scale-loss.png)
+![Median Latency Ms](tests/performance/diagram/generated/longpoll-scale-median.png)
+![Mean Latency Ms](tests/performance/diagram/generated/longpoll-scale-mean.png)
+![Max Latency Ms](tests/performance/diagram/generated/longpoll-scale-max.png)
 
 
 ## How to setup
-#### running the full benchmark takes about 1.5 hours
+#### running the full benchmark takes about 30 minutes
 
 ```
 # Clone the repository

@@ -12,8 +12,6 @@ Run from this directory:
     uv run main.py [../results/<run_id>.csv ...]
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import sys
@@ -92,7 +90,7 @@ class ScenarioKey:
     bot_count: str
 
     @classmethod
-    def from_row(cls, row: dict[str, str]) -> ScenarioKey:
+    def from_row(cls, row: dict[str, str]) -> "ScenarioKey":
         return cls(*(row[column] for column in SERIES_COLUMNS))
 
     @property
@@ -210,6 +208,7 @@ def _aggregate(records: list[dict[str, str]], metric: str) -> list[Series]:
 def create_plot(
     filename: Path,
     title: str,
+    subtitle: str,
     x_label: str,
     y_label: str,
     records: list[dict[str, str]],
@@ -226,7 +225,8 @@ def create_plot(
     series_list = _aggregate(filtered_records, metric)
 
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.set_title(title, fontsize=20)
+    fig.suptitle(title, fontsize=20)
+    ax.set_title(subtitle, fontsize=13, color="#444", pad=8)
     ax.set_xlabel(x_label, fontsize=14)
     ax.set_ylabel(y_label, fontsize=14)
     ax.grid(True)
@@ -248,7 +248,8 @@ def create_plot(
 
     if series_list:
         ax.legend(loc="upper left", fontsize=12, framealpha=0.9)
-    fig.tight_layout()
+
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(filename, dpi=100)
     plt.close(fig)
 
@@ -289,10 +290,10 @@ def main() -> int:
         return 1
 
     plots = [
-        ("loss", "Loss (%)", "loss_percent"),
-        ("mean", "Time (ms)", "mean_ms"),
-        ("max", "Time (ms)", "max_ms"),
-        ("median", "Time (ms)", "p50_ms"),
+        ("loss", "Packet loss", "Loss (%)", "loss_percent"),
+        ("mean", "Mean latency", "Mean latency (ms)", "mean_ms"),
+        ("max", "Max latency", "Max latency (ms)", "max_ms"),
+        ("median", "Median latency (p50)", "Median latency p50 (ms)", "p50_ms"),
     ]
     chart_sets = [
         ("webhook", "overhead", "Webhook routing overhead, equal backend count"),
@@ -301,10 +302,11 @@ def main() -> int:
         ("longpoll", "scale", "Long-poll tgin scale-out by backend count"),
     ]
     for transport, scenario_family, title in chart_sets:
-        for metric_slug, y_label, metric in plots:
+        for metric_slug, metric_title, y_label, metric in plots:
             create_plot(
                 out_dir / f"{transport}-{scenario_family}-{metric_slug}.png",
                 title,
+                metric_title,
                 "Target RPS",
                 y_label,
                 records,
@@ -312,6 +314,7 @@ def main() -> int:
                 scenario_family=scenario_family,
                 transport=transport,
             )
+
     return 0
 
 
