@@ -18,10 +18,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Mutex, Notify},
-    time::interval,
+    sync::{Mutex, Notify, Semaphore},
+    task::JoinSet,
+    time::{interval, MissedTickBehavior},
 };
-use uuid::Uuid;
 
 const CSV_COLUMNS: &[&str] = &[
     "run_id",
@@ -36,6 +36,7 @@ const CSV_COLUMNS: &[&str] = &[
     "rps_actual",
     "duration_seconds",
     "drain_timeout_seconds",
+    "max_in_flight",
     "sent",
     "received",
     "send_errors",
@@ -104,6 +105,11 @@ struct Args {
     bot_count: u16,
     #[arg(long, default_value_t = 2)]
     drain_timeout: u64,
+    /// Maximum concurrent in-flight webhook sends. The scheduler waits on a
+    /// semaphore at this bound; achieved RPS exposes generator saturation
+    /// instead of letting it manifest as runaway scheduler memory.
+    #[arg(long, default_value_t = 10_000)]
+    max_in_flight: usize,
 }
 
 struct BenchState {
@@ -131,6 +137,7 @@ struct BenchReport {
     rps_actual: f64,
     duration_seconds: u64,
     drain_timeout_seconds: u64,
+    max_in_flight: usize,
     sent: usize,
     received: usize,
     send_errors: usize,
@@ -164,6 +171,7 @@ impl BenchReport {
             format_f64(self.rps_actual),
             self.duration_seconds.to_string(),
             self.drain_timeout_seconds.to_string(),
+            self.max_in_flight.to_string(),
             self.sent.to_string(),
             self.received.to_string(),
             self.send_errors.to_string(),
@@ -178,6 +186,50 @@ impl BenchReport {
             format_optional_f64(self.max_ms),
         ]
         .join(",")
+    }
+
+    /// Build a report from raw counters with placeholder metadata. Used by
+    /// unit tests that assert the report math distinguishes failure modes.
+    #[cfg(test)]
+    fn from_counts_for_test(
+        sent: usize,
+        received: usize,
+        send_errors: usize,
+        http_errors: usize,
+        pending_end: usize,
+    ) -> BenchReport {
+        let loss_percent = if sent > 0 {
+            100.0 * (sent.saturating_sub(received)) as f64 / sent as f64
+        } else {
+            0.0
+        };
+        BenchReport {
+            run_id: "test".to_string(),
+            git_sha: "test".to_string(),
+            scenario_family: "test".to_string(),
+            transport: "test".to_string(),
+            route_path: "test".to_string(),
+            scenario: "test".to_string(),
+            mode: "webhook".to_string(),
+            bot_count: 1,
+            rps_target: 0,
+            rps_actual: 0.0,
+            duration_seconds: 0,
+            drain_timeout_seconds: 0,
+            max_in_flight: 0,
+            sent,
+            received,
+            send_errors,
+            http_errors,
+            pending_end,
+            loss_percent,
+            min_ms: None,
+            mean_ms: None,
+            p50_ms: None,
+            p95_ms: None,
+            p99_ms: None,
+            max_ms: None,
+        }
     }
 }
 
@@ -232,94 +284,136 @@ async fn main() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let gen_state = state.clone();
-    let target_url = args.target.clone();
-    let rps = args.rps;
-    let duration_sec = args.duration;
-    let mode = args.mode.clone();
     let client = Client::builder()
         .pool_max_idle_per_host(1000)
         .build()
         .unwrap();
 
-    let generator_handle = tokio::spawn(async move {
-        let start_test = Instant::now();
-        let interval_micros = if rps > 0 { 1_000_000 / rps } else { 100_000 };
-        let mut ticker = interval(Duration::from_micros(interval_micros));
-        let mut update_id_counter = 100000;
+    let send_semaphore = Arc::new(Semaphore::new(args.max_in_flight.max(1)));
+    let mut send_tasks: JoinSet<()> = JoinSet::new();
 
-        while start_test.elapsed().as_secs() < duration_sec {
-            ticker.tick().await;
-            let uuid = Uuid::new_v4().to_string();
-            let s = gen_state.clone();
-            s.pending.insert(uuid.clone(), Instant::now());
-            s.sent_count.fetch_add(1, Ordering::Relaxed);
+    let start_test = Instant::now();
+    let interval_micros = if args.rps > 0 {
+        1_000_000 / args.rps
+    } else {
+        100_000
+    };
+    let mut ticker = interval(Duration::from_micros(interval_micros));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            update_id_counter += 1;
+    let mut update_id_counter: u64 = 100_000;
+    let mut sequence: u64 = 0;
+    let duration_sec = args.duration;
 
-            let update = json!({
-                "update_id": update_id_counter,
-                "message": {
-                    "message_id": 123,
-                    "date": timestamp,
-                    "chat": { "id": 1, "type": "private" },
-                    "from": { "id": 1, "is_bot": false, "first_name": "Bench" },
-                    "text": uuid
-                }
-            });
+    while start_test.elapsed().as_secs() < duration_sec {
+        ticker.tick().await;
 
-            match mode {
-                BenchMode::Webhook => {
-                    let c = client.clone();
-                    let u = target_url.clone();
-                    tokio::spawn(async move {
-                        match c.post(&u).json(&update).send().await {
-                            Ok(response) if !response.status().is_success() => {
-                                s.http_errors_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                s.send_errors_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(_) => {}
+        // Monotonic per-run correlation ID. Uniqueness within a run is all
+        // the bookkeeping needs; UUIDv4 generation was hot-path noise.
+        let correlation_id = format!("{}:{}", args.run_id, sequence);
+        sequence += 1;
+
+        state.pending.insert(correlation_id.clone(), Instant::now());
+        state.sent_count.fetch_add(1, Ordering::Relaxed);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        update_id_counter += 1;
+
+        let update = json!({
+            "update_id": update_id_counter,
+            "message": {
+                "message_id": 123,
+                "date": timestamp,
+                "chat": { "id": 1, "type": "private" },
+                "from": { "id": 1, "is_bot": false, "first_name": "Bench" },
+                "text": correlation_id
+            }
+        });
+
+        match args.mode {
+            BenchMode::Webhook => {
+                // Acquire before spawn: when the in-flight bound is reached,
+                // the scheduler blocks here. That backpressure shows up in
+                // `rps_actual` and tells the caller the generator (not the
+                // SUT) is saturated.
+                let permit = send_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore closed");
+                let c = client.clone();
+                let u = args.target.clone();
+                let s = state.clone();
+                let cid = correlation_id.clone();
+                send_tasks.spawn(async move {
+                    let _permit = permit;
+                    match c.post(&u).json(&update).send().await {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(_) => {
+                            s.http_errors_count.fetch_add(1, Ordering::Relaxed);
+                            // The send did not reach a successful path; the
+                            // caller never gets a sendMessage callback for
+                            // this id, so the pending entry would otherwise
+                            // be miscounted as response-loss.
+                            s.pending.remove(&cid);
                         }
-                    });
-                }
-                BenchMode::Longpoll => {
-                    let mut q = s.lp_queue.lock().await;
-                    q.push(update);
-                    // notify_one (not notify_waiters): closes the same lost-wakeup
-                    // window that handle_get_updates has between dropping its empty-
-                    // check guard and registering the Notified future. With
-                    // notify_waiters here, a notification fired while the consumer
-                    // is mid-registration is silently dropped and the consumer holds
-                    // its request open until the 1 s internal timeout.
-                    s.notify.notify_one();
-                }
+                        Err(_) => {
+                            s.send_errors_count.fetch_add(1, Ordering::Relaxed);
+                            s.pending.remove(&cid);
+                        }
+                    }
+                });
+            }
+            BenchMode::Longpoll => {
+                let mut q = state.lp_queue.lock().await;
+                q.push(update);
+                // notify_one (not notify_waiters): closes the same lost-wakeup
+                // window that handle_get_updates has between dropping its empty-
+                // check guard and registering the Notified future. With
+                // notify_waiters here, a notification fired while the consumer
+                // is mid-registration is silently dropped and the consumer holds
+                // its request open until the 1 s internal timeout.
+                state.notify.notify_one();
             }
         }
-    });
+    }
 
-    let _stats_handle = tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-        }
-    });
+    let elapsed_generation = start_test.elapsed();
 
-    generator_handle.await.unwrap();
     if args.format == OutputFormat::Text {
         println!(
-            "🏁 Sending finished. Waiting {}s for trailing responses...",
+            "🏁 Sending finished. Draining outstanding sends and trailing responses (drain timeout: {}s)...",
             args.drain_timeout
         );
     }
-    tokio::time::sleep(Duration::from_secs(args.drain_timeout)).await;
 
-    let report = build_report(&args, &state).await;
+    let drain_deadline = Instant::now() + Duration::from_secs(args.drain_timeout);
+
+    // Drain in two stages, both bounded by the same deadline:
+    //   1. Outstanding webhook send tasks. Until they finish we cannot tell
+    //      send/HTTP failures from genuine pending-end loss.
+    //   2. Trailing sendMessage callbacks for updates already in flight on
+    //      the SUT side.
+    while !send_tasks.is_empty() {
+        let now = Instant::now();
+        if now >= drain_deadline {
+            break;
+        }
+        let remaining = drain_deadline - now;
+        tokio::select! {
+            _ = send_tasks.join_next() => {}
+            _ = tokio::time::sleep(remaining) => break,
+        }
+    }
+
+    while !state.pending.is_empty() && Instant::now() < drain_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let report = build_report(&args, &state, elapsed_generation).await;
     emit_report(&args.format, &report);
 }
 
@@ -382,7 +476,11 @@ async fn handle_get_updates(
     Json(json!({ "ok": true, "result": updates }))
 }
 
-async fn build_report(args: &Args, state: &BenchState) -> BenchReport {
+async fn build_report(
+    args: &Args,
+    state: &BenchState,
+    elapsed_generation: Duration,
+) -> BenchReport {
     let sent = state.sent_count.load(Ordering::Relaxed);
     let received = state.received_count.load(Ordering::Relaxed);
     let send_errors = state.send_errors_count.load(Ordering::Relaxed);
@@ -394,8 +492,13 @@ async fn build_report(args: &Args, state: &BenchState) -> BenchReport {
     } else {
         0.0
     };
-    let rps_actual = if args.duration > 0 {
-        sent as f64 / args.duration as f64
+    // Achieved generation rate based on how long the scheduler actually ran,
+    // not the configured duration. When the semaphore or scheduler delays
+    // ticks, this number diverges from `rps_target` and flags the generator
+    // as the bottleneck.
+    let elapsed_secs = elapsed_generation.as_secs_f64();
+    let rps_actual = if elapsed_secs > 0.0 {
+        sent as f64 / elapsed_secs
     } else {
         0.0
     };
@@ -426,6 +529,7 @@ async fn build_report(args: &Args, state: &BenchState) -> BenchReport {
         rps_actual,
         duration_seconds: args.duration,
         drain_timeout_seconds: args.drain_timeout,
+        max_in_flight: args.max_in_flight,
         sent,
         received,
         send_errors,
@@ -456,7 +560,11 @@ fn print_text_report(report: &BenchReport) {
     println!("==========================================");
     println!("Requests Sent:     {}", report.sent);
     println!("Responses Recv:    {}", report.received);
-    println!("Errors (Net):      {}", report.send_errors);
+    println!("Send Errors:       {}", report.send_errors);
+    println!("HTTP Errors:       {}", report.http_errors);
+    println!("Pending at End:    {}", report.pending_end);
+    println!("RPS Target:        {}", report.rps_target);
+    println!("RPS Actual:        {:.2}", report.rps_actual);
     println!("Loss Rate:         {:.2}%", report.loss_percent);
     println!("------------------------------------------");
     println!("LATENCY (Round-Trip Time):");
@@ -511,6 +619,7 @@ mod tests {
             rps_actual: 99.5,
             duration_seconds: 10,
             drain_timeout_seconds: 2,
+            max_in_flight: 10_000,
             sent: 1000,
             received: 995,
             send_errors: 3,
@@ -565,5 +674,22 @@ mod tests {
                 "expected empty latency field, got {field:?}"
             );
         }
+    }
+
+    #[test]
+    fn report_distinguishes_send_errors_from_pending_loss() {
+        let report = BenchReport::from_counts_for_test(100, 90, 3, 2, 5);
+        assert_eq!(report.sent, 100);
+        assert_eq!(report.received, 90);
+        assert_eq!(report.send_errors, 3);
+        assert_eq!(report.http_errors, 2);
+        assert_eq!(report.pending_end, 5);
+        assert_eq!(report.loss_percent, 10.0);
+    }
+
+    #[test]
+    fn report_zero_sent_is_not_a_division_by_zero() {
+        let report = BenchReport::from_counts_for_test(0, 0, 0, 0, 0);
+        assert_eq!(report.loss_percent, 0.0);
     }
 }
