@@ -1,9 +1,9 @@
 """Plot tgin benchmark results.
 
 Reads the typed CSV schema produced by `tgin-bench` / `benchmark.sh` and emits
-four PNGs (loss, mean, max, median) into ./generated/. Rows are aggregated only
-when their scenario identity matches, and failed runs remain visible in loss
-plots without being plotted as 0 ms latency.
+separate PNG sets for overhead and scale benchmark families into ./generated/.
+Rows are aggregated only when their scenario identity matches, and failed runs
+remain visible in loss plots without being plotted as 0 ms latency.
 
 By default, the newest ../results/*.csv run file is plotted. Pass one or more
 CSV paths explicitly to render specific campaigns.
@@ -214,8 +214,16 @@ def create_plot(
     y_label: str,
     records: list[dict[str, str]],
     metric: str,
+    scenario_family: str | None = None,
+    transport: str | None = None,
 ) -> None:
-    series_list = _aggregate(records, metric)
+    filtered_records = [
+        row
+        for row in records
+        if (scenario_family is None or row["scenario_family"] == scenario_family)
+        and (transport is None or row["transport"] == transport)
+    ]
+    series_list = _aggregate(filtered_records, metric)
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.set_title(title, fontsize=20)
@@ -271,6 +279,8 @@ def main() -> int:
 
     out_dir = here / "generated"
     out_dir.mkdir(exist_ok=True)
+    for stale_chart in out_dir.glob("*.png"):
+        stale_chart.unlink()
 
     try:
         records = read_csv_files(csv_paths)
@@ -279,14 +289,29 @@ def main() -> int:
         return 1
 
     plots = [
-        ("loss.png", "Loss Rate (%)", "Loss (%)", "loss_percent"),
-        ("mean.png", "Mean Latency (ms)", "Time (ms)", "mean_ms"),
-        ("max.png", "Max Latency (ms)", "Time (ms)", "max_ms"),
-        ("median.png", "Median Latency (ms)", "Time (ms)", "p50_ms"),
+        ("loss", "Loss (%)", "loss_percent"),
+        ("mean", "Time (ms)", "mean_ms"),
+        ("max", "Time (ms)", "max_ms"),
+        ("median", "Time (ms)", "p50_ms"),
     ]
-    for filename, title, y_label, metric in plots:
-        create_plot(out_dir / filename, title, "Target RPS", y_label, records, metric)
-
+    chart_sets = [
+        ("webhook", "overhead", "Webhook routing overhead, equal backend count"),
+        ("webhook", "scale", "Webhook tgin scale-out by backend count"),
+        ("longpoll", "overhead", "Long-poll routing overhead, equal backend count"),
+        ("longpoll", "scale", "Long-poll tgin scale-out by backend count"),
+    ]
+    for transport, scenario_family, title in chart_sets:
+        for metric_slug, y_label, metric in plots:
+            create_plot(
+                out_dir / f"{transport}-{scenario_family}-{metric_slug}.png",
+                title,
+                "Target RPS",
+                y_label,
+                records,
+                metric,
+                scenario_family=scenario_family,
+                transport=transport,
+            )
     return 0
 
 

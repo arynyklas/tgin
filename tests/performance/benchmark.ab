@@ -1,4 +1,4 @@
-let usecases = ["webhook-direct", "webhook-tgin", "webhook-tgin-3", "webhook-tgin-4", "webhook-tgin-5", "webhook-tgin-10", "longpull-direct", "longpull-tgin", "longpull-tgin-3", "longpull-tgin-4", "longpull-tgin-5", "longpull-tgin-10"]
+let usecases = ["webhook-direct-1", "webhook-tgin-1", "webhook-tgin-scale-2", "webhook-tgin-scale-3", "webhook-tgin-scale-5", "webhook-tgin-scale-10", "longpoll-direct-1", "longpoll-tgin-1", "longpoll-tgin-scale-2", "longpoll-tgin-scale-3", "longpoll-tgin-scale-5", "longpoll-tgin-scale-10"]
 let rps_values = [500, 1000, 2000, 5000, 8000, 10000]
 
 main {
@@ -6,7 +6,6 @@ main {
     let run_id = $ printenv RUN_ID || date -u +%Y%m%dT%H%M%SZ $?
     let git_sha = $ printenv GIT_SHA || git rev-parse --short HEAD $?
     let result_dir = $ printenv RESULT_DIR || echo results $?
-    let scenario_family = $ printenv SCENARIO_FAMILY || echo performance $?
     let result_path = $ printenv RESULT_PATH || echo {result_dir}/{run_id}.csv $?
 
     $ mkdir -p {result_dir} $?
@@ -19,9 +18,10 @@ main {
 
     for rps in rps_values {
         for mode in usecases {
-            let transport = $ case "{mode}" in webhook*) echo webhook ;; longpull*) echo longpoll ;; esac $?
-            let route_path = $ case "{mode}" in webhook*) echo /webhook ;; longpull-direct) echo /bot123:test/getUpdates ;; longpull*) echo '/bot*/getUpdates' ;; esac $?
-            let bot_count = $ case "{mode}" in *-direct) echo 1 ;; *-tgin) echo 2 ;; *-tgin-*) mode="{mode}"; echo "${mode##*-}" ;; esac $?
+            let scenario_family = $ case "{mode}" in *-scale-*) echo scale ;; *) echo overhead ;; esac $?
+            let transport = $ case "{mode}" in webhook*) echo webhook ;; longpoll*) echo longpoll ;; esac $?
+            let route_path = $ case "{mode}" in webhook*) echo /webhook ;; longpoll-direct-1) echo /bot123:test/getUpdates ;; longpoll-tgin-1) echo /bot1/getUpdates ;; longpoll-tgin-scale-*) echo '/bot*/getUpdates' ;; esac $?
+            let bot_count = $ case "{mode}" in *-scale-*) mode="{mode}"; echo "${mode##*-}" ;; *-1) echo 1 ;; esac $?
 
             echo "Running {mode} at {rps} RPS -> {result_path}"
             $ make {mode} RPS={rps} DURATION={duration} BENCH_FORMAT=csv-row RUN_ID={run_id} GIT_SHA={git_sha} SCENARIO_FAMILY={scenario_family} TRANSPORT={transport} ROUTE_PATH={route_path} SCENARIO={mode} BOT_COUNT={bot_count} BENCH_OUTPUT={result_path} $?

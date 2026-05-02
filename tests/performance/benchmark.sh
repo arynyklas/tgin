@@ -6,8 +6,8 @@
 set -euo pipefail
 
 usecases=(
-    "webhook-direct" "webhook-tgin" "webhook-tgin-3" "webhook-tgin-4" "webhook-tgin-5" "webhook-tgin-10"
-    "longpull-direct" "longpull-tgin" "longpull-tgin-3" "longpull-tgin-4" "longpull-tgin-5" "longpull-tgin-10"
+    "webhook-direct-1" "webhook-tgin-1" "webhook-tgin-scale-2" "webhook-tgin-scale-3" "webhook-tgin-scale-5" "webhook-tgin-scale-10"
+    "longpoll-direct-1" "longpoll-tgin-1" "longpoll-tgin-scale-2" "longpoll-tgin-scale-3" "longpoll-tgin-scale-5" "longpoll-tgin-scale-10"
 )
 rps_values=(500 1000 2000 5000 8000 10000)
 
@@ -15,22 +15,34 @@ duration="${DURATION:-10}"
 run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 git_sha="${GIT_SHA:-$(git rev-parse --short HEAD)}"
 result_dir="${RESULT_DIR:-results}"
-scenario_family="${SCENARIO_FAMILY:-performance}"
 result_path="${RESULT_PATH:-${result_dir}/${run_id}.csv}"
 
 scenario_metadata() {
     local mode=$1
 
     case "${mode}" in
+        *-scale-*)
+            scenario_family="scale"
+            ;;
+        *)
+            scenario_family="overhead"
+            ;;
+    esac
+
+    case "${mode}" in
         webhook*)
             transport="webhook"
             route_path="/webhook"
             ;;
-        longpull-direct)
+        longpoll-direct-1)
             transport="longpoll"
             route_path="/bot123:test/getUpdates"
             ;;
-        longpull*)
+        longpoll-tgin-1)
+            transport="longpoll"
+            route_path="/bot1/getUpdates"
+            ;;
+        longpoll-tgin-scale-*)
             transport="longpoll"
             route_path="/bot*/getUpdates"
             ;;
@@ -41,14 +53,11 @@ scenario_metadata() {
     esac
 
     case "${mode}" in
-        *-direct)
-            bot_count=1
-            ;;
-        *-tgin)
-            bot_count=2
-            ;;
-        *-tgin-*)
+        *-scale-*)
             bot_count="${mode##*-}"
+            ;;
+        *-1)
+            bot_count=1
             ;;
         *)
             echo "cannot infer bot count for benchmark mode: ${mode}" >&2
