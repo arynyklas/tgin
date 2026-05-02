@@ -1,6 +1,7 @@
 import asyncio
-import logging
-import sys, os, time
+import os
+
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -14,6 +15,7 @@ TGIN_ENDPOINT = os.getenv("TGIN_ENDPOINT", "http://localhost:8090/bot123:test/ge
 
 TOKEN = os.getenv("BOT_TOKEN", "123:test")
 API_URL = os.getenv("TELEGRAM_API_URL", "http://localhost:8090")
+PORT = int(os.getenv("PORT", 8080))
 
 
 
@@ -33,6 +35,19 @@ class TginUpateLongPullServer(TelegramAPIServer):
 
 
 
+
+
+async def healthz(_request):
+    return web.Response(text="ok")
+
+
+async def start_health_server() -> None:
+    app = web.Application()
+    app.router.add_get("/healthz", healthz)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
 
 
 async def main() -> None:
@@ -68,6 +83,17 @@ async def main() -> None:
 
     bot = Bot(token=TOKEN, session=session)
 
-    await dp.start_polling(bot, polling_timeout=0)
+    # Long-poll the way real bots do: park up to 10 s on getUpdates and let
+    # the server respond as soon as an update is available. polling_timeout=0
+    # short-polls in a tight HTTP loop, which (a) tests a mode no production
+    # bot uses and (b) hides the long-poll wakeup path in tgin's
+    # LongPollRoute under thousands of empty no-op requests per second.
+    polling_task = asyncio.create_task(dp.start_polling(bot, polling_timeout=10))
+    await asyncio.sleep(0)
+    if polling_task.done():
+        await polling_task
+
+    await start_health_server()
+    await polling_task
 
 asyncio.run(main())

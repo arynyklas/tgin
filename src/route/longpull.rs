@@ -14,10 +14,10 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,24 +58,27 @@ impl LongPollRoute {
         let duration = Duration::from_secs(timeout_sec);
 
         loop {
-            {
-                let mut lock = updates.lock().await;
-
-                if !lock.is_empty() {
+            // Sync mutex: every critical section is push_back / pop_front /
+            // is_empty. None of them `.await`. Holding a `tokio::sync::Mutex`
+            // here scheduled the task on every push and every poll — a heavy
+            // primitive for an O(1) operation. With std::sync::Mutex the
+            // uncontended path is one CAS; the contended path blocks an OS
+            // thread for a few ns, never long enough for tokio to care.
+            let batch_opt: Option<Vec<Bytes>> = {
+                let mut lock = updates
+                    .lock()
+                    .expect("longpull buffer mutex poisoned");
+                if lock.is_empty() {
+                    None
+                } else {
                     let limit = params.limit.unwrap_or(1000) as usize;
-                    let drain = limit.min(lock.len());
-                    let mut batch: Vec<Bytes> = Vec::with_capacity(drain);
-
-                    while batch.len() < limit {
-                        if let Some(upd) = lock.pop_front() {
-                            batch.push(upd);
-                        } else {
-                            break;
-                        }
-                    }
-
-                    return build_get_updates_response(&batch);
+                    let take = limit.min(lock.len());
+                    Some(lock.drain(..take).collect())
                 }
+            };
+
+            if let Some(batch) = batch_opt {
+                return build_get_updates_response(&batch);
             }
 
             if timeout_sec == 0 || start_time.elapsed() >= duration {
@@ -122,9 +125,35 @@ fn build_get_updates_response(batch: &[Bytes]) -> Response {
 #[async_trait]
 impl Routeable for LongPollRoute {
     async fn process(&self, update: Bytes) {
-        let mut lock = self.updates.lock().await;
-        lock.push_back(update);
-        self.notify.notify_waiters();
+        // Push and notify must NOT both run while the buffer mutex is held.
+        // The poller wakes from `notify.notified()` and immediately tries to
+        // lock the same mutex; if `notify_one` fires before we drop the
+        // guard, the poller is contended for the duration of this critical
+        // section. Drop the lock first, then notify.
+        {
+            let mut lock = self
+                .updates
+                .lock()
+                .expect("longpull buffer mutex poisoned");
+            lock.push_back(update);
+        }
+        // `notify_one` instead of `notify_waiters` to close the lost-wakeup
+        // window in `handle_request`: between dropping the empty-check lock
+        // and registering the `Notify` future, a `notify_waiters` call from a
+        // concurrent `process` would have no waiter to wake and the signal
+        // would be silently dropped, parking the consumer for up to its full
+        // `timeout=...` deadline. `notify_one` stores a permit when no
+        // waiter is registered, so the next `notified().await` consumes it
+        // immediately. Coalescing of multiple notifications into a single
+        // permit is fine because the consumer always re-checks `is_empty`
+        // after wake.
+        //
+        // Caveat: with multiple concurrent pollers on the same route
+        // (atypical — aiogram opens one in-flight `getUpdates` per bot),
+        // only one wakes per push. Unwoken pollers see the next push
+        // instead. No update is lost; the queue is drained FIFO regardless
+        // of which poller wakes.
+        self.notify.notify_one();
     }
 
     fn id(&self) -> Option<RouteId> {
@@ -255,6 +284,21 @@ mod tests {
         assert!(duration.as_millis() >= 1000);
     }
 
+    /// Wake property: once a `handle_request(timeout > 0)` is parked on
+    /// the empty-queue branch, a subsequent `process()` MUST wake it
+    /// promptly with the queued update.
+    ///
+    /// This covers the post-park notification path -- the dominant case
+    /// in production, where bots issue one `getUpdates` and park for
+    /// many seconds before any update arrives. It does NOT cover the
+    /// race window between dropping the empty-check `Mutex` guard and
+    /// registering the `Notify` future inside `tokio_timeout`: that
+    /// window is ~50 ns of synchronous Rust and is too narrow to hit by
+    /// scheduling alone, even with thousands of trial iterations on a
+    /// multi-thread runtime. The fix for that race is the choice of
+    /// `notify_one` over `notify_waiters` in `process` (see the comment
+    /// there); a deterministic test would require production-code
+    /// instrumentation we are not willing to add for a one-line fix.
     #[tokio::test]
     async fn test_longpoll_notification() {
         let route = Arc::new(LongPollRoute::new("/test".to_string()));

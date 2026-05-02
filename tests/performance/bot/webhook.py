@@ -11,6 +11,10 @@ API_URL = os.getenv("TELEGRAM_API_URL", "http://host.docker.internal:8090")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", 8080))
 
+async def healthz(_request):
+    return web.Response(text="ok")
+
+
 async def main():
     session = AiohttpSession(api=TelegramAPIServer.from_base(API_URL))
     bot = Bot(token=TOKEN, session=session)
@@ -25,6 +29,7 @@ async def main():
             print(f"Error sending reply: {e}")
 
     app = web.Application()
+    app.router.add_get("/healthz", healthz)
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 

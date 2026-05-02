@@ -8,7 +8,7 @@ services:
       - ./tgin.ron:/etc/tgin/config.ron
     environment:
       - TOKEN=${TOKEN}
-      - WH=http://bot_3:3001/bot
+      - WH_ENDPOINT=http://bot_3:3001/bot
 
   bot_1:
     build: .

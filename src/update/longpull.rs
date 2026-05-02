@@ -21,11 +21,18 @@ const TELEGRAM_LONG_POLL_LIMIT_MAX: u64 = 100;
 /// always exceeds Telegram's reply window.
 const REQUEST_TIMEOUT_SLACK: Duration = Duration::from_secs(10);
 /// Upper bound on the backoff sleep when a flapping upstream keeps failing.
-/// Bounded at 5 s so a transient outage (mock server that hasn't bound yet,
-/// brief network blip, single 5xx burst) does not leave the poller asleep
-/// past the recovery moment. Sustained outages still rate-limit themselves
-/// because the loop hits this cap after ~6 consecutive failures.
-const BACKOFF_CAP_MS: u64 = 5_000;
+/// Bounded at 1 s for two reasons:
+///   * Recovery latency. With `jittered(cap)`, the average sleep at cap is
+///     `cap/2`. A 5 s cap meant up to 5 s of contaminated tail latency after
+///     any transient blip (idle keep-alive close, brief listener pause,
+///     mock-server startup race). 1 s caps the worst-case recovery window
+///     to ~1 s and the average to ~500 ms while still rate-limiting a
+///     hard outage to a sustainable ~1 RPS.
+///   * Long-poll already throttles itself. Each attempt holds for up to
+///     `long_poll_timeout` seconds anyway, so we don't need a long backoff
+///     to keep retry traffic low — we need a short one to resume polling
+///     promptly the moment upstream comes back.
+const BACKOFF_CAP_MS: u64 = 1_000;
 /// Floor for the backoff base — `error_timeout_sleep=0` would otherwise wedge
 /// the loop in a tight retry spin.
 const BACKOFF_FLOOR_MS: u64 = 50;
@@ -163,7 +170,7 @@ impl Updater for LongPollUpdate {
                 }
             };
 
-            // Successful 2xx parse \u2192 reset backoff.
+            // Successful 2xx parse → reset backoff.
             backoff_ms = backoff_base_ms;
 
             for raw in parsed.result {

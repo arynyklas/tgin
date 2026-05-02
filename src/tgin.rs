@@ -288,7 +288,7 @@ mod tests {
     impl Serverable for ConcurrencyProbe {}
     impl Printable for ConcurrencyProbe {}
 
-    /// `dark_threads` workers must run `process` concurrently \u2014 the new
+    /// `dark_threads` workers must run `process` concurrently — the new
     /// design replaces unbounded `tokio::spawn` with a fixed worker pool,
     /// so this is the test that proves the pool actually parallelises and
     /// is not, e.g., serialised by the receiver mutex.
