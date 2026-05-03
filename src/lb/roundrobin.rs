@@ -1,4 +1,4 @@
-use crate::base::{Printable, RouteId, Routeable, RouteableComponent, Serverable};
+use crate::base::{AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable};
 
 use crate::api::message::AddRouteType;
 
@@ -65,7 +65,7 @@ impl Routeable for RoundRobinLB {
         route.process(update).await;
     }
 
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
+    async fn add_route(&self, route: AddRouteType) -> Result<(), AddRouteError> {
         match route {
             AddRouteType::Longpull(route_arc) => {
                 // Registry insert MUST happen before the LB swap: a
@@ -91,7 +91,7 @@ impl Routeable for RoundRobinLB {
         }
     }
 
-    async fn remove_route(&self, target: RouteId) -> Result<(), ()> {
+    async fn remove_route(&self, target: RouteId) -> Result<(), RemoveRouteError> {
         // For long-poll targets, drop the dynamic-handler registry entry
         // before the LB swap so the route disappears from both surfaces
         // in the same operation. `remove` is a no-op for an absent key.
@@ -128,7 +128,7 @@ impl Routeable for RoundRobinLB {
         if child_removed {
             Ok(())
         } else {
-            Err(())
+            Err(RemoveRouteError::NotFound)
         }
     }
 }

@@ -21,7 +21,8 @@ pub enum AddRouteType {
 ///
 /// The previous design dropped the result on the floor: handlers returned
 /// `()` (always 200) and `Routeable::{add_route, remove_route}` returned
-/// `Result<(), ()>` that nothing observed. This enum is the wire-level
+/// `Result<(), ()>` that nothing observed. The trait now returns typed
+/// `AddRouteError` / `RemoveRouteError`; this enum is the wire-level
 /// contract between the API loop and the HTTP layer; status-code mapping
 /// lives in `IntoResponse` so the loop never touches HTTP types.
 #[derive(Debug)]
