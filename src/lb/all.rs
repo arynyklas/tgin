@@ -1,4 +1,4 @@
-use crate::base::{Printable, RouteId, Routeable, RouteableComponent, Serverable};
+use crate::base::{AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable};
 
 use axum::Router;
 use bytes::Bytes;
@@ -78,7 +78,7 @@ impl Routeable for AllLB {
         }
     }
 
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
+    async fn add_route(&self, route: AddRouteType) -> Result<(), AddRouteError> {
         match route {
             AddRouteType::Longpull(route_arc) => {
                 longpoll_registry::insert(route_arc.path.clone(), route_arc.clone());
@@ -100,7 +100,7 @@ impl Routeable for AllLB {
         }
     }
 
-    async fn remove_route(&self, target: RouteId) -> Result<(), ()> {
+    async fn remove_route(&self, target: RouteId) -> Result<(), RemoveRouteError> {
         if let RouteId::Path(path) = &target {
             longpoll_registry::remove(path);
         }
@@ -132,7 +132,7 @@ impl Routeable for AllLB {
         if child_removed {
             Ok(())
         } else {
-            Err(())
+            Err(RemoveRouteError::NotFound)
         }
     }
 }
