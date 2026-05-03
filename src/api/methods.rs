@@ -27,20 +27,12 @@ pub async fn add_route(
 ) -> Result<StatusCode, ApiError> {
     let route = match data.typee {
         AddRouteTypeSch::Longpull(route) => {
-            if route.path.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "Longpull route requires a non-empty `path`".into(),
-                ));
-            }
+            validate_longpoll_path(&route.path, "Longpull route")?;
             let update = LongPollRoute::new(route.path);
             AddRouteType::Longpull(Arc::new(update))
         }
         AddRouteTypeSch::Webhook(route) => {
-            if route.url.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "Webhook route requires a non-empty `url`".into(),
-                ));
-            }
+            validate_webhook_url(&route.url, "Webhook route")?;
             let timeout = route
                 .request_timeout_ms
                 .map(Duration::from_millis)
@@ -93,19 +85,11 @@ pub async fn remove_route(
 ) -> Result<StatusCode, ApiError> {
     let target = match data.typee {
         RmRouteTypeSch::Longpull(r) => {
-            if r.path.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "Longpull removal requires a non-empty `path`".into(),
-                ));
-            }
+            validate_longpoll_path(&r.path, "Longpull removal")?;
             RouteId::Path(r.path)
         }
         RmRouteTypeSch::Webhook(r) => {
-            if r.url.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "Webhook removal requires a non-empty `url`".into(),
-                ));
-            }
+            validate_webhook_url(&r.url, "Webhook removal")?;
             RouteId::Url(r.url)
         }
     };
@@ -123,6 +107,55 @@ pub async fn remove_route(
         .map_err(|_| ApiError::Internal("control plane dropped response".into()))??;
 
     Ok(StatusCode::OK)
+}
+
+/// Reject a long-poll path that the routing layer cannot serve.
+///
+/// `axum::Router::route` requires paths that begin with `/`; anything else
+/// silently fails to match at request time and the operator sees a 404 with
+/// no clear cause. Catching it here turns a runtime symptom into a 400 with
+/// an actionable message. `kind` distinguishes "add" vs "remove" in the
+/// error so a misconfigured `DELETE` body says "removal" and not "route".
+fn validate_longpoll_path(path: &str, kind: &str) -> Result<(), ApiError> {
+    if path.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{kind} requires a non-empty `path`"
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(ApiError::BadRequest(format!(
+            "{kind} `path` must start with `/`, got `{path}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a webhook URL that `reqwest` will fail to dispatch to.
+///
+/// `reqwest::Url::parse` catches malformed URLs (missing scheme, illegal
+/// characters, IDN issues). The scheme guard catches structurally-valid
+/// URLs whose scheme `WebhookRoute` cannot POST to (`ftp://`, `file://`,
+/// `data:`, etc.). Without the guard, the route would be added, every
+/// dispatched update would fail at request time, and the operator would
+/// see a stream of best-effort-logged failures with no upfront warning.
+fn validate_webhook_url(url: &str, kind: &str) -> Result<(), ApiError> {
+    if url.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{kind} requires a non-empty `url`"
+        )));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|err| {
+        ApiError::BadRequest(format!(
+            "{kind} `url` is not a valid URL ({err}): `{url}`"
+        ))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest(format!(
+            "{kind} `url` must use http or https, got `{}`",
+            parsed.scheme()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -293,4 +326,107 @@ mod tests {
             other => panic!("expected Internal, got {:?}", other),
         }
     }
+
+    /// `add_route` MUST reject a long-poll path that doesn't start with `/`.
+    /// Without this, the route is added but `axum::Router::route` won't match
+    /// any incoming request and the operator sees an opaque 404.
+    #[tokio::test]
+    async fn add_longpull_path_without_leading_slash_returns_400() {
+        let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
+        let body = AddRouteSch {
+            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
+                path: "bot/updates".into(),
+            }),
+        };
+
+        let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
+        match res {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("must start with `/`"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `remove_route` MUST apply the same path-shape check as `add_route` so
+    /// callers can't half-trick the API into deleting a path that could not
+    /// have been added through it.
+    #[tokio::test]
+    async fn remove_longpull_path_without_leading_slash_returns_400() {
+        let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
+        let body = RmRouteSch {
+            typee: RmRouteTypeSch::Longpull(RmLongpullRouteSch {
+                path: "bot/updates".into(),
+            }),
+        };
+
+        let res = remove_route(State(tx), Json(body)).await;
+        match res {
+            Err(ApiError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `add_route` MUST reject a webhook URL that `reqwest::Url::parse`
+    /// can't parse. The route would otherwise be added, every dispatched
+    /// update would fail at request time, and the failure would only show
+    /// up in `eprintln!` from `WebhookRoute`.
+    #[tokio::test]
+    async fn add_webhook_malformed_url_returns_400() {
+        let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
+        let body = AddRouteSch {
+            typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+                url: "not a url".into(),
+                request_timeout_ms: None,
+            }),
+        };
+
+        let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
+        match res {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("not a valid URL"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `add_route` MUST reject schemes `WebhookRoute` cannot POST to.
+    /// `reqwest::Client::post` rejects non-http/https at request time
+    /// (`UnsupportedScheme`), so allowing `ftp://` here would just defer
+    /// the failure to the dispatcher loop.
+    #[tokio::test]
+    async fn add_webhook_non_http_scheme_returns_400() {
+        let cases = ["ftp://example.com/bot", "file:///etc/passwd", "data:,hi"];
+        for url in cases {
+            let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
+            let body = AddRouteSch {
+                typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+                    url: url.into(),
+                    request_timeout_ms: None,
+                }),
+            };
+
+            let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
+            match res {
+                Err(ApiError::BadRequest(msg)) => {
+                    assert!(
+                        msg.contains("http or https"),
+                        "{url}: unexpected error message: {msg}"
+                    );
+                }
+                other => panic!("{url}: expected BadRequest, got {:?}", other),
+            }
+            assert!(rx.try_recv().is_err(), "{url}: leaked into channel");
+        }
+    }
+
 }
