@@ -12,6 +12,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde_json::json;
+use serde_json::value::RawValue;
 use std::time::Duration;
 
 use subtle::ConstantTimeEq;
@@ -119,6 +120,16 @@ impl Serverable for WebhookUpdate {
         // deep parse on every webhook hit. Downstreams that expect
         // structured JSON pay one parse on their side, the same as
         // they always have.
+        //
+        // We still gate on JSON *shape* before pushing into the channel:
+        // a single `from_slice::<&RawValue>` confirms the bytes are a
+        // syntactically valid JSON value without allocating a `Value`
+        // tree or reformatting the wire bytes. The routing tree assumes
+        // every `process(update)` call carries one valid JSON value
+        // (see `Routeable::process`); without this gate, a misbehaving
+        // caller posting non-JSON corrupts the next `getUpdates`
+        // response on any `LongPollRoute` downstream and the consuming
+        // bot's client library aborts the whole batch.
         let handler_func = move |State(tx): State<Sender<Bytes>>,
                                  headers: HeaderMap,
                                  body: Bytes| {
@@ -142,6 +153,14 @@ impl Serverable for WebhookUpdate {
                     if !(len_eq && bytes_eq) {
                         return StatusCode::UNAUTHORIZED;
                     }
+                }
+                // Validate JSON shape *after* the secret check so
+                // unauthenticated callers can't probe body parsing
+                // behaviour. `&RawValue` borrows from `body` and is
+                // dropped at the end of this `if` -- the bytes are
+                // forwarded unchanged below.
+                if serde_json::from_slice::<&RawValue>(&body).is_err() {
+                    return StatusCode::BAD_REQUEST;
                 }
                 match tx.send(body).await {
                     Ok(()) => StatusCode::OK,
@@ -311,5 +330,78 @@ mod tests {
             "too long"
         );
         assert_eq!(send(Some("shared-secret")).await, StatusCode::OK, "correct secret");
+    }
+
+    /// `Routeable::process` requires a syntactically valid JSON value;
+    /// the routing tree concatenates the bytes verbatim into a
+    /// `getUpdates` envelope, so non-JSON ingress would corrupt the
+    /// response and silently drop every update batched alongside it.
+    /// The webhook handler MUST gate on shape and return 400 *before*
+    /// the bytes reach the channel.
+    #[tokio::test]
+    async fn test_handler_rejects_non_json_body() {
+        let updater = WebhookUpdate::new("/bot/update".to_string());
+
+        let cases: &[(&str, &[u8])] = &[
+            ("binary garbage", b"garbage\x00not-json"),
+            ("empty body", b""),
+            ("trailing junk after a JSON value", br#"{"update_id":1} trailing"#),
+            ("unterminated object", br#"{"update_id":1"#),
+            ("bare identifier", b"undefined"),
+        ];
+
+        for (label, body) in cases {
+            let (tx, mut rx) = mpsc::channel(10);
+            let app = updater.set_server(Router::new()).await.with_state(tx);
+
+            let request = Request::builder()
+                .method("POST")
+                .uri("/bot/update")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_vec()))
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{label}: non-JSON body must be rejected with 400"
+            );
+
+            // The malformed body MUST NOT have been forwarded onto the
+            // channel -- otherwise the next LongPollRoute downstream
+            // would emit a corrupted `getUpdates` envelope.
+            assert!(
+                rx.try_recv().is_err(),
+                "{label}: malformed body leaked into the channel"
+            );
+        }
+    }
+
+    /// The shape gate runs *after* the secret-token check, so an
+    /// unauthenticated caller posting non-JSON sees 401 (auth failure
+    /// remains the louder signal) rather than 400. Guards against
+    /// a refactor that swaps the two checks and lets unauthenticated
+    /// callers probe body-parsing behaviour.
+    #[tokio::test]
+    async fn test_handler_secret_check_runs_before_json_shape_check() {
+        let mut updater = WebhookUpdate::new("/bot/update".to_string());
+        updater.set_secret_token("shared-secret".to_string());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let app = updater.set_server(Router::new()).await.with_state(tx);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/bot/update")
+            .header("content-type", "application/json")
+            // Wrong secret AND non-JSON body -- auth must win.
+            .header("x-telegram-bot-api-secret-token", "wrong")
+            .body(Body::from(b"garbage\x00not-json".to_vec()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err());
     }
 }
