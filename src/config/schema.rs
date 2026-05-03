@@ -73,6 +73,12 @@ pub struct RegistrationWebhookConfig {
 pub enum RouteConfig {
     LongPollRoute {
         path: String,
+        /// Cap on per-route in-memory buffer depth. When reached, oldest
+        /// updates are evicted FIFO (Telegram already buffers ~24 h
+        /// server-side, so tgin is best-effort recovery, not authoritative).
+        /// Default: [`crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES`].
+        #[serde(default = "default_max_buffered_updates")]
+        max_buffered_updates: usize,
     },
     WebhookRoute {
         url: String,
@@ -92,4 +98,8 @@ pub enum RouteConfig {
 
 fn default_webhook_request_timeout_ms() -> u64 {
     crate::route::webhook::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64
+}
+
+fn default_max_buffered_updates() -> usize {
+    crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES
 }
