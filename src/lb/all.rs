@@ -3,6 +3,7 @@ use crate::base::{AddRouteError, Printable, RemoveRouteError, RouteId, Routeable
 use axum::Router;
 use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinSet;
 
 use arc_swap::ArcSwap;
 
@@ -44,16 +45,36 @@ impl Routeable for AllLB {
             );
             return;
         }
-        for route in routes.iter() {
-            let route = route.clone();
-            // `Bytes::clone` is one atomic ref-count bump per child:
-            // every spawned dispatcher receives the same shared payload
-            // with no per-child copy.
-            let update = update.clone();
+        // Snapshot the children so the `ArcSwap` read guard is released
+        // before any downstream I/O. `Bytes::clone` is one atomic ref-count
+        // bump per child: every spawned dispatcher receives the same
+        // shared payload with no per-child copy.
+        let children: Vec<Arc<dyn RouteableComponent>> =
+            routes.iter().cloned().collect();
+        drop(routes);
 
-            tokio::spawn(async move {
+        let mut set: JoinSet<()> = JoinSet::new();
+        for route in children {
+            let update = update.clone();
+            set.spawn(async move {
                 route.process(update).await;
             });
+        }
+
+        // Drain before returning. The calling worker stays parked here
+        // until every child completes, so the worker-pool bound
+        // (`dark_threads` in `Tgin::run_async`) caps the number of
+        // concurrent fanouts. Panics in children surface as `JoinError`
+        // and MUST NOT take down sibling fanouts or the calling worker —
+        // log and continue draining.
+        while let Some(res) = set.join_next().await {
+            if let Err(e) = res {
+                if e.is_panic() {
+                    eprintln!("AllLB child panicked during fanout: {e}");
+                }
+                // `JoinError::is_cancelled` only fires when the `JoinSet`
+                // is dropped mid-flight, which we don't do during drain.
+            }
         }
     }
 
@@ -275,5 +296,174 @@ mod tests {
 
         let hit = outer.remove_route(RouteId::Url(nested_target)).await;
         assert!(hit.is_ok());
+    }
+
+    /// `process` MUST NOT return until every child has completed. With
+    /// the previous `tokio::spawn` design, `process` returned immediately
+    /// and children finished asynchronously — callers had to `sleep` to
+    /// observe results. After the fix, no sleep is needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_alllb_process_awaits_all_children() {
+        let r1 = Arc::new(MockCallsRoute::new("a"));
+        let r2 = Arc::new(MockCallsRoute::new("b"));
+        let r3 = Arc::new(MockCallsRoute::new("c"));
+        let lb = AllLB::new(vec![r1.clone(), r2.clone(), r3.clone()]);
+
+        lb.process(update_bytes(json!({"k": 1}))).await;
+
+        // No `sleep` — `process` MUST have awaited all children.
+        assert_eq!(r1.count().await, 1);
+        assert_eq!(r2.count().await, 1);
+        assert_eq!(r3.count().await, 1);
+    }
+
+    /// A child panic MUST surface in logs but MUST NOT propagate to the
+    /// caller or abort sibling fanouts. The calling worker survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_alllb_panicking_child_does_not_kill_siblings() {
+        struct PanickingRoute;
+        #[async_trait]
+        impl Routeable for PanickingRoute {
+            async fn process(&self, _update: Bytes) {
+                panic!("intentional test panic");
+            }
+        }
+        impl Serverable for PanickingRoute {}
+        impl Printable for PanickingRoute {}
+
+        let survivor = Arc::new(MockCallsRoute::new("survivor"));
+        let lb: AllLB = AllLB::new(vec![
+            Arc::new(PanickingRoute) as Arc<dyn RouteableComponent>,
+            survivor.clone(),
+        ]);
+
+        // MUST NOT propagate the child panic to the caller.
+        lb.process(update_bytes(json!({"k": 1}))).await;
+
+        // Sibling MUST have been delivered to.
+        assert_eq!(survivor.count().await, 1);
+    }
+
+    /// Headline test: prove the worker-pool bound holds. Drive `AllLB`
+    /// via the same shape used by `run_async` (a bounded mpsc fed by a
+    /// fixed pool of workers calling `lb.process(...)`), with parking
+    /// children, and assert that no probe ever sees more than
+    /// `worker_count` concurrent calls — even when many more updates are
+    /// queued. The OLD `tokio::spawn` design violates this: every queued
+    /// update would spawn a child immediately, pushing per-probe
+    /// in-flight up to `queued_updates`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_alllb_caps_concurrent_fanouts_at_worker_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{mpsc, Notify};
+
+        struct ParkingProbe {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+            gate: Notify,
+            release: AtomicUsize,
+        }
+        #[async_trait]
+        impl Routeable for ParkingProbe {
+            async fn process(&self, _u: Bytes) {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                loop {
+                    if self.release.load(Ordering::SeqCst) > 0 {
+                        self.release.fetch_sub(1, Ordering::SeqCst);
+                        break;
+                    }
+                    self.gate.notified().await;
+                }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl Serverable for ParkingProbe {}
+        impl Printable for ParkingProbe {}
+
+        let k = 3usize;
+        let workers_n = 2usize;
+        let queued_updates = 8usize;
+
+        let probes: Vec<Arc<ParkingProbe>> = (0..k)
+            .map(|_| {
+                Arc::new(ParkingProbe {
+                    in_flight: AtomicUsize::new(0),
+                    max_in_flight: AtomicUsize::new(0),
+                    gate: Notify::new(),
+                    release: AtomicUsize::new(0),
+                })
+            })
+            .collect();
+
+        let children: Vec<Arc<dyn RouteableComponent>> = probes
+            .iter()
+            .cloned()
+            .map(|p| p as Arc<dyn RouteableComponent>)
+            .collect();
+        let lb: Arc<dyn RouteableComponent> = Arc::new(AllLB::new(children));
+
+        // Mirror run_async's worker pool.
+        let (tx, rx) = mpsc::channel::<Bytes>(1024);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let mut workers = Vec::new();
+        for _ in 0..workers_n {
+            let rx = rx.clone();
+            let lb = lb.clone();
+            workers.push(tokio::spawn(async move {
+                loop {
+                    let next = { rx.lock().await.recv().await };
+                    match next {
+                        Some(u) => lb.process(u).await,
+                        None => return,
+                    }
+                }
+            }));
+        }
+
+        for i in 0..queued_updates {
+            tx.send(update_bytes(json!({ "i": i }))).await.unwrap();
+        }
+
+        // Wait until the workers reach steady state: every worker is in
+        // a fanout, so each probe has `workers_n` concurrent calls.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let peak: usize = probes
+                .iter()
+                .map(|p| p.in_flight.load(Ordering::SeqCst))
+                .max()
+                .unwrap();
+            if peak >= workers_n {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("workers never reached steady state");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The bound: at most `workers_n` fanouts in flight, so each probe
+        // sees at most `workers_n` concurrent calls.
+        for p in &probes {
+            let peak = p.max_in_flight.load(Ordering::SeqCst);
+            assert!(
+                peak <= workers_n,
+                "probe peaked at {} concurrent calls, worker-pool bound is {}",
+                peak,
+                workers_n
+            );
+        }
+
+        // Drain.
+        for p in &probes {
+            p.release.store(queued_updates, Ordering::SeqCst);
+            p.gate.notify_waiters();
+        }
+        drop(tx);
+        for w in workers {
+            let _ = w.await;
+        }
     }
 }

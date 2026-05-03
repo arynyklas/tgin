@@ -150,7 +150,10 @@ impl Tgin {
         // `route.process(...)` directly: the routing tree is the unit of
         // concurrency, not the individual update. This caps in-flight work
         // at `dark_threads` regardless of arrival rate, so a slow downstream
-        // can no longer grow the task pool unboundedly.
+        // can no longer grow the task pool unboundedly. A load-balancer node
+        // is itself a `process` call: any fanout (e.g. `AllLB`) drains its
+        // children inline before returning, so the fixed pool caps
+        // concurrent fanouts at `dark_threads` too — not just leaf dispatches.
         //
         // The receiver is shared via a `tokio::sync::Mutex`. The lock is
         // held only across `recv().await` (a single tokio primitive op);
