@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::base::{Printable, Routeable, Serverable};
 use async_trait::async_trait;
 use bytes::Bytes;
