@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -193,7 +194,7 @@ fn walk_route(
     paths: &mut HashMap<String, &'static str>,
 ) {
     match cfg {
-        RouteConfig::LongPollRoute { path } => {
+        RouteConfig::LongPollRoute { path, .. } => {
             if let Some(prev) = paths.insert(path.clone(), "LongPollRoute") {
                 errs.push(ValidationError::DuplicatePath {
                     path: path.clone(),
@@ -234,7 +235,11 @@ fn walk_route(
 /// shared `reqwest::Client`; every adapter that issues outbound HTTP gets a
 /// clone (cheap — `Client` is `Arc`-internal) so they share the connection
 /// pool, DNS resolver, and TLS state.
-pub fn build_updates(configs: Vec<UpdateConfig>, client: &Client) -> Vec<Box<dyn UpdaterComponent>> {
+pub fn build_updates(
+    configs: Vec<UpdateConfig>,
+    client: &Client,
+    health_counter: &Arc<AtomicUsize>,
+) -> Vec<Box<dyn UpdaterComponent>> {
     let mut result: Vec<Box<dyn UpdaterComponent>> = Vec::new();
 
     for cfg in configs {
@@ -253,6 +258,7 @@ pub fn build_updates(configs: Vec<UpdateConfig>, client: &Client) -> Vec<Box<dyn
                 }
                 up.set_timeouts(default_timeout_sleep, error_timeout_sleep);
                 up.set_long_poll_params(long_poll_timeout, long_poll_limit);
+                up.set_health_counter(health_counter.clone());
                 result.push(Box::new(up));
             }
             UpdateConfig::WebhookUpdate {
@@ -281,7 +287,11 @@ pub fn build_updates(configs: Vec<UpdateConfig>, client: &Client) -> Vec<Box<dyn
 
 pub fn build_route(cfg: RouteConfig, client: &Client) -> Arc<dyn RouteableComponent> {
     match cfg {
-        RouteConfig::LongPollRoute { path } => Arc::new(LongPollRoute::new(path)),
+        RouteConfig::LongPollRoute { path, max_buffered_updates } => {
+            let mut route = LongPollRoute::new(path);
+            route.set_max_buffered_updates(max_buffered_updates);
+            Arc::new(route)
+        }
         RouteConfig::WebhookRoute {
             url,
             request_timeout_ms,
@@ -335,7 +345,8 @@ mod tests {
         }];
 
         let client = build_shared_client();
-        let built = build_updates(cfg, &client);
+        let health = Arc::new(AtomicUsize::new(0));
+        let built = build_updates(cfg, &client, &health);
         assert_eq!(built.len(), 1);
 
         let banner = built[0].print().await;
@@ -363,7 +374,8 @@ mod tests {
         }];
 
         let client = build_shared_client();
-        let built = build_updates(cfg, &client);
+        let health = Arc::new(AtomicUsize::new(0));
+        let built = build_updates(cfg, &client, &health);
         let banner = built[0].print().await;
         assert!(
             !banner.contains("REGISTRATED ON"),
@@ -455,8 +467,8 @@ mod tests {
     fn test_validate_rejects_duplicate_longpoll_paths() {
         let cfg = base_config(RouteConfig::RoundRobinLB {
             routes: vec![
-                RouteConfig::LongPollRoute { path: "/bot/up".to_string() },
-                RouteConfig::LongPollRoute { path: "/bot/up".to_string() },
+                RouteConfig::LongPollRoute { path: "/bot/up".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
+                RouteConfig::LongPollRoute { path: "/bot/up".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
             ],
         });
         let errs = validate(&cfg).expect_err("duplicate path rejected");
@@ -478,7 +490,7 @@ mod tests {
                 registration: None,
                 secret_token: None,
             }],
-            route: RouteConfig::LongPollRoute { path: "/shared".to_string() },
+            route: RouteConfig::LongPollRoute { path: "/shared".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
             api: None,
         };
         let errs = validate(&cfg).expect_err("ingress/egress path collision rejected");

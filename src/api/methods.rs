@@ -28,7 +28,10 @@ pub async fn add_route(
     let route = match data.typee {
         AddRouteTypeSch::Longpull(route) => {
             validate_longpoll_path(&route.path, "Longpull route")?;
-            let update = LongPollRoute::new(route.path);
+            let mut update = LongPollRoute::new(route.path);
+            if let Some(cap) = route.max_buffered_updates {
+                update.set_max_buffered_updates(cap);
+            }
             AddRouteType::Longpull(Arc::new(update))
         }
         AddRouteTypeSch::Webhook(route) => {
@@ -201,9 +204,7 @@ mod tests {
     async fn add_longpull_empty_path_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
-                path: String::new(),
-            }),
+            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: String::new(), max_buffered_updates: None }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
@@ -334,9 +335,7 @@ mod tests {
     async fn add_longpull_path_without_leading_slash_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
-                path: "bot/updates".into(),
-            }),
+            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: "bot/updates".into(), max_buffered_updates: None }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;

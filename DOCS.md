@@ -73,6 +73,11 @@ Long-polls Telegram for updates and dispatches each one into the routing tree.
 | `long_poll_timeout`     | `u64` (seconds)  | `30`                       | Server-side hold time passed as `timeout` to `getUpdates`. Telegram caps this at 50.   |
 | `long_poll_limit`       | `u64`            | `100`                      | Max updates per `getUpdates` response. Telegram caps this at 100.                      |
 
+Failure handling: `LongPollUpdate` distinguishes transient from permanent upstream failures.
+
+- **Transient** (network errors, 5xx, body-read errors, JSON-parse errors, 429): retry with full-jitter exponential backoff capped at 1 s. After ~60 consecutive failures the updater emits a single `longpull prolonged outage ...` warning so a sustained outage is loud, then keeps retrying. Telegram's own multi-minute incidents are riden out, not abandoned.
+- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `longpull permanent failure ...` line, increments a process-wide health counter, and stops. When the binary eventually exits with no remaining producers, a non-zero permanent-failure count produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
+
 #### `WebhookUpdate`
 
 Exposes an HTTP endpoint on `server_port` that Telegram POSTs updates to.
@@ -87,9 +92,26 @@ Exposes an HTTP endpoint on `server_port` that Telegram POSTs updates to.
 
 ### Routing targets (`route`)
 
-#### `LongPollRoute { path }`
+#### `LongPollRoute { path, max_buffered_updates? }`
 
 Exposes a Telegram-shaped endpoint at `path` that downstream bots can poll. Updates are buffered in memory until a client calls the route via an `application/x-www-form-urlencoded` request with Telegram-compatible `offset` / `timeout` parameters. `offset` filtering follows Telegram semantics, so multiple bots can safely read from the same buffer.
+
+| Field                  | Type     | Default  | Description                                                                                                                                                                                                                                                                                                    |
+|------------------------|----------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `path`                 | `String` | required | Local URL path the downstream bot polls (e.g. `/bot1/getUpdates`).                                                                                                                                                                                                                                             |
+| `max_buffered_updates` | `usize`  | `10000`  | Cap on the per-route in-memory buffer. When reached, oldest updates are evicted FIFO and the eviction is reflected in `metrics.queue_dropped_total` on `/api/routes`. Telegram already buffers ~24 h of undelivered updates server-side, so tgin is best-effort recovery; raise the cap only if you need more. |
+
+Each `LongPollRoute` exposes runtime metrics through `GET /api/routes`:
+
+```json
+{
+  "type": "longpoll",
+  "options": { "path": "/bot1/getUpdates", "max_buffered_updates": 10000 },
+  "metrics": { "queue_depth": 7, "queue_dropped_total": 0 }
+}
+```
+
+When `queue_depth` first crosses 80 % of `max_buffered_updates`, tgin emits a one-time `warning: long-poll route ... crossed buffer high-watermark` log line so a downstream that has gone offline does not leak silently.
 
 #### `WebhookRoute { url, request_timeout_ms? }`
 
@@ -124,11 +146,11 @@ api: Some(ApiConfig(
 
 Routes are nested under `base_path` and share the same listener as the ingress endpoints.
 
-| Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                   |
-|---------------|----------|------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `/api/routes` | `GET`    | —                                        | Returns the current routing tree as JSON (source: `Routeable::json_struct`).                                                                                                                                  |
-| `/api/route`  | `POST`   | `{ "type": "Webhook"\|"Longpull", ... }` | Adds a route dynamically. `Webhook` form: `{"type": "Webhook", "url": "...", "request_timeout_ms": <ms>?}`. `Longpull` form: `{"type": "Longpull", "path": "..."}`. `request_timeout_ms` defaults to `10000`. |
-| `/api/route`  | `DELETE` | `{ "type": "Webhook"\|"Longpull", ... }` | Removes a previously-added route. Match by `url` (`Webhook`) or `path` (`Longpull`).                                                                                                                          |
+| Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                                                                                             |
+|---------------|----------|------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `/api/routes` | `GET`    | —                                        | Returns the current routing tree as JSON (source: `Routeable::json_struct`).                                                                                                                                                                                                            |
+| `/api/route`  | `POST`   | `{ "type": "Webhook"\|"Longpull", ... }` | Adds a route dynamically. `Webhook` form: `{"type": "Webhook", "url": "...", "request_timeout_ms": <ms>?}`. `Longpull` form: `{"type": "Longpull", "path": "...", "max_buffered_updates": <n>?}`. `request_timeout_ms` defaults to `10000`; `max_buffered_updates` defaults to `10000`. |
+| `/api/route`  | `DELETE` | `{ "type": "Webhook"\|"Longpull", ... }` | Removes a previously-added route. Match by `url` (`Webhook`) or `path` (`Longpull`).                                                                                                                                                                                                    |
 
 Status codes are honest about the outcome — the API used to return 200 for every request regardless of what the routing tree did:
 

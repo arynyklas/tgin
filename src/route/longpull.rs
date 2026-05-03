@@ -2,6 +2,7 @@ use crate::base::{Printable, RouteId, Routeable, Serverable};
 use async_trait::async_trait;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::{
     body::Body,
@@ -30,6 +31,23 @@ pub struct GetUpdatesParams {
     pub limit: Option<u64>,
 }
 
+/// Default cap on the per-route buffer. Telegram already buffers ~24 h of
+/// undelivered updates server-side and re-delivers them via `getUpdates` once
+/// the consuming bot returns, so tgin does not need to be authoritative for
+/// downstreams that go offline. The cap exists to turn a downstream outage
+/// from a slow-motion OOM (see `longpoll-route-buffer-unbounded`) into a
+/// loud, observable signal: oldest updates are evicted FIFO, the eviction
+/// counter increments, and the operator sees the depth on `/routes`.
+pub const DEFAULT_MAX_BUFFERED_UPDATES: usize = 10_000;
+
+/// Fraction of `max_buffered_updates` at which we log a one-time warning.
+/// Matches the threshold a typical operator would set in an external
+/// monitor: by 80 % full, you want to know — by 100 % we are already
+/// dropping. Sticky once-per-route via `high_watermark_logged`; we do not
+/// want one congested route to spam the log every dispatch.
+const HIGH_WATERMARK_RATIO_NUM: usize = 4;
+const HIGH_WATERMARK_RATIO_DEN: usize = 5;
+
 #[derive(Clone)]
 pub struct LongPollRoute {
     /// Each entry is one update's wire JSON. We buffer raw bytes so the
@@ -38,15 +56,52 @@ pub struct LongPollRoute {
     updates: Arc<Mutex<VecDeque<Bytes>>>,
     notify: Arc<Notify>,
     pub path: String,
+    /// Hard cap on `updates.len()`. When `process` would push past this,
+    /// the oldest entries are evicted FIFO until there is room for the
+    /// new one and `dropped_oldest` is incremented by the number evicted.
+    /// Always `>= 1` (clamped in [`set_max_buffered_updates`]).
+    max_buffered_updates: usize,
+    /// Cumulative count of updates evicted due to overflow. Surfaced via
+    /// [`Routeable::json_struct`] so the management API `/routes` endpoint
+    /// reports it. Monotonic; never decreases.
+    dropped_oldest: Arc<AtomicU64>,
+    /// Sticky one-shot: set the first time `updates.len()` reaches the
+    /// high-watermark threshold after a push. Prevents log spam when a
+    /// route stays hot.
+    high_watermark_logged: Arc<AtomicBool>,
 }
 
 impl LongPollRoute {
+    /// Construct a route with the default buffer cap
+    /// ([`DEFAULT_MAX_BUFFERED_UPDATES`]). Override with
+    /// [`set_max_buffered_updates`] before the route is mounted.
     pub fn new(path: String) -> Self {
         Self {
             updates: Arc::new(Mutex::new(VecDeque::new())),
             notify: Arc::new(Notify::new()),
             path,
+            max_buffered_updates: DEFAULT_MAX_BUFFERED_UPDATES,
+            dropped_oldest: Arc::new(AtomicU64::new(0)),
+            high_watermark_logged: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Set the hard cap on buffer depth. Values below `1` are clamped to
+    /// `1`: a cap of `0` would silently drop every dispatched update,
+    /// turning the route into a black hole no operator would ask for.
+    pub fn set_max_buffered_updates(&mut self, cap: usize) {
+        self.max_buffered_updates = cap.max(1);
+    }
+
+    /// High-watermark threshold (`floor(cap * 4 / 5)`, with a `1` floor for
+    /// tiny caps so the warning still fires). Pulled into a method so the
+    /// computation is shared between `process` and tests.
+    fn high_watermark(&self) -> usize {
+        let raw = self
+            .max_buffered_updates
+            .saturating_mul(HIGH_WATERMARK_RATIO_NUM)
+            / HIGH_WATERMARK_RATIO_DEN;
+        raw.max(1)
     }
 
     pub async fn handle_request(&self, params: GetUpdatesParams) -> Response {
@@ -130,12 +185,52 @@ impl Routeable for LongPollRoute {
         // lock the same mutex; if `notify_one` fires before we drop the
         // guard, the poller is contended for the duration of this critical
         // section. Drop the lock first, then notify.
+        //
+        // The buffer is bounded by `max_buffered_updates`. When the cap is
+        // reached, evict the oldest entry FIFO before pushing the new one:
+        // freshness wins because Telegram already buffers undelivered
+        // updates server-side, so `LongPollRoute` is best-effort recovery,
+        // not the system of record. Refusing to accept (the alternative
+        // strategy in the recommended-fix doc) would require an LB above
+        // us to react — today the LBs do not, so a refusal would just
+        // bubble up to the worker pool and stall it. Eviction keeps the
+        // dispatch hot path moving.
+        let mut evicted: u64 = 0;
+        let depth_after_push;
         {
             let mut lock = self
                 .updates
                 .lock()
                 .expect("longpull buffer mutex poisoned");
+            // Loop, not single pop: `set_max_buffered_updates` may have
+            // shrunk the cap below the current depth between pushes.
+            while lock.len() >= self.max_buffered_updates {
+                lock.pop_front();
+                evicted += 1;
+            }
             lock.push_back(update);
+            depth_after_push = lock.len();
+        }
+        if evicted > 0 {
+            // `Relaxed` is sufficient: the counter is observed only via
+            // `json_struct`, which has no happens-before relationship with
+            // the dispatch hot path beyond "some prior process call".
+            self.dropped_oldest.fetch_add(evicted, Ordering::Relaxed);
+        }
+        // High-watermark warning. Sticky once-per-route via
+        // `compare_exchange` so a hot route cannot spam the log. The check
+        // runs after the push so the threshold reflects the depth a poller
+        // would actually observe.
+        if depth_after_push >= self.high_watermark()
+            && self
+                .high_watermark_logged
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            eprintln!(
+                "warning: long-poll route {} crossed buffer high-watermark ({}/{} updates buffered); downstream may be offline",
+                self.path, depth_after_push, self.max_buffered_updates
+            );
         }
         // `notify_one` instead of `notify_waiters` to close the lost-wakeup
         // window in `handle_request`: between dropping the empty-check lock
@@ -184,10 +279,21 @@ impl Printable for LongPollRoute {
     }
 
     async fn json_struct(&self) -> Value {
+        let queue_depth = self
+            .updates
+            .lock()
+            .map(|lock| lock.len())
+            .unwrap_or(0);
+        let queue_dropped_total = self.dropped_oldest.load(Ordering::Relaxed);
         json!({
             "type": "longpoll",
             "options": {
-                "path": self.path
+                "path": self.path,
+                "max_buffered_updates": self.max_buffered_updates
+            },
+            "metrics": {
+                "queue_depth": queue_depth,
+                "queue_dropped_total": queue_dropped_total
             }
         })
     }
@@ -362,6 +468,13 @@ mod tests {
 
         assert_eq!(json["type"], "longpoll");
         assert_eq!(json["options"]["path"], "/my/path");
+        assert_eq!(
+            json["options"]["max_buffered_updates"],
+            DEFAULT_MAX_BUFFERED_UPDATES as u64,
+            "default cap must be exposed so /routes is self-describing"
+        );
+        assert_eq!(json["metrics"]["queue_depth"], 0);
+        assert_eq!(json["metrics"]["queue_dropped_total"], 0);
     }
 
     /// `build_get_updates_response` must always emit a syntactically valid
@@ -383,5 +496,94 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["update_id"], 1);
         assert_eq!(arr[1]["update_id"], 2);
+    }
+
+    /// The unbounded buffer was the OOM vector this fix exists to close.
+    /// With the cap in place, pushing past it MUST evict oldest-first and
+    /// MUST increment the dropped counter; the kept entries MUST be the
+    /// most recent ones in FIFO order.
+    #[tokio::test]
+    async fn test_process_evicts_oldest_at_cap() {
+        let mut route = LongPollRoute::new("/cap".to_string());
+        route.set_max_buffered_updates(3);
+
+        for i in 0..5 {
+            route.process(update_bytes(json!({"update_id": i}))).await;
+        }
+
+        let json = route.json_struct().await;
+        assert_eq!(json["metrics"]["queue_depth"], 3);
+        assert_eq!(
+            json["metrics"]["queue_dropped_total"], 2,
+            "two oldest updates (id 0 and 1) must have been evicted"
+        );
+
+        let response = route.handle_request(default_params()).await;
+        let body = read_body_json(response).await;
+        let results = body["result"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        // Survivors are the three newest, in FIFO order.
+        assert_eq!(results[0]["update_id"], 2);
+        assert_eq!(results[1]["update_id"], 3);
+        assert_eq!(results[2]["update_id"], 4);
+
+        // Counters must persist after the drain -- they are cumulative,
+        // not a snapshot of the current queue.
+        let json = route.json_struct().await;
+        assert_eq!(json["metrics"]["queue_depth"], 0);
+        assert_eq!(json["metrics"]["queue_dropped_total"], 2);
+    }
+
+    /// `set_max_buffered_updates(0)` would silently turn the route into a
+    /// black hole (every push immediately evicts itself). Clamp to `1`.
+    #[tokio::test]
+    async fn test_set_max_buffered_updates_clamps_to_one() {
+        let mut route = LongPollRoute::new("/zero".to_string());
+        route.set_max_buffered_updates(0);
+
+        route.process(update_bytes(json!({"update_id": 1}))).await;
+        route.process(update_bytes(json!({"update_id": 2}))).await;
+
+        let json = route.json_struct().await;
+        assert_eq!(
+            json["options"]["max_buffered_updates"], 1,
+            "cap of 0 must clamp to 1 -- a black-hole route is never the operator's intent"
+        );
+        assert_eq!(json["metrics"]["queue_depth"], 1);
+        assert_eq!(json["metrics"]["queue_dropped_total"], 1);
+
+        let response = route.handle_request(default_params()).await;
+        let body = read_body_json(response).await;
+        let results = body["result"].as_array().unwrap();
+        // The newest survives.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["update_id"], 2);
+    }
+
+    /// Shrinking the cap mid-flight (config reload) MUST evict down to the
+    /// new cap on the very next push, not silently leave a too-deep buffer.
+    #[tokio::test]
+    async fn test_shrunk_cap_evicts_on_next_push() {
+        let mut route = LongPollRoute::new("/shrink".to_string());
+        route.set_max_buffered_updates(10);
+
+        for i in 0..10 {
+            route.process(update_bytes(json!({"update_id": i}))).await;
+        }
+        let json = route.json_struct().await;
+        assert_eq!(json["metrics"]["queue_depth"], 10);
+        assert_eq!(json["metrics"]["queue_dropped_total"], 0);
+
+        // Shrink and push one more -- a single push must drain the queue
+        // back down to the new cap, not just evict one slot.
+        route.set_max_buffered_updates(3);
+        route.process(update_bytes(json!({"update_id": 99}))).await;
+
+        let json = route.json_struct().await;
+        assert_eq!(json["metrics"]["queue_depth"], 3);
+        assert_eq!(
+            json["metrics"]["queue_dropped_total"], 8,
+            "shrinking from 10 to 3 then pushing one must evict 8 (10 - 3 + 1)"
+        );
     }
 }

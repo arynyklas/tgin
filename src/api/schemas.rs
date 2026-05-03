@@ -14,6 +14,10 @@ pub struct AddWebhookRouteSch {
 pub struct AddLongpullRouteSch {
     #[serde(default)]
     pub path: String,
+    /// Override the per-route buffer cap. Omit to fall back to
+    /// [`crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES`].
+    #[serde(default)]
+    pub max_buffered_updates: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
