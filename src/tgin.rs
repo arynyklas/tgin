@@ -1,6 +1,6 @@
-use crate::api::message::ApiMessage;
+use crate::api::message::{ApiError, ApiMessage};
 use crate::api::router::Api;
-use crate::base::{RouteableComponent, Serverable, UpdaterComponent};
+use crate::base::{AddRouteError, RemoveRouteError, RouteableComponent, Serverable, UpdaterComponent};
 
 use axum::Router;
 use bytes::Bytes;
@@ -202,16 +202,40 @@ impl Tgin {
                             let _ = tx_response.send(self.route.json_struct().await);
                         }
 
-                        ApiMessage::AddRoute { route, sublevel } => {
-                            let _ = sublevel;
-                            let _ = self.route.add_route(route).await;
+                        // Run synchronously in the API loop and plumb the
+                        // result back through the oneshot. Mutation is
+                        // sub-millisecond (`arc_swap::rcu` over a `Vec`) so
+                        // there is no latency case for spawning, and
+                        // synchronous handling is what lets the trait-level
+                        // `AddRouteError` surface as an honest 4xx instead of
+                        // a silent 200.
+                        ApiMessage::AddRoute { route, resp } => {
+                            let result = self.route.add_route(route).await.map_err(|err| {
+                                match err {
+                                    AddRouteError::Conflict => ApiError::Conflict(
+                                        "top-level route does not accept dynamic children"
+                                            .into(),
+                                    ),
+                                }
+                            });
+                            let _ = resp.send(result);
                         }
 
-                        ApiMessage::RmRoute(target) => {
-                            let self_route = self.route.clone();
-                            tokio::spawn(async move {
-                                let _ = self_route.remove_route(target).await;
+                        // Symmetric with AddRoute: the previous
+                        // `tokio::spawn` made `add` then `rm` racy and
+                        // hid "target absent" behind a 200. Running in
+                        // the loop preserves caller ordering and lets
+                        // `RemoveRouteError::NotFound` surface as a 404.
+                        ApiMessage::RmRoute { target, resp } => {
+                            let result = self.route.remove_route(target).await.map_err(|err| {
+                                match err {
+                                    RemoveRouteError::NotFound => ApiError::NotFound(
+                                        "no route in the tree matched the supplied target"
+                                            .into(),
+                                    ),
+                                }
                             });
+                            let _ = resp.send(result);
                         }
                     }
                 }

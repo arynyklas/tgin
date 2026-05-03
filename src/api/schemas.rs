@@ -1,9 +1,5 @@
 use serde::Deserialize;
 
-fn default_sublevel() -> i8 {
-    0
-}
-
 #[derive(Deserialize, Debug)]
 pub struct AddWebhookRouteSch {
     #[serde(default)]
@@ -27,12 +23,21 @@ pub enum AddRouteTypeSch {
     Longpull(AddLongpullRouteSch),
 }
 
+/// Body of `POST /<base_path>/route`.
+///
+/// Historically this struct also carried a `sublevel: i8` field intended
+/// for hierarchical insertion (e.g. "attach this child to the LB N levels
+/// down"). The runtime never honored it — the value was discarded with
+/// `let _ = sublevel;` in `Tgin::run_async` and the route always landed at
+/// the top. A field that silently no-ops is worse than no field at all:
+/// operators read the docs, set it, and were quietly lied to. The field
+/// has been removed; if hierarchical insertion is ever implemented it must
+/// address LBs by a stable id exposed through `/routes`, not by an
+/// integer level that has no defined semantics in a heterogeneous tree.
 #[derive(Deserialize, Debug)]
 pub struct AddRouteSch {
     #[serde(flatten)]
     pub typee: AddRouteTypeSch,
-    #[serde(default = "default_sublevel")]
-    pub sublevel: i8,
 }
 
 #[derive(Deserialize, Debug)]

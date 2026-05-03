@@ -28,6 +28,37 @@ pub enum RouteId {
     Url(String),
 }
 
+/// Reasons `Routeable::add_route` can fail.
+///
+/// Encoded at the type level so the API loop in `tgin.rs` does not have to
+/// invent a meaning for an opaque `Err(())`. The previous shape
+/// (`Result<(), ()>`) forced the loop to map the unit error to a different
+/// `ApiError` variant per operation (Add → Conflict, Rm → NotFound), which
+/// silently broke if a future LB impl ever wanted to distinguish causes.
+/// Splitting the trait surface into per-method error enums lets each
+/// implementor say exactly which failures it can produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddRouteError {
+    /// This node cannot accept a child. Today the only producer is the
+    /// default trait impl on a leaf (`LongPollRoute`, `WebhookRoute`,
+    /// `MockCallsRoute`): a leaf has no children list to push into. The
+    /// API maps this to `409 Conflict`.
+    Conflict,
+}
+
+/// Reasons `Routeable::remove_route` can fail.
+///
+/// See [`AddRouteError`] for the rationale on per-method error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveRouteError {
+    /// Target is not present anywhere in the subtree rooted at this node.
+    /// Both LB impls produce this when neither their direct children nor
+    /// any nested LB owns the target; the default trait impl on a leaf
+    /// produces it unconditionally (a leaf trivially has no descendants).
+    /// The API maps this to `404 Not Found`.
+    NotFound,
+}
+
 #[async_trait]
 pub trait Routeable: Send + Sync {
     /// Dispatch one update through this node.
@@ -60,14 +91,21 @@ pub trait Routeable: Send + Sync {
         None
     }
 
-    async fn add_route(&self, route: AddRouteType) -> Result<(), ()> {
+    /// Attach a child route at runtime. The default returns
+    /// [`AddRouteError::Conflict`] — leaves cannot accept children.
+    /// Load balancers override this to push into their children list.
+    async fn add_route(&self, route: AddRouteType) -> Result<(), AddRouteError> {
         drop(route);
-        Err(())
+        Err(AddRouteError::Conflict)
     }
 
-    async fn remove_route(&self, target: RouteId) -> Result<(), ()> {
+    /// Detach a previously-added route at runtime. The default returns
+    /// [`RemoveRouteError::NotFound`] — leaves have no children to search.
+    /// Load balancers override this to walk the children list and recurse
+    /// into nested LBs.
+    async fn remove_route(&self, target: RouteId) -> Result<(), RemoveRouteError> {
         drop(target);
-        Err(())
+        Err(RemoveRouteError::NotFound)
     }
 }
 #[async_trait]
@@ -109,5 +147,35 @@ mod tests {
         assert_ne!(path, url);
         assert_eq!(path, RouteId::Path("/x".to_string()));
         assert_eq!(url, RouteId::Url("/x".to_string()));
+    }
+
+    /// The default `Routeable::add_route` impl MUST return
+    /// `AddRouteError::Conflict` so the API loop can map it to 409 without
+    /// inventing a meaning for an opaque `Err(())`. This is the contract
+    /// the leaf routes (`LongPollRoute`, `WebhookRoute`, `MockCallsRoute`)
+    /// rely on by inheriting the default; if the default ever changes,
+    /// the API loop's mapping in `tgin.rs` would silently lie.
+    #[tokio::test]
+    async fn test_default_add_route_returns_conflict() {
+        use crate::mock::routes::MockCallsRoute;
+        use crate::route::longpull::LongPollRoute;
+        use std::sync::Arc;
+
+        let leaf = MockCallsRoute::new("leaf");
+        let child = Arc::new(LongPollRoute::new("/dyn".to_string()));
+        let res = leaf.add_route(AddRouteType::Longpull(child)).await;
+        assert_eq!(res, Err(AddRouteError::Conflict));
+    }
+
+    /// The default `Routeable::remove_route` impl MUST return
+    /// `RemoveRouteError::NotFound`. Same rationale as
+    /// `test_default_add_route_returns_conflict`.
+    #[tokio::test]
+    async fn test_default_remove_route_returns_not_found() {
+        use crate::mock::routes::MockCallsRoute;
+
+        let leaf = MockCallsRoute::new("leaf");
+        let res = leaf.remove_route(RouteId::Path("/anything".to_string())).await;
+        assert_eq!(res, Err(RemoveRouteError::NotFound));
     }
 }
