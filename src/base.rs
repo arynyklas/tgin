@@ -32,11 +32,27 @@ pub enum RouteId {
 pub trait Routeable: Send + Sync {
     /// Dispatch one update through this node.
     ///
-    /// The update is the original wire JSON, carried as `Bytes` so the
-    /// router never re-parses or re-serializes it. Cloning is one atomic
-    /// ref-count bump, so a broadcast load balancer hands the same payload
-    /// to N children with no per-child copy and no `serde_json::Value`
-    /// allocation.
+    /// `update` MUST be a single, syntactically valid JSON value. The
+    /// router never re-parses or re-serializes it: a `LongPollRoute`
+    /// concatenates the bytes verbatim into a `getUpdates` envelope, a
+    /// `WebhookRoute` POSTs them as the request body. Pushing non-JSON
+    /// bytes here corrupts the consuming bot's response and silently
+    /// drops every update batched alongside the bad one.
+    ///
+    /// Enforcement lives at the ingress boundary, not here:
+    ///   * `LongPollUpdate` deserializes the upstream `result` array as
+    ///     `Vec<Box<RawValue>>` and walks each element, so anything it
+    ///     forwards is by construction a valid JSON value.
+    ///   * `WebhookUpdate` validates the request body with
+    ///     `serde_json::from_slice::<&RawValue>` and rejects malformed
+    ///     bodies with `400 Bad Request` before they enter the channel.
+    /// Any new ingress adapter MUST do the same before sending bytes
+    /// into the routing tree.
+    ///
+    /// Carrying the update as `Bytes` (not `serde_json::Value`) keeps
+    /// cloning to one atomic ref-count bump, so a broadcast load
+    /// balancer hands the same payload to N children with no per-child
+    /// copy and no `Value` allocation.
     async fn process(&self, update: Bytes);
 
     /// Identity of this route, or `None` for inner nodes (load balancers).
