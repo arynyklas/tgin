@@ -5,8 +5,11 @@ use crate::utils::defaults::TELEGRAM_TOKEN_REGEX;
 
 use async_trait::async_trait;
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{DefaultBodyLimit, Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::IntoResponse,
     routing::post,
     Router,
 };
@@ -22,6 +25,17 @@ use reqwest::Client;
 use tokio::sync::mpsc::Sender;
 
 use regex::Regex;
+
+/// Cap the request body for webhook ingress. Telegram updates are
+/// well under 64 KiB in practice (a few KiB for normal messages, the
+/// upper bound is documented at <1 MiB even in pathological cases).
+/// Without this cap an unauthenticated caller could pin
+/// `axum::extract::DefaultBodyLimit`'s default (2 MiB) of allocator
+/// state per request just by being able to hit the public webhook
+/// URL. The cap is enforced before the body is fully buffered: the
+/// `Bytes` extractor stops reading and returns 413 once the limit is
+/// exceeded.
+const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 
 pub struct RegistrationWebhookConfig {
     public_ip: String,
@@ -114,6 +128,45 @@ impl Serverable for WebhookUpdate {
         let path = self.path.clone();
         let secret = self.secret_token.clone();
 
+        // Auth runs as a middleware *before* the body extractor so an
+        // unauthenticated caller cannot force the server to buffer the
+        // request body. axum's `Bytes` extractor reads the entire body
+        // into memory before the handler future starts; placing the
+        // secret check inside the handler (the previous shape of this
+        // code) made the public webhook path a free DoS amplifier --
+        // anyone who could hit the URL could pin up to
+        // `DefaultBodyLimit` (2 MiB by default) per request without
+        // ever proving knowledge of the secret. Doing the check in a
+        // layer that runs ahead of extraction means an unauthenticated
+        // request is dropped on the headers alone; the body is never
+        // pulled off the wire.
+        let auth_layer = middleware::from_fn(move |req: Request<Body>, next: Next| {
+            let secret = secret.clone();
+            async move {
+                if let Some(sec) = secret {
+                    let provided = req
+                        .headers()
+                        .get("x-telegram-bot-api-secret-token")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("");
+                    let provided_bytes = provided.as_bytes();
+                    let expected_bytes = sec.as_bytes();
+                    let len_eq = provided_bytes.len() == expected_bytes.len();
+                    // Compare same-length buffers (zero-padded to expected len) so that
+                    // a length mismatch still goes through ct_eq and doesn't short-circuit
+                    // by length alone. The final `&` with `len_eq` rejects length mismatches.
+                    let mut padded = vec![0u8; expected_bytes.len()];
+                    let copy_len = provided_bytes.len().min(expected_bytes.len());
+                    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
+                    let bytes_eq: bool = padded.ct_eq(expected_bytes).into();
+                    if !(len_eq && bytes_eq) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                }
+                next.run(req).await
+            }
+        });
+
         // Capture the request body as raw `Bytes` instead of parsing
         // `Json<Value>`: Telegram already produced valid JSON; the
         // router's job is to forward those bytes verbatim. Saves one
@@ -130,35 +183,8 @@ impl Serverable for WebhookUpdate {
         // caller posting non-JSON corrupts the next `getUpdates`
         // response on any `LongPollRoute` downstream and the consuming
         // bot's client library aborts the whole batch.
-        let handler_func = move |State(tx): State<Sender<Bytes>>,
-                                 headers: HeaderMap,
-                                 body: Bytes| {
-            let secret = secret.clone();
-            async move {
-                if let Some(sec) = secret {
-                    let provided = headers
-                        .get("x-telegram-bot-api-secret-token")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or("");
-                    let provided_bytes = provided.as_bytes();
-                    let expected_bytes = sec.as_bytes();
-                    let len_eq = provided_bytes.len() == expected_bytes.len();
-                    // Compare same-length buffers (zero-padded to expected len) so that
-                    // a length mismatch still goes through ct_eq and doesn't short-circuit
-                    // by length alone. The final `&` with `len_eq` rejects length mismatches.
-                    let mut padded = vec![0u8; expected_bytes.len()];
-                    let copy_len = provided_bytes.len().min(expected_bytes.len());
-                    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
-                    let bytes_eq: bool = padded.ct_eq(expected_bytes).into();
-                    if !(len_eq && bytes_eq) {
-                        return StatusCode::UNAUTHORIZED;
-                    }
-                }
-                // Validate JSON shape *after* the secret check so
-                // unauthenticated callers can't probe body parsing
-                // behaviour. `&RawValue` borrows from `body` and is
-                // dropped at the end of this `if` -- the bytes are
-                // forwarded unchanged below.
+        let handler_func =
+            |State(tx): State<Sender<Bytes>>, body: Bytes| async move {
                 if serde_json::from_slice::<&RawValue>(&body).is_err() {
                     return StatusCode::BAD_REQUEST;
                 }
@@ -169,10 +195,21 @@ impl Serverable for WebhookUpdate {
                     // delivers an acknowledged update. 503 makes it retry.
                     Err(_) => StatusCode::SERVICE_UNAVAILABLE,
                 }
-            }
-        };
+            };
 
-        router.route(&path, post(handler_func))
+        // Layer order (outer to inner): auth -> body-limit -> handler.
+        // axum applies layers innermost-first when stacked via `.layer`,
+        // so the `auth_layer` call MUST come last to wrap everything.
+        // The body cap is enforced by the `Bytes` extractor reading the
+        // `DefaultBodyLimit` extension, so requests above the limit
+        // return `413 Payload Too Large` before the body is fully
+        // buffered.
+        router.route(
+            &path,
+            post(handler_func)
+                .layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT))
+                .layer(auth_layer),
+        )
     }
 }
 
@@ -404,4 +441,66 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(rx.try_recv().is_err());
     }
+
+    /// `WEBHOOK_BODY_LIMIT` MUST cap the body at the extractor layer.
+    /// axum's default `DefaultBodyLimit` is 2 MiB; without an explicit
+    /// cap on this route, an unauthenticated caller could pin that much
+    /// allocator state per request just by being able to hit the public
+    /// URL. The handler MUST surface oversized bodies as 413, and the
+    /// channel MUST stay empty (the bytes never reach `process`).
+    #[tokio::test]
+    async fn test_handler_caps_oversized_body() {
+        let updater = WebhookUpdate::new("/bot/update".to_string());
+        let (tx, mut rx) = mpsc::channel(10);
+        let app = updater.set_server(Router::new()).await.with_state(tx);
+
+        // One byte over the cap is enough to prove the limit is wired.
+        let oversized = vec![b'a'; WEBHOOK_BODY_LIMIT + 1];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/bot/update")
+            .header("content-type", "application/json")
+            .body(Body::from(oversized))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            rx.try_recv().is_err(),
+            "oversized body MUST NOT reach the dispatch channel",
+        );
+    }
+
+    /// The auth check MUST run before the body extractor, so an
+    /// unauthenticated caller posting an oversized body sees 401, not
+    /// 413 -- proof that the body was never buffered. If a refactor
+    /// moves auth back into the handler the body extractor runs first,
+    /// hits the size cap, and this test starts seeing 413: regression
+    /// caught.
+    #[tokio::test]
+    async fn test_auth_rejects_before_body_is_buffered() {
+        let mut updater = WebhookUpdate::new("/bot/update".to_string());
+        updater.set_secret_token("shared-secret".to_string());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let app = updater.set_server(Router::new()).await.with_state(tx);
+
+        let oversized = vec![b'a'; WEBHOOK_BODY_LIMIT * 4];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/bot/update")
+            .header("content-type", "application/json")
+            .header("x-telegram-bot-api-secret-token", "wrong")
+            .body(Body::from(oversized))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "auth MUST short-circuit before the body cap is checked",
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
 }
