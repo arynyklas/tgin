@@ -93,7 +93,7 @@ struct Args {
     target: String,
     #[arg(short, long, default_value_t = 1000)]
     rps: u64,
-    #[arg(short, long, default_value_t = 10)]
+    #[arg(short, long, default_value_t = 30)]
     duration: u64,
     #[arg(short, long, default_value_t = 8090)]
     port: u16,
@@ -350,10 +350,7 @@ struct GetUpdatesParams {
 ///    — only a later request with a higher offset acknowledges them.
 /// 3. If no updates match, wait up to `timeout` seconds (capped at
 ///    `TELEGRAM_GET_UPDATES_TIMEOUT_MAX_SECS`) for a notification, then re-check.
-async fn take_updates_for_request(
-    stream: &UpdateStream,
-    params: &GetUpdatesParams,
-) -> Vec<Value> {
+async fn take_updates_for_request(stream: &UpdateStream, params: &GetUpdatesParams) -> Vec<Value> {
     let limit = params
         .limit
         .unwrap_or(TELEGRAM_GET_UPDATES_LIMIT_MAX)
@@ -775,10 +772,7 @@ fn print_text_report(report: &BenchReport) {
         println!("------------------------------------------");
         println!("LONG-POLL BATCHING:");
         println!("  getUpdates calls:    {}", report.get_updates_calls);
-        println!(
-            "  empty calls:         {}",
-            report.empty_get_updates_calls
-        );
+        println!("  empty calls:         {}", report.empty_get_updates_calls);
         println!("  max batch size:      {}", report.max_get_updates_batch);
         match report.mean_get_updates_batch {
             Some(mean) => println!("  mean batch size:     {mean:.2}"),

@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Written in [Amber](https://amber-lang.com/)
-# version: 0.5.1-alpha
-# Amber is not currently available in this workspace; keep this generated script
-# synchronized with benchmark.ab when editing either file.
 set -euo pipefail
 
 usecases=(
@@ -11,7 +7,8 @@ usecases=(
 )
 rps_values=(500 1000 2000 5000 8000 10000)
 
-duration="${DURATION:-10}"
+duration="${DURATION:-30}"
+runs="${RUNS:-3}"
 run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 git_sha="${GIT_SHA:-$(git rev-parse --short HEAD)}"
 result_dir="${RESULT_DIR:-results}"
@@ -66,6 +63,13 @@ scenario_metadata() {
     esac
 }
 
+case "${runs}" in
+    ""|*[!0-9]*|0)
+        echo "RUNS must be a positive integer" >&2
+        exit 1
+        ;;
+esac
+
 mkdir -p "${result_dir}"
 make clean
 make build
@@ -77,19 +81,21 @@ docker compose down
 for rps in "${rps_values[@]}"; do
     for mode in "${usecases[@]}"; do
         scenario_metadata "${mode}"
-        echo "Running ${mode} at ${rps} RPS -> ${result_path}"
-        make "${mode}" \
-            RPS="${rps}" \
-            DURATION="${duration}" \
-            BENCH_FORMAT=csv-row \
-            RUN_ID="${run_id}" \
-            GIT_SHA="${git_sha}" \
-            SCENARIO_FAMILY="${scenario_family}" \
-            TRANSPORT="${transport}" \
-            ROUTE_PATH="${route_path}" \
-            SCENARIO="${mode}" \
-            BOT_COUNT="${bot_count}" \
-            BENCH_OUTPUT="${result_path}"
+        for run in $(seq 1 "${runs}"); do
+            echo "Running ${mode} at ${rps} RPS (run ${run}/${runs}) -> ${result_path}"
+            make "${mode}" \
+                RPS="${rps}" \
+                DURATION="${duration}" \
+                BENCH_FORMAT=csv-row \
+                RUN_ID="${run_id}" \
+                GIT_SHA="${git_sha}" \
+                SCENARIO_FAMILY="${scenario_family}" \
+                TRANSPORT="${transport}" \
+                ROUTE_PATH="${route_path}" \
+                SCENARIO="${mode}" \
+                BOT_COUNT="${bot_count}" \
+                BENCH_OUTPUT="${result_path}"
+        done
     done
 done
 

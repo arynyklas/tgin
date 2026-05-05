@@ -105,13 +105,14 @@ _tgin buffering and distributing updates across 2, 3, 5, and 10 backends._
 
 ## Reproducing the benchmarks
 
-A full benchmark sweep takes about 30 minutes.
+A full benchmark sweep runs three 30-second samples for each scenario by default.
 
 ```bash
 git clone https://github.com/arynyklas/tgin.git
 cd tgin/tests/performance
 
 # Run the full RPS matrix (writes results/<run_id>.csv).
+# Defaults: DURATION=30 RUNS=3.
 . ./benchmark.sh
 
 # Regenerate the charts under diagram/generated/.
@@ -119,7 +120,7 @@ cd diagram
 uv run main.py
 ```
 
-Per-scenario runs are also exposed through the makefile, e.g. `make webhook-tgin-scale-5 RPS=1000 DURATION=10`.
+Per-scenario runs are also exposed through the makefile, e.g. `make webhook-tgin-scale-5 RPS=1000 DURATION=30`. Override full-sweep sampling with `DURATION=<seconds>` and `RUNS=<count>` when needed.
 
 ## See also
 

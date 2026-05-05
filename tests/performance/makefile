@@ -1,5 +1,5 @@
 RPS ?= 100
-DURATION ?= 10
+DURATION ?= 30
 BENCH_PORT := 8090
 BENCH_FORMAT ?= text
 RUN_ID ?= manual
