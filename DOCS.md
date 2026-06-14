@@ -60,7 +60,7 @@ Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
 | `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress.                                                                                                   |
 | `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off`. `RUST_LOG` overrides it. |
 | `log_format`   | `"Compact"` \| `"Json"`           | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
-| `auth_token`   | `Option<String>`                  | `None`    | Optional shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. A present-but-blank value is rejected at startup. |
+| `auth_token`   | `Option<String>`                  | `None`    | Optional shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. A present-but-blank value is ignored with a startup warning (auth stays disabled). |
 
 ### Update providers (`updates`)
 
@@ -198,7 +198,7 @@ tgin exposes structured logs plus two always-on HTTP endpoints. The endpoints ar
 
 ### Authentication
 
-The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is unauthenticated by default and assumes network-layer isolation (a private network or a reverse proxy). Set the top-level `auth_token` to require `Authorization: Bearer <auth_token>` on all three: a request without the exact credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time, and a present-but-blank `auth_token` is a startup validation error. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
+The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is unauthenticated by default and assumes network-layer isolation (a private network or a reverse proxy). Set the top-level `auth_token` to require `Authorization: Bearer <auth_token>` on all three: a request without the exact credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time. A present-but-blank `auth_token` is ignored — auth stays disabled and tgin logs a startup warning so the misconfiguration is visible. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
 
 For Prometheus, pass the secret through the scrape config's `authorization` block (`type: Bearer`, `credentials: <auth_token>`).
 

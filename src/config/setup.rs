@@ -84,6 +84,17 @@ fn substitute_env_vars(input: &str) -> Result<String, Vec<String>> {
     Ok(out.into_owned())
 }
 
+/// Resolve the effective `auth_token`. A present-but-blank value is dropped to
+/// `None` (auth disabled): a blank secret would make the bearer gate admit
+/// every request, so it must never reach the middleware. `was_blank` lets the
+/// caller warn that a configured token was ignored.
+pub fn effective_auth_token(token: Option<String>) -> (Option<String>, bool) {
+    match token {
+        Some(t) if t.trim().is_empty() => (None, true),
+        other => (other, false),
+    }
+}
+
 /// Walk the parsed config and report every semantic issue we can detect
 /// before the runtime starts. Collects every error so a multi-issue config
 /// surfaces all of them in one pass.
@@ -102,12 +113,6 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         errs.push(ValidationError::InvalidLogLevel {
             value: cfg.log_level.clone(),
         });
-    }
-
-    if let Some(token) = &cfg.auth_token {
-        if token.trim().is_empty() {
-            errs.push(ValidationError::EmptyAuthToken);
-        }
     }
 
     if let Some(ssl) = &cfg.ssl {
@@ -662,13 +667,17 @@ mod tests {
         )));
     }
 
-    /// A present-but-blank `auth_token` must be rejected: the empty credential
-    /// matches, so it would silently leave the control plane open.
+    /// A present-but-blank `auth_token` resolves to disabled auth (`None`),
+    /// flagged so startup can warn — a blank secret must never reach the gate,
+    /// where the empty credential would otherwise match every request.
     #[test]
-    fn test_validate_rejects_blank_auth_token() {
-        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
-        cfg.auth_token = Some("   ".to_string());
-        let errs = validate(&cfg).expect_err("blank auth_token rejected");
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyAuthToken)));
+    fn test_effective_auth_token_blank_disables() {
+        assert_eq!(effective_auth_token(Some("   ".to_string())), (None, true));
+        assert_eq!(effective_auth_token(Some(String::new())), (None, true));
+        assert_eq!(
+            effective_auth_token(Some("s3cret".to_string())),
+            (Some("s3cret".to_string()), false)
+        );
+        assert_eq!(effective_auth_token(None), (None, false));
     }
 }

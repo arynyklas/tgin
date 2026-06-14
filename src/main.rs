@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::process::ExitCode;
 
-use crate::config::setup::{build_route, build_updates, load_config};
+use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
 use crate::tgin::Tgin;
 use crate::utils::http::build_shared_client;
 
@@ -97,10 +97,18 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let lb = build_route(conf.route, &http_client);
 
     let mut tgin = Tgin::new(inputs, lb, conf.dark_threads, conf.server_port);
-    tgin.set_auth_token(conf.auth_token.clone());
+
+    let (auth_token, blank_token) = effective_auth_token(conf.auth_token);
+    if blank_token {
+        tracing::warn!(
+            "auth_token is set but blank; ignoring it — the control plane \
+             (/status, /metrics, management API) is UNAUTHENTICATED"
+        );
+    }
+    tgin.set_auth_token(auth_token.clone());
 
     if let Some(api) = conf.api {
-        let api = api::router::Api::new(api.base_path, http_client.clone(), conf.auth_token.clone());
+        let api = api::router::Api::new(api.base_path, http_client.clone(), auth_token.clone());
         tgin.set_api(api);
     }
 

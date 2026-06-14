@@ -74,9 +74,6 @@ pub enum ValidationError {
     /// `log_level` is not one of trace/debug/info/warn/error/off
     /// (case-insensitive).
     InvalidLogLevel { value: String },
-    /// `auth_token` is present but blank. A blank token would admit every
-    /// request (the empty credential matches), defeating the gate silently.
-    EmptyAuthToken,
     /// SSL cert / key file is unreadable. Without this check, the failure
     /// surfaces inside an `axum_server::tls_rustls` task far from the
     /// config site.
@@ -160,11 +157,6 @@ impl fmt::Display for ValidationError {
                 f,
                 "log_level {value:?} is not a recognised level \
                  (hint: use one of trace, debug, info, warn, error, off)"
-            ),
-            ValidationError::EmptyAuthToken => write!(
-                f,
-                "auth_token is set but blank; a blank token would admit every request \
-                 (hint: remove the field to disable auth, or set a non-empty secret)"
             ),
             ValidationError::SslFileUnreadable {
                 field,
