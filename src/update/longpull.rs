@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 
 /// Telegram caps `getUpdates?timeout=` at 50 seconds.
 const TELEGRAM_LONG_POLL_TIMEOUT_MAX: u64 = 50;
@@ -117,7 +118,7 @@ impl LongPollUpdate {
 
 #[async_trait]
 impl Updater for LongPollUpdate {
-    async fn start(&self, tx: Sender<Bytes>) {
+    async fn start(&self, tx: Sender<Bytes>, shutdown: CancellationToken) {
         let mut offset: i64 = 0;
         let backoff_base_ms = self.error_timeout_sleep.max(BACKOFF_FLOOR_MS);
         let mut backoff_ms = backoff_base_ms;
@@ -144,13 +145,16 @@ impl Updater for LongPollUpdate {
                 ("limit", self.long_poll_limit.to_string()),
             ];
 
-            let response = self
-                .client
-                .get(&self.url)
-                .query(&params)
-                .timeout(request_timeout)
-                .send()
-                .await;
+            let response = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                r = self
+                    .client
+                    .get(&self.url)
+                    .query(&params)
+                    .timeout(request_timeout)
+                    .send() => r,
+            };
 
             let response = match response {
                 Ok(r) => r,
@@ -161,7 +165,9 @@ impl Updater for LongPollUpdate {
                         &mut prolonged_outage_logged,
                         &redacted_url,
                     );
-                    sleep(jittered(backoff_ms)).await;
+                    if sleep_or_shutdown(jittered(backoff_ms), &shutdown).await {
+                        return;
+                    }
                     backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
                     continue;
                 }
@@ -176,7 +182,9 @@ impl Updater for LongPollUpdate {
                     redacted_url, status, body
                 );
                 let wait = retry_after.unwrap_or_else(|| jittered(backoff_ms));
-                sleep(wait).await;
+                if sleep_or_shutdown(wait, &shutdown).await {
+                    return;
+                }
                 backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
                 continue;
             }
@@ -210,7 +218,9 @@ impl Updater for LongPollUpdate {
                     &mut prolonged_outage_logged,
                     &redacted_url,
                 );
-                sleep(jittered(backoff_ms)).await;
+                if sleep_or_shutdown(jittered(backoff_ms), &shutdown).await {
+                    return;
+                }
                 backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
                 continue;
             }
@@ -228,7 +238,9 @@ impl Updater for LongPollUpdate {
                         &mut prolonged_outage_logged,
                         &redacted_url,
                     );
-                    sleep(jittered(backoff_ms)).await;
+                    if sleep_or_shutdown(jittered(backoff_ms), &shutdown).await {
+                        return;
+                    }
                     backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
                     continue;
                 }
@@ -243,7 +255,9 @@ impl Updater for LongPollUpdate {
                         &mut prolonged_outage_logged,
                         &redacted_url,
                     );
-                    sleep(jittered(backoff_ms)).await;
+                    if sleep_or_shutdown(jittered(backoff_ms), &shutdown).await {
+                        return;
+                    }
                     backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
                     continue;
                 }
@@ -282,8 +296,10 @@ impl Updater for LongPollUpdate {
                 }
             }
 
-            if self.default_timeout_sleep > 0 {
-                sleep(Duration::from_millis(self.default_timeout_sleep)).await;
+            if self.default_timeout_sleep > 0
+                && sleep_or_shutdown(Duration::from_millis(self.default_timeout_sleep), &shutdown).await
+            {
+                return;
             }
         }
     }
@@ -358,6 +374,17 @@ fn jittered(current_ms: u64) -> Duration {
     Duration::from_millis(n)
 }
 
+/// Sleep for `dur`, but wake immediately if `shutdown` is signalled.
+/// Returns `true` when shutdown won the race (caller must stop polling),
+/// `false` on a normal timer wake.
+async fn sleep_or_shutdown(dur: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => true,
+        _ = sleep(dur) => false,
+    }
+}
+
 /// Parse the `Retry-After` HTTP header as a `delta-seconds` value. We do not
 /// support `HTTP-date` form — Telegram emits seconds.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -393,6 +420,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{any, path};
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
@@ -408,6 +436,40 @@ mod tests {
         // Long-poll hold of 0 keeps the mock from blocking the test thread.
         updater.set_long_poll_params(0, 100);
         updater
+    }
+
+    /// With the upstream parked in `send()`, cancelling the shutdown token
+    /// MUST make `start` return promptly instead of blocking on the request
+    /// (or the reqwest deadline). Proves the poll loop is cancellation-aware.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_longpoll_returns_promptly_on_shutdown() {
+        let mock_server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({ "ok": true, "result": [] }))
+                    .set_delay(Duration::from_secs(30)), // park the poll in send()
+            )
+            .mount(&mock_server)
+            .await;
+
+        let updater = build_updater(&mock_server);
+        let (tx, _rx) = mpsc::channel(10); // keep _rx alive: channel must stay open
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            updater.start(tx, shutdown).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await; // let it reach the park
+        cancel.cancel();
+
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("start() did not return within 2s after shutdown signalled")
+            .expect("start task panicked");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -438,7 +500,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
 
         let handle = tokio::spawn(async move {
-            updater.start(tx).await;
+            updater.start(tx, CancellationToken::new()).await;
         });
 
         let update1 = timeout(Duration::from_secs(1), rx.recv())
@@ -507,7 +569,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let handle = tokio::spawn(async move {
-            updater.start(tx).await;
+            updater.start(tx, CancellationToken::new()).await;
         });
 
         let update = timeout(Duration::from_secs(5), rx.recv())
@@ -571,7 +633,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let started = tokio::time::Instant::now();
         let handle = tokio::spawn(async move {
-            updater.start(tx).await;
+            updater.start(tx, CancellationToken::new()).await;
         });
 
         let update = timeout(Duration::from_secs(5), rx.recv())
@@ -670,7 +732,7 @@ mod tests {
             // `start` MUST return on its own -- not via `abort` -- within
             // a tight window. Without the permanent-status handling, the
             // task would loop forever and this `timeout` would fire.
-            timeout(Duration::from_secs(2), updater.start(tx))
+            timeout(Duration::from_secs(2), updater.start(tx, CancellationToken::new()))
                 .await
                 .unwrap_or_else(|_| {
                     panic!("updater never returned for status {status}")
@@ -712,7 +774,7 @@ mod tests {
         // `start` must NOT return inside this window: 5xx is transient.
         // If we ever regress and treat 5xx as permanent, this `timeout`
         // resolves with `Ok(())` and the assertion below fires.
-        let outcome = timeout(Duration::from_millis(500), updater.start(tx)).await;
+        let outcome = timeout(Duration::from_millis(500), updater.start(tx, CancellationToken::new())).await;
         assert!(
             outcome.is_err(),
             "start returned on 5xx; permanent-failure classification leaked into transient errors"

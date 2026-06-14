@@ -9,7 +9,10 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 
 use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use std::net::SocketAddr;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use tokio::runtime::Builder;
 
@@ -54,7 +57,7 @@ impl Tgin {
         self.ssl_key = Some(ssl_key);
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<()> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(self.dark_threads)
             .enable_all()
@@ -74,10 +77,10 @@ impl Tgin {
             println!("{}", &self.route.print().await);
         });
 
-        runtime.block_on(self.run_async());
+        runtime.block_on(self.run_async())
     }
 
-    pub async fn run_async(self) {
+    pub async fn run_async(self) -> std::io::Result<()> {
         // Bounded buffer: a small queue is flow control. The previous
         // 1_000_000-slot channel was not — it was a runway for OOM that
         // hid downstream slowness from producers until memory ran out.
@@ -88,55 +91,110 @@ impl Tgin {
 
         let api = self.api;
 
-        if let Some(port) = self.server_port {
-            let mut router: Router<Sender<Bytes>> = Router::new();
+        let shutdown = CancellationToken::new();
+        // Released only after the HTTP server has finished its graceful drain,
+        // so the worker pool and the control-plane loop keep consuming updates
+        // produced by in-flight webhook handlers right up until the server is
+        // done — then drain the backlog and exit.
+        let drain = CancellationToken::new();
 
-            for provider in &self.updates {
-                router = provider.set_server(router).await;
-            }
+        let server: Option<(Handle<SocketAddr>, tokio::task::JoinHandle<()>)> =
+            if let Some(port) = self.server_port {
+                let mut router: Router<Sender<Bytes>> = Router::new();
 
-            router = self.route.set_server(router).await;
+                for provider in &self.updates {
+                    router = provider.set_server(router).await;
+                }
 
-            if let Some(ref api) = api {
-                router = api.set_server(router).await;
-            }
+                router = self.route.set_server(router).await;
 
-            let app = router.with_state(tx.clone());
+                if let Some(ref api) = api {
+                    router = api.set_server(router).await;
+                }
 
-            let app = if api.is_some() {
-                app.fallback(dynamic_handler)
+                let app = router.with_state(tx.clone());
+
+                let app = if api.is_some() {
+                    app.fallback(dynamic_handler)
+                } else {
+                    app
+                };
+
+                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+                // Bind on THIS task so a bind failure (EADDRINUSE, bad addr) is
+                // an honest startup error propagated to `main`, not a panic
+                // lost in a detached task that leaves a live process with no
+                // HTTP plane.
+                let std_listener = std::net::TcpListener::bind(addr)?;
+                std_listener.set_nonblocking(true)?;
+
+                let handle = Handle::new();
+                println!("LISTENING ON {addr}");
+
+                let task = match (self.ssl_cert.clone(), self.ssl_key.clone()) {
+                    (Some(cert_path), Some(key_path)) => {
+                        let config = RustlsConfig::from_pem_file(cert_path, key_path).await?;
+                        let server = axum_server::from_tcp_rustls(std_listener, config)?
+                            .handle(handle.clone());
+                        tokio::spawn(async move {
+                            if let Err(err) = server.serve(app.into_make_service()).await {
+                                eprintln!("tgin: HTTPS server terminated with error: {err}");
+                            }
+                        })
+                    }
+                    _ => {
+                        let server = axum_server::from_tcp(std_listener)?.handle(handle.clone());
+                        tokio::spawn(async move {
+                            if let Err(err) = server.serve(app.into_make_service()).await {
+                                eprintln!("tgin: HTTP server terminated with error: {err}");
+                            }
+                        })
+                    }
+                };
+
+                Some((handle, task))
             } else {
-                app
+                None
             };
 
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-            match (self.ssl_cert.clone(), self.ssl_key.clone()) {
-                (Some(cert_path), Some(key_path)) => {
-                    let config = RustlsConfig::from_pem_file(cert_path, key_path)
-                        .await
-                        .expect("Failed to load SSL certificates");
-
-                    tokio::spawn(async move {
-                        axum_server::bind_rustls(addr, config)
-                            .serve(app.into_make_service())
-                            .await
-                            .unwrap();
-                    });
-                }
-                _ => {
-                    tokio::spawn(async move {
-                        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-                        axum::serve(listener, app).await.unwrap();
-                    });
-                }
-            }
-        }
+        let (server_handle, server_task) = match server {
+            Some((handle, task)) => (Some(handle), Some(task)),
+            None => (None, None),
+        };
 
         for provider in self.updates {
             let tx_clone = tx.clone();
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                provider.start(tx_clone).await;
+                provider.start(tx_clone, shutdown).await;
+            });
+        }
+
+        // Graceful shutdown coordinator. On SIGTERM / Ctrl-C:
+        //   1. cancel `shutdown` so long-poll ingest stops pulling new updates
+        //      from Telegram;
+        //   2. start the HTTP server's bounded graceful drain and wait for it
+        //      to finish, so in-flight requests complete and no further
+        //      webhook updates are produced;
+        //   3. cancel `drain` so the worker pool and control-plane loop finish
+        //      the buffered backlog and exit, letting `run_async` return.
+        // The worker pool deliberately outlives the HTTP drain so updates
+        // pushed by draining webhook handlers are still consumed, not dropped.
+        {
+            let shutdown = shutdown.clone();
+            let drain = drain.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                eprintln!("tgin: shutdown signal received; draining…");
+                shutdown.cancel();
+                if let Some(handle) = server_handle {
+                    handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+                }
+                if let Some(task) = server_task {
+                    let _ = task.await;
+                }
+                drain.cancel();
             });
         }
 
@@ -145,45 +203,15 @@ impl Tgin {
         // exit.
         drop(tx);
 
-        // N long-lived consumers replace the previous `spawn`-per-update
-        // pattern. Each worker loops on `rx.recv()` and `await`s
-        // `route.process(...)` directly: the routing tree is the unit of
-        // concurrency, not the individual update. This caps in-flight work
-        // at `dark_threads` regardless of arrival rate, so a slow downstream
-        // can no longer grow the task pool unboundedly. A load-balancer node
-        // is itself a `process` call: any fanout (e.g. `AllLB`) drains its
-        // children inline before returning, so the fixed pool caps
-        // concurrent fanouts at `dark_threads` too — not just leaf dispatches.
-        //
-        // The receiver is shared via a `tokio::sync::Mutex`. The lock is
-        // held only across `recv().await` (a single tokio primitive op);
-        // contention is brief and bounded by N. While one worker is parked
-        // in `recv`, the other N-1 can be processing — the mutex serialises
-        // _picking_ items, not _doing_ work.
-        let worker_count = self.dark_threads.max(1);
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
-        let mut workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let rx = rx.clone();
-            let route = self.route.clone();
-            workers.push(tokio::spawn(async move {
-                loop {
-                    let next = {
-                        let mut guard = rx.lock().await;
-                        guard.recv().await
-                    };
-                    match next {
-                        Some(update) => {
-                            // `Bytes::clone` inside the routing tree is
-                            // one atomic op; no `Value` allocation, no
-                            // re-serialization on egress.
-                            route.process(update).await;
-                        }
-                        None => return,
-                    }
-                }
-            }));
-        }
+        // Fixed-size consumer pool: `dark_threads` workers each pull one
+        // update at a time and run `route.process` to completion before
+        // taking the next, capping in-flight work (and any `AllLB` fanout) at
+        // `dark_threads`. Workers stop when the channel closes on the clean
+        // no-signal path, or when `drain` is cancelled (after the HTTP server
+        // has finished draining), at which point they finish the buffered
+        // backlog and exit. They never wait on every `Sender` clone dropping,
+        // which the axum router does not guarantee on shutdown.
+        let workers = spawn_worker_pool(rx, self.route.clone(), self.dark_threads, drain.clone());
 
         match api {
             None => {
@@ -195,11 +223,25 @@ impl Tgin {
                 }
             }
 
-            Some(mut api) => {
-                // Control plane runs alongside the worker pool. Updates do
-                // not flow through this loop anymore — workers own the
-                // update channel.
-                while let Some(api_msg) = api.rx.recv().await {
+            Some(api) => {
+                // Control plane runs alongside the worker pool. Move the
+                // receiver out of `Api`, dropping its own `Sender` clone — on
+                // the no-server path that is the last sender, so `recv`
+                // returns `None` and the loop ends. With a server running, the
+                // `drain` token is authoritative: the loop keeps serving
+                // control-plane requests through the HTTP drain and breaks once
+                // `drain` is cancelled, rather than waiting for every
+                // router-held sender clone to drop (which is not guaranteed).
+                let Api { mut rx, .. } = api;
+                loop {
+                    let api_msg = tokio::select! {
+                        biased;
+                        msg = rx.recv() => msg,
+                        _ = drain.cancelled() => break,
+                    };
+                    let Some(api_msg) = api_msg else {
+                        break;
+                    };
                     match api_msg {
                         ApiMessage::GetRoutes(tx_response) => {
                             let _ = tx_response.send(self.route.json_struct().await);
@@ -248,6 +290,8 @@ impl Tgin {
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -257,6 +301,89 @@ impl Tgin {
 /// producers see backpressure immediately when the worker pool falls
 /// behind.
 const UPDATE_CHANNEL_CAPACITY: usize = 1024;
+
+/// Hard deadline for draining in-flight HTTP connections on graceful
+/// shutdown. Bounds the wait so a parked long-poll downstream connection or
+/// a wedged request cannot block exit indefinitely, while leaving headroom
+/// under the common 30 s orchestrator (k8s/systemd) kill window.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Resolves on the first SIGTERM (Unix) or Ctrl-C (all platforms). On
+/// Windows there is no SIGTERM, so only Ctrl-C arms.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// Spawn `worker_count` (min 1) consumers over a shared receiver. Each worker
+/// pulls one update at a time and runs `route.process` to completion before
+/// taking the next, so in-flight work is capped at `worker_count`.
+///
+/// Termination is deterministic and does not rely on every `Sender` clone
+/// being dropped (the axum router retains state-sender clones past its own
+/// drop): a worker stops when the channel closes (clean no-signal path) or
+/// when `shutdown` is cancelled. On cancellation the biased `recv` still wins
+/// whenever an update is ready, so a backlog keeps draining; the worker exits
+/// only once the buffer is empty.
+fn spawn_worker_pool(
+    rx: mpsc::Receiver<Bytes>,
+    route: Arc<dyn RouteableComponent>,
+    worker_count: usize,
+    shutdown: CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let worker_count = worker_count.max(1);
+    // Shared via a `tokio::sync::Mutex`: the guard is held only across the
+    // pick (`recv`), never across `route.process`, so N-1 workers can be
+    // processing while one is parked waiting for the next update.
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let rx = rx.clone();
+        let route = route.clone();
+        let shutdown = shutdown.clone();
+        workers.push(tokio::spawn(async move {
+            loop {
+                let next = {
+                    let mut guard = rx.lock().await;
+                    tokio::select! {
+                        biased;
+                        msg = guard.recv() => msg,
+                        // Cancelled: drain whatever is buffered (one per
+                        // iteration via the biased `recv` above); `try_recv`
+                        // yields `None` once empty, ending the worker.
+                        _ = shutdown.cancelled() => guard.try_recv().ok(),
+                    }
+                };
+                match next {
+                    // `Bytes::clone` inside the routing tree is one atomic op;
+                    // no `Value` allocation, no re-serialization on egress.
+                    Some(update) => route.process(update).await,
+                    None => return,
+                }
+            }
+        }));
+    }
+    workers
+}
 
 #[cfg(test)]
 mod tests {
@@ -326,7 +453,7 @@ mod tests {
 
         let workers_n = 4;
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_workers(rx, route_dyn, workers_n);
+        let workers = spawn_worker_pool(rx, route_dyn, workers_n, CancellationToken::new());
 
         for i in 0..workers_n {
             tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
@@ -373,7 +500,7 @@ mod tests {
         let route_dyn: Arc<dyn RouteableComponent> = route.clone();
 
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_workers(rx, route_dyn.clone(), 4);
+        let workers = spawn_worker_pool(rx, route_dyn.clone(), 4, CancellationToken::new());
 
         for i in 0..32 {
             tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
@@ -398,7 +525,7 @@ mod tests {
 
         let workers_n = 2;
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_workers(rx, route_dyn, workers_n);
+        let workers = spawn_worker_pool(rx, route_dyn, workers_n, CancellationToken::new());
 
         // Fill the channel: workers are blocked on `gate`, so anything we
         // send beyond `worker_count + capacity` must be rejected.
@@ -445,40 +572,66 @@ mod tests {
         }
     }
 
-    /// Test-only mirror of the worker-spawning logic in `run_async`.
-    /// Exists so unit tests can drive the dispatch surface without
-    /// standing up a full `Tgin` (which would also require ingress
-    /// adapters, an axum router, and a port).
-    fn spawn_workers(
-        rx: mpsc::Receiver<Bytes>,
-        route: Arc<dyn RouteableComponent>,
-        worker_count: usize,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
-        (0..worker_count.max(1))
-            .map(|_| {
-                let rx = rx.clone();
-                let route = route.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let next = {
-                            let mut guard = rx.lock().await;
-                            guard.recv().await
-                        };
-                        match next {
-                            Some(update) => {
-                                route.process(update).await;
-                            }
-                            None => return,
-                        }
-                    }
-                })
-            })
-            .collect()
-    }
-
     /// Helper for tests that want a `Bytes` payload from a `serde_json::Value`.
     fn update_bytes(value: Value) -> Bytes {
         Bytes::from(serde_json::to_vec(&value).unwrap())
+    }
+
+    /// A bind failure (port already in use) MUST surface as `Err` from
+    /// `run_async` so `main` can exit non-zero, rather than panicking in a
+    /// detached task and leaving a live process with no HTTP plane.
+    #[tokio::test]
+    async fn test_run_async_errors_when_port_unavailable() {
+        use crate::mock::routes::MockCallsRoute;
+
+        // Occupy 0.0.0.0:<port>; tgin binds the same addr and must fail fast.
+        let occupied = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let route: Arc<dyn RouteableComponent> = Arc::new(MockCallsRoute::new("sink"));
+        let tgin = Tgin::new(vec![], route, 1, Some(port));
+
+        let result = tgin.run_async().await;
+        assert!(
+            result.is_err(),
+            "bind on an occupied port must surface as Err, not a detached panic"
+        );
+    }
+
+    /// Graceful-shutdown contract for the worker pool: cancelling the
+    /// shutdown token must drain whatever is already buffered and then exit
+    /// every worker — even though the channel is NOT closed (a `Sender` is
+    /// still alive). `run_async` relies on this: the axum router keeps
+    /// `Sender` clones past its own drop, so workers can never depend on the
+    /// channel closing to stop on shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_worker_pool_drains_buffered_then_exits_on_shutdown() {
+        use crate::mock::routes::MockCallsRoute;
+
+        let route = Arc::new(MockCallsRoute::new("sink"));
+        let route_dyn: Arc<dyn RouteableComponent> = route.clone();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let workers = spawn_worker_pool(rx, route_dyn, 4, shutdown.clone());
+
+        for i in 0..16 {
+            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
+        }
+
+        // Cancel while `tx` is still held open: proves workers stop on the
+        // token, not on the channel closing.
+        shutdown.cancel();
+
+        for w in workers {
+            tokio::time::timeout(std::time::Duration::from_secs(5), w)
+                .await
+                .expect("worker did not exit within 5s of shutdown despite a live sender")
+                .expect("worker task panicked");
+        }
+
+        // Every buffered update was drained before the workers exited.
+        assert_eq!(route.count().await, 16);
+        drop(tx);
     }
 }
