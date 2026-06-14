@@ -10,3 +10,6 @@ build
 
 test.py
 /dest
+__pycache__/
+
+.vscode
