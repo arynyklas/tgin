@@ -1635,7 +1635,6 @@ dependencies = [
  "bytes",
  "clap",
  "http-body-util",
- "lazy_static",
  "once_cell",
  "rand",
  "regex",

@@ -1,4 +1,4 @@
-use crate::base::{Printable, Routeable, Serverable};
+use crate::base::{Printable, RouteId, Routeable, Serverable};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -40,6 +40,12 @@ impl Routeable for MockCallsRoute {
         // Capture the bytes verbatim so tests assert against the same wire
         // payload that downstreams would receive.
         self.calls.lock().await.push(update);
+    }
+
+    fn id(&self) -> Option<RouteId> {
+        // Behave as a leaf so LB id-based removal can match it, like the real
+        // routes. Tests only ever attach a mock via the webhook add path.
+        Some(RouteId::Url(self.id.clone()))
     }
 }
 

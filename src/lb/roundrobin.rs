@@ -191,6 +191,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remove_route_matches_mock_by_id() {
+        let m = Arc::new(MockCallsRoute::new("http://sink"));
+        let lb = RoundRobinLB::new(vec![m]);
+        let res = lb
+            .remove_route(RouteId::Url("http://sink".to_string()))
+            .await;
+        assert!(res.is_ok());
+        assert_eq!(lb.json_struct().await["routes"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_round_robin_distribution_even() {
         let route1 = Arc::new(MockCallsRoute::new("A"));
         let route2 = Arc::new(MockCallsRoute::new("B"));

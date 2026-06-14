@@ -47,7 +47,7 @@ All async trait methods use `#[async_trait]`.
 | `src/route/{longpull,webhook}.rs` | Egress routes. Same `longpull` spelling. |
 | `src/lb/{roundrobin,all}.rs` | Load balancers, both `RwLock<Vec<Arc<dyn RouteableComponent>>>` + dynamic add/remove. |
 | `src/api/{router,methods,message,schemas}.rs` | Hot-reconfig HTTP API + `ApiMessage` enum. |
-| `src/dynamic/handler.rs` | Axum fallback that dispatches to dynamically-added long-poll routes via `LONGPOLL_REGISTRY` (`src/dynamic/longpoll_registry.rs`, `Lazy<RwLock<HashMap<String, Arc<LongPollRoute>>>>`). |
+| `src/dynamic/handler.rs` | Axum fallback that dispatches to dynamically-added long-poll routes via `LONGPOLL_REGISTRY` (`src/dynamic/longpoll_registry.rs`, `Lazy<ArcSwap<HashMap<String, Arc<LongPollRoute>>>>`). |
 | `src/utils/defaults.rs` | `TELEGRAM_TOKEN_REGEX` for log redaction. |
 | `src/mock/routes.rs` | `MockCallsRoute` test double, gated by `#[cfg(test)]` on `mod mock` in `main.rs`. |
 | `tests/performance/` | Docker-compose load-test harness (Rust bench tool, Python aiogram bots, Go plotter). |
@@ -118,7 +118,7 @@ Variants must match `RouteConfig` / `UpdateConfig` exactly. The HTTP API `POST /
 
 - **Composition over inheritance.** New ingress adapter = a struct implementing `Updater + Serverable + Printable`; new route = `Routeable + Serverable + Printable`. The blanket impl wires it into `*Component`. Default trait methods (e.g. `Serverable::set_server` returning the router unchanged) make stubs cheap.
 - **Async everywhere via `async_trait`.** Match the pattern; do not introduce sync trait methods on these traits.
-- **Shared state**: `Arc<RwLock<Vec<Arc<dyn RouteableComponent>>>>` for mutable route lists, `Arc<Mutex<VecDeque<Value>>>` + `Arc<Notify>` for the long-poll buffer, `AtomicUsize` for round-robin cursor, `Lazy<RwLock<HashMap<...>>>` (`once_cell`) for `LONGPOLL_REGISTRY`. Reach for the matching primitive rather than introducing a new pattern.
+- **Shared state**: `ArcSwap<Vec<Arc<dyn RouteableComponent>>>` for mutable route lists, `Arc<Mutex<VecDeque<Value>>>` + `Arc<Notify>` for the long-poll buffer, `AtomicUsize` for round-robin cursor, `Lazy<ArcSwap<HashMap<...>>>` (`once_cell` + `arc-swap`) for `LONGPOLL_REGISTRY`. Reach for the matching primitive rather than introducing a new pattern.
 - **Update flow is one direction.** Producers own `Sender<Value>`; the routing tree lives behind `Arc<dyn RouteableComponent>` and is `process`-called from the main loop. Don't bypass the channel.
 - **Errors on the egress path are swallowed after best-effort logging** (`WebhookRoute` ignores HTTP failures so one bad downstream can't kill the dispatcher). Preserve this behavior unless explicitly changing the contract — downstreams must be resilient.
 - **Token redaction**: when logging or printing anything that may carry a Telegram token, use `utils::defaults::TELEGRAM_TOKEN_REGEX`.

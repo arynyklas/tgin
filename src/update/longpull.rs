@@ -1,11 +1,10 @@
 use crate::base::{Printable, Serverable};
 use crate::update::base::Updater;
-use crate::utils::defaults::TELEGRAM_TOKEN_REGEX;
+use crate::utils::defaults::TELEGRAM_TOKEN_RE;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use rand::Rng;
-use regex::Regex;
 use reqwest::header::RETRY_AFTER;
 use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde::Deserialize;
@@ -61,7 +60,6 @@ pub struct LongPollUpdate {
     long_poll_timeout: u64,
     /// `getUpdates?limit=` value. Capped at `TELEGRAM_LONG_POLL_LIMIT_MAX`.
     long_poll_limit: u64,
-    token_regex: Regex,
     /// Shared permanent-failure counter. Incremented from `start` when the
     /// upstream returns a status that means "this updater will never
     /// succeed without operator intervention" (401 / 403 / 404 — see
@@ -79,7 +77,6 @@ impl LongPollUpdate {
             error_timeout_sleep: 100,
             long_poll_timeout: 30,
             long_poll_limit: TELEGRAM_LONG_POLL_LIMIT_MAX,
-            token_regex: Regex::new(TELEGRAM_TOKEN_REGEX).unwrap(),
             health_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -123,7 +120,7 @@ impl Updater for LongPollUpdate {
         let backoff_base_ms = self.error_timeout_sleep.max(BACKOFF_FLOOR_MS);
         let mut backoff_ms = backoff_base_ms;
         let request_timeout = self.request_timeout();
-        let redacted_url = self.token_regex.replace_all(&self.url, "#####").to_string();
+        let redacted_url = TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####").to_string();
 
         // Outage bookkeeping. `consecutive_failures` is reset on every
         // successful 2xx parse; it tracks transient failures only (network
@@ -400,7 +397,7 @@ impl Serverable for LongPollUpdate {}
 #[async_trait]
 impl Printable for LongPollUpdate {
     async fn print(&self) -> String {
-        let token = self.token_regex.replace_all(&self.url, "#####");
+        let token = TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####");
         format!(
             "longpull: {} timeout={} limit={} sleep={}/{}",
             token,

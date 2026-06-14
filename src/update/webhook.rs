@@ -1,7 +1,7 @@
 use crate::base::{Printable, Serverable};
 use crate::update::base::Updater;
 
-use crate::utils::defaults::TELEGRAM_TOKEN_REGEX;
+use crate::utils::defaults::TELEGRAM_TOKEN_RE;
 
 use async_trait::async_trait;
 use axum::{
@@ -25,8 +25,6 @@ use reqwest::Client;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use regex::Regex;
-
 /// Cap the request body for webhook ingress. Telegram updates are
 /// well under 64 KiB in practice (a few KiB for normal messages, the
 /// upper bound is documented at <1 MiB even in pathological cases).
@@ -42,8 +40,6 @@ pub struct RegistrationWebhookConfig {
     public_ip: String,
     client: Client,
     set_webhook_url: String,
-
-    token_regex: Regex,
 }
 
 impl RegistrationWebhookConfig {
@@ -52,7 +48,6 @@ impl RegistrationWebhookConfig {
             public_ip,
             client,
             set_webhook_url: format!("https://api.telegram.org/bot{}/setWebhook", token),
-            token_regex: Regex::new(TELEGRAM_TOKEN_REGEX).unwrap(),
         }
     }
 
@@ -219,8 +214,8 @@ impl Printable for WebhookUpdate {
     async fn print(&self) -> String {
         let reg_text = match &self.registration {
             Some(reg) => format!(
-                "REGISTRATED ON {}",
-                &reg.token_regex.replace_all(&reg.set_webhook_url, "#####")
+                "REGISTERED ON {}",
+                &TELEGRAM_TOKEN_RE.replace_all(&reg.set_webhook_url, "#####")
             ),
             None => "".to_string(),
         };

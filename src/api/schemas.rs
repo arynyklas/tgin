@@ -41,7 +41,7 @@ pub enum AddRouteTypeSch {
 #[derive(Deserialize, Debug)]
 pub struct AddRouteSch {
     #[serde(flatten)]
-    pub typee: AddRouteTypeSch,
+    pub r#type: AddRouteTypeSch,
 }
 
 #[derive(Deserialize, Debug)]
@@ -66,5 +66,5 @@ pub enum RmRouteTypeSch {
 #[derive(Deserialize, Debug)]
 pub struct RmRouteSch {
     #[serde(flatten)]
-    pub typee: RmRouteTypeSch,
+    pub r#type: RmRouteTypeSch,
 }
