@@ -210,6 +210,14 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
 
 3. **Run tgin.** The Axum server binds `0.0.0.0:<server_port>` and serves HTTPS using the supplied certificate. Long-poll routes, webhook ingress, and the management API all use the same TLS listener.
 
+## Lifecycle & shutdown
+
+**Startup.** With `server_port` set, tgin binds `0.0.0.0:<server_port>` on the main task before serving. A bind failure (port already in use, bad address) or an unreadable TLS certificate is reported as a single `tgin: <error>` line on stderr and the process exits `1` — it does not start a half-initialized process with no HTTP plane.
+
+**Graceful shutdown.** On `SIGTERM` (Unix) or `Ctrl-C` (all platforms) tgin logs `tgin: shutdown signal received; draining…` and drains in order: long-poll ingest stops pulling new updates from Telegram; the HTTP server finishes in-flight requests (bounded to a 10 s deadline, so a parked downstream connection cannot block exit indefinitely); the worker pool then processes the buffered backlog and exits. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start, so no acknowledged update is lost across a restart.
+
+**Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped; see [Failure handling](#longpollupdate).
+
 ## Configuration example
 
 `${VAR}` placeholders are pulled from the process environment before parsing.

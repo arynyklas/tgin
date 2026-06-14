@@ -103,7 +103,7 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
         tgin.set_ssl(ssl.cert, ssl.key);
     }
 
-    tgin.run();
+    tgin.run()?;
 
     // `tgin.run()` returns once every producer has terminated and the
     // worker pool drained. If any updater stopped because of a permanent

@@ -23,6 +23,7 @@ use subtle::ConstantTimeEq;
 use reqwest::Client;
 
 use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 use regex::Regex;
 
@@ -110,7 +111,7 @@ impl WebhookUpdate {
 
 #[async_trait]
 impl Updater for WebhookUpdate {
-    async fn start(&self, _tx: Sender<Bytes>) {
+    async fn start(&self, _tx: Sender<Bytes>, _shutdown: CancellationToken) {
         if let Some(config) = &self.registration {
             self.register_webhook(config).await;
         } else {
@@ -233,6 +234,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -263,7 +265,7 @@ mod tests {
 
         let (tx, _) = mpsc::channel(1);
 
-        updater.start(tx).await;
+        updater.start(tx, CancellationToken::new()).await;
     }
 
     #[tokio::test]
