@@ -40,9 +40,8 @@ impl Routeable for AllLB {
             // Static config rejects empty LBs at startup, but the API can
             // drain a runtime LB via `remove_route`. Surface the drop so
             // the operator sees updates being silently swallowed.
-            eprintln!(
-                "warning: dropping update at empty AllLB (LB drained at runtime)"
-            );
+            crate::observe::record_lb_drop();
+            tracing::warn!(lb = "all", "dropping update at empty load balancer (drained at runtime)");
             return;
         }
         // Snapshot the children so the `ArcSwap` read guard is released
@@ -70,7 +69,7 @@ impl Routeable for AllLB {
         while let Some(res) = set.join_next().await {
             if let Err(e) = res {
                 if e.is_panic() {
-                    eprintln!("AllLB child panicked during fanout: {e}");
+                    tracing::error!(error = %e, "AllLB child panicked during fanout");
                 }
                 // `JoinError::is_cancelled` only fires when the `JoinSet`
                 // is dropped mid-flight, which we don't do during drain.

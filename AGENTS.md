@@ -19,7 +19,7 @@ Pipeline stages, all glued together by `src/tgin.rs::Tgin::run_async`:
 2. **Routing tree** (`src/route/`, `src/lb/`): a single `Arc<dyn RouteableComponent>` owns all destinations.
    - Leaves: `LongPollRoute` (buffers updates in `Arc<Mutex<VecDeque<Value>>>` + `Notify`, served as a Telegram-shaped `getUpdates` endpoint), `WebhookRoute` (POSTs to a downstream URL).
    - Inner nodes: `RoundRobinLB` (atomic cursor → one child per update), `AllLB` (broadcasts via `tokio::spawn` to every child).
-3. **HTTP plane** (axum): every component implements `Serverable::set_server(Router) -> Router`; `Tgin` builds one router by chaining `set_server` calls, then binds it on `0.0.0.0:<server_port>` (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so newly-added long-poll routes resolve through `LONGPOLL_REGISTRY`.
+3. **HTTP plane** (axum): every component implements `Serverable::set_server(Router) -> Router`; `Tgin` builds one router by chaining `set_server` calls, then binds it on `0.0.0.0:<server_port>` (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so newly-added long-poll routes resolve through `LONGPOLL_REGISTRY`. `GET /status` (JSON) and `GET /metrics` (Prometheus) are always-on whenever `server_port` is set, independent of `api`; log level/format come from the `log_level` / `log_format` config fields. When `auth_token` is set, `/status`, `/metrics`, and the `/api/*` plane are wrapped by `utils::auth::guard` and require `Authorization: Bearer <auth_token>`; the data plane (webhook ingress, long-poll route endpoints) is never gated.
 4. **Management API** (`src/api/`): owns its own `mpsc` pair; HTTP handlers send `ApiMessage::{GetRoutes, AddRoute, RmRoute}` to the main loop, which mutates the routing tree (`add_route` / `remove_route` on `RouteableComponent`).
 
 The main loop in `Tgin::run_async` is a `tokio::select!` between the update channel and the API channel — without an API, it degrades to a plain `while let Some(update) = rx.recv()`.
@@ -49,6 +49,8 @@ All async trait methods use `#[async_trait]`.
 | `src/api/{router,methods,message,schemas}.rs` | Hot-reconfig HTTP API + `ApiMessage` enum. |
 | `src/dynamic/handler.rs` | Axum fallback that dispatches to dynamically-added long-poll routes via `LONGPOLL_REGISTRY` (`src/dynamic/longpoll_registry.rs`, `Lazy<ArcSwap<HashMap<String, Arc<LongPollRoute>>>>`). |
 | `src/utils/defaults.rs` | `TELEGRAM_TOKEN_REGEX` for log redaction. |
+| `src/observe.rs` | tracing subscriber init, dispatch span, per-component metrics, `/status` + `/metrics` handlers, process-global metrics registry. |
+| `src/utils/auth.rs` | Shared auth primitives: `secret_eq` (the single constant-time compare, reused by webhook-ingress secret check and the control-plane gate) and `guard` (optional `Bearer` middleware over `/status`, `/metrics`, `/api/*`). |
 | `src/mock/routes.rs` | `MockCallsRoute` test double, gated by `#[cfg(test)]` on `mod mock` in `main.rs`. |
 | `tests/performance/` | Docker-compose load-test harness (Rust bench tool, Python aiogram bots, Go plotter). |
 | `examples/simple/` | Working docker-compose example with two long-poll bots and one webhook bot. |
@@ -121,7 +123,8 @@ Variants must match `RouteConfig` / `UpdateConfig` exactly. The HTTP API `POST /
 - **Shared state**: `ArcSwap<Vec<Arc<dyn RouteableComponent>>>` for mutable route lists, `Arc<Mutex<VecDeque<Value>>>` + `Arc<Notify>` for the long-poll buffer, `AtomicUsize` for round-robin cursor, `Lazy<ArcSwap<HashMap<...>>>` (`once_cell` + `arc-swap`) for `LONGPOLL_REGISTRY`. Reach for the matching primitive rather than introducing a new pattern.
 - **Update flow is one direction.** Producers own `Sender<Value>`; the routing tree lives behind `Arc<dyn RouteableComponent>` and is `process`-called from the main loop. Don't bypass the channel.
 - **Errors on the egress path are swallowed after best-effort logging** (`WebhookRoute` ignores HTTP failures so one bad downstream can't kill the dispatcher). Preserve this behavior unless explicitly changing the contract — downstreams must be resilient.
-- **Token redaction**: when logging or printing anything that may carry a Telegram token, use `utils::defaults::TELEGRAM_TOKEN_REGEX`.
+- **Token redaction**: when logging or printing anything that may carry a Telegram token, use `utils::defaults::TELEGRAM_TOKEN_REGEX`. This includes `json_struct` outputs (they feed `/status` and `/api/routes`), so `WebhookRoute::json_struct` redacts its `url`.
+- **Constant-time secret compares go through `utils::auth::secret_eq`** — do not hand-roll another `ct_eq` dance. The optional control-plane `Bearer` gate is `utils::auth::guard`; a blank `auth_token` is normalized to `None` by `config::setup::effective_auth_token` (auth disabled) with a startup warning, never reaching the gate.
 - **`build_route` recurses** through `RouteConfig::{RoundRobinLB,AllLB}` — keep it the single construction site for the routing tree.
 - **Naming quirk**: long-poll modules and types are spelled `longpull` (`src/update/longpull.rs`, `src/route/longpull.rs`, `AddRouteType::Longpull`, API `"type":"Longpull"`). User-facing docs say "long poll" / "LongPoll"; do not "fix" the in-code spelling without a deliberate, repo-wide rename.
 - **No `unsafe`**, no custom panics outside config loading. Surface failures as `Result<(), ()>` on the `Routeable` mutation methods (the unit-error is intentional — the API logs and continues).

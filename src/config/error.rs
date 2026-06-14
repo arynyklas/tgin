@@ -71,6 +71,9 @@ pub enum ValidationError {
     },
     /// `dark_threads: 0` panics deep inside `tokio::runtime::Builder`.
     DarkThreadsZero,
+    /// `log_level` is not one of trace/debug/info/warn/error/off
+    /// (case-insensitive).
+    InvalidLogLevel { value: String },
     /// SSL cert / key file is unreadable. Without this check, the failure
     /// surfaces inside an `axum_server::tls_rustls` task far from the
     /// config site.
@@ -149,6 +152,11 @@ impl fmt::Display for ValidationError {
             ValidationError::DarkThreadsZero => write!(
                 f,
                 "dark_threads: 0 is not supported (hint: omit the field for default 4, or set >= 1)"
+            ),
+            ValidationError::InvalidLogLevel { value } => write!(
+                f,
+                "log_level {value:?} is not a recognised level \
+                 (hint: use one of trace, debug, info, warn, error, off)"
             ),
             ValidationError::SslFileUnreadable {
                 field,

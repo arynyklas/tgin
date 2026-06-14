@@ -1,10 +1,12 @@
 use crate::base::{Printable, RouteId, Routeable, Serverable};
+use crate::utils::defaults::TELEGRAM_TOKEN_RE;
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default per-request deadline for forwarding an update to a downstream bot.
 /// A bot that does not ack within this window is treated as failed for the
@@ -18,11 +20,23 @@ pub struct WebhookRoute {
     client: Client,
     url: String,
     request_timeout: Duration,
+    dispatched: AtomicU64,
+    http_success: AtomicU64,
+    http_failure: AtomicU64,
+    http_error: AtomicU64,
 }
 
 impl WebhookRoute {
     pub fn new(url: String, client: Client, request_timeout: Duration) -> Self {
-        Self { client, url, request_timeout }
+        Self {
+            client,
+            url,
+            request_timeout,
+            dispatched: AtomicU64::new(0),
+            http_success: AtomicU64::new(0),
+            http_failure: AtomicU64::new(0),
+            http_error: AtomicU64::new(0),
+        }
     }
 }
 
@@ -33,14 +47,36 @@ impl Routeable for WebhookRoute {
         // re-serializing here would discard byte-for-byte fidelity (key
         // ordering, number normalisation) and add a `Value` allocation
         // and a serializer pass on every dispatch.
-        let _ = self
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        match self
             .client
             .post(&self.url)
             .header(CONTENT_TYPE, "application/json")
             .body(update)
             .timeout(self.request_timeout)
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                self.http_success.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(resp) => {
+                self.http_failure.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
+                    status = resp.status().as_u16(),
+                    "webhook downstream returned non-success"
+                );
+            }
+            Err(err) => {
+                self.http_error.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
+                    error = %err,
+                    "webhook downstream request failed"
+                );
+            }
+        }
     }
 
     fn id(&self) -> Option<RouteId> {
@@ -60,7 +96,13 @@ impl Printable for WebhookRoute {
         json!({
             "type": "webhook",
             "options": {
-                "url": self.url
+                "url": TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####").as_ref()
+            },
+            "metrics": {
+                "dispatched_total": self.dispatched.load(Ordering::Relaxed),
+                "http_success_total": self.http_success.load(Ordering::Relaxed),
+                "http_failure_total": self.http_failure.load(Ordering::Relaxed),
+                "http_error_total": self.http_error.load(Ordering::Relaxed)
             }
         })
     }
@@ -120,6 +162,22 @@ mod tests {
         assert_eq!(json_info["options"]["url"], url);
     }
 
+    /// A downstream URL that embeds a Telegram bot token must surface redacted
+    /// in `json_struct` — the tree feeds the unauthenticated `/status` document
+    /// and the management API `/routes`, so a leaked token here is a token leak.
+    #[tokio::test]
+    async fn test_json_struct_redacts_token_in_url() {
+        let url = "https://api.telegram.org/bot12345678:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345/fwd";
+        let route = WebhookRoute::new(url.to_string(), test_client(), DEFAULT_REQUEST_TIMEOUT);
+
+        let reported = route.json_struct().await["options"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!reported.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), "token leaked: {reported}");
+        assert!(reported.contains("#####"), "expected redaction marker: {reported}");
+    }
+
     /// A downstream that holds the request open longer than the configured
     /// per-request timeout MUST cause `process` to give up and return inside the
     /// timeout window. Without this guarantee a single slow bot would park a
@@ -150,5 +208,65 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "process did not honor the per-request timeout (elapsed {elapsed:?})",
         );
+    }
+
+    /// A 2xx downstream response increments dispatched + http_success.
+    #[tokio::test]
+    async fn test_process_records_success_counters() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
+        route
+            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .await;
+
+        let m = route.json_struct().await;
+        assert_eq!(m["metrics"]["dispatched_total"], 1);
+        assert_eq!(m["metrics"]["http_success_total"], 1);
+        assert_eq!(m["metrics"]["http_failure_total"], 0);
+        assert_eq!(m["metrics"]["http_error_total"], 0);
+    }
+
+    /// A non-success status increments http_failure (not http_error): the
+    /// request completed, the downstream just refused it.
+    #[tokio::test]
+    async fn test_process_records_failure_on_non_success_status() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
+        route
+            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .await;
+
+        let m = route.json_struct().await;
+        assert_eq!(m["metrics"]["dispatched_total"], 1);
+        assert_eq!(m["metrics"]["http_failure_total"], 1);
+        assert_eq!(m["metrics"]["http_success_total"], 0);
+    }
+
+    /// A transport-level failure (no server listening) increments http_error.
+    #[tokio::test]
+    async fn test_process_records_error_on_unroutable_url() {
+        let route = WebhookRoute::new(
+            "http://127.0.0.1:9/never".to_string(),
+            test_client(),
+            Duration::from_millis(500),
+        );
+        route
+            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .await;
+
+        let m = route.json_struct().await;
+        assert_eq!(m["metrics"]["dispatched_total"], 1);
+        assert_eq!(m["metrics"]["http_error_total"], 1);
+        assert_eq!(m["metrics"]["http_success_total"], 0);
     }
 }

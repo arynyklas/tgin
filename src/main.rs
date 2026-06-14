@@ -2,6 +2,7 @@ mod base;
 mod config;
 mod dynamic;
 mod lb;
+mod observe;
 mod route;
 mod tgin;
 mod update;
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::process::ExitCode;
 
-use crate::config::setup::{build_route, build_updates, load_config};
+use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
 use crate::tgin::Tgin;
 use crate::utils::http::build_shared_client;
 
@@ -33,8 +34,9 @@ fn main() -> ExitCode {
             // tell "tgin failed to start" from "a configured bot's
             // token / URL is wrong". Both are operator-fixable, but only
             // the latter has been running long enough to handle traffic.
-            eprintln!(
-                "tgin: {n} updater(s) terminated with permanent failure -- check earlier `longpull permanent failure` lines"
+            tracing::error!(
+                updaters = n,
+                "updater(s) terminated with permanent failure; check earlier long-poll permanent-failure logs"
             );
             ExitCode::from(2)
         }
@@ -75,6 +77,8 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
 
     let conf = load_config(config_path)?;
 
+    crate::observe::init(&conf.log_level, conf.log_format);
+
     // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
     // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,
     // RegistrationWebhookConfig, dynamically added routes via the API) shares
@@ -94,8 +98,17 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
 
     let mut tgin = Tgin::new(inputs, lb, conf.dark_threads, conf.server_port);
 
+    let (auth_token, blank_token) = effective_auth_token(conf.auth_token);
+    if blank_token {
+        tracing::warn!(
+            "auth_token is set but blank; ignoring it — the control plane \
+             (/status, /metrics, management API) is UNAUTHENTICATED"
+        );
+    }
+    tgin.set_auth_token(auth_token.clone());
+
     if let Some(api) = conf.api {
-        let api = api::router::Api::new(api.base_path, http_client.clone());
+        let api = api::router::Api::new(api.base_path, http_client.clone(), auth_token.clone());
         tgin.set_api(api);
     }
 
