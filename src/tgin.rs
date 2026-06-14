@@ -72,7 +72,7 @@ impl Tgin {
                 println!("{}\n", update.print().await);
             }
 
-            println!("\nRUTE TO\n");
+            println!("\nROUTE TO\n");
 
             println!("{}", &self.route.print().await);
         });

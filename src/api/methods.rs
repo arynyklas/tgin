@@ -25,7 +25,7 @@ pub async fn add_route(
     Extension(client): Extension<Client>,
     Json(data): Json<AddRouteSch>,
 ) -> Result<StatusCode, ApiError> {
-    let route = match data.typee {
+    let route = match data.r#type {
         AddRouteTypeSch::Longpull(route) => {
             validate_longpoll_path(&route.path, "Longpull route")?;
             let mut update = LongPollRoute::new(route.path);
@@ -86,7 +86,7 @@ pub async fn remove_route(
     State(tx): State<Sender<ApiMessage>>,
     Json(data): Json<RmRouteSch>,
 ) -> Result<StatusCode, ApiError> {
-    let target = match data.typee {
+    let target = match data.r#type {
         RmRouteTypeSch::Longpull(r) => {
             validate_longpoll_path(&r.path, "Longpull removal")?;
             RouteId::Path(r.path)
@@ -181,7 +181,7 @@ mod tests {
     async fn add_webhook_empty_url_returns_400_and_does_not_send() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+            r#type: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
                 url: String::new(),
                 request_timeout_ms: None,
             }),
@@ -204,7 +204,7 @@ mod tests {
     async fn add_longpull_empty_path_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: String::new(), max_buffered_updates: None }),
+            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: String::new(), max_buffered_updates: None }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
@@ -221,7 +221,7 @@ mod tests {
     async fn remove_empty_identifier_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = RmRouteSch {
-            typee: RmRouteTypeSch::Webhook(RmWebhookRouteSch {
+            r#type: RmRouteTypeSch::Webhook(RmWebhookRouteSch {
                 url: String::new(),
             }),
         };
@@ -233,7 +233,7 @@ mod tests {
         }
 
         let body = RmRouteSch {
-            typee: RmRouteTypeSch::Longpull(RmLongpullRouteSch {
+            r#type: RmRouteTypeSch::Longpull(RmLongpullRouteSch {
                 path: String::new(),
             }),
         };
@@ -261,7 +261,7 @@ mod tests {
         });
 
         let body = RmRouteSch {
-            typee: RmRouteTypeSch::Webhook(RmWebhookRouteSch {
+            r#type: RmRouteTypeSch::Webhook(RmWebhookRouteSch {
                 url: "http://does-not-exist".into(),
             }),
         };
@@ -291,7 +291,7 @@ mod tests {
         });
 
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+            r#type: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
                 url: "http://downstream.invalid/bot".into(),
                 request_timeout_ms: None,
             }),
@@ -315,7 +315,7 @@ mod tests {
         drop(rx);
 
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+            r#type: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
                 url: "http://downstream.invalid/bot".into(),
                 request_timeout_ms: None,
             }),
@@ -335,7 +335,7 @@ mod tests {
     async fn add_longpull_path_without_leading_slash_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: "bot/updates".into(), max_buffered_updates: None }),
+            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: "bot/updates".into(), max_buffered_updates: None }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
@@ -358,7 +358,7 @@ mod tests {
     async fn remove_longpull_path_without_leading_slash_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = RmRouteSch {
-            typee: RmRouteTypeSch::Longpull(RmLongpullRouteSch {
+            r#type: RmRouteTypeSch::Longpull(RmLongpullRouteSch {
                 path: "bot/updates".into(),
             }),
         };
@@ -379,7 +379,7 @@ mod tests {
     async fn add_webhook_malformed_url_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+            r#type: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
                 url: "not a url".into(),
                 request_timeout_ms: None,
             }),
@@ -408,7 +408,7 @@ mod tests {
         for url in cases {
             let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
             let body = AddRouteSch {
-                typee: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
+                r#type: AddRouteTypeSch::Webhook(AddWebhookRouteSch {
                     url: url.into(),
                     request_timeout_ms: None,
                 }),

@@ -331,7 +331,7 @@ mod tests {
     /// `build_updates` MUST forward the parsed `registration` block into the runtime
     /// `WebhookUpdate`. We can't poke at the private `registration` field from here,
     /// so we observe it through the public `Printable` impl: the boot banner contains
-    /// `REGISTRATED ON <redacted-url>` iff `registration` ended up `Some`.
+    /// `REGISTERED ON <redacted-url>` iff `registration` ended up `Some`.
     #[tokio::test]
     async fn test_build_updates_wires_webhook_registration() {
         let cfg = vec![UpdateConfig::WebhookUpdate {
@@ -351,7 +351,7 @@ mod tests {
 
         let banner = built[0].print().await;
         assert!(
-            banner.contains("REGISTRATED ON"),
+            banner.contains("REGISTERED ON"),
             "registration block was discarded; banner was {banner:?}"
         );
         // The token shape matches TELEGRAM_TOKEN_REGEX, so the banner must not leak
@@ -378,7 +378,7 @@ mod tests {
         let built = build_updates(cfg, &client, &health);
         let banner = built[0].print().await;
         assert!(
-            !banner.contains("REGISTRATED ON"),
+            !banner.contains("REGISTERED ON"),
             "unexpected registration banner: {banner:?}"
         );
     }

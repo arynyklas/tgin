@@ -156,25 +156,29 @@ impl LongPollRoute {
     /// Parse the body (JSON or urlencoded) and dispatch to [`handle_request`].
     /// Shared by the static `set_server` route and the dynamic fallback so a
     /// `getUpdates` poll behaves identically regardless of how the route was
-    /// added. A malformed JSON body returns a Telegram-shaped 400 envelope.
+    /// added. A malformed request body returns a Telegram-shaped 400 envelope.
     pub async fn handle_get_updates(&self, content_type: &str, body: &[u8]) -> Response {
         match parse_get_updates_params(content_type, body) {
             Ok(params) => self.handle_request(params).await,
-            Err(()) => get_updates_error(400, "invalid json body"),
+            Err(()) => get_updates_error(400, "invalid request body"),
         }
     }
 }
 
 /// Parse `getUpdates` params from a raw request body, accepting both
 /// `application/json` and `application/x-www-form-urlencoded` — Telegram's
-/// Bot API accepts both and the dynamic fallback always has. `Err(())` means
-/// a malformed JSON body; malformed urlencoded falls back to default
-/// (all-`None`) params, matching the prior dynamic-handler behaviour.
+/// Bot API accepts both and the dynamic fallback always has. `Err(())` means a
+/// non-empty body that is malformed for its declared content type; an empty body
+/// parses to default (all-`None`) params.
 fn parse_get_updates_params(content_type: &str, body: &[u8]) -> Result<GetUpdatesParams, ()> {
     if content_type.contains("application/json") {
         serde_json::from_slice(body).map_err(|_| ())
+    } else if body.is_empty() {
+        // A bodyless getUpdates (Content-Length: 0) is a valid poll with all
+        // defaults — never an error.
+        Ok(GetUpdatesParams::default())
     } else {
-        Ok(serde_urlencoded::from_bytes(body).unwrap_or_default())
+        serde_urlencoded::from_bytes(body).map_err(|_| ())
     }
 }
 
@@ -381,6 +385,26 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body_bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_updates_rejects_malformed_urlencoded() {
+        let route = LongPollRoute::new("/bot/updates".to_string());
+        let response = route
+            .handle_get_updates("application/x-www-form-urlencoded", b"offset=notanumber")
+            .await;
+        let body = read_body_json(response).await;
+        assert_eq!(body["error_code"], 400);
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_updates_empty_body_defaults() {
+        let route = LongPollRoute::new("/bot/updates".to_string());
+        let response = route
+            .handle_get_updates("application/x-www-form-urlencoded", b"")
+            .await;
+        let body = read_body_json(response).await;
+        assert_eq!(body["result"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
