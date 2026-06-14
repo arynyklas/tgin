@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::{
     body::Body,
-    extract::Form,
-    http::header,
+    extract::DefaultBodyLimit,
+    http::{header, HeaderMap},
     response::Response,
     routing::post,
     Router,
@@ -21,7 +21,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct GetUpdatesParams {
     #[serde(default)]
     pub offset: Option<i64>,
@@ -47,6 +47,14 @@ pub const DEFAULT_MAX_BUFFERED_UPDATES: usize = 10_000;
 /// want one congested route to spam the log every dispatch.
 const HIGH_WATERMARK_RATIO_NUM: usize = 4;
 const HIGH_WATERMARK_RATIO_DEN: usize = 5;
+
+/// Cap on the `getUpdates` request body for both the statically-mounted
+/// route and the dynamic fallback. A `getUpdates` poll carries only
+/// offset/timeout/limit (plus an optional small allowed_updates array) —
+/// well under 1 KiB in practice. 8 KiB leaves generous headroom while
+/// closing the unbounded-body buffering vector the dynamic handler had
+/// and keeping both surfaces on one limit.
+pub const GET_UPDATES_BODY_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone)]
 pub struct LongPollRoute {
@@ -144,6 +152,46 @@ impl LongPollRoute {
             let _ = tokio_timeout(remaining, notify.notified()).await;
         }
     }
+
+    /// Parse the body (JSON or urlencoded) and dispatch to [`handle_request`].
+    /// Shared by the static `set_server` route and the dynamic fallback so a
+    /// `getUpdates` poll behaves identically regardless of how the route was
+    /// added. A malformed JSON body returns a Telegram-shaped 400 envelope.
+    pub async fn handle_get_updates(&self, content_type: &str, body: &[u8]) -> Response {
+        match parse_get_updates_params(content_type, body) {
+            Ok(params) => self.handle_request(params).await,
+            Err(()) => get_updates_error(400, "invalid json body"),
+        }
+    }
+}
+
+/// Parse `getUpdates` params from a raw request body, accepting both
+/// `application/json` and `application/x-www-form-urlencoded` — Telegram's
+/// Bot API accepts both and the dynamic fallback always has. `Err(())` means
+/// a malformed JSON body; malformed urlencoded falls back to default
+/// (all-`None`) params, matching the prior dynamic-handler behaviour.
+fn parse_get_updates_params(content_type: &str, body: &[u8]) -> Result<GetUpdatesParams, ()> {
+    if content_type.contains("application/json") {
+        serde_json::from_slice(body).map_err(|_| ())
+    } else {
+        Ok(serde_urlencoded::from_bytes(body).unwrap_or_default())
+    }
+}
+
+/// Telegram-shaped error envelope (HTTP 200, `{"ok":false,...}` — Bot API
+/// convention; the error lives in the JSON body, not the HTTP status),
+/// matching `dynamic::handler::error_response`.
+fn get_updates_error(error_code: u16, description: &str) -> Response {
+    let body = serde_json::to_vec(&json!({
+        "ok": false,
+        "error_code": error_code,
+        "description": description,
+    }))
+    .expect("static json! never fails to serialize");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static headers and Bytes body always build a valid Response")
 }
 
 /// Hand-build `{"ok":true,"result":[<raw1>,<raw2>,...]}` directly from the
@@ -262,13 +310,21 @@ impl Serverable for LongPollRoute {
         let this = self.clone();
         let path = self.path.clone();
 
-        let handler = move |Form(params): Form<GetUpdatesParams>| {
+        let handler = move |headers: HeaderMap, body: Bytes| {
             let this = this.clone();
-
-            async move { this.handle_request(params).await }
+            async move {
+                let content_type = headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                this.handle_get_updates(content_type, &body).await
+            }
         };
 
-        router.route(&path, post(handler))
+        router.route(
+            &path,
+            post(handler).layer(DefaultBodyLimit::max(GET_UPDATES_BODY_LIMIT)),
+        )
     }
 }
 
@@ -444,6 +500,38 @@ mod tests {
             .uri(path)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from("timeout=0&limit=10"))
+            .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let app = app.with_state(tx);
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body_json["result"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_set_server_accepts_json_body() {
+        let path = "/bot123/getUpdates";
+        let route = LongPollRoute::new(path.to_string());
+
+        route.process(update_bytes(json!({"ok": true}))).await;
+
+        let app = Router::new();
+        let app = route.set_server(app).await;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"timeout":0,"limit":10}"#))
             .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<Bytes>(1);
