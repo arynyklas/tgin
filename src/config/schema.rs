@@ -14,6 +14,12 @@ pub struct TginConfig {
     pub log_level: String,
     #[serde(default)]
     pub log_format: LogFormat,
+    /// Optional shared secret for the control / observability plane. When set,
+    /// `/status`, `/metrics`, and the management API (`/<api.base_path>/*`)
+    /// require `Authorization: Bearer <auth_token>`. Omit to leave them open
+    /// (the default), relying on network-layer isolation.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 fn default_workers() -> usize {

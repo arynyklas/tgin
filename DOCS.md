@@ -60,6 +60,7 @@ Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
 | `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress.                                                                                                   |
 | `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off`. `RUST_LOG` overrides it. |
 | `log_format`   | `"Compact"` \| `"Json"`           | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
+| `auth_token`   | `Option<String>`                  | `None`    | Optional shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. A present-but-blank value is rejected at startup. |
 
 ### Update providers (`updates`)
 
@@ -149,6 +150,8 @@ api: Some(ApiConfig(
 
 Routes are nested under `base_path` and share the same listener as the ingress endpoints.
 
+> **Authentication:** these endpoints are unauthenticated unless the top-level `auth_token` is set, in which case every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)). They mutate the routing tree, so restrict access at the network layer regardless.
+
 | Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                                                                                             |
 |---------------|----------|------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `/api/routes` | `GET`    | —                                        | Returns the current routing tree as JSON (source: `Routeable::json_struct`).                                                                                                                                                                                                            |
@@ -192,6 +195,12 @@ The API talks to the routing core via an in-memory channel (see `src/api/router.
 ## Observability
 
 tgin exposes structured logs plus two always-on HTTP endpoints. The endpoints are mounted on the main listener whenever `server_port` is set — **independent of `api`**; observability never requires enabling hot-reconfig. `/status` and `/metrics` are reserved paths: a configured route on either is a validation error at startup, not a runtime collision.
+
+### Authentication
+
+The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is unauthenticated by default and assumes network-layer isolation (a private network or a reverse proxy). Set the top-level `auth_token` to require `Authorization: Bearer <auth_token>` on all three: a request without the exact credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time, and a present-but-blank `auth_token` is a startup validation error. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
+
+For Prometheus, pass the secret through the scrape config's `authorization` block (`type: Bearer`, `credentials: <auth_token>`).
 
 ### Logging
 
@@ -265,6 +274,7 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
     server_port: Some(3000),
     // api: Some(ApiConfig(base_path: "/api")),
     // ssl: Some(SslConfig(cert: "/cert.pem", key: "/privkey.pem")),
+    // auth_token: Some("change-me"),
     updates: [
         LongPollUpdate(
             token: "${TOKEN}",

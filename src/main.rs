@@ -97,9 +97,10 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let lb = build_route(conf.route, &http_client);
 
     let mut tgin = Tgin::new(inputs, lb, conf.dark_threads, conf.server_port);
+    tgin.set_auth_token(conf.auth_token.clone());
 
     if let Some(api) = conf.api {
-        let api = api::router::Api::new(api.base_path, http_client.clone());
+        let api = api::router::Api::new(api.base_path, http_client.clone(), conf.auth_token.clone());
         tgin.set_api(api);
     }
 

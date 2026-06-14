@@ -19,9 +19,6 @@ use serde_json::json;
 use serde_json::value::RawValue;
 use std::time::Duration;
 use std::sync::Arc;
-
-use subtle::ConstantTimeEq;
-
 use reqwest::Client;
 
 use tokio::sync::mpsc::Sender;
@@ -151,17 +148,9 @@ impl Serverable for WebhookUpdate {
                         .get("x-telegram-bot-api-secret-token")
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("");
-                    let provided_bytes = provided.as_bytes();
-                    let expected_bytes = sec.as_bytes();
-                    let len_eq = provided_bytes.len() == expected_bytes.len();
-                    // Compare same-length buffers (zero-padded to expected len) so that
-                    // a length mismatch still goes through ct_eq and doesn't short-circuit
-                    // by length alone. The final `&` with `len_eq` rejects length mismatches.
-                    let mut padded = vec![0u8; expected_bytes.len()];
-                    let copy_len = provided_bytes.len().min(expected_bytes.len());
-                    padded[..copy_len].copy_from_slice(&provided_bytes[..copy_len]);
-                    let bytes_eq: bool = padded.ct_eq(expected_bytes).into();
-                    if !(len_eq && bytes_eq) {
+                    // Timing-safe compare shared with the control-plane bearer
+                    // gate (see `utils::auth::secret_eq`).
+                    if !crate::utils::auth::secret_eq(provided.as_bytes(), sec.as_bytes()) {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
                 }

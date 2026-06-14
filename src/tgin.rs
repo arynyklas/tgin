@@ -31,6 +31,8 @@ pub struct Tgin {
     pub ssl_key: Option<String>,
 
     api: Option<Api>,
+
+    auth_token: Option<String>,
 }
 
 impl Tgin {
@@ -48,6 +50,7 @@ impl Tgin {
             ssl_cert: None,
             ssl_key: None,
             api: None,
+            auth_token: None,
         }
     }
 
@@ -58,6 +61,10 @@ impl Tgin {
     pub fn set_ssl(&mut self, ssl_cert: String, ssl_key: String) {
         self.ssl_cert = Some(ssl_cert);
         self.ssl_key = Some(ssl_key);
+    }
+
+    pub fn set_auth_token(&mut self, auth_token: Option<String>) {
+        self.auth_token = auth_token;
     }
 
     pub fn run(self) -> std::io::Result<()> {
@@ -89,6 +96,7 @@ impl Tgin {
         crate::observe::set_route(self.route.clone());
 
         let api = self.api;
+        let auth_token = self.auth_token;
 
         let shutdown = CancellationToken::new();
         // Released only after the HTTP server has finished its graceful drain,
@@ -114,10 +122,20 @@ impl Tgin {
                 // Always-on observability endpoints, independent of the
                 // management API. Explicit routes take precedence over the
                 // `dynamic_handler` fallback, and take no `State`, so they are
-                // valid on `Router<Sender<Bytes>>`.
-                router = router
-                    .route("/status", get(crate::observe::status_handler))
-                    .route("/metrics", get(crate::observe::metrics_handler));
+                // valid on `Router<Sender<Bytes>>`. The optional bearer gate
+                // shares the same `auth_token` as the management API.
+                let observe_routes = crate::utils::auth::guard(
+                    Router::<Sender<Bytes>>::new()
+                        .route("/status", get(crate::observe::status_handler))
+                        .route("/metrics", get(crate::observe::metrics_handler)),
+                    auth_token.clone(),
+                );
+                router = router.merge(observe_routes);
+
+                tracing::info!(
+                    authenticated = auth_token.is_some(),
+                    "observability endpoints mounted (/status, /metrics)"
+                );
 
                 let app = router.with_state(tx.clone());
 

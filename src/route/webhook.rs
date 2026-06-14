@@ -96,7 +96,7 @@ impl Printable for WebhookRoute {
         json!({
             "type": "webhook",
             "options": {
-                "url": self.url
+                "url": TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####").as_ref()
             },
             "metrics": {
                 "dispatched_total": self.dispatched.load(Ordering::Relaxed),
@@ -160,6 +160,22 @@ mod tests {
         let json_info = route.json_struct().await;
         assert_eq!(json_info["type"], "webhook");
         assert_eq!(json_info["options"]["url"], url);
+    }
+
+    /// A downstream URL that embeds a Telegram bot token must surface redacted
+    /// in `json_struct` — the tree feeds the unauthenticated `/status` document
+    /// and the management API `/routes`, so a leaked token here is a token leak.
+    #[tokio::test]
+    async fn test_json_struct_redacts_token_in_url() {
+        let url = "https://api.telegram.org/bot12345678:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345/fwd";
+        let route = WebhookRoute::new(url.to_string(), test_client(), DEFAULT_REQUEST_TIMEOUT);
+
+        let reported = route.json_struct().await["options"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!reported.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), "token leaked: {reported}");
+        assert!(reported.contains("#####"), "expected redaction marker: {reported}");
     }
 
     /// A downstream that holds the request open longer than the configured

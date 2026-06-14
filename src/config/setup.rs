@@ -104,6 +104,12 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         });
     }
 
+    if let Some(token) = &cfg.auth_token {
+        if token.trim().is_empty() {
+            errs.push(ValidationError::EmptyAuthToken);
+        }
+    }
+
     if let Some(ssl) = &cfg.ssl {
         check_ssl(ssl, &mut errs);
     }
@@ -454,6 +460,7 @@ mod tests {
             api: None,
             log_level: "info".to_string(),
             log_format: crate::config::schema::LogFormat::Compact,
+            auth_token: None,
         }
     }
 
@@ -515,6 +522,7 @@ mod tests {
             api: None,
             log_level: "info".to_string(),
             log_format: crate::config::schema::LogFormat::Compact,
+            auth_token: None,
         };
         let errs = validate(&cfg).expect_err("ingress/egress path collision rejected");
         assert!(errs.iter().any(|e| matches!(
@@ -611,6 +619,7 @@ mod tests {
             api: None,
             log_level: "info".to_string(),
             log_format: crate::config::schema::LogFormat::Compact,
+            auth_token: None,
         };
         let errs = validate(&cfg).expect_err("bad public_ip rejected");
         assert!(errs
@@ -651,5 +660,15 @@ mod tests {
             e,
             ValidationError::DuplicatePath { path, .. } if path == "/metrics"
         )));
+    }
+
+    /// A present-but-blank `auth_token` must be rejected: the empty credential
+    /// matches, so it would silently leave the control plane open.
+    #[test]
+    fn test_validate_rejects_blank_auth_token() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.auth_token = Some("   ".to_string());
+        let errs = validate(&cfg).expect_err("blank auth_token rejected");
+        assert!(errs.iter().any(|e| matches!(e, ValidationError::EmptyAuthToken)));
     }
 }
