@@ -10,10 +10,28 @@ pub struct TginConfig {
     pub updates: Vec<UpdateConfig>,
     pub route: RouteConfig,
     pub api: Option<ApiConfig>,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub log_format: LogFormat,
 }
 
 fn default_workers() -> usize {
     4
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+/// Subscriber output format selected by the `log_format` config field.
+/// `Compact` is human-readable single-line; `Json` emits one JSON object
+/// per line for log shippers.
+#[derive(Deserialize, Debug, Default, Clone, Copy)]
+pub enum LogFormat {
+    #[default]
+    Compact,
+    Json,
 }
 
 #[derive(Deserialize, Debug)]

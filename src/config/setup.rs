@@ -94,6 +94,16 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         errs.push(ValidationError::DarkThreadsZero);
     }
 
+    let lvl = cfg.log_level.to_ascii_lowercase();
+    if !matches!(
+        lvl.as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    ) {
+        errs.push(ValidationError::InvalidLogLevel {
+            value: cfg.log_level.clone(),
+        });
+    }
+
     if let Some(ssl) = &cfg.ssl {
         check_ssl(ssl, &mut errs);
     }
@@ -104,6 +114,15 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
     // The first registration wins in axum's `Router`; collisions silently
     // shadow at request time.
     let mut paths: HashMap<String, &'static str> = HashMap::new();
+
+    // Reserve the always-on observability endpoints so a configured route
+    // on either path surfaces as a clean `DuplicatePath` validation error
+    // instead of an axum duplicate-route panic at bind time. Only relevant
+    // when an HTTP server is actually mounted.
+    if cfg.server_port.is_some() {
+        paths.insert("/status".to_string(), "tgin /status endpoint");
+        paths.insert("/metrics".to_string(), "tgin /metrics endpoint");
+    }
 
     for (idx, upd) in cfg.updates.iter().enumerate() {
         match upd {
@@ -433,6 +452,8 @@ mod tests {
             updates: vec![],
             route,
             api: None,
+            log_level: "info".to_string(),
+            log_format: crate::config::schema::LogFormat::Compact,
         }
     }
 
@@ -492,6 +513,8 @@ mod tests {
             }],
             route: RouteConfig::LongPollRoute { path: "/shared".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
             api: None,
+            log_level: "info".to_string(),
+            log_format: crate::config::schema::LogFormat::Compact,
         };
         let errs = validate(&cfg).expect_err("ingress/egress path collision rejected");
         assert!(errs.iter().any(|e| matches!(
@@ -586,6 +609,8 @@ mod tests {
             }],
             route: wh_route("http://127.0.0.1:8080/bot"),
             api: None,
+            log_level: "info".to_string(),
+            log_format: crate::config::schema::LogFormat::Compact,
         };
         let errs = validate(&cfg).expect_err("bad public_ip rejected");
         assert!(errs
@@ -600,5 +625,31 @@ mod tests {
         let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
         cfg.api = Some(ApiConfig { base_path: "/api".to_string() });
         validate(&cfg).expect("api config validates");
+    }
+
+    /// `log_level` must be a recognised level; a typo is a clean config error.
+    #[test]
+    fn test_validate_rejects_invalid_log_level() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.log_level = "loud".to_string();
+        let errs = validate(&cfg).expect_err("invalid log_level rejected");
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidLogLevel { value } if value == "loud")));
+    }
+
+    /// A route configured on a reserved observability path collides with the
+    /// always-on `/status` / `/metrics` endpoints and must be rejected.
+    #[test]
+    fn test_validate_rejects_route_on_reserved_path() {
+        let cfg = base_config(RouteConfig::LongPollRoute {
+            path: "/metrics".to_string(),
+            max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+        });
+        let errs = validate(&cfg).expect_err("route on /metrics rejected");
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::DuplicatePath { path, .. } if path == "/metrics"
+        )));
     }
 }

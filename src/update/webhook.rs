@@ -1,5 +1,6 @@
 use crate::base::{Printable, Serverable};
 use crate::update::base::Updater;
+use crate::observe::UpdaterMetrics;
 
 use crate::utils::defaults::TELEGRAM_TOKEN_RE;
 
@@ -17,6 +18,7 @@ use bytes::Bytes;
 use serde_json::json;
 use serde_json::value::RawValue;
 use std::time::Duration;
+use std::sync::Arc;
 
 use subtle::ConstantTimeEq;
 
@@ -60,14 +62,17 @@ pub struct WebhookUpdate {
     path: String,
     secret_token: Option<String>,
     registration: Option<RegistrationWebhookConfig>,
+    metrics: Arc<UpdaterMetrics>,
 }
 
 impl WebhookUpdate {
     pub fn new(path: String) -> Self {
+        let metrics = UpdaterMetrics::new("webhook", format!("0.0.0.0{path}"));
         Self {
             path,
             secret_token: None,
             registration: None,
+            metrics,
         }
     }
 
@@ -94,12 +99,12 @@ impl WebhookUpdate {
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    println!("Webhook set successfully for path: {}", self.path);
+                    tracing::info!(path = %self.path, "webhook registered with Telegram");
                 } else {
-                    eprintln!("Failed to set webhook. Status: {}", resp.status());
+                    tracing::error!(path = %self.path, status = resp.status().as_u16(), "failed to set webhook");
                 }
             }
-            Err(e) => eprintln!("Network error setting webhook: {}", e),
+            Err(e) => tracing::error!(path = %self.path, error = %e, "network error setting webhook"),
         }
     }
 }
@@ -110,11 +115,12 @@ impl Updater for WebhookUpdate {
         if let Some(config) = &self.registration {
             self.register_webhook(config).await;
         } else {
-            println!(
-                "Webhook started in passive mode (no auto-registration) for {}",
-                self.path
-            );
+            tracing::info!(path = %self.path, "webhook started in passive mode (no auto-registration)");
         }
+    }
+
+    fn metrics(&self) -> Option<Arc<UpdaterMetrics>> {
+        Some(self.metrics.clone())
     }
 }
 
@@ -179,19 +185,25 @@ impl Serverable for WebhookUpdate {
         // caller posting non-JSON corrupts the next `getUpdates`
         // response on any `LongPollRoute` downstream and the consuming
         // bot's client library aborts the whole batch.
-        let handler_func =
-            |State(tx): State<Sender<Bytes>>, body: Bytes| async move {
+        let metrics = self.metrics.clone();
+        let handler_func = move |State(tx): State<Sender<Bytes>>, body: Bytes| {
+            let metrics = metrics.clone();
+            async move {
                 if serde_json::from_slice::<&RawValue>(&body).is_err() {
                     return StatusCode::BAD_REQUEST;
                 }
                 match tx.send(body).await {
-                    Ok(()) => StatusCode::OK,
+                    Ok(()) => {
+                        metrics.record_update();
+                        StatusCode::OK
+                    }
                     // Channel closed: the dispatcher is gone (shutdown). Telling Telegram
                     // 200 here would silently drop the update because Telegram never re-
                     // delivers an acknowledged update. 503 makes it retry.
                     Err(_) => StatusCode::SERVICE_UNAVAILABLE,
                 }
-            };
+            }
+        };
 
         // Layer order (outer to inner): auth -> body-limit -> handler.
         // axum applies layers innermost-first when stacked via `.layer`,

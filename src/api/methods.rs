@@ -374,7 +374,7 @@ mod tests {
     /// `add_route` MUST reject a webhook URL that `reqwest::Url::parse`
     /// can't parse. The route would otherwise be added, every dispatched
     /// update would fail at request time, and the failure would only show
-    /// up in `eprintln!` from `WebhookRoute`.
+    /// up in a `tracing::warn!` from `WebhookRoute`.
     #[tokio::test]
     async fn add_webhook_malformed_url_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);

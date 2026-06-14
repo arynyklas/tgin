@@ -2,6 +2,7 @@ mod base;
 mod config;
 mod dynamic;
 mod lb;
+mod observe;
 mod route;
 mod tgin;
 mod update;
@@ -33,8 +34,9 @@ fn main() -> ExitCode {
             // tell "tgin failed to start" from "a configured bot's
             // token / URL is wrong". Both are operator-fixable, but only
             // the latter has been running long enough to handle traffic.
-            eprintln!(
-                "tgin: {n} updater(s) terminated with permanent failure -- check earlier `longpull permanent failure` lines"
+            tracing::error!(
+                updaters = n,
+                "updater(s) terminated with permanent failure; check earlier long-poll permanent-failure logs"
             );
             ExitCode::from(2)
         }
@@ -74,6 +76,8 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
         .expect("clap default guarantees a value");
 
     let conf = load_config(config_path)?;
+
+    crate::observe::init(&conf.log_level, conf.log_format);
 
     // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
     // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,

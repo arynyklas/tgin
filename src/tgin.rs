@@ -3,6 +3,7 @@ use crate::api::router::Api;
 use crate::base::{AddRouteError, RemoveRouteError, RouteableComponent, Serverable, UpdaterComponent};
 
 use axum::Router;
+use axum::routing::get;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tokio::runtime::Builder;
 
 use crate::dynamic::handler::dynamic_handler;
+
+use tracing::Instrument;
 
 pub struct Tgin {
     updates: Vec<Box<dyn UpdaterComponent>>,
@@ -64,17 +67,11 @@ impl Tgin {
             .build()
             .expect("Failed to build Tokio runtime");
         runtime.block_on(async {
-            println!("STARTED TGIN with {} worker threads\n", &self.dark_threads);
-
-            println!("CATCH UPDATES FROM\n");
-
+            tracing::info!(worker_threads = self.dark_threads, "tgin started");
             for update in &self.updates {
-                println!("{}\n", update.print().await);
+                tracing::info!(source = %update.print().await, "ingress configured");
             }
-
-            println!("\nROUTE TO\n");
-
-            println!("{}", &self.route.print().await);
+            tracing::info!(routing = %self.route.print().await, "routing tree configured");
         });
 
         runtime.block_on(self.run_async())
@@ -88,6 +85,8 @@ impl Tgin {
         // (LongPoll stops calling `getUpdates`; webhook handlers hold open)
         // and overload becomes immediately visible.
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
+
+        crate::observe::set_route(self.route.clone());
 
         let api = self.api;
 
@@ -112,6 +111,14 @@ impl Tgin {
                     router = api.set_server(router).await;
                 }
 
+                // Always-on observability endpoints, independent of the
+                // management API. Explicit routes take precedence over the
+                // `dynamic_handler` fallback, and take no `State`, so they are
+                // valid on `Router<Sender<Bytes>>`.
+                router = router
+                    .route("/status", get(crate::observe::status_handler))
+                    .route("/metrics", get(crate::observe::metrics_handler));
+
                 let app = router.with_state(tx.clone());
 
                 let app = if api.is_some() {
@@ -130,7 +137,7 @@ impl Tgin {
                 std_listener.set_nonblocking(true)?;
 
                 let handle = Handle::new();
-                println!("LISTENING ON {addr}");
+                tracing::info!(%addr, "listening");
 
                 let task = match (self.ssl_cert.clone(), self.ssl_key.clone()) {
                     (Some(cert_path), Some(key_path)) => {
@@ -139,7 +146,7 @@ impl Tgin {
                             .handle(handle.clone());
                         tokio::spawn(async move {
                             if let Err(err) = server.serve(app.into_make_service()).await {
-                                eprintln!("tgin: HTTPS server terminated with error: {err}");
+                                tracing::error!(error = %err, "HTTPS server terminated with error");
                             }
                         })
                     }
@@ -147,7 +154,7 @@ impl Tgin {
                         let server = axum_server::from_tcp(std_listener)?.handle(handle.clone());
                         tokio::spawn(async move {
                             if let Err(err) = server.serve(app.into_make_service()).await {
-                                eprintln!("tgin: HTTP server terminated with error: {err}");
+                                tracing::error!(error = %err, "HTTP server terminated with error");
                             }
                         })
                     }
@@ -164,6 +171,9 @@ impl Tgin {
         };
 
         for provider in self.updates {
+            if let Some(m) = provider.metrics() {
+                crate::observe::register_updater(m);
+            }
             let tx_clone = tx.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
@@ -186,7 +196,7 @@ impl Tgin {
             let drain = drain.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
-                eprintln!("tgin: shutdown signal received; draining…");
+                tracing::info!("shutdown signal received; draining");
                 shutdown.cancel();
                 if let Some(handle) = server_handle {
                     handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
@@ -376,7 +386,10 @@ fn spawn_worker_pool(
                 match next {
                     // `Bytes::clone` inside the routing tree is one atomic op;
                     // no `Value` allocation, no re-serialization on egress.
-                    Some(update) => route.process(update).await,
+                    Some(update) => {
+                        let span = crate::observe::dispatch_span(&update);
+                        route.process(update).instrument(span).await;
+                    }
                     None => return,
                 }
             }

@@ -11,6 +11,7 @@
   - [Routing targets (`route`)](#routing-targets-route)
   - [Load balancers](#load-balancers)
 - [HTTP management API](#http-management-api)
+- [Observability](#observability)
 - [TLS setup](#tls-setup)
 - [Configuration example](#configuration-example)
 - [Further reading](#further-reading)
@@ -57,6 +58,8 @@ Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
 | `updates`      | `Vec<UpdateConfig>`               | —       | Ingress providers. Multiple providers can coexist; tgin merges updates from all of them.                                                                                                                                    |
 | `route`        | `RouteConfig`                     | —       | The single root of the routing tree. Either a leaf route or a load-balancer subtree.                                                                                                                                        |
 | `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress.                                                                                                   |
+| `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off`. `RUST_LOG` overrides it. |
+| `log_format`   | `"Compact"` \| `"Json"`           | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
 
 ### Update providers (`updates`)
 
@@ -75,8 +78,8 @@ Long-polls Telegram for updates and dispatches each one into the routing tree.
 
 Failure handling: `LongPollUpdate` distinguishes transient from permanent upstream failures.
 
-- **Transient** (network errors, 5xx, body-read errors, JSON-parse errors, 429): retry with full-jitter exponential backoff capped at 1 s. After ~60 consecutive failures the updater emits a single `longpull prolonged outage ...` warning so a sustained outage is loud, then keeps retrying. Telegram's own multi-minute incidents are riden out, not abandoned.
-- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `longpull permanent failure ...` line, increments a process-wide health counter, and stops. When the binary eventually exits with no remaining producers, a non-zero permanent-failure count produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
+- **Transient** (network errors, 5xx, body-read errors, JSON-parse errors, 429): retry with full-jitter exponential backoff capped at 1 s. After ~60 consecutive failures the updater emits a single `long-poll prolonged outage` warning so a sustained outage is loud, then keeps retrying. Telegram's own multi-minute incidents are riden out, not abandoned.
+- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `long-poll permanent failure` error line, increments a process-wide health counter, and stops. When the binary eventually exits with no remaining producers, a non-zero permanent-failure count produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
 
 #### `WebhookUpdate`
 
@@ -186,6 +189,40 @@ curl -X POST http://localhost:3000/bot-c/getUpdates \
 
 The API talks to the routing core via an in-memory channel (see `src/api/router.rs` and `src/api/methods.rs`).
 
+## Observability
+
+tgin exposes structured logs plus two always-on HTTP endpoints. The endpoints are mounted on the main listener whenever `server_port` is set — **independent of `api`**; observability never requires enabling hot-reconfig. `/status` and `/metrics` are reserved paths: a configured route on either is a validation error at startup, not a runtime collision.
+
+### Logging
+
+All operator output is emitted through `tracing`. `log_level` sets the minimum level (overridable via the `RUST_LOG` environment variable) and `log_format` selects `Compact` (human-readable) or `Json` (one JSON object per line) output. Telegram tokens are redacted from every log line.
+
+### `GET /status`
+
+Returns a JSON snapshot:
+
+- `updaters[]` — one object per ingress provider: `type` (`longpoll`/`webhook`), redacted `source`, and `metrics` (`updates_received_total`, `poll_failures_total`, `permanent_failure`).
+- `routes` — the routing tree (same shape as `GET /api/routes`), with per-leaf `metrics`.
+- `load_balancer.dropped_empty_total` — updates dropped at a load balancer drained empty at runtime.
+
+### `GET /metrics`
+
+Prometheus text exposition (`Content-Type: text/plain; version=0.0.4`). Metric names:
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `tgin_updater_updates_received_total` | counter | `source` | Updates accepted from an ingress provider. |
+| `tgin_updater_poll_failures_total` | counter | `source` | Long-poll transient poll failures (webhook stays 0). |
+| `tgin_updater_permanent_failure` | gauge | `source` | `1` once a long-poll updater stopped on a permanent failure. |
+| `tgin_route_queue_depth` | gauge | `route` | Current depth of a long-poll route buffer. |
+| `tgin_route_queue_dropped_total` | counter | `route` | Updates evicted from a long-poll buffer at its cap. |
+| `tgin_route_served_total` | counter | `route` | Updates served out via a long-poll route's `getUpdates`. |
+| `tgin_route_dispatched_total` | counter | `route` | Updates a webhook route attempted to forward. |
+| `tgin_route_http_responses_total` | counter | `route`, `result` | Webhook downstream outcomes (`result` = `success`/`failure`/`error`). |
+| `tgin_lb_dropped_empty_total` | counter | — | Updates dropped at an empty load balancer. |
+
+All `source` / `route` label values are token-redacted and Prometheus-escaped.
+
 ## TLS setup
 
 tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
@@ -214,7 +251,7 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
 
 **Startup.** With `server_port` set, tgin binds `0.0.0.0:<server_port>` on the main task before serving. A bind failure (port already in use, bad address) or an unreadable TLS certificate is reported as a single `tgin: <error>` line on stderr and the process exits `1` — it does not start a half-initialized process with no HTTP plane.
 
-**Graceful shutdown.** On `SIGTERM` (Unix) or `Ctrl-C` (all platforms) tgin logs `tgin: shutdown signal received; draining…` and drains in order: long-poll ingest stops pulling new updates from Telegram; the HTTP server finishes in-flight requests (bounded to a 10 s deadline, so a parked downstream connection cannot block exit indefinitely); the worker pool then processes the buffered backlog and exits. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start, so no acknowledged update is lost across a restart.
+**Graceful shutdown.** On `SIGTERM` (Unix) or `Ctrl-C` (all platforms) tgin logs `shutdown signal received; draining` and drains in order: long-poll ingest stops pulling new updates from Telegram; the HTTP server finishes in-flight requests (bounded to a 10 s deadline, so a parked downstream connection cannot block exit indefinitely); the worker pool then processes the buffered backlog and exits. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start, so no acknowledged update is lost across a restart.
 
 **Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped; see [Failure handling](#longpollupdate).
 

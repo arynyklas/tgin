@@ -48,9 +48,8 @@ impl Routeable for RoundRobinLB {
             // Static config rejects empty LBs at startup, but the API can
             // drain a runtime LB via `remove_route`. Surface the drop so
             // the operator sees updates being silently swallowed.
-            eprintln!(
-                "warning: dropping update at empty RoundRobinLB (LB drained at runtime)"
-            );
+            crate::observe::record_lb_drop();
+            tracing::warn!(lb = "round-robin", "dropping update at empty load balancer (drained at runtime)");
             return;
         }
         let current = self.current.fetch_add(1, Ordering::Relaxed);
@@ -188,6 +187,17 @@ mod tests {
 
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
+    }
+
+    /// Dispatching to an empty LB bumps the process-global drop counter.
+    /// Delta assertion: the counter is shared, so other tests may also bump
+    /// it; only the increase from this dispatch is asserted.
+    #[tokio::test]
+    async fn test_empty_lb_increments_dropped_counter() {
+        let lb = RoundRobinLB::new(vec![]);
+        let before = crate::observe::lb_dropped_for_test();
+        lb.process(update_bytes(json!({"update_id": 1}))).await;
+        assert!(crate::observe::lb_dropped_for_test() > before);
     }
 
     #[tokio::test]

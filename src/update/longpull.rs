@@ -1,6 +1,7 @@
 use crate::base::{Printable, Serverable};
 use crate::update::base::Updater;
 use crate::utils::defaults::TELEGRAM_TOKEN_RE;
+use crate::observe::UpdaterMetrics;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -66,22 +67,38 @@ pub struct LongPollUpdate {
     /// [`is_permanent_status`]). The binary reads this counter on
     /// shutdown to decide its exit code.
     health_counter: Arc<AtomicUsize>,
+    /// Per-updater ingress counters surfaced on `/status` and `/metrics`.
+    /// `source` is the redacted poll URL.
+    metrics: Arc<UpdaterMetrics>,
 }
 
 impl LongPollUpdate {
     pub fn new(token: String, client: Client) -> Self {
+        let url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+        let metrics = UpdaterMetrics::new(
+            "longpoll",
+            TELEGRAM_TOKEN_RE.replace_all(&url, "#####").to_string(),
+        );
         Self {
             client,
-            url: format!("https://api.telegram.org/bot{}/getUpdates", token),
+            url,
             default_timeout_sleep: 0,
             error_timeout_sleep: 100,
             long_poll_timeout: 30,
             long_poll_limit: TELEGRAM_LONG_POLL_LIMIT_MAX,
             health_counter: Arc::new(AtomicUsize::new(0)),
+            metrics,
         }
     }
 
     pub fn set_url(&mut self, url: String) {
+        // Rebuild so the Prometheus `source` label tracks the override.
+        // Counters reset to zero, which is harmless: this only runs during
+        // construction in `build_updates`, before the updater task starts.
+        self.metrics = UpdaterMetrics::new(
+            "longpoll",
+            TELEGRAM_TOKEN_RE.replace_all(&url, "#####").to_string(),
+        );
         self.url = url;
     }
 
@@ -156,7 +173,8 @@ impl Updater for LongPollUpdate {
             let response = match response {
                 Ok(r) => r,
                 Err(err) => {
-                    eprintln!("longpull network error ({}): {:?}", redacted_url, err);
+                    tracing::warn!(url = %redacted_url, error = ?err, "long-poll network error");
+                    self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
                         &mut prolonged_outage_logged,
@@ -174,10 +192,7 @@ impl Updater for LongPollUpdate {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = parse_retry_after(response.headers());
                 let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "longpull rate-limited ({}) status={} body={:?}",
-                    redacted_url, status, body
-                );
+                tracing::warn!(url = %redacted_url, status = status.as_u16(), body = %body, "long-poll rate-limited");
                 let wait = retry_after.unwrap_or_else(|| jittered(backoff_ms));
                 if sleep_or_shutdown(wait, &shutdown).await {
                     return;
@@ -196,20 +211,16 @@ impl Updater for LongPollUpdate {
                 // the shared health counter so the binary can exit
                 // non-zero on shutdown.
                 let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "longpull permanent failure ({}) status={} body={:?} -- updater stopping; check token/URL configuration",
-                    redacted_url, status, body
-                );
+                tracing::error!(url = %redacted_url, status = status.as_u16(), body = %body, "long-poll permanent failure; updater stopping, check token/URL");
+                self.metrics.mark_permanent_failure();
                 self.health_counter.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "longpull HTTP error ({}) status={} body={:?}",
-                    redacted_url, status, body
-                );
+                tracing::warn!(url = %redacted_url, status = status.as_u16(), body = %body, "long-poll HTTP error");
+                self.metrics.record_poll_failure();
                 note_consecutive_failure(
                     &mut consecutive_failures,
                     &mut prolonged_outage_logged,
@@ -229,7 +240,8 @@ impl Updater for LongPollUpdate {
             let body = match response.bytes().await {
                 Ok(b) => b,
                 Err(err) => {
-                    eprintln!("longpull body read error ({}): {:?}", redacted_url, err);
+                    tracing::warn!(url = %redacted_url, error = ?err, "long-poll body read error");
+                    self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
                         &mut prolonged_outage_logged,
@@ -246,7 +258,8 @@ impl Updater for LongPollUpdate {
             let parsed: PollResponse = match serde_json::from_slice(&body) {
                 Ok(p) => p,
                 Err(err) => {
-                    eprintln!("longpull JSON parse error ({}): {:?}", redacted_url, err);
+                    tracing::warn!(url = %redacted_url, error = ?err, "long-poll JSON parse error");
+                    self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
                         &mut prolonged_outage_logged,
@@ -277,10 +290,7 @@ impl Updater for LongPollUpdate {
                 let id = match serde_json::from_str::<UpdateIdOnly>(raw_str) {
                     Ok(x) => x.update_id,
                     Err(err) => {
-                        eprintln!(
-                            "longpull update missing update_id ({}): {:?}",
-                            redacted_url, err
-                        );
+                        tracing::warn!(url = %redacted_url, error = ?err, "long-poll update missing update_id; skipping");
                         continue;
                     }
                 };
@@ -291,6 +301,7 @@ impl Updater for LongPollUpdate {
                 if tx.send(update_bytes).await.is_err() {
                     return;
                 }
+                self.metrics.record_update();
             }
 
             if self.default_timeout_sleep > 0
@@ -299,6 +310,10 @@ impl Updater for LongPollUpdate {
                 return;
             }
         }
+    }
+
+    fn metrics(&self) -> Option<Arc<UpdaterMetrics>> {
+        Some(self.metrics.clone())
     }
 }
 
@@ -351,10 +366,7 @@ fn note_consecutive_failure(
     *consecutive_failures = consecutive_failures.saturating_add(1);
     if !*prolonged_outage_logged && *consecutive_failures >= PROLONGED_OUTAGE_THRESHOLD {
         *prolonged_outage_logged = true;
-        eprintln!(
-            "longpull prolonged outage ({}): {} consecutive failed attempts -- downstream may be wedged",
-            redacted_url, *consecutive_failures
-        );
+        tracing::warn!(url = %redacted_url, consecutive_failures = *consecutive_failures, "long-poll prolonged outage; downstream may be wedged");
     }
 }
 
@@ -830,7 +842,7 @@ mod tests {
         assert!(logged);
 
         // Past threshold while flag is set: counter still tracks but the
-        // log MUST NOT fire again -- same reason `eprintln!` is sticky:
+        // log MUST NOT fire again -- same reason the warning is sticky:
         // we want one signal per outage, not one per retry.
         let logged_before = logged;
         for _ in 0..10 {

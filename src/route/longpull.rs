@@ -77,6 +77,9 @@ pub struct LongPollRoute {
     /// high-watermark threshold after a push. Prevents log spam when a
     /// route stays hot.
     high_watermark_logged: Arc<AtomicBool>,
+    /// Cumulative count of updates served out via `getUpdates` responses.
+    /// Monotonic; surfaced via [`Routeable::json_struct`].
+    served: Arc<AtomicU64>,
 }
 
 impl LongPollRoute {
@@ -91,6 +94,7 @@ impl LongPollRoute {
             max_buffered_updates: DEFAULT_MAX_BUFFERED_UPDATES,
             dropped_oldest: Arc::new(AtomicU64::new(0)),
             high_watermark_logged: Arc::new(AtomicBool::new(false)),
+            served: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -141,6 +145,7 @@ impl LongPollRoute {
             };
 
             if let Some(batch) = batch_opt {
+                self.served.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 return build_get_updates_response(&batch);
             }
 
@@ -279,9 +284,11 @@ impl Routeable for LongPollRoute {
                 .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            eprintln!(
-                "warning: long-poll route {} crossed buffer high-watermark ({}/{} updates buffered); downstream may be offline",
-                self.path, depth_after_push, self.max_buffered_updates
+            tracing::warn!(
+                route = %self.path,
+                depth = depth_after_push,
+                cap = self.max_buffered_updates,
+                "long-poll route crossed buffer high-watermark; downstream may be offline"
             );
         }
         // `notify_one` instead of `notify_waiters` to close the lost-wakeup
@@ -353,7 +360,8 @@ impl Printable for LongPollRoute {
             },
             "metrics": {
                 "queue_depth": queue_depth,
-                "queue_dropped_total": queue_dropped_total
+                "queue_dropped_total": queue_dropped_total,
+                "served_total": self.served.load(Ordering::Relaxed)
             }
         })
     }
@@ -587,6 +595,22 @@ mod tests {
         );
         assert_eq!(json["metrics"]["queue_depth"], 0);
         assert_eq!(json["metrics"]["queue_dropped_total"], 0);
+        assert_eq!(json["metrics"]["served_total"], 0);
+    }
+
+    /// `served_total` counts updates drained out via `getUpdates`.
+    #[tokio::test]
+    async fn test_served_total_counts_drained_updates() {
+        let route = LongPollRoute::new("/served".to_string());
+        route.process(update_bytes(json!({"update_id": 1}))).await;
+        route.process(update_bytes(json!({"update_id": 2}))).await;
+
+        let response = route.handle_request(default_params()).await;
+        let body = read_body_json(response).await;
+        assert_eq!(body["result"].as_array().unwrap().len(), 2);
+
+        let json = route.json_struct().await;
+        assert_eq!(json["metrics"]["served_total"], 2);
     }
 
     /// `build_get_updates_response` must always emit a syntactically valid

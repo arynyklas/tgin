@@ -19,7 +19,7 @@ Pipeline stages, all glued together by `src/tgin.rs::Tgin::run_async`:
 2. **Routing tree** (`src/route/`, `src/lb/`): a single `Arc<dyn RouteableComponent>` owns all destinations.
    - Leaves: `LongPollRoute` (buffers updates in `Arc<Mutex<VecDeque<Value>>>` + `Notify`, served as a Telegram-shaped `getUpdates` endpoint), `WebhookRoute` (POSTs to a downstream URL).
    - Inner nodes: `RoundRobinLB` (atomic cursor → one child per update), `AllLB` (broadcasts via `tokio::spawn` to every child).
-3. **HTTP plane** (axum): every component implements `Serverable::set_server(Router) -> Router`; `Tgin` builds one router by chaining `set_server` calls, then binds it on `0.0.0.0:<server_port>` (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so newly-added long-poll routes resolve through `LONGPOLL_REGISTRY`.
+3. **HTTP plane** (axum): every component implements `Serverable::set_server(Router) -> Router`; `Tgin` builds one router by chaining `set_server` calls, then binds it on `0.0.0.0:<server_port>` (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so newly-added long-poll routes resolve through `LONGPOLL_REGISTRY`. `GET /status` (JSON) and `GET /metrics` (Prometheus) are always-on whenever `server_port` is set, independent of `api`; log level/format come from the `log_level` / `log_format` config fields.
 4. **Management API** (`src/api/`): owns its own `mpsc` pair; HTTP handlers send `ApiMessage::{GetRoutes, AddRoute, RmRoute}` to the main loop, which mutates the routing tree (`add_route` / `remove_route` on `RouteableComponent`).
 
 The main loop in `Tgin::run_async` is a `tokio::select!` between the update channel and the API channel — without an API, it degrades to a plain `while let Some(update) = rx.recv()`.
@@ -49,6 +49,7 @@ All async trait methods use `#[async_trait]`.
 | `src/api/{router,methods,message,schemas}.rs` | Hot-reconfig HTTP API + `ApiMessage` enum. |
 | `src/dynamic/handler.rs` | Axum fallback that dispatches to dynamically-added long-poll routes via `LONGPOLL_REGISTRY` (`src/dynamic/longpoll_registry.rs`, `Lazy<ArcSwap<HashMap<String, Arc<LongPollRoute>>>>`). |
 | `src/utils/defaults.rs` | `TELEGRAM_TOKEN_REGEX` for log redaction. |
+| `src/observe.rs` | tracing subscriber init, dispatch span, per-component metrics, `/status` + `/metrics` handlers, process-global metrics registry. |
 | `src/mock/routes.rs` | `MockCallsRoute` test double, gated by `#[cfg(test)]` on `mod mock` in `main.rs`. |
 | `tests/performance/` | Docker-compose load-test harness (Rust bench tool, Python aiogram bots, Go plotter). |
 | `examples/simple/` | Working docker-compose example with two long-poll bots and one webhook bot. |
