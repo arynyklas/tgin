@@ -366,11 +366,12 @@ pub async fn metrics_handler() -> Response {
         .into_response()
 }
 
-/// Span correlating one update's hops through the routing tree. `update_id`
-/// is parsed off the wire bytes only when an info-level span would actually
-/// record, so the dispatch hot path pays nothing when info logging is off.
+/// Span correlating one update's hops through the routing tree. A `debug`-level
+/// span so the default `info` configuration pays nothing: `update_id` is parsed
+/// off the wire bytes only when the span would actually record, i.e. when
+/// `log_level` / `RUST_LOG` is at `debug` or finer.
 pub fn dispatch_span(update: &Bytes) -> tracing::Span {
-    let span = tracing::info_span!("dispatch", update_id = tracing::field::Empty);
+    let span = tracing::debug_span!("dispatch", update_id = tracing::field::Empty);
     if !span.is_disabled() {
         #[derive(serde::Deserialize)]
         struct Peek {
