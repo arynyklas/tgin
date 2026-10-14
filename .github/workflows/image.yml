@@ -2,9 +2,10 @@ name: Image
 
 # Builds the container image natively on amd64 and arm64 runners, pushes each
 # platform by digest, merges them into one multi-arch index and attests it.
+# Only semver release tags, so a stray `v*` tag cannot push untagged images.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: read

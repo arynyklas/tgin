@@ -23,12 +23,14 @@ github-attestations = true
 cargo-auditable = true
 # Generate a CycloneDX SBOM with cargo-cyclonedx
 cargo-cyclonedx = true
-# .github/workflows/release.yml carries hand edits that dist cannot express:
-# the generated workflow grants `contents: write` to every job, while ours
-# grants it only to the `host` job that creates the GitHub Release, and the
-# pinned actions carry `# vX.Y.Z` comments for Dependabot. To regenerate after
-# a config change or a dist upgrade: drop this line, run `dist generate`,
-# re-apply both edits (see the header of release.yml), then restore this line.
+# .github/workflows/release.yml carries hand edits that dist cannot express;
+# the header of release.yml lists them. To regenerate after a config change or
+# a dist upgrade:
+# 1. copy the action SHAs currently pinned in release.yml (Dependabot updates
+#    them there) into [dist.github-action-commits] below;
+# 2. drop this line and run `dist generate`;
+# 3. re-apply every hand edit listed in the release.yml header;
+# 4. restore this line.
 allow-dirty = ["ci"]
 
 # Build arm64 Windows natively. dist's default cross-compiles it with

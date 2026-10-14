@@ -34,9 +34,12 @@ advisory. Once a fixed release is out, the advisory is published.
 
 The per-platform release archives and the container image carry GitHub build
 provenance attestations. To check that an artifact was built from this
-repository by its release workflow, use the [GitHub CLI](https://cli.github.com/):
+repository by the workflow that publishes it, use the
+[GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify tgin-x86_64-unknown-linux-gnu.tar.xz --repo arynyklas/tgin
-gh attestation verify oci://ghcr.io/arynyklas/tgin:0.2.0 --repo arynyklas/tgin
+gh attestation verify tgin-x86_64-unknown-linux-gnu.tar.xz --repo arynyklas/tgin \
+  --signer-workflow arynyklas/tgin/.github/workflows/release.yml
+gh attestation verify oci://ghcr.io/arynyklas/tgin:0.2.0 --repo arynyklas/tgin \
+  --signer-workflow arynyklas/tgin/.github/workflows/image.yml
 ```

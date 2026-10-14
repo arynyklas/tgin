@@ -68,7 +68,7 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 - `GET /livez` (always `200`) and `GET /readyz` (`200`, or `503` while
   draining) probes. They stay unauthenticated when `auth_token` is set.
 - Graceful shutdown on Windows console events: Ctrl+C, Ctrl+Break, console
-  close, logoff and system shutdown.
+  close and system shutdown.
 - `tgin --version`.
 - Multi-arch (amd64, arm64) container image at `ghcr.io/arynyklas/tgin`,
   tagged `<version>`, `<major>.<minor>` and `latest`, with a build provenance

@@ -18,7 +18,9 @@
 # * permissions: `contents: read` at the root, `contents: write` on `host` only;
 # * `# vX.Y.Z` comments after the pinned action commits;
 # * `steps.cargo-cyclonedx.outputs.paths` in build-global-artifacts (the
-#   template reads `.output.paths`, which is always empty).
+#   template reads `.output.paths`, which is always empty);
+# * `Install cargo-auditable` runs `cargo install cargo-auditable --locked
+#   --version 0.7.7` instead of piping the unpinned `releases/latest` installer.
 
 name: Release
 # Local edit: dist grants `contents: write` here, to every job. Only the
@@ -149,8 +151,10 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # Local edit: dist pipes the `releases/latest` cargo-auditable installer
+      # into sh/iex. Install a pinned version from crates.io instead.
       - name: Install cargo-auditable
-        run: ${{ matrix.install_cargo_auditable.run }}
+        run: cargo install cargo-auditable --locked --version 0.7.7
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
