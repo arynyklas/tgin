@@ -139,6 +139,7 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         match upd {
             UpdateConfig::WebhookUpdate { path, registration, .. } => {
                 let location = format!("updates[{idx}].WebhookUpdate");
+                check_path(path, &format!("{location}.path"), &mut errs);
                 if let Some(prev) = paths.insert(path.clone(), "WebhookUpdate") {
                     errs.push(ValidationError::DuplicatePath {
                         path: path.clone(),
@@ -169,10 +170,47 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
 
     walk_route(&cfg.route, "route", &mut errs, &mut paths);
 
+    if let Some(api) = &cfg.api {
+        if api.base_path == "/" {
+            errs.push(ValidationError::InvalidPath {
+                path: api.base_path.clone(),
+                location: "api.base_path".to_string(),
+                reason: "must not be `/` (axum cannot nest at the root)",
+            });
+        } else {
+            check_path(&api.base_path, "api.base_path", &mut errs);
+        }
+    }
+
     if errs.is_empty() {
         Ok(())
     } else {
         Err(errs)
+    }
+}
+
+/// Why `path` cannot be mounted as a literal axum 0.8 route, if it cannot.
+/// Shared with the runtime `POST /<base>/route` validation.
+pub(crate) fn path_violation(path: &str) -> Option<&'static str> {
+    if !path.starts_with('/') {
+        return Some("must start with `/`");
+    }
+    if path.contains(['{', '}']) {
+        return Some("must not contain `{` or `}` (axum capture syntax)");
+    }
+    if path.split('/').any(|seg| seg.starts_with([':', '*'])) {
+        return Some("no segment may start with `:` or `*` (axum rejects them)");
+    }
+    None
+}
+
+fn check_path(path: &str, location: &str, errs: &mut Vec<ValidationError>) {
+    if let Some(reason) = path_violation(path) {
+        errs.push(ValidationError::InvalidPath {
+            path: path.to_string(),
+            location: location.to_string(),
+            reason,
+        });
     }
 }
 
@@ -225,6 +263,7 @@ fn walk_route(
 ) {
     match cfg {
         RouteConfig::LongPollRoute { path, .. } => {
+            check_path(path, &format!("{location}.path"), errs);
             if let Some(prev) = paths.insert(path.clone(), "LongPollRoute") {
                 errs.push(ValidationError::DuplicatePath {
                     path: path.clone(),
@@ -538,6 +577,64 @@ mod tests {
                 second: "LongPollRoute",
             } if path == "/shared"
         )));
+    }
+
+    fn lp_route(path: &str) -> RouteConfig {
+        RouteConfig::LongPollRoute {
+            path: path.to_string(),
+            max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+        }
+    }
+
+    fn assert_invalid_path(cfg: &TginConfig, want_path: &str, want_location: &str) {
+        let errs = validate(cfg).expect_err("invalid path rejected");
+        assert!(
+            matches!(
+                errs.as_slice(),
+                [ValidationError::InvalidPath { path, location, .. }]
+                    if path == want_path && location == want_location
+            ),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_path_without_leading_slash() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.updates = vec![UpdateConfig::WebhookUpdate {
+            path: "bot".to_string(),
+            registration: None,
+            secret_token: None,
+        }];
+        assert_invalid_path(&cfg, "bot", "updates[0].WebhookUpdate.path");
+    }
+
+    #[test]
+    fn test_validate_rejects_path_with_braces() {
+        let cfg = base_config(RouteConfig::RoundRobinLB {
+            routes: vec![lp_route("/bot/{id}")],
+        });
+        assert_invalid_path(&cfg, "/bot/{id}", "route.routes[0].path");
+    }
+
+    #[test]
+    fn test_validate_rejects_path_with_colon_segment() {
+        let cfg = base_config(lp_route("/bot/:id"));
+        assert_invalid_path(&cfg, "/bot/:id", "route.path");
+    }
+
+    #[test]
+    fn test_validate_rejects_path_with_star_segment() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.api = Some(ApiConfig { base_path: "/*api".to_string() });
+        assert_invalid_path(&cfg, "/*api", "api.base_path");
+    }
+
+    #[test]
+    fn test_validate_rejects_root_api_base_path() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.api = Some(ApiConfig { base_path: "/".to_string() });
+        assert_invalid_path(&cfg, "/", "api.base_path");
     }
 
     /// Catch malformed webhook URLs at startup instead of letting them surface

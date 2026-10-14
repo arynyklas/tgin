@@ -69,6 +69,14 @@ pub enum ValidationError {
         location: String,
         reason: String,
     },
+    /// An HTTP path (`WebhookUpdate.path`, `LongPollRoute.path`,
+    /// `api.base_path`) that axum 0.8 would panic on at mount time or
+    /// silently interpret as a capture instead of a literal segment.
+    InvalidPath {
+        path: String,
+        location: String,
+        reason: &'static str,
+    },
     /// `dark_threads: 0` panics deep inside `tokio::runtime::Builder`.
     DarkThreadsZero,
     /// `log_level` is not one of trace/debug/info/warn/error/off
@@ -132,6 +140,12 @@ impl fmt::Display for ValidationError {
                 f,
                 "duplicate HTTP path {path:?}: registered by {first} and {second} \
                  (hint: each LongPollRoute / WebhookUpdate path must be unique within the process)"
+            ),
+            ValidationError::InvalidPath { path, location, reason } => write!(
+                f,
+                "{location}: HTTP path {path:?} is invalid ({reason}) \
+                 (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
+                 or segments starting with `:` / `*`)"
             ),
             ValidationError::InvalidWebhookUrl { url, location, reason } => write!(
                 f,

@@ -142,7 +142,7 @@ Variants must match `RouteConfig` / `UpdateConfig` exactly. The HTTP API `POST /
 ## Runtime / Tooling
 
 - **Rust** edition 2021, stable toolchain (no `rust-toolchain` pin). Tokio multi-threaded runtime with `dark_threads` workers.
-- **Async runtime is fixed**: tokio + axum 0.7 + axum-server 0.8 (TLS via rustls) + reqwest 0.11 (rustls). Do not introduce alternative HTTP / TLS stacks.
+- **Async runtime is fixed**: tokio + axum 0.8 + axum-server 0.8 (TLS via rustls) + reqwest 0.13 (rustls-only, `default-features = false`; aws-lc-rs provider + platform verifier, no OpenSSL / native-tls). Do not introduce alternative HTTP / TLS stacks.
 - **Config format**: RON 0.12 only. JSON-shaped types in `src/api/schemas.rs` use `serde` + `serde_json`.
 - **Python integration** (`integrations/pytgin/`, `examples/simple/`): managed with `uv`, not pip.
 - No package manager wrappers, no `Makefile` at the repo root — interact with the project through `cargo` directly.

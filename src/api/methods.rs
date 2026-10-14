@@ -125,9 +125,9 @@ fn validate_longpoll_path(path: &str, kind: &str) -> Result<(), ApiError> {
             "{kind} requires a non-empty `path`"
         )));
     }
-    if !path.starts_with('/') {
+    if let Some(reason) = crate::config::setup::path_violation(path) {
         return Err(ApiError::BadRequest(format!(
-            "{kind} `path` must start with `/`, got `{path}`"
+            "{kind} `path` {reason}, got `{path}`"
         )));
     }
     Ok(())
@@ -349,6 +349,21 @@ mod tests {
             other => panic!("expected BadRequest, got {:?}", other),
         }
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Paths axum 0.8 would panic on or treat as a capture are rejected
+    /// before they reach the router.
+    #[tokio::test]
+    async fn add_longpull_path_with_capture_syntax_returns_400() {
+        for path in ["/bot/{id}", "/bot/:id", "/bot/*rest"] {
+            let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
+            let body = AddRouteSch {
+                r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: path.into(), max_buffered_updates: None }),
+            };
+            let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
+            assert!(matches!(res, Err(ApiError::BadRequest(_))), "{path}: {res:?}");
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// `remove_route` MUST apply the same path-shape check as `add_route` so

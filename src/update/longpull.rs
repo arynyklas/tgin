@@ -5,7 +5,7 @@ use crate::observe::UpdaterMetrics;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::RETRY_AFTER;
 use reqwest::{header::HeaderMap, Client, StatusCode};
 use serde::Deserialize;

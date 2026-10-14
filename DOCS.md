@@ -150,6 +150,8 @@ api: Some(ApiConfig(
 
 Routes are nested under `base_path` and share the same listener as the ingress endpoints.
 
+Every HTTP path (`WebhookUpdate.path`, `LongPollRoute.path`, `api.base_path`, and `Longpull` paths added via `POST /api/route`) is matched literally and must start with `/`; paths containing `{` or `}`, or with a segment starting with `:` or `*`, are rejected (an `InvalidPath` validation error at startup, `400` at runtime), and `api.base_path` may not be `/`.
+
 > **Authentication:** these endpoints are unauthenticated unless the top-level `auth_token` is set, in which case every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)). They mutate the routing tree, so restrict access at the network layer regardless.
 
 | Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                                                                                             |
@@ -163,7 +165,7 @@ Status codes are honest about the outcome — the API used to return 200 for eve
 | Status | Meaning                                                                                                                                                                                                                                  |
 |--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `200`  | Mutation applied (or, for `GET /routes`, snapshot returned).                                                                                                                                                                             |
-| `400`  | Caller-supplied input is malformed: empty `url` or `path`, a `path` that doesn't start with `/`, a `url` that fails `reqwest::Url::parse` or whose scheme is not `http`/`https`, or a body that fails to deserialize against the schema. |
+| `400`  | Caller-supplied input is malformed: empty `url` or `path`, a `path` that doesn't start with `/` or contains `{`/`}` or a segment starting with `:`/`*`, a `url` that fails `reqwest::Url::parse` or whose scheme is not `http`/`https`, or a body that fails to deserialize against the schema. |
 | `404`  | `DELETE /route` target is not present anywhere in the tree.                                                                                                                                                                              |
 | `409`  | `POST /route` cannot attach a child to the current top-level route — e.g. it is a leaf (`WebhookRoute` / `LongPollRoute`) rather than a load balancer. Wrap the static config in an LB to make dynamic adds work.                        |
 | `500`  | Control plane itself failed (channel closed, response dropped). This is a tgin bug, not a caller bug.                                                                                                                                    |

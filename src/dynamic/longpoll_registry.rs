@@ -12,7 +12,7 @@
 //! the surface area small.
 
 use arc_swap::ArcSwap;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,8 +20,8 @@ use crate::route::longpull::LongPollRoute;
 
 type Registry = HashMap<String, Arc<LongPollRoute>>;
 
-static LONGPOLL_REGISTRY: Lazy<ArcSwap<Registry>> =
-    Lazy::new(|| ArcSwap::from_pointee(Registry::new()));
+static LONGPOLL_REGISTRY: LazyLock<ArcSwap<Registry>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Registry::new()));
 
 /// Look up a long-poll route by its `getUpdates` path.
 pub fn get(path: &str) -> Option<Arc<LongPollRoute>> {
