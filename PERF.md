@@ -107,7 +107,8 @@ cd tgin/tests/performance
 # Defaults: DURATION=30 RUNS=3.
 ./benchmark.sh
 
-# Regenerate the charts under diagram/generated/ from the newest results/*.csv.
+# Regenerate the charts under diagram/generated/ from the most recently modified
+# results/*.csv (pass CSV paths to `uv run main.py` to choose a specific run).
 cd diagram
 uv run main.py
 ```

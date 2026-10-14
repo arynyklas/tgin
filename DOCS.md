@@ -45,7 +45,7 @@ Errors on the egress path are logged and counted, never retried. A failing downs
 
 - **Between tgin and downstream bots, delivery is at most once.** A `WebhookRoute` sends each update once, with no retries. A `LongPollRoute` removes updates from its buffer when it returns them in a `getUpdates` response; if that response never reaches the bot (the bot crashed mid-request, the connection dropped), those updates are lost.
 - **Webhook ingress acknowledges on enqueue.** tgin answers Telegram `200` once the update is in the dispatch queue, before any downstream has it. Telegram does not redeliver an acknowledged update.
-- **Long-poll ingress can redeliver after a restart.** Telegram treats a batch as confirmed only when the next `getUpdates` call carries a higher `offset`. The last batch fetched before tgin stops is never confirmed, so Telegram returns it again on the next start and downstreams can see those updates twice.
+- **Long-poll ingress can redeliver after a stop in a narrow window.** tgin confirms a batch to Telegram with its next `getUpdates` call, whose `offset` is past the batch. If tgin stops after receiving a batch but before that next call (for example while it waits for room in a full dispatch queue, during `default_timeout_sleep`, or because it was killed in that window), the batch is not confirmed and Telegram returns it on the next start, so downstreams can see those updates twice.
 - **Everything buffered lives in process memory.** If the process is killed rather than drained, updates in the dispatch queue and in long-poll route buffers are lost. See [Lifecycle & shutdown](#lifecycle--shutdown) for what a graceful stop delivers.
 
 ## Quick start
@@ -59,7 +59,7 @@ TOKEN=123456:ABC TGIN_AUTH_TOKEN=$(openssl rand -hex 32) ./target/release/tgin -
 
 The shipped `tgin.ron` reads the bot token from `TOKEN` and, because it enables the management API, the API secret from `TGIN_AUTH_TOKEN`. Building requires Rust 1.88 or newer and a C compiler for `aws-lc-sys` (the TLS crypto backend).
 
-The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs. Every unset variable is listed on stderr and tgin exits with code `1`.
+The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs, everywhere in the file, including comments. Every unset variable is listed on stderr and tgin exits with code `1`.
 
 Prebuilt release archives and the container image are listed in the [README](README.md#install-a-release); [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify their build provenance.
 
@@ -143,13 +143,13 @@ Exposes `POST <path>` as a Telegram-shaped `getUpdates` endpoint that downstream
 | Field                  | Type     | Default  | Description |
 |------------------------|----------|----------|-------------|
 | `path`                 | `String` | required | Local URL path the downstream bot polls (e.g. `/bot1/getUpdates`). |
-| `max_buffered_updates` | `usize`  | `10000`  | Cap on the buffer (values below 1 become 1). When full, the oldest update is evicted to make room and counted in `queue_dropped_total`. Telegram itself keeps undelivered updates for about 24 h, so tgin's buffer is best-effort recovery, not the system of record. |
+| `max_buffered_updates` | `usize`  | `10000`  | Cap on the buffer (values below 1 become 1). When full, the oldest update is evicted to make room; evicted updates are lost and counted in `queue_dropped_total`. tgin has already confirmed them to Telegram, so they cannot be fetched from Telegram again. |
 
 How a poll is answered:
 
 - **Drain-on-read.** A poll removes up to `limit` updates from the buffer and returns them as `{"ok":true,"result":[...]}`. An update is handed out once; this is at-most-once delivery (see [Delivery semantics](#delivery-semantics)).
 - **`offset` is ignored**, and so is `allowed_updates`. Bots may keep sending them, but they do not filter or acknowledge anything. Several bots polling the same path split its updates between them; each update goes to whichever poll takes it first.
-- **Parameters** come from the request body, either `application/json` or `application/x-www-form-urlencoded`; an empty body means all defaults. `limit` defaults to 100 and is clamped to 1–100. `timeout` defaults to 0 (answer at once) and is capped at 50 s; with a timeout, a poll on an empty buffer waits until an update arrives or the timeout expires, then answers with an empty `result`.
+- **Parameters** come from the request body, either `application/json` or `application/x-www-form-urlencoded`. An empty body without a JSON content type means all defaults; an empty body sent with `Content-Type: application/json` is malformed JSON and gets the error envelope below. `limit` defaults to 100 and is clamped to 1–100. `timeout` defaults to 0 (answer at once) and is capped at 50 s; with a timeout, a poll on an empty buffer waits until an update arrives or the timeout expires, then answers with an empty `result`.
 - **Errors** follow the Bot API convention: a malformed body gets HTTP `200` with `{"ok":false,"error_code":400,...}`. Request bodies are capped at 8 KiB.
 - **During shutdown** a poll on an empty buffer is held for at most 500 ms; see [Lifecycle & shutdown](#lifecycle--shutdown).
 
@@ -398,14 +398,14 @@ docker run -d --name tgin \
 
 ## Configuration example
 
-`${VAR}` placeholders are pulled from the process environment before parsing.
+`${VAR}` placeholders are pulled from the process environment before parsing. They are substituted everywhere in the file, comments included, so a commented-out line that contains a placeholder still needs that variable set; the commented lines below use literal values for that reason.
 
 ```ron
 (
     dark_threads: 6,
     server_port: Some(3000),
     // api: Some(ApiConfig(base_path: "/api")),
-    // auth_token: Some("${TGIN_AUTH_TOKEN}"),  // required when `api` is set
+    // auth_token: Some("change-me"),  // required when `api` is set; use a long random secret
     // ssl: Some(SslConfig(cert: "/cert.pem", key: "/privkey.pem")),
     updates: [
         LongPollUpdate(
@@ -413,7 +413,7 @@ docker run -d --name tgin \
         ),
         // WebhookUpdate(
         //     path: "/bot/pull",
-        //     secret_token: Some("${WEBHOOK_SECRET}"),
+        //     secret_token: Some("change-me"),
         // ),
     ],
     route: RoundRobinLB(
