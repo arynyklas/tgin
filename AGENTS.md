@@ -60,7 +60,7 @@ All async trait methods use `#[async_trait]`.
 
 - `Cargo.toml` — single binary, edition 2021, no custom features/profiles.
 - `tgin.ron` — root example config, demonstrates `${TOKEN}` substitution.
-- `Dockerfile` — multi-stage `rust:slim-bookworm` → `debian:bookworm-slim`, runs as `tginuser`, `CMD ["tgin","-f","/etc/tgin/config.ron"]`.
+- `Dockerfile` — BuildKit multi-stage: `rust:<ver>-alpine` builds a static musl binary → `gcr.io/distroless/static-debian13` (pinned by digest), runs as numeric `65532:65532`, `ENTRYPOINT ["/usr/local/bin/tgin"]`, `CMD ["-f","/etc/tgin/config.ron"]`, OCI labels from build args `VERSION`/`REVISION`/`CREATED`.
 - `DOCS.md` — full configuration reference and HTTP API table.
 - `PERF.md` — benchmark methodology and latest numbers.
 

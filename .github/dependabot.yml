@@ -1,0 +1,60 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+      - "/tests/performance/benchmark"
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: docker
+    directories:
+      - "/"
+      - "/tests/performance/benchmark"
+      - "/tests/performance/bot"
+      - "/examples/simple"
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: uv
+    directories:
+      - "/examples/simple"
+      - "/tests/performance/diagram"
+    schedule:
+      interval: weekly
+    groups:
+      uv:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: "/tests/performance/bot"
+    schedule:
+      interval: weekly
+    groups:
+      pip:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
