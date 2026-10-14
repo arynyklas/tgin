@@ -13,7 +13,9 @@
 //! identity so a misconfigured route URL or path carrying a bot token never
 //! leaks through `/status` or `/metrics`.
 
+use std::ffi::OsStr;
 use std::fmt::Write;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -50,8 +52,23 @@ pub fn init(log_level: &str, log_format: LogFormat) {
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     match log_format {
         LogFormat::Json => builder.json().init(),
-        LogFormat::Compact => builder.compact().init(),
+        LogFormat::Compact => {
+            let ansi = use_ansi(
+                std::io::stdout().is_terminal(),
+                std::env::var_os("NO_COLOR").as_deref(),
+            );
+            builder.compact().with_ansi(ansi).init()
+        }
     }
+}
+
+/// Whether `Compact` logs get ANSI colours: only when stdout is a terminal
+/// (`docker logs` and log files get plain text) and `NO_COLOR` is unset or
+/// empty (<https://no-color.org>). Decided here because `with_ansi`
+/// overrides tracing-subscriber's own `NO_COLOR` check, which never looks
+/// at the terminal.
+fn use_ansi(is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
 /// Counters for one ingress adapter (updater). Shared as an `Arc` between the
@@ -402,6 +419,26 @@ pub fn dispatch_span(update: &Bytes) -> tracing::Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_use_ansi() {
+        let set = |v: &'static str| Some(OsStr::new(v));
+        for (is_terminal, no_color, want) in [
+            (true, None, true),
+            (true, set(""), true),
+            (true, set("1"), false),
+            (true, set("0"), false),
+            (false, None, false),
+            (false, set(""), false),
+            (false, set("1"), false),
+        ] {
+            assert_eq!(
+                use_ansi(is_terminal, no_color),
+                want,
+                "is_terminal={is_terminal} NO_COLOR={no_color:?}"
+            );
+        }
+    }
 
     fn sample_tree() -> Value {
         json!({
