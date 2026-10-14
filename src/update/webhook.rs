@@ -101,7 +101,12 @@ impl WebhookUpdate {
                     tracing::error!(path = %self.path, status = resp.status().as_u16(), "failed to set webhook");
                 }
             }
-            Err(e) => tracing::error!(path = %self.path, error = %e.without_url(), "network error setting webhook"),
+            Err(e) => tracing::error!(
+                path = %self.path,
+                url = %TELEGRAM_TOKEN_RE.replace_all(&config.set_webhook_url, "#####"),
+                error = ?e.without_url(),
+                "network error setting webhook"
+            ),
         }
     }
 }

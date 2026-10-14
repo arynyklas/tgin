@@ -72,7 +72,7 @@ impl Routeable for WebhookRoute {
                 self.http_error.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
-                    error = %err.without_url(),
+                    error = ?err.without_url(),
                     "webhook downstream request failed"
                 );
             }

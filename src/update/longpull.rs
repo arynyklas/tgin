@@ -173,7 +173,7 @@ impl Updater for LongPollUpdate {
             let response = match response {
                 Ok(r) => r,
                 Err(err) => {
-                    tracing::warn!(url = %redacted_url, error = %err.without_url(), "long-poll network error");
+                    tracing::warn!(url = %redacted_url, error = ?err.without_url(), "long-poll network error");
                     self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
@@ -240,7 +240,7 @@ impl Updater for LongPollUpdate {
             let body = match response.bytes().await {
                 Ok(b) => b,
                 Err(err) => {
-                    tracing::warn!(url = %redacted_url, error = %err.without_url(), "long-poll body read error");
+                    tracing::warn!(url = %redacted_url, error = ?err.without_url(), "long-poll body read error");
                     self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
