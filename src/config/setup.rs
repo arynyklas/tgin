@@ -126,13 +126,16 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
     // shadow at request time.
     let mut paths: HashMap<String, &'static str> = HashMap::new();
 
-    // Reserve the always-on observability endpoints so a configured route
-    // on either path surfaces as a clean `DuplicatePath` validation error
-    // instead of an axum duplicate-route panic at bind time. Only relevant
-    // when an HTTP server is actually mounted.
+    // Reserve the always-on observability endpoints and probes so a
+    // configured route on any of these paths surfaces as a clean
+    // `DuplicatePath` validation error instead of an axum duplicate-route
+    // panic at bind time. Only relevant when an HTTP server is actually
+    // mounted.
     if cfg.server_port.is_some() {
         paths.insert("/status".to_string(), "tgin /status endpoint");
         paths.insert("/metrics".to_string(), "tgin /metrics endpoint");
+        paths.insert("/livez".to_string(), "tgin /livez probe");
+        paths.insert("/readyz".to_string(), "tgin /readyz probe");
     }
 
     for (idx, upd) in cfg.updates.iter().enumerate() {
@@ -923,6 +926,22 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(
             e,
             ValidationError::DuplicatePath { path, .. } if path == "/metrics"
+        )));
+    }
+
+    /// The always-on `/livez` / `/readyz` probes are reserved like `/status`:
+    /// a route configured on either path must surface as `DuplicatePath`
+    /// rather than an axum duplicate-route panic at bind time.
+    #[test]
+    fn test_probe_paths_reserved() {
+        let cfg = base_config(RouteConfig::LongPollRoute {
+            path: "/readyz".to_string(),
+            max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+        });
+        let errs = validate(&cfg).expect_err("route on /readyz rejected");
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::DuplicatePath { path, .. } if path == "/readyz"
         )));
     }
 

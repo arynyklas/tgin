@@ -4,9 +4,11 @@ use crate::base::{
     AddRouteError, RemoveRouteError, RouteableComponent, Serverable, UpdaterComponent,
 };
 
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
@@ -106,6 +108,9 @@ impl Tgin {
         // produced by in-flight webhook handlers right up until the server is
         // done — then drain the backlog and exit.
         let drain = CancellationToken::new();
+        // Set by the shutdown coordinator as its first action, flipping
+        // `/readyz` to 503 so load balancers stop routing to this instance.
+        let draining = Arc::new(AtomicBool::new(false));
 
         let server: Option<(Handle<SocketAddr>, tokio::task::JoinHandle<()>)> =
             if let Some(port) = self.server_port {
@@ -121,22 +126,16 @@ impl Tgin {
                     router = api.set_server(router).await;
                 }
 
-                // Always-on observability endpoints, independent of the
-                // management API. Explicit routes take precedence over the
-                // `dynamic_handler` fallback, and take no `State`, so they are
-                // valid on `Router<Sender<Bytes>>`. The optional bearer gate
-                // shares the same `auth_token` as the management API.
-                let observe_routes = crate::utils::auth::guard(
-                    Router::<Sender<Bytes>>::new()
-                        .route("/status", get(crate::observe::status_handler))
-                        .route("/metrics", get(crate::observe::metrics_handler)),
-                    auth_token.clone(),
-                );
-                router = router.merge(observe_routes);
+                // Always-on observability endpoints and probes, independent
+                // of the management API. Explicit routes take precedence over
+                // the `dynamic_handler` fallback. `/status` and `/metrics`
+                // share the management API's optional bearer gate; `/livez`
+                // and `/readyz` stay open for orchestrator probes.
+                router = router.merge(observability_routes(auth_token.clone(), draining.clone()));
 
                 tracing::info!(
                     authenticated = auth_token.is_some(),
-                    "observability endpoints mounted (/status, /metrics)"
+                    "observability endpoints mounted (/status, /metrics, /livez, /readyz)"
                 );
 
                 let app = router.with_state(tx.clone());
@@ -201,25 +200,28 @@ impl Tgin {
             });
         }
 
-        // Graceful shutdown coordinator. On SIGTERM / Ctrl-C:
-        //   1. cancel `shutdown` so long-poll ingest stops pulling new updates
+        // Graceful shutdown coordinator. On a shutdown cause:
+        //   1. set `draining` so `/readyz` answers 503;
+        //   2. cancel `shutdown` so long-poll ingest stops pulling new updates
         //      from Telegram;
-        //   2. start the HTTP server's bounded graceful drain and wait for it
+        //   3. start the HTTP server's bounded graceful drain and wait for it
         //      to finish, so in-flight requests complete and no further
         //      webhook updates are produced;
-        //   3. cancel `drain` so the worker pool and control-plane loop finish
+        //   4. cancel `drain` so the worker pool and control-plane loop finish
         //      the buffered backlog and exit, letting `run_async` return.
         // The worker pool deliberately outlives the HTTP drain so updates
         // pushed by draining webhook handlers are still consumed, not dropped.
         {
             let shutdown = shutdown.clone();
             let drain = drain.clone();
+            let draining = draining.clone();
             tokio::spawn(async move {
-                shutdown_signal().await;
-                tracing::info!("shutdown signal received; draining");
+                let cause = shutdown_signal().await;
+                draining.store(true, Ordering::SeqCst);
+                tracing::info!(?cause, "shutdown signal received; draining");
                 shutdown.cancel();
                 if let Some(handle) = server_handle {
-                    handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+                    handle.graceful_shutdown(Some(cause.http_drain_grace()));
                 }
                 if let Some(task) = server_task {
                     let _ = task.await;
@@ -338,29 +340,120 @@ const UPDATE_CHANNEL_CAPACITY: usize = 1024;
 /// under the common 30 s orchestrator (k8s/systemd) kill window.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// Resolves on the first SIGTERM (Unix) or Ctrl-C (all platforms). On
-/// Windows there is no SIGTERM, so only Ctrl-C arms.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// HTTP drain deadline after the console window is closed. Windows kills
+/// the process about 5 s after `CTRL_CLOSE_EVENT`, so the drain must finish
+/// inside that window.
+#[cfg(windows)]
+const CTRL_CLOSE_GRACE: Duration = Duration::from_secs(4);
 
+/// Always-on observability routes. `/livez` always answers 200 while the
+/// process serves HTTP; `/readyz` answers 200 until `draining` is set, then
+/// 503. Both probes sit outside the bearer gate so orchestrators can probe
+/// without credentials; `/status` and `/metrics` stay behind it. The
+/// handlers take no `State`, so the router is valid on any state type.
+fn observability_routes(
+    auth_token: Option<String>,
+    draining: Arc<AtomicBool>,
+) -> Router<Sender<Bytes>> {
+    let guarded = crate::utils::auth::guard(
+        Router::new()
+            .route("/status", get(crate::observe::status_handler))
+            .route("/metrics", get(crate::observe::metrics_handler)),
+        auth_token,
+    );
+
+    Router::new()
+        .route("/livez", get(|| async { "ok" }))
+        .route(
+            "/readyz",
+            get(move || {
+                let ready = !draining.load(Ordering::SeqCst);
+                async move {
+                    if ready {
+                        (StatusCode::OK, "ready")
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "draining")
+                    }
+                }
+            }),
+        )
+        .merge(guarded)
+}
+
+/// What triggered shutdown. Variants are gated to the platform that can
+/// deliver them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownCause {
+    /// SIGTERM.
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
+    Terminate,
+    /// SIGINT on Unix, `CTRL_C_EVENT` on Windows.
+    CtrlC,
+    /// `CTRL_BREAK_EVENT`, also what `GenerateConsoleCtrlEvent` delivers to
+    /// a process group started with `CREATE_NEW_PROCESS_GROUP`.
+    #[cfg(windows)]
+    CtrlBreak,
+    /// `CTRL_CLOSE_EVENT`: the console window is closing.
+    #[cfg(windows)]
+    CtrlClose,
+    /// `CTRL_SHUTDOWN_EVENT`: the system is shutting down.
+    #[cfg(windows)]
+    CtrlShutdown,
+}
+
+impl ShutdownCause {
+    /// Deadline for the HTTP server's graceful drain.
+    fn http_drain_grace(self) -> Duration {
+        #[cfg(windows)]
+        if self == ShutdownCause::CtrlClose {
+            return CTRL_CLOSE_GRACE;
+        }
+        SHUTDOWN_GRACE
+    }
+}
+
+/// Await one signal listener, or never resolve if it could not be
+/// registered, so a registration failure does not shut the process down.
+macro_rules! signal_or_pending {
+    ($listener:expr, $name:literal) => {
+        async {
+            match $listener {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, signal = $name, "cannot listen for signal");
+                    std::future::pending::<()>().await;
+                }
             }
-            Err(_) => std::future::pending::<()>().await,
         }
     };
+}
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+/// Resolves with the first SIGTERM or SIGINT.
+#[cfg(unix)]
+async fn shutdown_signal() -> ShutdownCause {
+    use tokio::signal::unix::{signal, SignalKind};
 
     tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+        _ = signal_or_pending!(signal(SignalKind::interrupt()), "SIGINT") => ShutdownCause::CtrlC,
+        _ = signal_or_pending!(signal(SignalKind::terminate()), "SIGTERM") => ShutdownCause::Terminate,
+    }
+}
+
+/// Resolves with the first console control event: Ctrl-C, Ctrl-Break,
+/// console close, or system shutdown. For close and shutdown, tokio holds
+/// the OS handler open, so the process keeps running only until Windows'
+/// own kill deadline.
+#[cfg(windows)]
+async fn shutdown_signal() -> ShutdownCause {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+
+    tokio::select! {
+        _ = signal_or_pending!(ctrl_c(), "ctrl_c") => ShutdownCause::CtrlC,
+        _ = signal_or_pending!(ctrl_break(), "ctrl_break") => ShutdownCause::CtrlBreak,
+        _ = signal_or_pending!(ctrl_close(), "ctrl_close") => ShutdownCause::CtrlClose,
+        _ = signal_or_pending!(ctrl_shutdown(), "ctrl_shutdown") => ShutdownCause::CtrlShutdown,
     }
 }
 
@@ -671,5 +764,82 @@ mod tests {
         // Every buffered update was drained before the workers exited.
         assert_eq!(route.count().await, 16);
         drop(tx);
+    }
+
+    /// Build the observability sub-router with a throwaway update channel as
+    /// state, exactly as `run_async` attaches it before serving.
+    fn probe_app(auth_token: Option<String>, draining: Arc<AtomicBool>) -> Router {
+        let (tx, _rx) = mpsc::channel::<Bytes>(1);
+        observability_routes(auth_token, draining).with_state(tx)
+    }
+
+    async fn get_status_code(app: Router, path: &str) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+
+        app.oneshot(
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn test_livez_ok() {
+        let draining = Arc::new(AtomicBool::new(false));
+        let app = probe_app(None, draining.clone());
+        assert_eq!(
+            get_status_code(app.clone(), "/livez").await,
+            axum::http::StatusCode::OK
+        );
+
+        // Liveness is about the process, not the drain: it stays 200 while
+        // draining so an orchestrator never kills a process mid-drain.
+        draining.store(true, Ordering::SeqCst);
+        assert_eq!(
+            get_status_code(app, "/livez").await,
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_readyz_flips_to_503_when_draining() {
+        let draining = Arc::new(AtomicBool::new(false));
+        let app = probe_app(None, draining.clone());
+        assert_eq!(
+            get_status_code(app.clone(), "/readyz").await,
+            axum::http::StatusCode::OK
+        );
+
+        draining.store(true, Ordering::SeqCst);
+        assert_eq!(
+            get_status_code(app, "/readyz").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Probes sit outside the bearer gate (orchestrators probe without
+    /// credentials) while `/status` and `/metrics` stay behind it.
+    #[tokio::test]
+    async fn test_probes_unauthenticated_when_auth_token_set() {
+        let app = probe_app(Some("tok".to_string()), Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            get_status_code(app.clone(), "/readyz").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            get_status_code(app.clone(), "/livez").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            get_status_code(app.clone(), "/status").await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status_code(app, "/metrics").await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
     }
 }
