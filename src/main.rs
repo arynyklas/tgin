@@ -137,6 +137,8 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
 
     // Ingress shape for the all-ingress-failed shutdown: it fires only when
     // every long-poll updater has failed and no webhook can still deliver.
+    // Validation rejects a `WebhookUpdate` without `server_port`, so every
+    // configured webhook ingress is reachable.
     let long_poll_updaters = conf
         .updates
         .iter()

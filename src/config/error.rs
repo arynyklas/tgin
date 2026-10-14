@@ -86,6 +86,13 @@ pub enum ValidationError {
     /// `api` is set but `auth_token` is missing or blank. The management API
     /// rewrites the routing tree, so it is never mounted unauthenticated.
     ApiWithoutAuthToken,
+    /// A component that only works over HTTP (`WebhookUpdate`,
+    /// `LongPollRoute`, `api`) is configured without `server_port`, so
+    /// nothing can ever reach it.
+    RequiresServerPort {
+        location: String,
+        component: &'static str,
+    },
     /// `dark_threads: 0` panics deep inside `tokio::runtime::Builder`.
     DarkThreadsZero,
     /// `log_level` is not one of trace/debug/info/warn/error/off
@@ -172,6 +179,15 @@ impl fmt::Display for ValidationError {
                  anyone who can reach it rewrite the routing tree (hint: set \
                  auth_token: Some(\"${{TGIN_AUTH_TOKEN}}\") and generate the value with e.g. \
                  `openssl rand -hex 32`)"
+            ),
+            ValidationError::RequiresServerPort {
+                location,
+                component,
+            } => write!(
+                f,
+                "{location}: {component} is served over HTTP, but server_port is not set, so \
+                 nothing can ever reach it (hint: set server_port, e.g. server_port: Some(3000), \
+                 or remove the {component})"
             ),
             ValidationError::InvalidWebhookUrl {
                 url,

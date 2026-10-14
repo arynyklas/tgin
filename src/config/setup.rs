@@ -119,6 +119,10 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         check_ssl(ssl, &mut errs);
     }
 
+    // `WebhookUpdate`, `LongPollRoute` and `api` are reachable only through
+    // the HTTP listener; without `server_port` each is a validation error.
+    let has_http = cfg.server_port.is_some();
+
     // Every HTTP path that lands on the shared axum router. Includes both
     // ingress (`WebhookUpdate.path`) and the long-poll _routes_ that
     // `LongPollRoute` mounts as Telegram-shaped `getUpdates` endpoints.
@@ -131,7 +135,7 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
     // `DuplicatePath` validation error instead of an axum duplicate-route
     // panic at bind time. Only relevant when an HTTP server is actually
     // mounted.
-    if cfg.server_port.is_some() {
+    if has_http {
         paths.insert("/status".to_string(), "tgin /status endpoint");
         paths.insert("/metrics".to_string(), "tgin /metrics endpoint");
         paths.insert("/livez".to_string(), "tgin /livez probe");
@@ -146,6 +150,12 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
                 secret_token,
             } => {
                 let location = format!("updates[{idx}].WebhookUpdate");
+                if !has_http {
+                    errs.push(ValidationError::RequiresServerPort {
+                        location: location.clone(),
+                        component: "WebhookUpdate",
+                    });
+                }
                 check_path(path, &format!("{location}.path"), &mut errs);
                 if let Some(token) = secret_token {
                     let valid = (1..=256).contains(&token.len())
@@ -186,9 +196,15 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         }
     }
 
-    walk_route(&cfg.route, "route", &mut errs, &mut paths);
+    walk_route(&cfg.route, "route", has_http, &mut errs, &mut paths);
 
     if let Some(api) = &cfg.api {
+        if !has_http {
+            errs.push(ValidationError::RequiresServerPort {
+                location: "api".to_string(),
+                component: "api",
+            });
+        }
         if api.base_path == "/" {
             errs.push(ValidationError::InvalidPath {
                 path: api.base_path.clone(),
@@ -289,11 +305,18 @@ fn check_ssl(ssl: &SslConfig, errs: &mut Vec<ValidationError>) {
 fn walk_route(
     cfg: &RouteConfig,
     location: &str,
+    has_http: bool,
     errs: &mut Vec<ValidationError>,
     paths: &mut HashMap<String, &'static str>,
 ) {
     match cfg {
         RouteConfig::LongPollRoute { path, .. } => {
+            if !has_http {
+                errs.push(ValidationError::RequiresServerPort {
+                    location: location.to_string(),
+                    component: "LongPollRoute",
+                });
+            }
             check_path(path, &format!("{location}.path"), errs);
             if let Some(prev) = paths.insert(path.clone(), "LongPollRoute") {
                 errs.push(ValidationError::DuplicatePath {
@@ -314,7 +337,13 @@ fn walk_route(
                 });
             }
             for (i, child) in routes.iter().enumerate() {
-                walk_route(child, &format!("{location}.routes[{i}]"), errs, paths);
+                walk_route(
+                    child,
+                    &format!("{location}.routes[{i}]"),
+                    has_http,
+                    errs,
+                    paths,
+                );
             }
         }
         RouteConfig::AllLB { routes } => {
@@ -325,7 +354,13 @@ fn walk_route(
                 });
             }
             for (i, child) in routes.iter().enumerate() {
-                walk_route(child, &format!("{location}.routes[{i}]"), errs, paths);
+                walk_route(
+                    child,
+                    &format!("{location}.routes[{i}]"),
+                    has_http,
+                    errs,
+                    paths,
+                );
             }
         }
     }
@@ -782,16 +817,21 @@ mod tests {
 
     /// Telegram accepts `secret_token` only as 1–256 chars of `A-Za-z0-9_-`;
     /// anything else makes `setWebhook` fail at runtime, so reject it at load.
+    /// The empty string is rejected too: an empty secret would make the
+    /// constant-time compare accept a request without the header.
     #[test]
     fn test_secret_token_charset_validated() {
-        for bad in ["bad token!".to_string(), "a".repeat(257)] {
+        let webhook = |secret: &str| {
             let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
             cfg.updates = vec![UpdateConfig::WebhookUpdate {
                 path: "/bot".to_string(),
                 registration: None,
-                secret_token: Some(bad.clone()),
+                secret_token: Some(secret.to_string()),
             }];
-            let errs = validate(&cfg).expect_err("bad secret_token rejected");
+            cfg
+        };
+        for bad in [String::new(), "bad token!".to_string(), "a".repeat(257)] {
+            let errs = validate(&webhook(&bad)).expect_err("bad secret_token rejected");
             assert!(
                 matches!(
                     errs.as_slice(),
@@ -800,6 +840,11 @@ mod tests {
                 ),
                 "token {bad:?}: unexpected errors: {errs:?}"
             );
+        }
+        for good in ["a".to_string(), "a".repeat(256), "s3cret_-".to_string()] {
+            if let Err(errs) = validate(&webhook(&good)) {
+                panic!("token {good:?} rejected: {errs:?}");
+            }
         }
     }
 
@@ -833,6 +878,78 @@ mod tests {
                 "token {token:?}"
             );
         }
+    }
+
+    /// Each HTTP-only component is rejected without `server_port`: nothing
+    /// could ever reach it.
+    #[test]
+    fn test_webhook_update_requires_server_port() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.server_port = None;
+        cfg.updates = vec![UpdateConfig::WebhookUpdate {
+            path: "/bot".to_string(),
+            registration: None,
+            secret_token: None,
+        }];
+        let errs = validate(&cfg).expect_err("webhook ingress without server_port rejected");
+        assert_eq!(
+            errs,
+            vec![ValidationError::RequiresServerPort {
+                location: "updates[0].WebhookUpdate".to_string(),
+                component: "WebhookUpdate",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_longpoll_route_requires_server_port() {
+        let mut cfg = base_config(RouteConfig::RoundRobinLB {
+            routes: vec![wh_route("http://127.0.0.1:8080/bot"), lp_route("/bot1")],
+        });
+        cfg.server_port = None;
+        let errs = validate(&cfg).expect_err("long-poll route without server_port rejected");
+        assert_eq!(
+            errs,
+            vec![ValidationError::RequiresServerPort {
+                location: "route.routes[1]".to_string(),
+                component: "LongPollRoute",
+            }]
+        );
+    }
+
+    #[test]
+    fn test_api_requires_server_port() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.server_port = None;
+        cfg.api = Some(ApiConfig {
+            base_path: "/api".to_string(),
+        });
+        cfg.auth_token = Some("s3cret".to_string());
+        let errs = validate(&cfg).expect_err("api without server_port rejected");
+        assert_eq!(
+            errs,
+            vec![ValidationError::RequiresServerPort {
+                location: "api".to_string(),
+                component: "api",
+            }]
+        );
+    }
+
+    /// Without `server_port`, long-poll ingress feeding webhook routes is the
+    /// one valid shape.
+    #[test]
+    fn test_validate_ok_without_server_port() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.server_port = None;
+        cfg.updates = vec![UpdateConfig::LongPollUpdate {
+            token: "12345678:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345".to_string(),
+            url: None,
+            default_timeout_sleep: 0,
+            error_timeout_sleep: 0,
+            long_poll_timeout: 30,
+            long_poll_limit: 100,
+        }];
+        validate(&cfg).expect("long poll -> webhook route needs no HTTP listener");
     }
 
     // ---------- load_config ----------
