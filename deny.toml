@@ -1,0 +1,48 @@
+# cargo-deny configuration (cargo-deny 0.20). CI runs `cargo deny check` via
+# EmbarkStudios/cargo-deny-action; run it locally with the same command.
+
+[graph]
+all-features = false
+
+# Advisories: RustSec database, default severity handling (vulnerable,
+# unmaintained, unsound and yanked crates are errors).
+[advisories]
+
+[licenses]
+# Exactly the licenses the current dependency graph needs. Each entry names the
+# crates whose license expression cannot be satisfied without it.
+allow = [
+    # tgin itself (LICENSE), tokio, axum, hyper, tower, tracing and ~40 more
+    "MIT",
+    # sync_wrapper; aws-lc-sys (AND expression); ryu and dunce pick it over BSL-1.0 / CC0-1.0
+    "Apache-2.0",
+    # subtle, matchit (MIT AND BSD-3-Clause), aws-lc-sys
+    "BSD-3-Clause",
+    # rustls-webpki, untrusted, aws-lc-rs, aws-lc-sys
+    "ISC",
+    # icu_* / zerovec / yoke / zerofrom / tinystr / litemap / writeable /
+    # potential_utf (via url -> idna), unicode-ident
+    "Unicode-3.0",
+    # webpki-root-certs (via rustls-platform-verifier)
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+# The TLS stack is rustls + aws-lc-rs only. ring 0.17 appears in Cargo.lock as
+# an inactive optional dependency of quinn-proto / rustls-webpki
+# (rust-lang/cargo#10801) but is not part of the resolved graph checked here.
+deny = [
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+    { crate = "ring" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
