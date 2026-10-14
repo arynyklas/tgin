@@ -32,6 +32,9 @@ tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["test-util"] }
 wiremock = "0.6.5"
