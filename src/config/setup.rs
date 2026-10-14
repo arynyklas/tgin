@@ -1099,6 +1099,14 @@ mod tests {
             .any(|e| matches!(e, ValidationError::InvalidLogLevel { value } if value == "loud")));
     }
 
+    #[test]
+    fn test_invalid_log_level_redacts_token() {
+        let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+        cfg.log_level = TOKEN.to_string();
+        let errs = validate(&cfg).expect_err("token-shaped log_level rejected");
+        assert_redacted(&ConfigError::Validation(errs));
+    }
+
     /// A route configured on a reserved observability path collides with the
     /// always-on `/status` / `/metrics` endpoints and must be rejected.
     #[test]

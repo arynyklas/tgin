@@ -164,9 +164,9 @@ impl fmt::Display for ValidationError {
             } => {
                 let path = redact(path);
                 write!(
-                f,
-                "duplicate HTTP path {path:?}: registered by {first} and {second} \
-                 (hint: each LongPollRoute / WebhookUpdate path must be unique within the process)"
+                    f,
+                    "duplicate HTTP path {path:?}: registered by {first} and {second} \
+                     (hint: each LongPollRoute / WebhookUpdate path must be unique within the process)"
                 )
             }
             ValidationError::InvalidPath {
@@ -176,10 +176,10 @@ impl fmt::Display for ValidationError {
             } => {
                 let path = redact(path);
                 write!(
-                f,
-                "{location}: HTTP path {path:?} is invalid ({reason}) \
-                 (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
-                 or segments starting with `:` / `*`)"
+                    f,
+                    "{location}: HTTP path {path:?} is invalid ({reason}) \
+                     (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
+                     or segments starting with `:` / `*`)"
                 )
             }
             ValidationError::InvalidSecretToken { location } => write!(
@@ -210,9 +210,9 @@ impl fmt::Display for ValidationError {
             } => {
                 let url = redact(url);
                 write!(
-                f,
-                "{location}: WebhookRoute.url {url:?} is not a valid absolute URL ({reason}) \
-                 (hint: use an absolute http(s):// URL, e.g. \"http://127.0.0.1:8080/bot\")"
+                    f,
+                    "{location}: WebhookRoute.url {url:?} is not a valid absolute URL ({reason}) \
+                     (hint: use an absolute http(s):// URL, e.g. \"http://127.0.0.1:8080/bot\")"
                 )
             }
             ValidationError::InvalidPublicIp {
@@ -222,10 +222,10 @@ impl fmt::Display for ValidationError {
             } => {
                 let url = redact(url);
                 write!(
-                f,
-                "{location}: registration.public_ip {url:?} is not a valid absolute URL \
-                 ({reason}) (hint: use the public https:// origin Telegram will reach, \
-                 e.g. \"https://example.com\")"
+                    f,
+                    "{location}: registration.public_ip {url:?} is not a valid absolute URL \
+                     ({reason}) (hint: use the public https:// origin Telegram will reach, \
+                     e.g. \"https://example.com\")"
                 )
             }
             ValidationError::InvalidSetWebhookUrl {
@@ -235,20 +235,23 @@ impl fmt::Display for ValidationError {
             } => {
                 let url = redact(url);
                 write!(
-                f,
-                "{location}: registration.set_webhook_url {url:?} is not a valid absolute URL \
-                 ({reason})"
+                    f,
+                    "{location}: registration.set_webhook_url {url:?} is not a valid absolute URL \
+                     ({reason})"
                 )
             }
             ValidationError::DarkThreadsZero => write!(
                 f,
                 "dark_threads: 0 is not supported (hint: omit the field for default 4, or set >= 1)"
             ),
-            ValidationError::InvalidLogLevel { value } => write!(
-                f,
-                "log_level {value:?} is not a recognised level \
-                 (hint: use one of trace, debug, info, warn, error, off)"
-            ),
+            ValidationError::InvalidLogLevel { value } => {
+                let value = redact(value);
+                write!(
+                    f,
+                    "log_level {value:?} is not a recognised level \
+                     (hint: use one of trace, debug, info, warn, error, off)"
+                )
+            }
             ValidationError::SslFileUnreadable {
                 field,
                 path,
