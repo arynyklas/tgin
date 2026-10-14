@@ -72,7 +72,7 @@ impl Routeable for WebhookRoute {
                 self.http_error.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
-                    error = %err,
+                    error = %err.without_url(),
                     "webhook downstream request failed"
                 );
             }
@@ -89,7 +89,7 @@ impl Serverable for WebhookRoute {}
 #[async_trait]
 impl Printable for WebhookRoute {
     async fn print(&self) -> String {
-        format!("webhook: {}", self.url)
+        format!("webhook: {}", TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"))
     }
 
     async fn json_struct(&self) -> Value {
@@ -149,6 +149,40 @@ mod tests {
 
         let payload = json!({"test": "data"});
         route.process(Bytes::from(serde_json::to_vec(&payload).unwrap())).await;
+    }
+
+    const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn test_egress_error_log_redacts_url() {
+        let route = WebhookRoute::new(
+            format!("http://127.0.0.1:{}/hook/{TOKEN}", closed_port()),
+            test_client(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+
+        let ((), logs) =
+            crate::utils::testlog::capture_logs(route.process(Bytes::from_static(b"{}"))).await;
+
+        assert!(logs.contains("webhook downstream request failed"), "logs: {logs}");
+        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
+    }
+
+    #[tokio::test]
+    async fn test_banner_redacts_webhook_url() {
+        let route = WebhookRoute::new(
+            format!("http://127.0.0.1:{}/hook/{TOKEN}", closed_port()),
+            test_client(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+
+        let banner = route.print().await;
+
+        assert!(!banner.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "banner: {banner}");
     }
 
     #[tokio::test]

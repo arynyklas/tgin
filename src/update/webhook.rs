@@ -101,7 +101,7 @@ impl WebhookUpdate {
                     tracing::error!(path = %self.path, status = resp.status().as_u16(), "failed to set webhook");
                 }
             }
-            Err(e) => tracing::error!(path = %self.path, error = %e, "network error setting webhook"),
+            Err(e) => tracing::error!(path = %self.path, error = %e.without_url(), "network error setting webhook"),
         }
     }
 }
@@ -262,6 +262,23 @@ mod tests {
         let (tx, _) = mpsc::channel(1);
 
         updater.start(tx, CancellationToken::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_register_webhook_error_log_redacts_token() {
+        const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let mut reg_config =
+            RegistrationWebhookConfig::new(TOKEN.to_string(), "https://my-server.com".to_string(), client);
+        reg_config.set_webhook_url(format!("http://127.0.0.1:{closed}/bot{TOKEN}/setWebhook"));
+        let updater = WebhookUpdate::new("/webhook".to_string());
+
+        let ((), logs) =
+            crate::utils::testlog::capture_logs(updater.register_webhook(&reg_config)).await;
+
+        assert!(logs.contains("network error setting webhook"), "logs: {logs}");
+        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
     }
 
     #[tokio::test]

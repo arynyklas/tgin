@@ -173,7 +173,7 @@ impl Updater for LongPollUpdate {
             let response = match response {
                 Ok(r) => r,
                 Err(err) => {
-                    tracing::warn!(url = %redacted_url, error = ?err, "long-poll network error");
+                    tracing::warn!(url = %redacted_url, error = %err.without_url(), "long-poll network error");
                     self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
@@ -240,7 +240,7 @@ impl Updater for LongPollUpdate {
             let body = match response.bytes().await {
                 Ok(b) => b,
                 Err(err) => {
-                    tracing::warn!(url = %redacted_url, error = ?err, "long-poll body read error");
+                    tracing::warn!(url = %redacted_url, error = %err.without_url(), "long-poll body read error");
                     self.metrics.record_poll_failure();
                     note_consecutive_failure(
                         &mut consecutive_failures,
@@ -436,6 +436,8 @@ mod tests {
     fn test_client() -> Client {
         Client::builder().no_proxy().build().unwrap()
     }
+
+    const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn build_updater(server: &MockServer) -> LongPollUpdate {
         let mut updater = LongPollUpdate::new("MYTOKEN".to_string(), test_client());
@@ -660,6 +662,35 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_network_error_log_redacts_token() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // Windows retries refused connects for ~2 s; a short connect timeout
+        // makes the network error surface within the 300 ms window everywhere.
+        let client = Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let mut updater = LongPollUpdate::new(TOKEN.to_string(), client);
+        updater.set_url(format!("http://127.0.0.1:{closed}/bot{TOKEN}/getUpdates"));
+        let (tx, _rx) = mpsc::channel(10);
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+
+        let ((), logs) = crate::utils::testlog::capture_logs(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                cancel.cancel();
+            });
+            updater.start(tx, shutdown).await;
+        })
+        .await;
+
+        assert!(logs.contains("long-poll network error"), "logs: {logs}");
+        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
     }
 
     #[test]
