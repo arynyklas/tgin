@@ -120,9 +120,8 @@ impl LongPollRoute {
         let updates = self.updates.clone();
         let notify = self.notify.clone();
 
-        let timeout_sec = params.timeout.unwrap_or(0);
+        let duration = effective_timeout(params.timeout);
         let start_time = tokio::time::Instant::now();
-        let duration = Duration::from_secs(timeout_sec);
 
         loop {
             // Sync mutex: every critical section is push_back / pop_front /
@@ -136,8 +135,7 @@ impl LongPollRoute {
                 if lock.is_empty() {
                     None
                 } else {
-                    let limit = params.limit.unwrap_or(1000) as usize;
-                    let take = limit.min(lock.len());
+                    let take = effective_limit(params.limit).min(lock.len());
                     Some(lock.drain(..take).collect())
                 }
             };
@@ -147,7 +145,7 @@ impl LongPollRoute {
                 return build_get_updates_response(&batch);
             }
 
-            if timeout_sec == 0 || start_time.elapsed() >= duration {
+            if duration.is_zero() || start_time.elapsed() >= duration {
                 return build_get_updates_response(&[]);
             }
 
@@ -166,6 +164,27 @@ impl LongPollRoute {
             Err(()) => get_updates_error(400, "invalid request body"),
         }
     }
+}
+
+/// Telegram's `getUpdates` default and maximum batch size.
+const GET_UPDATES_MAX_LIMIT: usize = 100;
+
+/// Upper bound on a long-poll hold. Telegram's documented ceiling is 50 s;
+/// an unbounded client value would pin a connection and a task indefinitely.
+const GET_UPDATES_MAX_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// Batch size for a `getUpdates` poll: Telegram's semantics — default 100,
+/// clamped to `1..=100`.
+fn effective_limit(requested: Option<u64>) -> usize {
+    requested.map_or(GET_UPDATES_MAX_LIMIT, |limit| {
+        limit.clamp(1, GET_UPDATES_MAX_LIMIT as u64) as usize
+    })
+}
+
+/// Long-poll hold for a `getUpdates` poll: default 0 (short poll), capped at
+/// [`GET_UPDATES_MAX_TIMEOUT`].
+fn effective_timeout(requested: Option<u64>) -> Duration {
+    Duration::from_secs(requested.unwrap_or(0)).min(GET_UPDATES_MAX_TIMEOUT)
 }
 
 /// Parse `getUpdates` params from a raw request body, accepting both
@@ -467,6 +486,69 @@ mod tests {
 
         assert_eq!(results.len(), 0);
         assert!(duration.as_millis() >= 1000);
+    }
+
+    #[tokio::test]
+    async fn test_default_batch_is_100() {
+        let route = LongPollRoute::new("/test".to_string());
+        for i in 0..150 {
+            route.process(update_bytes(json!({"id": i}))).await;
+        }
+
+        let params = GetUpdatesParams {
+            limit: None,
+            ..default_params()
+        };
+        let body = read_body_json(route.handle_request(params).await).await;
+        let results = body["result"].as_array().unwrap();
+        assert_eq!(results.len(), 100);
+        assert_eq!(results[0]["id"], 0);
+        assert_eq!(results[99]["id"], 99);
+
+        let rest = read_body_json(route.handle_request(default_params()).await).await;
+        assert_eq!(rest["result"].as_array().unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_limit_above_100_clamped() {
+        let route = LongPollRoute::new("/test".to_string());
+        for i in 0..150 {
+            route.process(update_bytes(json!({"id": i}))).await;
+        }
+
+        let params = GetUpdatesParams {
+            limit: Some(1000),
+            ..default_params()
+        };
+        let body = read_body_json(route.handle_request(params).await).await;
+        assert_eq!(body["result"].as_array().unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero_returns_one() {
+        let route = LongPollRoute::new("/test".to_string());
+        for i in 0..3 {
+            route.process(update_bytes(json!({"id": i}))).await;
+        }
+
+        let params = GetUpdatesParams {
+            limit: Some(0),
+            ..default_params()
+        };
+        let body = read_body_json(route.handle_request(params).await).await;
+        let results = body["result"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], 0);
+    }
+
+    #[test]
+    fn test_timeout_clamped_to_50s() {
+        assert_eq!(effective_timeout(None), Duration::ZERO);
+        assert_eq!(effective_timeout(Some(0)), Duration::ZERO);
+        assert_eq!(effective_timeout(Some(30)), Duration::from_secs(30));
+        assert_eq!(effective_timeout(Some(50)), Duration::from_secs(50));
+        assert_eq!(effective_timeout(Some(51)), Duration::from_secs(50));
+        assert_eq!(effective_timeout(Some(u64::MAX)), Duration::from_secs(50));
     }
 
     /// Wake property: once a `handle_request(timeout > 0)` is parked on
