@@ -1,0 +1,8 @@
+target/
+**/target/
+.git/
+dest/
+**/.venv/
+**/__pycache__/
+tests/performance/results/
+**/*.png
