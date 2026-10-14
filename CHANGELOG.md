@@ -47,8 +47,8 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 - tgin warns at startup for every `WebhookUpdate` without a `secret_token`:
   anyone who can reach that path can inject forged updates.
 - The management API can no longer run without authentication: enabling `api`
-  requires `auth_token`, and every `/api/*` request must send
-  `Authorization: Bearer <auth_token>`.
+  requires `auth_token`, and every `/api/*` request must send that token
+  in the `Authorization` header using the bearer scheme.
 
 ### Fixed
 

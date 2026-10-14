@@ -20,7 +20,13 @@
 # * `steps.cargo-cyclonedx.outputs.paths` in build-global-artifacts (the
 #   template reads `.output.paths`, which is always empty);
 # * `Install cargo-auditable` runs `cargo install cargo-auditable --locked
-#   --version 0.7.7` instead of piping the unpinned `releases/latest` installer.
+#   --version 0.7.7` instead of piping the unpinned `releases/latest` installer;
+# * the plan job's `val` output carries only the manifest's `ci` section. The
+#   runner drops any job output that looks like a credential (for example
+#   `Bearer <word>` in the release notes), and an empty `val` used to skip
+#   every build while the release still published;
+# * `build-local-artifacts` runs whenever publishing, so a missing build matrix
+#   fails the run instead of silently skipping the builds.
 
 name: Release
 # Local edit: dist grants `contents: write` here, to every job. Only the
@@ -91,7 +97,7 @@ jobs:
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "manifest=$(jq -c "{ci: .ci}" plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -104,7 +110,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
