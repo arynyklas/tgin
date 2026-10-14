@@ -17,6 +17,8 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::utils::defaults::redact;
+
 /// Top-level loader error. Wraps the per-stage failure so `main` can format
 /// a single human-readable message and exit non-zero.
 #[derive(Debug)]
@@ -126,7 +128,13 @@ impl fmt::Display for ConfigError {
                 }
                 write!(f, "hint: export the missing variables before starting tgin")
             }
-            ConfigError::Parse { source } => write!(f, "failed to parse RON config: {source}"),
+            ConfigError::Parse { source } => {
+                write!(
+                    f,
+                    "failed to parse RON config: {}",
+                    redact(&source.to_string())
+                )
+            }
             ConfigError::Validation(errs) => {
                 writeln!(f, "{} configuration validation error(s):", errs.len())?;
                 for (i, e) in errs.iter().enumerate() {
@@ -153,21 +161,27 @@ impl fmt::Display for ValidationError {
                 path,
                 first,
                 second,
-            } => write!(
+            } => {
+                let path = redact(path);
+                write!(
                 f,
                 "duplicate HTTP path {path:?}: registered by {first} and {second} \
                  (hint: each LongPollRoute / WebhookUpdate path must be unique within the process)"
-            ),
+                )
+            }
             ValidationError::InvalidPath {
                 path,
                 location,
                 reason,
-            } => write!(
+            } => {
+                let path = redact(path);
+                write!(
                 f,
                 "{location}: HTTP path {path:?} is invalid ({reason}) \
                  (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
                  or segments starting with `:` / `*`)"
-            ),
+                )
+            }
             ValidationError::InvalidSecretToken { location } => write!(
                 f,
                 "{location}: secret_token is invalid (must be 1-256 characters of A-Z, a-z, 0-9, `_`, `-`) \
@@ -193,30 +207,39 @@ impl fmt::Display for ValidationError {
                 url,
                 location,
                 reason,
-            } => write!(
+            } => {
+                let url = redact(url);
+                write!(
                 f,
                 "{location}: WebhookRoute.url {url:?} is not a valid absolute URL ({reason}) \
                  (hint: use an absolute http(s):// URL, e.g. \"http://127.0.0.1:8080/bot\")"
-            ),
+                )
+            }
             ValidationError::InvalidPublicIp {
                 url,
                 location,
                 reason,
-            } => write!(
+            } => {
+                let url = redact(url);
+                write!(
                 f,
                 "{location}: registration.public_ip {url:?} is not a valid absolute URL \
                  ({reason}) (hint: use the public https:// origin Telegram will reach, \
                  e.g. \"https://example.com\")"
-            ),
+                )
+            }
             ValidationError::InvalidSetWebhookUrl {
                 url,
                 location,
                 reason,
-            } => write!(
+            } => {
+                let url = redact(url);
+                write!(
                 f,
                 "{location}: registration.set_webhook_url {url:?} is not a valid absolute URL \
                  ({reason})"
-            ),
+                )
+            }
             ValidationError::DarkThreadsZero => write!(
                 f,
                 "dark_threads: 0 is not supported (hint: omit the field for default 4, or set >= 1)"

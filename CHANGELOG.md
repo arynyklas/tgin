@@ -38,6 +38,7 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
   `LongPollRoute.path`, a common webhook pattern) are redacted too: in log
   lines, startup banners, the warning for a webhook without `secret_token`,
   `/status` and `/api/routes`.
+- Startup configuration errors redact bot tokens in echoed URLs and paths.
 - `WebhookUpdate` now sends its `secret_token` to `setWebhook` when it
   registers the webhook, so Telegram includes the
   `X-Telegram-Bot-Api-Secret-Token` header that tgin checks. Previously a
@@ -62,7 +63,7 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 - Shutdown is bounded at about lame duck + grace + 1 s (≈ 21 s with the
   defaults), whatever the downstreams do. Once the HTTP plane has closed, the
   workers keep dispatching only until the end of the grace (at least 1 s after
-  the close); dispatches still in flight then are aborted. Updates still
+  the HTTP close begins); dispatches still in flight then are aborted. Updates still
   queued, aborted or left in long-poll buffers are logged once as `abandoned`.
   Previously a slow or dead webhook downstream could hold the process for
   its request timeout per queued update.

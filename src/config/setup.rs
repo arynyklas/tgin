@@ -993,6 +993,74 @@ mod tests {
         assert_parse_error_mentions(res, "tokn");
     }
 
+    // ---------- token redaction in rendered errors ----------
+
+    const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn assert_redacted(err: &ConfigError) {
+        let msg = err.to_string();
+        assert!(msg.contains("#####"), "token not redacted: {msg}");
+        assert!(!msg.contains(SECRET), "token leaked: {msg}");
+    }
+
+    #[test]
+    fn test_invalid_set_webhook_url_redacts_token() {
+        let ron = format!(
+            r#"(server_port: Some(3000), updates: [WebhookUpdate(path: "/hook", registration: Some((public_ip: "https://example.com", set_webhook_url: Some("htp://api.telegram.org/bot{TOKEN}/setWebhook"), token: "t")))], route: LongPollRoute(path: "/bot1/getUpdates"))"#
+        );
+        let err = load_str("redact-set-webhook", &ron).expect_err("bad scheme rejected");
+        assert!(
+            matches!(&err, ConfigError::Validation(v) if v.iter().any(|e| matches!(e, ValidationError::InvalidSetWebhookUrl { .. }))),
+            "{err}"
+        );
+        assert_redacted(&err);
+    }
+
+    #[test]
+    fn test_invalid_path_redacts_token() {
+        let ron = format!(
+            r#"(server_port: Some(3000), updates: [], route: LongPollRoute(path: "bot{TOKEN}/getUpdates"))"#
+        );
+        let err = load_str("redact-invalid-path", &ron).expect_err("no leading slash rejected");
+        assert!(
+            matches!(&err, ConfigError::Validation(v) if v.iter().any(|e| matches!(e, ValidationError::InvalidPath { .. }))),
+            "{err}"
+        );
+        assert_redacted(&err);
+    }
+
+    #[test]
+    fn test_duplicate_path_redacts_token() {
+        let ron = format!(
+            r#"(server_port: Some(3000), updates: [WebhookUpdate(path: "/{TOKEN}")], route: LongPollRoute(path: "/{TOKEN}"))"#
+        );
+        let err = load_str("redact-duplicate-path", &ron).expect_err("duplicate path rejected");
+        assert!(
+            matches!(&err, ConfigError::Validation(v) if v.iter().any(|e| matches!(e, ValidationError::DuplicatePath { .. }))),
+            "{err}"
+        );
+        assert_redacted(&err);
+    }
+
+    /// ron does not echo the value for the loader's own schema
+    /// (`server_port: Some("<token>")` renders only `Expected integer`), so
+    /// use a real ron error that does echo it: an internally tagged enum
+    /// names the unknown tag value verbatim.
+    #[test]
+    fn test_parse_error_redacts_token() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "t")]
+        enum Tagged {
+            #[allow(dead_code)]
+            A,
+        }
+        let source = ron::from_str::<Tagged>(&format!(r#"(t: "{TOKEN}")"#))
+            .expect_err("unknown tag rejected");
+        assert!(source.to_string().contains(SECRET), "ron echoes the tag");
+        assert_redacted(&ConfigError::Parse { source });
+    }
+
     /// Every config the repository ships must load under the strict schema.
     #[test]
     fn test_shipped_configs_load() {
