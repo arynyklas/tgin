@@ -8,7 +8,7 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-14
+## [0.2.0] - 2026-10-15
 
 ### Upgrade notes
 

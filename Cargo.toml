@@ -1,6 +1,6 @@
 [package]
 name = "tgin"
-version = "0.2.0"
+version = "0.2.0-rc.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Routing layer between the Telegram Bot API and downstream bot instances"
