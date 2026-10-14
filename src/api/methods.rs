@@ -60,9 +60,7 @@ pub async fn add_route(
     Ok(StatusCode::OK)
 }
 
-pub async fn get_routes(
-    State(tx): State<Sender<ApiMessage>>,
-) -> Result<Json<Value>, ApiError> {
+pub async fn get_routes(State(tx): State<Sender<ApiMessage>>) -> Result<Json<Value>, ApiError> {
     let (tx_response, rx_response) = oneshot::channel();
 
     tx.send(ApiMessage::GetRoutes(tx_response))
@@ -148,9 +146,7 @@ fn validate_webhook_url(url: &str, kind: &str) -> Result<(), ApiError> {
         )));
     }
     let parsed = reqwest::Url::parse(url).map_err(|err| {
-        ApiError::BadRequest(format!(
-            "{kind} `url` is not a valid URL ({err}): `{url}`"
-        ))
+        ApiError::BadRequest(format!("{kind} `url` is not a valid URL ({err}): `{url}`"))
     })?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ApiError::BadRequest(format!(
@@ -204,7 +200,10 @@ mod tests {
     async fn add_longpull_empty_path_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: String::new(), max_buffered_updates: None }),
+            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
+                path: String::new(),
+                max_buffered_updates: None,
+            }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
@@ -221,9 +220,7 @@ mod tests {
     async fn remove_empty_identifier_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = RmRouteSch {
-            r#type: RmRouteTypeSch::Webhook(RmWebhookRouteSch {
-                url: String::new(),
-            }),
+            r#type: RmRouteTypeSch::Webhook(RmWebhookRouteSch { url: String::new() }),
         };
 
         let res = remove_route(State(tx.clone()), Json(body)).await;
@@ -335,7 +332,10 @@ mod tests {
     async fn add_longpull_path_without_leading_slash_returns_400() {
         let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
         let body = AddRouteSch {
-            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: "bot/updates".into(), max_buffered_updates: None }),
+            r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
+                path: "bot/updates".into(),
+                max_buffered_updates: None,
+            }),
         };
 
         let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
@@ -358,10 +358,16 @@ mod tests {
         for path in ["/bot/{id}", "/bot/:id", "/bot/*rest"] {
             let (tx, mut rx) = mpsc::channel::<ApiMessage>(8);
             let body = AddRouteSch {
-                r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch { path: path.into(), max_buffered_updates: None }),
+                r#type: AddRouteTypeSch::Longpull(AddLongpullRouteSch {
+                    path: path.into(),
+                    max_buffered_updates: None,
+                }),
             };
             let res = add_route(State(tx), Extension(test_client()), Json(body)).await;
-            assert!(matches!(res, Err(ApiError::BadRequest(_))), "{path}: {res:?}");
+            assert!(
+                matches!(res, Err(ApiError::BadRequest(_))),
+                "{path}: {res:?}"
+            );
             assert!(rx.try_recv().is_err());
         }
     }
@@ -442,5 +448,4 @@ mod tests {
             assert!(rx.try_recv().is_err(), "{url}: leaked into channel");
         }
     }
-
 }

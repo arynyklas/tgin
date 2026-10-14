@@ -101,7 +101,10 @@ mod tests {
     #[test]
     fn bearer_authorized_requires_exact_scheme_and_token() {
         assert!(bearer_authorized(&headers_with(Some("Bearer tok")), "tok"));
-        assert!(!bearer_authorized(&headers_with(Some("Bearer wrong")), "tok"));
+        assert!(!bearer_authorized(
+            &headers_with(Some("Bearer wrong")),
+            "tok"
+        ));
         // Missing scheme, wrong-case scheme, and absent header all fail.
         assert!(!bearer_authorized(&headers_with(Some("tok")), "tok"));
         assert!(!bearer_authorized(&headers_with(Some("bearer tok")), "tok"));

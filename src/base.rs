@@ -175,7 +175,9 @@ mod tests {
         use crate::mock::routes::MockCallsRoute;
 
         let leaf = MockCallsRoute::new("leaf");
-        let res = leaf.remove_route(RouteId::Path("/anything".to_string())).await;
+        let res = leaf
+            .remove_route(RouteId::Path("/anything".to_string()))
+            .await;
         assert_eq!(res, Err(RemoveRouteError::NotFound));
     }
 }

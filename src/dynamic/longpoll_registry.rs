@@ -12,9 +12,9 @@
 //! the surface area small.
 
 use arc_swap::ArcSwap;
-use std::sync::LazyLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use crate::route::longpull::LongPollRoute;
 

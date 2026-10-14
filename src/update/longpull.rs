@@ -1,7 +1,7 @@
 use crate::base::{Printable, Serverable};
+use crate::observe::UpdaterMetrics;
 use crate::update::base::Updater;
 use crate::utils::defaults::TELEGRAM_TOKEN_RE;
-use crate::observe::UpdaterMetrics;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -137,7 +137,9 @@ impl Updater for LongPollUpdate {
         let backoff_base_ms = self.error_timeout_sleep.max(BACKOFF_FLOOR_MS);
         let mut backoff_ms = backoff_base_ms;
         let request_timeout = self.request_timeout();
-        let redacted_url = TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####").to_string();
+        let redacted_url = TELEGRAM_TOKEN_RE
+            .replace_all(&self.url, "#####")
+            .to_string();
 
         // Outage bookkeeping. `consecutive_failures` is reset on every
         // successful 2xx parse; it tracks transient failures only (network
@@ -305,7 +307,8 @@ impl Updater for LongPollUpdate {
             }
 
             if self.default_timeout_sleep > 0
-                && sleep_or_shutdown(Duration::from_millis(self.default_timeout_sleep), &shutdown).await
+                && sleep_or_shutdown(Duration::from_millis(self.default_timeout_sleep), &shutdown)
+                    .await
             {
                 return;
             }
@@ -666,7 +669,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_network_error_log_redacts_token() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         // Windows retries refused connects for ~2 s; a short connect timeout
         // makes the network error surface within the 300 ms window everywhere.
         let client = Client::builder()
@@ -690,7 +697,10 @@ mod tests {
         .await;
 
         assert!(logs.contains("long-poll network error"), "logs: {logs}");
-        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
+        assert!(
+            !logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "logs: {logs}"
+        );
     }
 
     #[test]
@@ -725,7 +735,10 @@ mod tests {
 
         // HTTP-date form is unsupported on purpose — Telegram doesn't emit it.
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        h.insert(
+            RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
         assert_eq!(parse_retry_after(&h), None);
 
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
@@ -772,11 +785,12 @@ mod tests {
             // `start` MUST return on its own -- not via `abort` -- within
             // a tight window. Without the permanent-status handling, the
             // task would loop forever and this `timeout` would fire.
-            timeout(Duration::from_secs(2), updater.start(tx, CancellationToken::new()))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("updater never returned for status {status}")
-                });
+            timeout(
+                Duration::from_secs(2),
+                updater.start(tx, CancellationToken::new()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("updater never returned for status {status}"));
 
             assert_eq!(
                 health.load(Ordering::Relaxed),
@@ -814,7 +828,11 @@ mod tests {
         // `start` must NOT return inside this window: 5xx is transient.
         // If we ever regress and treat 5xx as permanent, this `timeout`
         // resolves with `Ok(())` and the assertion below fires.
-        let outcome = timeout(Duration::from_millis(500), updater.start(tx, CancellationToken::new())).await;
+        let outcome = timeout(
+            Duration::from_millis(500),
+            updater.start(tx, CancellationToken::new()),
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "start returned on 5xx; permanent-failure classification leaked into transient errors"
@@ -882,5 +900,4 @@ mod tests {
         assert_eq!(consecutive, PROLONGED_OUTAGE_THRESHOLD + 10);
         assert_eq!(logged, logged_before);
     }
-
 }

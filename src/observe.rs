@@ -281,13 +281,24 @@ fn render_prometheus(
     // --- long-poll routes ---
     let _ = writeln!(o, "# TYPE tgin_route_queue_depth gauge");
     for l in &leaves {
-        if let LeafSample::LongPoll { label, queue_depth, .. } = l {
-            let _ = writeln!(o, "tgin_route_queue_depth{{route=\"{label}\"}} {queue_depth}");
+        if let LeafSample::LongPoll {
+            label, queue_depth, ..
+        } = l
+        {
+            let _ = writeln!(
+                o,
+                "tgin_route_queue_depth{{route=\"{label}\"}} {queue_depth}"
+            );
         }
     }
     let _ = writeln!(o, "# TYPE tgin_route_queue_dropped_total counter");
     for l in &leaves {
-        if let LeafSample::LongPoll { label, queue_dropped, .. } = l {
+        if let LeafSample::LongPoll {
+            label,
+            queue_dropped,
+            ..
+        } = l
+        {
             let _ = writeln!(
                 o,
                 "tgin_route_queue_dropped_total{{route=\"{label}\"}} {queue_dropped}"
@@ -304,7 +315,10 @@ fn render_prometheus(
     // --- webhook routes ---
     let _ = writeln!(o, "# TYPE tgin_route_dispatched_total counter");
     for l in &leaves {
-        if let LeafSample::Webhook { label, dispatched, .. } = l {
+        if let LeafSample::Webhook {
+            label, dispatched, ..
+        } = l
+        {
             let _ = writeln!(
                 o,
                 "tgin_route_dispatched_total{{route=\"{label}\"}} {dispatched}"
@@ -313,7 +327,14 @@ fn render_prometheus(
     }
     let _ = writeln!(o, "# TYPE tgin_route_http_responses_total counter");
     for l in &leaves {
-        if let LeafSample::Webhook { label, success, failure, error, .. } = l {
+        if let LeafSample::Webhook {
+            label,
+            success,
+            failure,
+            error,
+            ..
+        } = l
+        {
             let _ = writeln!(
                 o,
                 "tgin_route_http_responses_total{{route=\"{label}\",result=\"success\"}} {success}"
@@ -419,7 +440,12 @@ mod tests {
         assert_eq!(leaves.len(), 2);
 
         match &leaves[0] {
-            LeafSample::LongPoll { label, queue_depth, queue_dropped, served } => {
+            LeafSample::LongPoll {
+                label,
+                queue_depth,
+                queue_dropped,
+                served,
+            } => {
                 assert_eq!(label, "/p/getUpdates");
                 assert_eq!(*queue_depth, 3);
                 assert_eq!(*queue_dropped, 2);
@@ -428,7 +454,13 @@ mod tests {
             _ => panic!("expected first leaf to be long-poll"),
         }
         match &leaves[1] {
-            LeafSample::Webhook { label, dispatched, success, failure, error } => {
+            LeafSample::Webhook {
+                label,
+                dispatched,
+                success,
+                failure,
+                error,
+            } => {
                 assert_eq!(label, "http://d/bot");
                 assert_eq!(*dispatched, 4);
                 assert_eq!(*success, 3);

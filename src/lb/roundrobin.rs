@@ -1,4 +1,6 @@
-use crate::base::{AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable};
+use crate::base::{
+    AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable,
+};
 
 use crate::api::message::AddRouteType;
 
@@ -49,7 +51,10 @@ impl Routeable for RoundRobinLB {
             // drain a runtime LB via `remove_route`. Surface the drop so
             // the operator sees updates being silently swallowed.
             crate::observe::record_lb_drop();
-            tracing::warn!(lb = "round-robin", "dropping update at empty load balancer (drained at runtime)");
+            tracing::warn!(
+                lb = "round-robin",
+                "dropping update at empty load balancer (drained at runtime)"
+            );
             return;
         }
         let current = self.current.fetch_add(1, Ordering::Relaxed);
@@ -208,7 +213,10 @@ mod tests {
             .remove_route(RouteId::Url("http://sink".to_string()))
             .await;
         assert!(res.is_ok());
-        assert_eq!(lb.json_struct().await["routes"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            lb.json_struct().await["routes"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -334,8 +342,7 @@ mod tests {
             client,
             DEFAULT_REQUEST_TIMEOUT,
         ));
-        let inner: Arc<dyn RouteableComponent> =
-            Arc::new(RoundRobinLB::new(vec![nested_route]));
+        let inner: Arc<dyn RouteableComponent> = Arc::new(RoundRobinLB::new(vec![nested_route]));
 
         let outer = RoundRobinLB::new(vec![inner]);
 
@@ -364,10 +371,7 @@ mod tests {
         let writer = tokio::spawn(async move {
             for i in 0..50 {
                 let r = Arc::new(MockCallsRoute::new(&format!("dyn{i}")));
-                writer_lb
-                    .add_route(AddRouteType::Webhook(r))
-                    .await
-                    .unwrap();
+                writer_lb.add_route(AddRouteType::Webhook(r)).await.unwrap();
             }
         });
 

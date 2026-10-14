@@ -1,9 +1,11 @@
 use crate::api::message::{ApiError, ApiMessage};
 use crate::api::router::Api;
-use crate::base::{AddRouteError, RemoveRouteError, RouteableComponent, Serverable, UpdaterComponent};
+use crate::base::{
+    AddRouteError, RemoveRouteError, RouteableComponent, Serverable, UpdaterComponent,
+};
 
-use axum::Router;
 use axum::routing::get;
+use axum::Router;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -283,14 +285,12 @@ impl Tgin {
                         // `AddRouteError` surface as an honest 4xx instead of
                         // a silent 200.
                         ApiMessage::AddRoute { route, resp } => {
-                            let result = self.route.add_route(route).await.map_err(|err| {
-                                match err {
+                            let result =
+                                self.route.add_route(route).await.map_err(|err| match err {
                                     AddRouteError::Conflict => ApiError::Conflict(
-                                        "top-level route does not accept dynamic children"
-                                            .into(),
+                                        "top-level route does not accept dynamic children".into(),
                                     ),
-                                }
-                            });
+                                });
                             let _ = resp.send(result);
                         }
 
@@ -300,14 +300,16 @@ impl Tgin {
                         // the loop preserves caller ordering and lets
                         // `RemoveRouteError::NotFound` surface as a 404.
                         ApiMessage::RmRoute { target, resp } => {
-                            let result = self.route.remove_route(target).await.map_err(|err| {
-                                match err {
-                                    RemoveRouteError::NotFound => ApiError::NotFound(
-                                        "no route in the tree matched the supplied target"
-                                            .into(),
-                                    ),
-                                }
-                            });
+                            let result =
+                                self.route
+                                    .remove_route(target)
+                                    .await
+                                    .map_err(|err| match err {
+                                        RemoveRouteError::NotFound => ApiError::NotFound(
+                                            "no route in the tree matched the supplied target"
+                                                .into(),
+                                        ),
+                                    });
                             let _ = resp.send(result);
                         }
                     }
@@ -487,7 +489,9 @@ mod tests {
         let workers = spawn_worker_pool(rx, route_dyn, workers_n, CancellationToken::new());
 
         for i in 0..workers_n {
-            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
+            tx.send(update_bytes(json!({ "update_id": i })))
+                .await
+                .unwrap();
         }
 
         // Spin until every worker is parked in `process` simultaneously.
@@ -519,7 +523,6 @@ mod tests {
         }
     }
 
-
     /// End-to-end through the public dispatch surface: spawn the worker
     /// pool via a test-only helper that mirrors `run_async` and assert
     /// that all updates land at the route.
@@ -534,7 +537,9 @@ mod tests {
         let workers = spawn_worker_pool(rx, route_dyn.clone(), 4, CancellationToken::new());
 
         for i in 0..32 {
-            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
+            tx.send(update_bytes(json!({ "update_id": i })))
+                .await
+                .unwrap();
         }
         drop(tx);
 
@@ -647,7 +652,9 @@ mod tests {
         let workers = spawn_worker_pool(rx, route_dyn, 4, shutdown.clone());
 
         for i in 0..16 {
-            tx.send(update_bytes(json!({ "update_id": i }))).await.unwrap();
+            tx.send(update_bytes(json!({ "update_id": i })))
+                .await
+                .unwrap();
         }
 
         // Cancel while `tx` is still held open: proves workers stop on the

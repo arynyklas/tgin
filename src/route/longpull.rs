@@ -132,9 +132,7 @@ impl LongPollRoute {
             // uncontended path is one CAS; the contended path blocks an OS
             // thread for a few ns, never long enough for tokio to care.
             let batch_opt: Option<Vec<Bytes>> = {
-                let mut lock = updates
-                    .lock()
-                    .expect("longpull buffer mutex poisoned");
+                let mut lock = updates.lock().expect("longpull buffer mutex poisoned");
                 if lock.is_empty() {
                     None
                 } else {
@@ -255,10 +253,7 @@ impl Routeable for LongPollRoute {
         let mut evicted: u64 = 0;
         let depth_after_push;
         {
-            let mut lock = self
-                .updates
-                .lock()
-                .expect("longpull buffer mutex poisoned");
+            let mut lock = self.updates.lock().expect("longpull buffer mutex poisoned");
             // Loop, not single pop: `set_max_buffered_updates` may have
             // shrunk the cap below the current depth between pushes.
             while lock.len() >= self.max_buffered_updates {
@@ -346,11 +341,7 @@ impl Printable for LongPollRoute {
     }
 
     async fn json_struct(&self) -> Value {
-        let queue_depth = self
-            .updates
-            .lock()
-            .map(|lock| lock.len())
-            .unwrap_or(0);
+        let queue_depth = self.updates.lock().map(|lock| lock.len()).unwrap_or(0);
         let queue_dropped_total = self.dropped_oldest.load(Ordering::Relaxed);
         json!({
             "type": "longpoll",
@@ -589,8 +580,7 @@ mod tests {
         assert_eq!(json["type"], "longpoll");
         assert_eq!(json["options"]["path"], "/my/path");
         assert_eq!(
-            json["options"]["max_buffered_updates"],
-            DEFAULT_MAX_BUFFERED_UPDATES as u64,
+            json["options"]["max_buffered_updates"], DEFAULT_MAX_BUFFERED_UPDATES as u64,
             "default cap must be exposed so /routes is self-describing"
         );
         assert_eq!(json["metrics"]["queue_depth"], 0);

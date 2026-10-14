@@ -5,8 +5,8 @@ use bytes::Bytes;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Default per-request deadline for forwarding an update to a downstream bot.
 /// A bot that does not ack within this window is treated as failed for the
@@ -89,7 +89,10 @@ impl Serverable for WebhookRoute {}
 #[async_trait]
 impl Printable for WebhookRoute {
     async fn print(&self) -> String {
-        format!("webhook: {}", TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"))
+        format!(
+            "webhook: {}",
+            TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####")
+        )
     }
 
     async fn json_struct(&self) -> Value {
@@ -136,7 +139,9 @@ mod tests {
 
         let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
 
-        route.process(Bytes::from(serde_json::to_vec(&payload).unwrap())).await;
+        route
+            .process(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .await;
     }
 
     #[tokio::test]
@@ -148,13 +153,19 @@ mod tests {
         );
 
         let payload = json!({"test": "data"});
-        route.process(Bytes::from(serde_json::to_vec(&payload).unwrap())).await;
+        route
+            .process(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .await;
     }
 
     const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn closed_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     #[tokio::test]
@@ -168,8 +179,14 @@ mod tests {
         let ((), logs) =
             crate::utils::testlog::capture_logs(route.process(Bytes::from_static(b"{}"))).await;
 
-        assert!(logs.contains("webhook downstream request failed"), "logs: {logs}");
-        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
+        assert!(
+            logs.contains("webhook downstream request failed"),
+            "logs: {logs}"
+        );
+        assert!(
+            !logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "logs: {logs}"
+        );
     }
 
     #[tokio::test]
@@ -182,7 +199,10 @@ mod tests {
 
         let banner = route.print().await;
 
-        assert!(!banner.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "banner: {banner}");
+        assert!(
+            !banner.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "banner: {banner}"
+        );
     }
 
     #[tokio::test]
@@ -208,8 +228,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(!reported.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"), "token leaked: {reported}");
-        assert!(reported.contains("#####"), "expected redaction marker: {reported}");
+        assert!(
+            !reported.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),
+            "token leaked: {reported}"
+        );
+        assert!(
+            reported.contains("#####"),
+            "expected redaction marker: {reported}"
+        );
     }
 
     /// A downstream that holds the request open longer than the configured
@@ -221,20 +247,18 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
             .mount(&mock_server)
             .await;
 
-        let route = WebhookRoute::new(
-            mock_server.uri(),
-            test_client(),
-            Duration::from_millis(100),
-        );
+        let route = WebhookRoute::new(mock_server.uri(), test_client(), Duration::from_millis(100));
 
         let start = std::time::Instant::now();
-        route.process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap())).await;
+        route
+            .process(Bytes::from(
+                serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+            ))
+            .await;
         let elapsed = start.elapsed();
 
         // Comfortable headroom over the 100ms cap, well under the 5s downstream delay.
@@ -255,7 +279,9 @@ mod tests {
 
         let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
         route
-            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .process(Bytes::from(
+                serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+            ))
             .await;
 
         let m = route.json_struct().await;
@@ -277,7 +303,9 @@ mod tests {
 
         let route = WebhookRoute::new(mock_server.uri(), test_client(), DEFAULT_REQUEST_TIMEOUT);
         route
-            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .process(Bytes::from(
+                serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+            ))
             .await;
 
         let m = route.json_struct().await;
@@ -295,7 +323,9 @@ mod tests {
             Duration::from_millis(500),
         );
         route
-            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .process(Bytes::from(
+                serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+            ))
             .await;
 
         let m = route.json_struct().await;

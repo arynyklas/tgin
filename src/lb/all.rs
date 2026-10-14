@@ -1,4 +1,6 @@
-use crate::base::{AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable};
+use crate::base::{
+    AddRouteError, Printable, RemoveRouteError, RouteId, Routeable, RouteableComponent, Serverable,
+};
 
 use axum::Router;
 use bytes::Bytes;
@@ -41,15 +43,17 @@ impl Routeable for AllLB {
             // drain a runtime LB via `remove_route`. Surface the drop so
             // the operator sees updates being silently swallowed.
             crate::observe::record_lb_drop();
-            tracing::warn!(lb = "all", "dropping update at empty load balancer (drained at runtime)");
+            tracing::warn!(
+                lb = "all",
+                "dropping update at empty load balancer (drained at runtime)"
+            );
             return;
         }
         // Snapshot the children so the `ArcSwap` read guard is released
         // before any downstream I/O. `Bytes::clone` is one atomic ref-count
         // bump per child: every spawned dispatcher receives the same
         // shared payload with no per-child copy.
-        let children: Vec<Arc<dyn RouteableComponent>> =
-            routes.iter().cloned().collect();
+        let children: Vec<Arc<dyn RouteableComponent>> = routes.iter().cloned().collect();
         drop(routes);
 
         let mut set: JoinSet<()> = JoinSet::new();
@@ -283,8 +287,7 @@ mod tests {
             client,
             DEFAULT_REQUEST_TIMEOUT,
         ));
-        let inner: Arc<dyn RouteableComponent> =
-            Arc::new(RoundRobinLB::new(vec![nested_route]));
+        let inner: Arc<dyn RouteableComponent> = Arc::new(RoundRobinLB::new(vec![nested_route]));
 
         let outer = AllLB::new(vec![inner]);
 
@@ -426,8 +429,7 @@ mod tests {
 
         // Wait until the workers reach steady state: every worker is in
         // a fanout, so each probe has `workers_n` concurrent calls.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let peak: usize = probes
                 .iter()

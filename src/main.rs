@@ -10,9 +10,9 @@ mod utils;
 
 mod api;
 
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::process::ExitCode;
 
 use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
 use crate::tgin::Tgin;

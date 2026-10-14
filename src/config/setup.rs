@@ -137,7 +137,9 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
 
     for (idx, upd) in cfg.updates.iter().enumerate() {
         match upd {
-            UpdateConfig::WebhookUpdate { path, registration, .. } => {
+            UpdateConfig::WebhookUpdate {
+                path, registration, ..
+            } => {
                 let location = format!("updates[{idx}].WebhookUpdate");
                 check_path(path, &format!("{location}.path"), &mut errs);
                 if let Some(prev) = paths.insert(path.clone(), "WebhookUpdate") {
@@ -231,11 +233,21 @@ fn check_url(raw: &str, location: &str, errs: &mut Vec<ValidationError>, field: 
         let url = raw.to_string();
         let location = location.to_string();
         errs.push(match field {
-            UrlField::Webhook => ValidationError::InvalidWebhookUrl { url, location, reason },
-            UrlField::PublicIp => ValidationError::InvalidPublicIp { url, location, reason },
-            UrlField::SetWebhookUrl => {
-                ValidationError::InvalidSetWebhookUrl { url, location, reason }
-            }
+            UrlField::Webhook => ValidationError::InvalidWebhookUrl {
+                url,
+                location,
+                reason,
+            },
+            UrlField::PublicIp => ValidationError::InvalidPublicIp {
+                url,
+                location,
+                reason,
+            },
+            UrlField::SetWebhookUrl => ValidationError::InvalidSetWebhookUrl {
+                url,
+                location,
+                reason,
+            },
         });
     }
 }
@@ -356,7 +368,10 @@ pub fn build_updates(
 
 pub fn build_route(cfg: RouteConfig, client: &Client) -> Arc<dyn RouteableComponent> {
     match cfg {
-        RouteConfig::LongPollRoute { path, max_buffered_updates } => {
+        RouteConfig::LongPollRoute {
+            path,
+            max_buffered_updates,
+        } => {
             let mut route = LongPollRoute::new(path);
             route.set_max_buffered_updates(max_buffered_updates);
             Arc::new(route)
@@ -371,25 +386,20 @@ pub fn build_route(cfg: RouteConfig, client: &Client) -> Arc<dyn RouteableCompon
         )),
 
         RouteConfig::RoundRobinLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
-                .into_iter()
-                .map(|r| build_route(r, client))
-                .collect();
+            let built_routes: Vec<Arc<dyn RouteableComponent>> =
+                routes.into_iter().map(|r| build_route(r, client)).collect();
 
             Arc::new(RoundRobinLB::new(built_routes))
         }
 
         RouteConfig::AllLB { routes } => {
-            let built_routes: Vec<Arc<dyn RouteableComponent>> = routes
-                .into_iter()
-                .map(|r| build_route(r, client))
-                .collect();
+            let built_routes: Vec<Arc<dyn RouteableComponent>> =
+                routes.into_iter().map(|r| build_route(r, client)).collect();
 
             Arc::new(AllLB::new(built_routes))
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -522,7 +532,10 @@ mod tests {
         let errs = validate(&cfg).expect_err("empty RoundRobinLB rejected");
         assert!(matches!(
             errs.as_slice(),
-            [ValidationError::EmptyLoadBalancer { kind: "RoundRobinLB", .. }]
+            [ValidationError::EmptyLoadBalancer {
+                kind: "RoundRobinLB",
+                ..
+            }]
         ));
 
         let cfg = base_config(RouteConfig::AllLB { routes: vec![] });
@@ -539,14 +552,20 @@ mod tests {
     fn test_validate_rejects_duplicate_longpoll_paths() {
         let cfg = base_config(RouteConfig::RoundRobinLB {
             routes: vec![
-                RouteConfig::LongPollRoute { path: "/bot/up".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
-                RouteConfig::LongPollRoute { path: "/bot/up".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
+                RouteConfig::LongPollRoute {
+                    path: "/bot/up".to_string(),
+                    max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+                },
+                RouteConfig::LongPollRoute {
+                    path: "/bot/up".to_string(),
+                    max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+                },
             ],
         });
         let errs = validate(&cfg).expect_err("duplicate path rejected");
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, ValidationError::DuplicatePath { path, .. } if path == "/bot/up")));
+        assert!(errs.iter().any(
+            |e| matches!(e, ValidationError::DuplicatePath { path, .. } if path == "/bot/up")
+        ));
     }
 
     /// A `WebhookUpdate` (ingress) and a `LongPollRoute` (egress) cannot share
@@ -562,7 +581,10 @@ mod tests {
                 registration: None,
                 secret_token: None,
             }],
-            route: RouteConfig::LongPollRoute { path: "/shared".to_string(), max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES },
+            route: RouteConfig::LongPollRoute {
+                path: "/shared".to_string(),
+                max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+            },
             api: None,
             log_level: "info".to_string(),
             log_format: crate::config::schema::LogFormat::Compact,
@@ -626,14 +648,18 @@ mod tests {
     #[test]
     fn test_validate_rejects_path_with_star_segment() {
         let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
-        cfg.api = Some(ApiConfig { base_path: "/*api".to_string() });
+        cfg.api = Some(ApiConfig {
+            base_path: "/*api".to_string(),
+        });
         assert_invalid_path(&cfg, "/*api", "api.base_path");
     }
 
     #[test]
     fn test_validate_rejects_root_api_base_path() {
         let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
-        cfg.api = Some(ApiConfig { base_path: "/".to_string() });
+        cfg.api = Some(ApiConfig {
+            base_path: "/".to_string(),
+        });
         assert_invalid_path(&cfg, "/", "api.base_path");
     }
 
@@ -664,7 +690,9 @@ mod tests {
         let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
         cfg.dark_threads = 0;
         let errs = validate(&cfg).expect_err("dark_threads=0 rejected");
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::DarkThreadsZero)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::DarkThreadsZero)));
     }
 
     /// Multi-issue config surfaces _every_ issue, not just the first one. The
@@ -676,7 +704,9 @@ mod tests {
         let errs = validate(&cfg).expect_err("multi-error config rejected");
         // dark_threads=0 + empty LB = at least 2 distinct errors
         assert!(errs.len() >= 2, "expected >=2 errors, got {errs:?}");
-        assert!(errs.iter().any(|e| matches!(e, ValidationError::DarkThreadsZero)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::DarkThreadsZero)));
         assert!(errs
             .iter()
             .any(|e| matches!(e, ValidationError::EmptyLoadBalancer { .. })));
@@ -734,7 +764,9 @@ mod tests {
     #[test]
     fn test_validate_ok_with_api() {
         let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
-        cfg.api = Some(ApiConfig { base_path: "/api".to_string() });
+        cfg.api = Some(ApiConfig {
+            base_path: "/api".to_string(),
+        });
         validate(&cfg).expect("api config validates");
     }
 

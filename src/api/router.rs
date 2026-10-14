@@ -79,8 +79,15 @@ mod tests {
     /// not need the main loop running to consume `ApiMessage`s).
     #[tokio::test]
     async fn test_api_rejects_without_bearer_when_token_set() {
-        let api = Api::new("/api".to_string(), test_client(), Some("s3cret".to_string()));
-        let app = api.set_server(Router::new()).await.with_state(mpsc::channel::<Bytes>(1).0);
+        let api = Api::new(
+            "/api".to_string(),
+            test_client(),
+            Some("s3cret".to_string()),
+        );
+        let app = api
+            .set_server(Router::new())
+            .await
+            .with_state(mpsc::channel::<Bytes>(1).0);
 
         let missing = app
             .clone()

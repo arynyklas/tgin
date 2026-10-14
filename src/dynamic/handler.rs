@@ -88,7 +88,9 @@ mod tests {
         let path = "/__dynamic_test_json/getUpdates";
         let route = Arc::new(LongPollRoute::new(path.to_string()));
         route
-            .process(Bytes::from(serde_json::to_vec(&json!({"update_id": 7})).unwrap()))
+            .process(Bytes::from(
+                serde_json::to_vec(&json!({"update_id": 7})).unwrap(),
+            ))
             .await;
         longpoll_registry::insert(path.to_string(), route);
 

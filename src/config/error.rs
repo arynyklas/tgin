@@ -41,7 +41,10 @@ pub enum ConfigError {
 pub enum ValidationError {
     /// A load-balancer node has zero children. Updates routed there are
     /// silently dropped.
-    EmptyLoadBalancer { kind: &'static str, location: String },
+    EmptyLoadBalancer {
+        kind: &'static str,
+        location: String,
+    },
     /// Two HTTP-mounted endpoints (`LongPollRoute` or `WebhookUpdate`) want
     /// the same path. Whichever registers second clobbers the first in
     /// `axum::Router` / `LONGPOLL_REGISTRY`.
@@ -108,10 +111,7 @@ impl fmt::Display for ConfigError {
                 for v in vars {
                     writeln!(f, "  - ${{{v}}}")?;
                 }
-                write!(
-                    f,
-                    "hint: export the missing variables before starting tgin"
-                )
+                write!(f, "hint: export the missing variables before starting tgin")
             }
             ConfigError::Parse { source } => write!(f, "failed to parse RON config: {source}"),
             ConfigError::Validation(errs) => {
@@ -136,29 +136,49 @@ impl fmt::Display for ValidationError {
                 "{location}: {kind} has no routes; updates dispatched here would be silently \
                  dropped (hint: add at least one child route or remove the load balancer)"
             ),
-            ValidationError::DuplicatePath { path, first, second } => write!(
+            ValidationError::DuplicatePath {
+                path,
+                first,
+                second,
+            } => write!(
                 f,
                 "duplicate HTTP path {path:?}: registered by {first} and {second} \
                  (hint: each LongPollRoute / WebhookUpdate path must be unique within the process)"
             ),
-            ValidationError::InvalidPath { path, location, reason } => write!(
+            ValidationError::InvalidPath {
+                path,
+                location,
+                reason,
+            } => write!(
                 f,
                 "{location}: HTTP path {path:?} is invalid ({reason}) \
                  (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
                  or segments starting with `:` / `*`)"
             ),
-            ValidationError::InvalidWebhookUrl { url, location, reason } => write!(
+            ValidationError::InvalidWebhookUrl {
+                url,
+                location,
+                reason,
+            } => write!(
                 f,
                 "{location}: WebhookRoute.url {url:?} is not a valid absolute URL ({reason}) \
                  (hint: use an absolute http(s):// URL, e.g. \"http://127.0.0.1:8080/bot\")"
             ),
-            ValidationError::InvalidPublicIp { url, location, reason } => write!(
+            ValidationError::InvalidPublicIp {
+                url,
+                location,
+                reason,
+            } => write!(
                 f,
                 "{location}: registration.public_ip {url:?} is not a valid absolute URL \
                  ({reason}) (hint: use the public https:// origin Telegram will reach, \
                  e.g. \"https://example.com\")"
             ),
-            ValidationError::InvalidSetWebhookUrl { url, location, reason } => write!(
+            ValidationError::InvalidSetWebhookUrl {
+                url,
+                location,
+                reason,
+            } => write!(
                 f,
                 "{location}: registration.set_webhook_url {url:?} is not a valid absolute URL \
                  ({reason})"

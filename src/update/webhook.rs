@@ -1,6 +1,6 @@
 use crate::base::{Printable, Serverable};
-use crate::update::base::Updater;
 use crate::observe::UpdaterMetrics;
+use crate::update::base::Updater;
 
 use crate::utils::defaults::TELEGRAM_TOKEN_RE;
 
@@ -15,11 +15,11 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use reqwest::Client;
 use serde_json::json;
 use serde_json::value::RawValue;
-use std::time::Duration;
 use std::sync::Arc;
-use reqwest::Client;
+use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
@@ -272,18 +272,31 @@ mod tests {
     #[tokio::test]
     async fn test_register_webhook_error_log_redacts_token() {
         const TOKEN: &str = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let client = Client::builder().no_proxy().build().unwrap();
-        let mut reg_config =
-            RegistrationWebhookConfig::new(TOKEN.to_string(), "https://my-server.com".to_string(), client);
+        let mut reg_config = RegistrationWebhookConfig::new(
+            TOKEN.to_string(),
+            "https://my-server.com".to_string(),
+            client,
+        );
         reg_config.set_webhook_url(format!("http://127.0.0.1:{closed}/bot{TOKEN}/setWebhook"));
         let updater = WebhookUpdate::new("/webhook".to_string());
 
         let ((), logs) =
             crate::utils::testlog::capture_logs(updater.register_webhook(&reg_config)).await;
 
-        assert!(logs.contains("network error setting webhook"), "logs: {logs}");
-        assert!(!logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "logs: {logs}");
+        assert!(
+            logs.contains("network error setting webhook"),
+            "logs: {logs}"
+        );
+        assert!(
+            !logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "logs: {logs}"
+        );
     }
 
     #[tokio::test]
@@ -336,7 +349,9 @@ mod tests {
             .method("POST")
             .uri("/bot/update")
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+            .body(Body::from(
+                serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+            ))
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
@@ -366,7 +381,9 @@ mod tests {
                     builder = builder.header("x-telegram-bot-api-secret-token", h);
                 }
                 let request = builder
-                    .body(Body::from(serde_json::to_vec(&json!({"update_id": 1})).unwrap()))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+                    ))
                     .unwrap();
 
                 let status = app.oneshot(request).await.unwrap().status();
@@ -377,16 +394,28 @@ mod tests {
         };
 
         assert_eq!(send(None).await, StatusCode::UNAUTHORIZED, "missing header");
-        assert_eq!(send(Some("wrong")).await, StatusCode::UNAUTHORIZED, "wrong secret");
+        assert_eq!(
+            send(Some("wrong")).await,
+            StatusCode::UNAUTHORIZED,
+            "wrong secret"
+        );
         // Length-mismatch case (shorter than expected) -- exercises the padded ct_eq path.
-        assert_eq!(send(Some("shared")).await, StatusCode::UNAUTHORIZED, "too short");
+        assert_eq!(
+            send(Some("shared")).await,
+            StatusCode::UNAUTHORIZED,
+            "too short"
+        );
         // Length-mismatch case (longer than expected) -- exercises the padded ct_eq path.
         assert_eq!(
             send(Some("shared-secret-extra")).await,
             StatusCode::UNAUTHORIZED,
             "too long"
         );
-        assert_eq!(send(Some("shared-secret")).await, StatusCode::OK, "correct secret");
+        assert_eq!(
+            send(Some("shared-secret")).await,
+            StatusCode::OK,
+            "correct secret"
+        );
     }
 
     /// `Routeable::process` requires a syntactically valid JSON value;
@@ -402,7 +431,10 @@ mod tests {
         let cases: &[(&str, &[u8])] = &[
             ("binary garbage", b"garbage\x00not-json"),
             ("empty body", b""),
-            ("trailing junk after a JSON value", br#"{"update_id":1} trailing"#),
+            (
+                "trailing junk after a JSON value",
+                br#"{"update_id":1} trailing"#,
+            ),
             ("unterminated object", br#"{"update_id":1"#),
             ("bare identifier", b"undefined"),
         ];
@@ -522,5 +554,4 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
     }
-
 }
