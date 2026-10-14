@@ -4,34 +4,49 @@
 
 - [Overview](#overview)
 - [Concepts](#concepts)
+- [Delivery semantics](#delivery-semantics)
 - [Quick start](#quick-start)
 - [Configuration reference](#configuration-reference)
   - [Top-level fields](#top-level-fields)
   - [Update providers (`updates`)](#update-providers-updates)
   - [Routing targets (`route`)](#routing-targets-route)
   - [Load balancers](#load-balancers)
+  - [Sizing](#sizing)
 - [HTTP management API](#http-management-api)
 - [Observability](#observability)
 - [TLS setup](#tls-setup)
+- [Lifecycle & shutdown](#lifecycle--shutdown)
+- [Running in Docker](#running-in-docker)
 - [Configuration example](#configuration-example)
 - [Further reading](#further-reading)
 
 ## Overview
 
-tgin is a routing layer between the Telegram Bot API and one or more downstream bot instances. It ingests updates over long poll or webhook, dispatches them through a tree of routes and load balancers, and forwards each update to its destination. Configuration is a single RON file (default: `tgin.ron`); behavior can be hot-reconfigured at runtime via an optional HTTP API, and ingress can be served over TLS.
+tgin is a routing layer between the Telegram Bot API and one or more downstream bot instances. It ingests updates over long poll or webhook, dispatches them through a tree of routes and load balancers, and forwards each update to its destination. Configuration is a single RON file (default: `tgin.ron`); routes can be added and removed at runtime through an optional HTTP API, and the HTTP listener can serve TLS.
+
+tgin is pre-1.0: until 1.0, a minor release may contain breaking changes ([CHANGELOG.md](CHANGELOG.md)).
 
 ## Concepts
 
-| Term             | Direction | Purpose                                                                                               |
-|------------------|-----------|-------------------------------------------------------------------------------------------------------|
-| `LongPollUpdate` | ingress   | Polls Telegram's `getUpdates` and feeds every update into the routing tree.                           |
-| `WebhookUpdate`  | ingress   | Exposes an HTTP endpoint that Telegram POSTs updates to. Optional self-registration via `setWebhook`. |
-| `LongPollRoute`  | egress    | Buffers updates and serves them to downstream bots through a Telegram-shaped `getUpdates` endpoint.   |
-| `WebhookRoute`   | egress    | POSTs each update to a downstream HTTP endpoint.                                                      |
-| `RoundRobinLB`   | egress    | Rotates through child routes; each update goes to exactly one child.                                  |
-| `AllLB`          | egress    | Broadcasts every update to every child concurrently.                                                  |
+| Term             | Direction | Purpose                                                                                                         |
+|------------------|-----------|-----------------------------------------------------------------------------------------------------------------|
+| `LongPollUpdate` | ingress   | Polls Telegram's `getUpdates` and feeds every update into the routing tree.                                     |
+| `WebhookUpdate`  | ingress   | Exposes an HTTP endpoint that Telegram POSTs updates to. Optional self-registration via `setWebhook`.           |
+| `LongPollRoute`  | egress    | Buffers updates in memory and hands each one out once through a Telegram-shaped `getUpdates` endpoint.          |
+| `WebhookRoute`   | egress    | POSTs each update to a downstream HTTP endpoint, once.                                                          |
+| `RoundRobinLB`   | egress    | Rotates through child routes; each update goes to exactly one child.                                            |
+| `AllLB`          | egress    | Sends every update to every child concurrently.                                                                 |
 
-Updates flow in one direction: every `update` provider pushes into a single shared channel; the consumer is the root `route`. Errors on the egress path are logged and swallowed so a single failing downstream cannot stall the dispatcher — downstreams must be resilient.
+Updates flow in one direction. Every ingress provider pushes the update's original JSON bytes into one bounded dispatch queue (1024 updates). `dark_threads` workers take updates from that queue one at a time and run each through the root `route` to completion before taking the next. When the queue is full, ingress waits: a long-poll updater stops calling `getUpdates` until there is room, and a webhook request is answered only once its update is queued.
+
+Errors on the egress path are logged and counted, never retried. A failing downstream does not stop the dispatcher, but a slow one holds a worker: a `WebhookRoute` keeps its worker busy until the downstream answers or `request_timeout_ms` expires, so `dark_threads` slow downstream requests in flight stall all dispatch.
+
+## Delivery semantics
+
+- **Between tgin and downstream bots, delivery is at most once.** A `WebhookRoute` sends each update once, with no retries. A `LongPollRoute` removes updates from its buffer when it returns them in a `getUpdates` response; if that response never reaches the bot (the bot crashed mid-request, the connection dropped), those updates are lost.
+- **Webhook ingress acknowledges on enqueue.** tgin answers Telegram `200` once the update is in the dispatch queue, before any downstream has it. Telegram does not redeliver an acknowledged update.
+- **Long-poll ingress can redeliver after a restart.** Telegram treats a batch as confirmed only when the next `getUpdates` call carries a higher `offset`. The last batch fetched before tgin stops is never confirmed, so Telegram returns it again on the next start and downstreams can see those updates twice.
+- **Everything buffered lives in process memory.** If the process is killed rather than drained, updates in the dispatch queue and in long-poll route buffers are lost. See [Lifecycle & shutdown](#lifecycle--shutdown) for what a graceful stop delivers.
 
 ## Quick start
 
@@ -39,106 +54,142 @@ Updates flow in one direction: every `update` provider pushes into a single shar
 git clone https://github.com/arynyklas/tgin.git
 cd tgin
 cargo build --release
-./target/release/tgin -f tgin.ron
+TOKEN=123456:ABC TGIN_AUTH_TOKEN=$(openssl rand -hex 32) ./target/release/tgin -f tgin.ron
 ```
 
-The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs; missing variables abort startup.
+The shipped `tgin.ron` reads the bot token from `TOKEN` and, because it enables the management API, the API secret from `TGIN_AUTH_TOKEN`. Building requires Rust 1.88 or newer and a C compiler for `aws-lc-sys` (the TLS crypto backend).
+
+The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs. Every unset variable is listed on stderr and tgin exits with code `1`.
+
+Prebuilt release archives and the container image are listed in the [README](README.md#install-a-release); [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify their build provenance.
 
 ## Configuration reference
 
 Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
 
-The schema is strict: an unknown field anywhere in the file (top level, inside a variant such as `LongPollUpdate(...)`, or in a nested struct) is a parse error that names the field, so a typo like `server_prot` fails startup instead of silently falling back to a default.
+The schema is strict: an unknown field anywhere in the file (top level, inside a variant such as `LongPollUpdate(...)`, or in a nested struct) is a parse error that names the field, so a typo like `server_prot` fails startup instead of silently falling back to a default. After parsing, tgin validates the whole config and reports every problem it finds in one message (exit code `1`).
 
 ### Top-level fields
 
-| Field          | Type                              | Default | Description                                                                                                                                                                                                                 |
-|----------------|-----------------------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `dark_threads` | `usize`                           | `4`     | Worker threads allocated to the Tokio runtime. Increase for higher concurrency.                                                                                                                                             |
-| `server_port`  | `Option<u16>`                     | —       | When set, tgin hosts every HTTP-facing component (webhook ingress, long-poll routes, management API) on `0.0.0.0:<port>`. Set to `None` to disable HTTP ingress entirely (only `LongPollUpdate` / `WebhookRoute` will run). |
-| `ssl`          | `Option<SslConfig { cert, key }>` | `None`  | Optional TLS certificate and private key (PEM file paths). When set, the listener serves HTTPS via rustls.                                                                                                                  |
-| `updates`      | `Vec<UpdateConfig>`               | —       | Ingress providers. Multiple providers can coexist; tgin merges updates from all of them.                                                                                                                                    |
-| `route`        | `RouteConfig`                     | —       | The single root of the routing tree. Either a leaf route or a load-balancer subtree.                                                                                                                                        |
-| `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress. Requires a non-blank `auth_token` (`ApiWithoutAuthToken` validation error otherwise).                |
-| `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off`. `RUST_LOG` overrides it. |
-| `log_format`   | `"Compact"` \| `"Json"`           | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
-| `auth_token`   | `Option<String>`                  | `None`    | Shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. **Required when `api` is set.** Without `api`, a present-but-blank value is ignored with a startup warning (auth stays disabled). |
+| Field          | Type                              | Default   | Description |
+|----------------|-----------------------------------|-----------|-------------|
+| `dark_threads` | `usize`                           | `4`       | Tokio worker threads, and the number of dispatch workers (one update in flight per worker). Must be at least `1`. |
+| `server_port`  | `Option<u16>`                     | `None`    | When set, tgin serves every HTTP-facing component (webhook ingress, long-poll routes, probes, `/status`, `/metrics`, management API) on `0.0.0.0:<port>`. Without it there is no HTTP listener: `WebhookUpdate` receives nothing and `LongPollRoute` buffers are never served (validation does not catch this). |
+| `ssl`          | `Option<SslConfig { cert, key }>` | `None`    | TLS certificate and private key (PEM file paths). When set, the listener serves HTTPS only, via rustls. |
+| `updates`      | `Vec<UpdateConfig>`               | required  | Ingress providers. Multiple providers can coexist; their updates share the dispatch queue. |
+| `route`        | `RouteConfig`                     | required  | The single root of the routing tree: a leaf route or a load-balancer subtree. |
+| `api`          | `Option<ApiConfig { base_path }>` | `None`    | Management API base path (e.g. `/api`), nested on the same listener. Requires a non-blank `auth_token` (`ApiWithoutAuthToken` validation error otherwise). |
+| `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off` (case-insensitive). `RUST_LOG` overrides it. |
+| `log_format`   | `Compact` \| `Json`               | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
+| `auth_token`   | `Option<String>`                  | `None`    | Shared secret for the control / observability plane. When set, `/status`, `/metrics` and the management API require `Authorization: Bearer <auth_token>`. **Required when `api` is set.** Without `api`, a present-but-blank value is ignored with a startup warning (auth stays disabled). |
 
 ### Update providers (`updates`)
 
 #### `LongPollUpdate`
 
-Long-polls Telegram for updates and dispatches each one into the routing tree.
+Long-polls Telegram with `GET getUpdates` and dispatches each update into the routing tree.
 
-| Field                   | Type             | Default                    | Description                                                                            |
-|-------------------------|------------------|----------------------------|----------------------------------------------------------------------------------------|
-| `token`                 | `String`         | required                   | Telegram bot token (e.g. `123456:ABC...`).                                             |
-| `url`                   | `Option<String>` | `https://api.telegram.org` | Override for the Telegram API base URL.                                                |
-| `default_timeout_sleep` | `u64` (seconds)  | `0`                        | Sleep between successful `getUpdates` calls. Bump it to throttle request rate at idle. |
-| `error_timeout_sleep`   | `u64` (seconds)  | `0`                        | Sleep between retries after a failed `getUpdates` call.                                |
-| `long_poll_timeout`     | `u64` (seconds)  | `30`                       | Server-side hold time passed as `timeout` to `getUpdates`. Telegram caps this at 50.   |
-| `long_poll_limit`       | `u64`            | `100`                      | Max updates per `getUpdates` response. Telegram caps this at 100.                      |
+| Field                   | Type                  | Default  | Description |
+|-------------------------|-----------------------|----------|-------------|
+| `token`                 | `String`              | required | Telegram bot token (e.g. `123456:ABC...`). Builds the default poll URL `https://api.telegram.org/bot<token>/getUpdates`. |
+| `url`                   | `Option<String>`      | `None`   | Full `getUpdates` URL that replaces the default one, including the `bot<token>` segment. `token` is then not used to build the URL. |
+| `default_timeout_sleep` | `u64` (milliseconds)  | `0`      | Pause after every successful `getUpdates` call. `0` polls again immediately. |
+| `error_timeout_sleep`   | `u64` (milliseconds)  | `0`      | Base of the retry backoff after a failed call; values below 50 ms are raised to 50 ms. See failure handling below. |
+| `long_poll_timeout`     | `u64` (seconds)       | `30`     | `timeout` passed to `getUpdates` (server-side hold). Clamped to at most 50. The HTTP request deadline is this value plus 10 s. |
+| `long_poll_limit`       | `u64`                 | `100`    | `limit` passed to `getUpdates`. Clamped to 1–100. |
 
-Failure handling: `LongPollUpdate` distinguishes transient from permanent upstream failures.
+To poll a [local Bot API server](https://github.com/tdlib/telegram-bot-api) instead of `api.telegram.org`, give the full URL:
 
-- **Transient** (network errors, 5xx, body-read errors, JSON-parse errors, 429): retry with full-jitter exponential backoff capped at 1 s. After ~60 consecutive failures the updater emits a single `long-poll prolonged outage` warning so a sustained outage is loud, then keeps retrying. Telegram's own multi-minute incidents are riden out, not abandoned.
-- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `long-poll permanent failure` error line, increments a process-wide health counter, and stops. Once every long-poll updater has stopped this way and no `WebhookUpdate` is configured, nothing can deliver updates any more: tgin starts a graceful shutdown within about a second (see [Lifecycle & shutdown](#lifecycle--shutdown)) and exits after the drain. A non-zero permanent-failure count at exit produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
+```ron
+LongPollUpdate(
+    token: "${TOKEN}",
+    url: Some("http://telegram-bot-api:8081/bot${TOKEN}/getUpdates"),
+),
+```
+
+Failure handling distinguishes transient from permanent upstream failures:
+
+- **Transient** (network errors, 5xx and other non-success statuses, body-read errors, JSON-parse errors): retry after a full-jitter exponential backoff. The base is `error_timeout_sleep` (at least 50 ms); it doubles after each consecutive failure up to a 1 s cap, and the actual sleep is a random value between 0 and the current backoff. A successful call resets it. After 60 consecutive transient failures the updater logs one `long-poll prolonged outage` warning, then keeps retrying; it never gives up on transient errors.
+- **429 Too Many Requests**: tgin sleeps for the `Retry-After` response header (seconds) when present, otherwise for the jittered backoff above. 429 does not count towards the outage warning.
+- **409 Conflict**: if Telegram says a webhook is active on the token, tgin calls `deleteWebhook` (keeping pending updates) and polls again; it does this at most once per 60 s, and only when the poll URL ends in `/getUpdates` (the `deleteWebhook` URL is derived from it). Otherwise — a webhook re-set within 60 s, a custom URL, or another process polling the same token — tgin logs the cause and retries after 5 s. Telegram allows one `getUpdates` poller per token; see [one replica per token](#deployment-rules).
+- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found): the token is wrong, revoked or malformed, and retrying cannot fix it. The updater logs a `long-poll permanent failure` error, increments a process-wide counter, and stops. Once every long-poll updater has stopped this way and no `WebhookUpdate` is configured, nothing can deliver updates any more: tgin starts a graceful shutdown within about a second and exits with code `2` after the drain (see [Lifecycle & shutdown](#lifecycle--shutdown)).
 
 #### `WebhookUpdate`
 
-Exposes an HTTP endpoint on `server_port` that Telegram POSTs updates to.
+Exposes `POST <path>` on `server_port` for Telegram to deliver updates to.
 
-| Field          | Type                                | Default  | Description                                                                                                                                                                                                                                                                              |
-|----------------|-------------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `path`         | `String`                            | required | Local URL path Telegram should hit (e.g. `/bot/pull`).                                                                                                                                                                                                                                   |
-| `secret_token` | `Option<String>`                    | `None`   | When set, tgin requires every inbound POST to carry a matching `x-telegram-bot-api-secret-token` header. Mismatches are rejected. When omitted, tgin logs a startup warning: anyone who can reach `path` can inject updates.                                                              |
-| `registration` | `Option<RegistrationWebhookConfig>` | `None`   | Enables automatic webhook registration at boot. tgin POSTs `setWebhook` to Telegram with `url = <public_ip><path>`. Override the registration endpoint via `set_webhook_url` (default `https://api.telegram.org/bot<token>/setWebhook`). Omit this block to manage the webhook yourself. |
+| Field          | Type                                | Default  | Description |
+|----------------|-------------------------------------|----------|-------------|
+| `path`         | `String`                            | required | Local URL path Telegram should hit (e.g. `/bot/pull`). |
+| `secret_token` | `Option<String>`                    | `None`   | 1–256 characters of `A-Z`, `a-z`, `0-9`, `_`, `-` (Telegram's rule; checked at startup). When set, every request must carry a matching `X-Telegram-Bot-Api-Secret-Token` header, compared in constant time; otherwise tgin answers `401` without reading the body. When omitted, tgin logs a startup warning: anyone who can reach `path` can inject updates. |
+| `registration` | `Option<RegistrationWebhookConfig>` | `None`   | Registers the webhook with Telegram at startup (see below). Omit it to manage the webhook yourself. |
 
-`RegistrationWebhookConfig` fields: `public_ip: String`, `token: String`, `set_webhook_url: Option<String>`.
+`RegistrationWebhookConfig` fields:
+
+- `public_ip: String` — the public `http(s)://` origin Telegram reaches tgin at (e.g. `"https://example.com"`); tgin appends `path` to it.
+- `token: String` — bot token used for the default endpoint `https://api.telegram.org/bot<token>/setWebhook`.
+- `set_webhook_url: Option<String>` — full `setWebhook` URL that replaces the default (e.g. for a local Bot API server).
+
+At startup tgin POSTs `setWebhook` with `url = <public_ip><path>` and, when configured, the same `secret_token`, so Telegram sends the header tgin checks. A failed registration is logged and does not stop tgin. tgin never deletes the webhook on shutdown.
+
+Request handling, in order: a wrong or missing secret gets `401`; a body over 64 KiB gets `413`; once ingest has stopped during shutdown, `503` with `Retry-After: 5`; a body that is not valid JSON gets `400`. Otherwise tgin waits for room in the dispatch queue, queues the original bytes, and answers `200`.
 
 ### Routing targets (`route`)
 
 #### `LongPollRoute { path, max_buffered_updates? }`
 
-Exposes a Telegram-shaped endpoint at `path` that downstream bots can poll. Updates are buffered in memory until a client calls the route via an `application/x-www-form-urlencoded` request with Telegram-compatible `offset` / `timeout` parameters. `offset` filtering follows Telegram semantics, so multiple bots can safely read from the same buffer.
+Exposes `POST <path>` as a Telegram-shaped `getUpdates` endpoint that downstream bots poll. Updates dispatched to the route wait in an in-memory FIFO buffer until a poll takes them.
 
-| Field                  | Type     | Default  | Description                                                                                                                                                                                                                                                                                                    |
-|------------------------|----------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `path`                 | `String` | required | Local URL path the downstream bot polls (e.g. `/bot1/getUpdates`).                                                                                                                                                                                                                                             |
-| `max_buffered_updates` | `usize`  | `10000`  | Cap on the per-route in-memory buffer. When reached, oldest updates are evicted FIFO and the eviction is reflected in `metrics.queue_dropped_total` on `/api/routes`. Telegram already buffers ~24 h of undelivered updates server-side, so tgin is best-effort recovery; raise the cap only if you need more. |
+| Field                  | Type     | Default  | Description |
+|------------------------|----------|----------|-------------|
+| `path`                 | `String` | required | Local URL path the downstream bot polls (e.g. `/bot1/getUpdates`). |
+| `max_buffered_updates` | `usize`  | `10000`  | Cap on the buffer (values below 1 become 1). When full, the oldest update is evicted to make room and counted in `queue_dropped_total`. Telegram itself keeps undelivered updates for about 24 h, so tgin's buffer is best-effort recovery, not the system of record. |
 
-Each `LongPollRoute` exposes runtime metrics through `GET /api/routes`:
+How a poll is answered:
+
+- **Drain-on-read.** A poll removes up to `limit` updates from the buffer and returns them as `{"ok":true,"result":[...]}`. An update is handed out once; this is at-most-once delivery (see [Delivery semantics](#delivery-semantics)).
+- **`offset` is ignored**, and so is `allowed_updates`. Bots may keep sending them, but they do not filter or acknowledge anything. Several bots polling the same path split its updates between them; each update goes to whichever poll takes it first.
+- **Parameters** come from the request body, either `application/json` or `application/x-www-form-urlencoded`; an empty body means all defaults. `limit` defaults to 100 and is clamped to 1–100. `timeout` defaults to 0 (answer at once) and is capped at 50 s; with a timeout, a poll on an empty buffer waits until an update arrives or the timeout expires, then answers with an empty `result`.
+- **Errors** follow the Bot API convention: a malformed body gets HTTP `200` with `{"ok":false,"error_code":400,...}`. Request bodies are capped at 8 KiB.
+- **During shutdown** a poll on an empty buffer is held for at most 500 ms; see [Lifecycle & shutdown](#lifecycle--shutdown).
+
+When the buffer depth first reaches 80 % of `max_buffered_updates`, tgin logs a one-time `long-poll route crossed buffer high-watermark` warning so a downstream that has gone offline does not go unnoticed.
+
+Each `LongPollRoute` reports its state in `GET /api/routes` and `GET /status`:
 
 ```json
 {
   "type": "longpoll",
   "options": { "path": "/bot1/getUpdates", "max_buffered_updates": 10000 },
-  "metrics": { "queue_depth": 7, "queue_dropped_total": 0 }
+  "metrics": { "queue_depth": 7, "queue_dropped_total": 0, "served_total": 1234 }
 }
 ```
 
-When `queue_depth` first crosses 80 % of `max_buffered_updates`, tgin emits a one-time `warning: long-poll route ... crossed buffer high-watermark` log line so a downstream that has gone offline does not leak silently.
-
 #### `WebhookRoute { url, request_timeout_ms? }`
 
-Push-based forwarder: every update triggers an HTTP POST of the original JSON payload to `url` (e.g. `http://internal-bot:8080/bot`). HTTP errors are logged and swallowed so one bad downstream cannot stall the dispatcher.
+Push-based forwarder: every update is POSTed once to `url` (e.g. `http://internal-bot:8080/bot`) with `Content-Type: application/json` and the original update bytes as the body. There are no retries. A non-2xx answer, a network error or a timeout is logged as a warning and counted (`http_failure_total` / `http_error_total`); the update is then dropped. The response body is ignored, so a bot cannot answer Telegram by replying to the webhook request; it has to call the Bot API itself.
 
-| Field                | Type     | Default  | Description                                                                                                                                       |
-|----------------------|----------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| `url`                | `String` | required | Downstream URL.                                                                                                                                   |
-| `request_timeout_ms` | `u64`    | `10000`  | Per-request deadline, in milliseconds. Lower it (e.g. `2000`) when downstreams are expected to be fast and you want backpressure to surface fast. |
+| Field                | Type     | Default  | Description |
+|----------------------|----------|----------|-------------|
+| `url`                | `String` | required | Absolute `http://` or `https://` downstream URL (checked at startup). |
+| `request_timeout_ms` | `u64`    | `10000`  | Per-request deadline in milliseconds. The dispatching worker waits up to this long, so lower it (e.g. `2000`) when downstreams should be fast. |
 
 ### Load balancers
 
-Load balancers compose multiple routes and can be nested arbitrarily deep.
+Load balancers compose multiple routes and can be nested arbitrarily deep. An empty load balancer in the config is a validation error; one emptied at runtime through the API drops updates and counts them in `dropped_empty_total`.
 
 #### `RoundRobinLB { routes }` (`src/lb/roundrobin.rs`)
 
-Holds an atomic cursor and forwards each update to the next child in sequence. Children can be heterogeneous — mix `WebhookRoute` and `LongPollRoute` freely.
+Forwards each update to the next child in turn. Children can be heterogeneous: mix `WebhookRoute` and `LongPollRoute` freely. There is no health checking: a child whose downstream is down keeps receiving its share.
 
 #### `AllLB { routes }` (`src/lb/all.rs`)
 
-Broadcast strategy: clones every update and dispatches it to every child concurrently. Useful when several specialized services must each see the full update stream (analytics, moderation, etc.). Be mindful of downstream backpressure — each update is processed `N` times.
+Sends every update to every child concurrently and returns once all of them have finished, so the slowest child sets the pace of the worker. Useful when several specialized services must each see the full update stream (analytics, moderation, etc.).
+
+### Sizing
+
+- **Memory.** The dominant cost is long-poll route buffers: at most Σ over `LongPollRoute`s of `max_buffered_updates` × update size, plus up to 1024 updates in the dispatch queue. Webhook ingress rejects updates over 64 KiB; long-poll ingress takes whatever Telegram sends. An update sent to several routes by `AllLB` is stored once and shared, so the sum is an upper bound. With the defaults, one route that fills up with 64 KiB updates holds 10 000 × 64 KiB ≈ 625 MiB; lower `max_buffered_updates` if that does not fit.
+- **Webhook throughput.** Each worker forwards one update at a time, so a tree of `WebhookRoute`s delivers at most about `dark_threads` ÷ (downstream response time) updates per second.
 
 ## HTTP management API
 
@@ -151,29 +202,32 @@ api: Some(ApiConfig(
 auth_token: Some("${TGIN_AUTH_TOKEN}"),
 ```
 
-Routes are nested under `base_path` and share the same listener as the ingress endpoints.
+Routes are nested under `base_path` and share the listener with the ingress endpoints.
 
 Every HTTP path (`WebhookUpdate.path`, `LongPollRoute.path`, `api.base_path`, and `Longpull` paths added via `POST /api/route`) is matched literally and must start with `/`; paths containing `{` or `}`, or with a segment starting with `:` or `*`, are rejected (an `InvalidPath` validation error at startup, `400` at runtime), and `api.base_path` may not be `/`.
 
-> **Authentication:** every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)); tgin refuses to start with `api` set and `auth_token` missing or blank. These endpoints mutate the routing tree, so restrict access at the network layer as well.
+> **Authentication:** every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)); tgin refuses to start with `api` set and `auth_token` missing or blank. These endpoints rewrite the routing tree, so restrict access at the network layer as well.
 
-| Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                                                                                             |
-|---------------|----------|------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `/api/routes` | `GET`    | —                                        | Returns the current routing tree as JSON (source: `Routeable::json_struct`).                                                                                                                                                                                                            |
-| `/api/route`  | `POST`   | `{ "type": "Webhook"\|"Longpull", ... }` | Adds a route dynamically. `Webhook` form: `{"type": "Webhook", "url": "...", "request_timeout_ms": <ms>?}`. `Longpull` form: `{"type": "Longpull", "path": "...", "max_buffered_updates": <n>?}`. `request_timeout_ms` defaults to `10000`; `max_buffered_updates` defaults to `10000`. |
-| `/api/route`  | `DELETE` | `{ "type": "Webhook"\|"Longpull", ... }` | Removes a previously-added route. Match by `url` (`Webhook`) or `path` (`Longpull`).                                                                                                                                                                                                    |
+| Endpoint      | Method   | Body                                     | Description |
+|---------------|----------|------------------------------------------|-------------|
+| `/api/routes` | `GET`    | —                                        | Returns the current routing tree as JSON, with per-leaf metrics. |
+| `/api/route`  | `POST`   | `{ "type": "Webhook"\|"Longpull", ... }` | Adds a route as a child of the top-level load balancer. `Webhook` form: `{"type": "Webhook", "url": "...", "request_timeout_ms": <ms>?}`. `Longpull` form: `{"type": "Longpull", "path": "...", "max_buffered_updates": <n>?}`. Defaults: `request_timeout_ms` 10000, `max_buffered_updates` 10000. |
+| `/api/route`  | `DELETE` | `{ "type": "Webhook"\|"Longpull", ... }` | Removes a route anywhere in the tree, matched by `url` (`Webhook`) or `path` (`Longpull`). |
 
-Status codes are honest about the outcome — the API used to return 200 for every request regardless of what the routing tree did:
+Routes added at runtime live in memory only; a restart reloads the routing tree from the config file. With `api` enabled, a request to a path no route handles is answered by the dynamic long-poll handler with a Bot API-style error envelope (HTTP `200`, `{"ok":false,...}`).
 
-| Status | Meaning                                                                                                                                                                                                                                  |
-|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `200`  | Mutation applied (or, for `GET /routes`, snapshot returned).                                                                                                                                                                             |
-| `400`  | Caller-supplied input is malformed: empty `url` or `path`, a `path` that doesn't start with `/` or contains `{`/`}` or a segment starting with `:`/`*`, a `url` that fails `reqwest::Url::parse` or whose scheme is not `http`/`https`, or a body that fails to deserialize against the schema. |
-| `404`  | `DELETE /route` target is not present anywhere in the tree.                                                                                                                                                                              |
-| `409`  | `POST /route` cannot attach a child to the current top-level route — e.g. it is a leaf (`WebhookRoute` / `LongPollRoute`) rather than a load balancer. Wrap the static config in an LB to make dynamic adds work.                        |
-| `500`  | Control plane itself failed (channel closed, response dropped). This is a tgin bug, not a caller bug.                                                                                                                                    |
+Status codes:
 
-> **Note:** the wire-level discriminant is `Longpull` (not `Longpoll`) — it matches the in-code spelling. User-facing prose says "long poll" / "LongPoll", but JSON and Rust identifiers use `Longpull`.
+| Status | Meaning |
+|--------|---------|
+| `200`  | Mutation applied (or, for `GET /routes`, snapshot returned). |
+| `400`  | tgin rejected the input: empty `url` or `path`, a `path` that doesn't start with `/` or contains `{`/`}` or a segment starting with `:`/`*`, or a `url` that does not parse or whose scheme is not `http`/`https`. |
+| `400` / `415` / `422` | axum rejected the body before tgin saw it: `415` without `Content-Type: application/json`, `400` for malformed JSON, `422` for JSON that does not match the schema (e.g. unknown `type`). |
+| `404`  | `DELETE /route` target is not present anywhere in the tree. |
+| `409`  | `POST /route` cannot attach a child because the top-level route is a leaf (`WebhookRoute` / `LongPollRoute`), not a load balancer. Wrap the static config in an LB to make dynamic adds work. |
+| `500`  | The control plane itself failed (channel closed, response dropped). This is a tgin bug, not a caller bug. |
+
+> **Note:** the wire-level discriminant is `Longpull` (not `Longpoll`); it matches the in-code spelling. User-facing prose says "long poll", but JSON and Rust identifiers use `Longpull`.
 
 Add a webhook route at runtime:
 
@@ -193,7 +247,6 @@ curl -X POST http://localhost:3000/api/route \
   -d '{"type": "Longpull", "path": "/bot-c/getUpdates"}'
 
 curl -X POST http://localhost:3000/bot-c/getUpdates \
-  --data-urlencode 'offset=0' \
   --data-urlencode 'timeout=30'
 ```
 
@@ -201,25 +254,32 @@ The API talks to the routing core via an in-memory channel (see `src/api/router.
 
 ## Observability
 
-tgin exposes structured logs plus two always-on HTTP endpoints. The endpoints are mounted on the main listener whenever `server_port` is set — **independent of `api`**; observability never requires enabling hot-reconfig. `/status` and `/metrics` are reserved paths: a configured route on either is a validation error at startup, not a runtime collision.
+tgin exposes structured logs plus four always-on HTTP endpoints: `/livez`, `/readyz`, `/status` and `/metrics`. They are mounted on the main listener whenever `server_port` is set, **independent of `api`**. All four paths are reserved: a `WebhookUpdate` or `LongPollRoute` on any of them is a validation error at startup.
 
 ### Authentication
 
-The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is gated by the top-level `auth_token`: when set, a request without the exact `Authorization: Bearer <auth_token>` credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time. The management API cannot run without it: setting `api` with a missing or blank `auth_token` fails validation at startup. Without `api`, `auth_token` is optional — `/status` and `/metrics` are then unauthenticated and assume network-layer isolation (a private network or a reverse proxy), and a present-but-blank value is ignored with a startup warning so the misconfiguration is visible. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
+The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is gated by the top-level `auth_token`: when set, a request without the exact `Authorization: Bearer <auth_token>` credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time. The management API cannot run without it: setting `api` with a missing or blank `auth_token` fails validation at startup. Without `api`, `auth_token` is optional — `/status` and `/metrics` are then unauthenticated and assume network-layer isolation (a private network or a reverse proxy), and a present-but-blank value is ignored with a startup warning so the misconfiguration is visible. The probes `/livez` and `/readyz` and the data plane — webhook ingress and long-poll route endpoints — are never gated by `auth_token`. Telegram tokens embedded in webhook route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
 
 For Prometheus, pass the secret through the scrape config's `authorization` block (`type: Bearer`, `credentials: <auth_token>`).
 
+### Probes
+
+- `GET /livez` answers `200 ok` whenever the process serves HTTP.
+- `GET /readyz` answers `200 ready`, and `503 draining` from the moment shutdown starts. It does not check Telegram or downstream reachability.
+
+Both are plain HTTP(S) on the main listener; with `ssl` set, probe them over HTTPS.
+
 ### Logging
 
-All operator output is emitted through `tracing`. `log_level` sets the minimum level (overridable via the `RUST_LOG` environment variable) and `log_format` selects `Compact` (human-readable) or `Json` (one JSON object per line) output. Telegram tokens are redacted from every log line.
+All operator output is emitted through `tracing` to stdout; startup errors (bad config, bind or TLS failure) are printed to stderr as a single `tgin: <error>` message. `log_level` sets the minimum level (overridable via the `RUST_LOG` environment variable) and `log_format` selects `Compact` (human-readable) or `Json` (one JSON object per line) output. Bot tokens in the long-poll URL, the `setWebhook` URL and webhook route URLs are replaced with `#####` in log lines and startup banners, and HTTP client errors are logged without their request URL. Paths you configure (`WebhookUpdate.path`, `LongPollRoute.path`) are logged as written, so keep tokens out of them.
 
 ### `GET /status`
 
 Returns a JSON snapshot:
 
-- `updaters[]` — one object per ingress provider: `type` (`longpoll`/`webhook`), redacted `source`, and `metrics` (`updates_received_total`, `poll_failures_total`, `permanent_failure`).
+- `updaters[]` — one object per ingress provider: `type` (`longpoll`/`webhook`), `source` (the token-redacted poll URL for long poll, `0.0.0.0<path>` for webhook), and `metrics` (`updates_received_total`, `poll_failures_total`, `permanent_failure`).
 - `routes` — the routing tree (same shape as `GET /api/routes`), with per-leaf `metrics`.
-- `load_balancer.dropped_empty_total` — updates dropped at a load balancer drained empty at runtime.
+- `load_balancer.dropped_empty_total` — updates dropped at a load balancer emptied at runtime.
 
 ### `GET /metrics`
 
@@ -228,13 +288,13 @@ Prometheus text exposition (`Content-Type: text/plain; version=0.0.4`). Metric n
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `tgin_updater_updates_received_total` | counter | `source` | Updates accepted from an ingress provider. |
-| `tgin_updater_poll_failures_total` | counter | `source` | Long-poll transient poll failures (webhook stays 0). |
+| `tgin_updater_poll_failures_total` | counter | `source` | Failed long-poll calls: transient errors, and `409` conflicts that tgin backs off on (not the one that triggers a `deleteWebhook`, nor `429`). Always `0` for webhook ingress. |
 | `tgin_updater_permanent_failure` | gauge | `source` | `1` once a long-poll updater stopped on a permanent failure. |
 | `tgin_route_queue_depth` | gauge | `route` | Current depth of a long-poll route buffer. |
 | `tgin_route_queue_dropped_total` | counter | `route` | Updates evicted from a long-poll buffer at its cap. |
 | `tgin_route_served_total` | counter | `route` | Updates served out via a long-poll route's `getUpdates`. |
 | `tgin_route_dispatched_total` | counter | `route` | Updates a webhook route attempted to forward. |
-| `tgin_route_http_responses_total` | counter | `route`, `result` | Webhook downstream outcomes (`result` = `success`/`failure`/`error`). |
+| `tgin_route_http_responses_total` | counter | `route`, `result` | Webhook downstream outcomes: `success` (2xx), `failure` (other status), `error` (no response: network error or timeout). |
 | `tgin_lb_dropped_empty_total` | counter | — | Updates dropped at an empty load balancer. |
 
 All `source` / `route` label values are token-redacted and Prometheus-escaped.
@@ -261,22 +321,80 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
    server_port: Some(3000),
    ```
 
-3. **Run tgin.** The Axum server binds `0.0.0.0:<server_port>` and serves HTTPS using the supplied certificate. Long-poll routes, webhook ingress, and the management API all use the same TLS listener.
+3. **Run tgin.** The listener binds `0.0.0.0:<server_port>` and serves HTTPS only, using the supplied certificate. Long-poll routes, webhook ingress, the probes, `/status`, `/metrics` and the management API all use the same TLS listener. Startup fails (exit `1`) if either file is missing or cannot be loaded. In the container image, the key file must be readable by uid `65532` (see [Running in Docker](#running-in-docker)).
 
 ## Lifecycle & shutdown
 
-**Startup.** With `server_port` set, tgin binds `0.0.0.0:<server_port>` on the main task before serving. A bind failure (port already in use, bad address) or an unreadable TLS certificate is reported as a single `tgin: <error>` line on stderr and the process exits `1` — it does not start a half-initialized process with no HTTP plane.
+**Startup.** tgin loads and validates the config, then, with `server_port` set, binds `0.0.0.0:<server_port>` before starting any updater. A config error, a bind failure (port already in use) or a certificate that cannot be loaded is reported as a single `tgin: <error>` message on stderr and the process exits `1`; it never runs half-initialized without its HTTP plane.
 
 **Graceful shutdown.** On `SIGTERM` or `SIGINT` (Unix), on Ctrl-C, Ctrl-Break, console close, or system shutdown (Windows), or once every ingress has failed permanently, tgin logs `shutdown started; draining` (with the cause and timing) and drains in order:
 
 1. **Lame duck (5 s).** `/readyz` answers `503` so load balancers stop routing here; everything else keeps working normally, including webhook ingress.
-2. **Stop ingest.** Long-poll updaters stop pulling from Telegram; webhook ingress answers `503` with `Retry-After: 5`, so Telegram redelivers those updates later rather than having them acknowledged by a process about to exit.
-3. **Drain (up to 15 s).** Updates already accepted keep flowing through the routing tree, and long-poll routes keep serving their buffers to downstream bots. A long poll on an empty buffer is held for at most 500 ms (a parked poll is released within 500 ms of the drain starting) and then answered with an empty batch, so consumers are neither held for their full `timeout` nor spinning on empty answers. The drain ends as soon as the dispatch queue and every long-poll buffer are empty.
-4. **Close.** The HTTP plane closes (in-flight requests get 1 s), the worker pool finishes any remaining backlog, and the process exits. Updates still sitting in a long-poll buffer at that point are logged as `abandoned`.
+2. **Stop ingest.** Long-poll updaters stop pulling from Telegram (an in-flight `getUpdates` is abandoned); webhook ingress answers `503` with `Retry-After: 5`, so Telegram redelivers those updates later (to a replacement instance, if one is up) rather than having them acknowledged by a process about to exit.
+3. **Drain (up to 15 s).** Updates already accepted keep flowing through the routing tree, and long-poll routes keep serving their buffers to downstream bots. A poll on an empty buffer is held for at most 500 ms (a poll already parked is released within 500 ms of the drain starting) and then answered with an empty batch, so consumers are neither held for their full `timeout` nor spinning on empty answers. Every 50 ms tgin checks whether the dispatch queue and every long-poll buffer are empty, and moves on as soon as they are.
+4. **Close.** The HTTP plane closes (in-flight requests get 1 s). The workers then finish whatever is still in the dispatch queue. This step has no deadline: if the 15 s ran out with updates still queued, each one can hold a worker for up to its webhook route's `request_timeout_ms`. Updates still in a long-poll buffer at exit are lost and logged as a warning with their count (`abandoned`).
 
-When the console window is closed on Windows, which kills the process about 5 s later, the lame duck is skipped and the drain is capped at 4 s. Without `server_port` there is no HTTP plane to drain: tgin logs `shutdown started; no HTTP plane, stopping ingest`, stops ingest and finishes the worker backlog right away. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start.
+With the defaults, steps 1–3 and the HTTP close take at most 5 s + 15 s + 1 s = 21 s; webhook requests still in flight after that run to completion or to their `request_timeout_ms`.
 
-**Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped, including the self-initiated shutdown once all ingress has failed; see [Failure handling](#longpollupdate).
+**Known limitation.** The drain is best-effort. A worker that has taken an update off the dispatch queue but not yet pushed it into a long-poll route is invisible to the emptiness check. If the check samples in that instant, the HTTP plane can close before the update reaches the buffer; it is then counted in the `abandoned` warning instead of being delivered.
+
+**Other cases.** When the console window is closed on Windows, which kills the process about 5 s later, the lame duck is skipped and the drain is capped at 4 s. Without `server_port` there is no HTTP plane to drain: tgin logs `shutdown started; no HTTP plane, stopping ingest`, skips the lame duck, stops ingest and finishes the worker backlog right away. When every long-poll updater has failed permanently and there is no webhook ingress, the shutdown starts within about a second and runs the full drain above.
+
+**Exit codes.**
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Clean shutdown (signal-driven drain, or every ingress stopped on its own without a permanent failure). |
+| `1`  | Startup failure: config read, env substitution, parse or validation error; bind or TLS error. |
+| `2`  | At least one long-poll updater stopped on a permanent failure (401/403/404) during the run, whatever ended the process; this includes the self-initiated shutdown once all ingress has failed. See [Failure handling](#longpollupdate). |
+
+### Deployment rules
+
+- **One replica per bot token with long-poll ingress.** Telegram accepts one `getUpdates` poller per token; a second one gets `409 Conflict`, and tgin backs off and logs `another process is polling this token`. Run a single tgin per token and replace it with a stop-then-start rollout (Kubernetes `strategy: Recreate`, `replicas: 1`), not a rolling update that briefly runs two.
+- **Long-poll route buffers are per process.** A downstream bot must poll the tgin instance that holds its updates.
+- **Give the drain time.** Set the orchestrator's stop timeout to at least 30 s: Kubernetes `terminationGracePeriodSeconds: 30`, Docker `--stop-timeout 30` or Compose `stop_grace_period: 30s` (Docker's default is 10 s, which cuts the drain short).
+- **Probes.** Liveness on `/livez`, readiness on `/readyz`.
+
+```yaml
+# Kubernetes Deployment excerpt for long-poll ingress
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: tgin
+          image: ghcr.io/arynyklas/tgin:0.2
+          livenessProbe:
+            httpGet: { path: /livez, port: 3000 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 3000 }
+```
+
+## Running in Docker
+
+The image (built from the repository `Dockerfile`, published as `ghcr.io/arynyklas/tgin` for `linux/amd64` and `linux/arm64`, tagged `<version>`, `<major>.<minor>` and `latest`) contains one static binary on `gcr.io/distroless/static-debian13`:
+
+- **Entrypoint** `/usr/local/bin/tgin`, default arguments `-f /etc/tgin/config.ron`: mount your config there, or pass your own `-f <path>`.
+- **User** numeric uid/gid `65532:65532`. A mounted config file must be readable by that uid (`chmod 0644 tgin.ron`); for a TLS private key, `chown 65532:65532 key.pem` or run the container with `--user` set to the key's owner.
+- **No shell, no curl.** A `HEALTHCHECK` that execs a command inside the container cannot work; probe `/livez` and `/readyz` over HTTP from outside (orchestrator HTTP probes).
+- **Port** `3000` is declared with `EXPOSE`, but tgin listens on the config's `server_port`; publish that one.
+
+```bash
+docker build -t tgin .            # or use ghcr.io/arynyklas/tgin:<version>
+chmod 0644 tgin.ron
+docker run -d --name tgin \
+  -p 3000:3000 \
+  -v "$PWD/tgin.ron:/etc/tgin/config.ron:ro" \
+  -e TOKEN=123456:ABC \
+  -e TGIN_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  --stop-timeout 30 \
+  tgin
+```
+
+`examples/simple` runs the same image with Docker Compose. [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify a published image's provenance attestation.
 
 ## Configuration example
 
@@ -287,7 +405,7 @@ When the console window is closed on Windows, which kills the process about 5 s 
     dark_threads: 6,
     server_port: Some(3000),
     // api: Some(ApiConfig(base_path: "/api")),
-    // auth_token: Some("change-me"),  // required when `api` is set
+    // auth_token: Some("${TGIN_AUTH_TOKEN}"),  // required when `api` is set
     // ssl: Some(SslConfig(cert: "/cert.pem", key: "/privkey.pem")),
     updates: [
         LongPollUpdate(
@@ -295,6 +413,7 @@ When the console window is closed on Windows, which kills the process about 5 s 
         ),
         // WebhookUpdate(
         //     path: "/bot/pull",
+        //     secret_token: Some("${WEBHOOK_SECRET}"),
         // ),
     ],
     route: RoundRobinLB(
@@ -308,7 +427,9 @@ When the console window is closed on Windows, which kills the process about 5 s 
 
 ## Further reading
 
-- [README.md](README.md) — high-level motivation and quick start.
-- [PERF.md](PERF.md) — benchmark methodology and results.
+- [README.md](README.md) — high-level motivation, quick start and release artefacts.
+- [PERF.md](PERF.md) — benchmark methodology, results and their known limits.
+- [CHANGELOG.md](CHANGELOG.md) — changes per release.
+- [SECURITY.md](SECURITY.md) — vulnerability reporting and release verification.
 - [examples/simple](examples/simple) — docker-compose demo with multiple downstream bots and a sample `tgin.ron`.
 - [integrations/pytgin](integrations/pytgin) — Python `aiogram` shim that reroutes `getUpdates` through tgin.

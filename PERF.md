@@ -1,10 +1,16 @@
 # Performance and benchmarks
 
+> [!WARNING]
+> **These numbers will be re-measured; do not use them for capacity planning.** The charts below come from a benchmark harness with known measurement defects:
+>
+> - **Closed-loop load.** The load generator does not keep its target rate when the system under test slows down: its ticker delays missed ticks instead of catching up, and webhook sends wait for one of `max_in_flight` slots. The offered load then drops below the target RPS (`rps_actual` in the CSV), and the latency of requests that were never sent goes unmeasured.
+> - **Broken direct long-poll baseline.** The fake Bot API in `tgin-bench` reads `getUpdates` parameters only from the query string and keeps every returned update until a later request carries a higher `offset`. The direct aiogram bot sends its parameters in the POST body, so its `offset` never arrives and it is served the same oldest batch again and again. The `longpoll-direct-1` rows measure this bug, not aiogram.
+> - **2 s drain cut-off.** After the send phase the generator waits at most 2 s (`--drain-timeout`, `DRAIN_TIMEOUT` in the makefile) for outstanding replies. Anything answered later, such as updates still queued in a tgin long-poll buffer, is counted as lost, so "loss" mixes late delivery with real loss.
+> - **10 ms bot sleep.** Every benchmark bot sleeps 10 ms per update before replying (`tests/performance/bot/*.py`). That sleep sets the latency floor and caps each bot's throughput, so the charts mostly show bot capacity, not routing overhead.
+
 ## Contents
 
-- [TL;DR](#tldr)
 - [Methodology](#methodology)
-- [Results summary](#results-summary)
 - [Webhook — routing overhead](#webhook--routing-overhead)
 - [Webhook — scale-out](#webhook--scale-out)
 - [Long-poll — routing overhead](#long-poll--routing-overhead)
@@ -12,36 +18,22 @@
 - [Reproducing the benchmarks](#reproducing-the-benchmarks)
 - [See also](#see-also)
 
-## TL;DR
-
-- A single direct aiogram bot is still clean at 2,000 RPS but collapses from 5,000 RPS upward (97–98% loss, multi-second p99 latency).
-- A 10-worker tgin webhook cluster sustains 10,000 RPS at 0% loss with mean ~11.6 ms and p99 ~15 ms. 5 workers also hold 0% loss at the same RPS, but the cluster queues: mean climbs to ~410 ms with p99 around 990 ms.
-- In long-poll mode tgin buffers spikes in a bounded route queue. With 5 or more workers loss stays at 0% at 10,000 RPS while latency rises temporarily as the backlog drains; narrower clusters fill the buffer and start dropping (3 workers see ~53% loss at 10,000 RPS, 1 worker drops ~91% from 5,000 RPS upward).
-
 ## Methodology
 
-Load testing uses `tgin-bench`, a Rust load generator that emits synthetic JSON payloads matching Telegram `Update` objects. Everything runs in Docker so the load generator, tgin, and downstream bots are isolated and reproducible.
+Load testing uses `tgin-bench` (`tests/performance/benchmark`), a Rust load generator that emits synthetic JSON payloads shaped like Telegram `Update` objects and plays the Telegram Bot API for the bots (`getUpdates`, `sendMessage`). A bot replies to each update with `sendMessage`; the time from sending an update to receiving that reply is its latency. Everything runs in Docker Compose so the load generator, tgin and the downstream bots are isolated.
 
 Two architectures are compared:
 
 - **Direct connection** — load generator → single Python aiogram bot.
-- **tgin cluster** — load generator → tgin → `N` aiogram workers, distributed via `RoundRobinLB`. Tested with `N ∈ {1, 2, 3, 5, 10}`.
+- **tgin cluster** — load generator → tgin → `N` aiogram bots, distributed via `RoundRobinLB`. Tested with `N ∈ {1, 2, 3, 5, 10}`.
 
-Per-run metrics:
+Each scenario runs for both the webhook and the long-poll transport, at 500, 1 000, 2 000, 5 000, 8 000 and 10 000 target RPS.
 
-- Requests per second (RPS).
-- Packet loss rate (%).
-- Latency: mean, median (p50), p99, max. The repository's plotted charts show loss, mean, median, and max; p99 is recorded in the CSV and cited in the prose.
+Per-run metrics (one CSV row per run):
 
-Each scenario is run for both the webhook and the long-poll transport.
-
-## Results summary
-
-A single aiogram instance hits a hard ceiling. At 2 000 RPS the direct setup is still clean; from 5 000 RPS upward it collapses with 97–98% loss and p99 latency in the tens of seconds.
-
-Putting tgin in front of even a single worker drops 5 000–10 000 RPS loss from ~97% to ~7%, and a 5-worker webhook cluster sustains 10 000 RPS at 0% loss.
-
-In webhook mode, 10 workers at 10 000 RPS hold mean latency around 11.6 ms with p99 around 15 ms; 5 workers also absorb the same load at 0% loss, but the cluster queues — mean rises to ~410 ms with p99 around 990 ms. In long-poll mode tgin buffers updates during spikes in a bounded route queue: latency rises temporarily as the backlog drains, and once the cluster is wide enough (≥5 workers at 10 000 RPS) no updates are lost. Narrower long-poll clusters fill the buffer and start dropping.
+- Target and achieved RPS.
+- Loss rate (%): updates without a reply by the end of the drain window.
+- Latency: min, mean, median (p50), p95, p99, max. The charts show loss, mean, median and max; the other columns are in the CSV.
 
 ## Webhook — routing overhead
 
@@ -75,7 +67,7 @@ _tgin fanning traffic out across 2, 3, 5, and 10 backends._
 
 ## Long-poll — routing overhead
 
-_Equal backend count: direct bot vs. a single bot behind tgin._
+_Equal backend count: direct bot vs. a single bot behind tgin. The direct baseline is broken (see the warning above)._
 
 <table>
   <tr>
@@ -105,7 +97,7 @@ _tgin buffering and distributing updates across 2, 3, 5, and 10 backends._
 
 ## Reproducing the benchmarks
 
-A full benchmark sweep runs three 30-second samples for each scenario by default.
+Requires Docker with Compose, `make`, `curl`, `git` and `bash`; the chart step requires [uv](https://docs.astral.sh/uv/). A full sweep runs 12 scenarios × 6 RPS values × 3 runs = 216 runs of 30 s load each, plus container start-up per run: about 3 hours.
 
 ```bash
 git clone https://github.com/arynyklas/tgin.git
@@ -113,9 +105,9 @@ cd tgin/tests/performance
 
 # Run the full RPS matrix (writes results/<run_id>.csv).
 # Defaults: DURATION=30 RUNS=3.
-. ./benchmark.sh
+./benchmark.sh
 
-# Regenerate the charts under diagram/generated/.
+# Regenerate the charts under diagram/generated/ from the newest results/*.csv.
 cd diagram
 uv run main.py
 ```

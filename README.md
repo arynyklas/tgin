@@ -24,7 +24,7 @@
 tgin distributes incoming Telegram updates between multiple bot instances. It was built for teams scaling Telegram bots into a microservices-style deployment.
 
 > [!IMPORTANT]
-> Active development is ongoing — there is no stable release yet.
+> tgin is pre-1.0 (`0.x`). Until 1.0, a minor release (`0.x.0`) may contain breaking changes; each one is listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contents
 
@@ -38,13 +38,13 @@ tgin distributes incoming Telegram updates between multiple bot instances. It wa
 
 ## Why tgin
 
-- **Load balancing** — distributes Telegram updates across multiple bot instances.
+- **Load balancing** — round-robin or broadcast updates across multiple bot instances.
 - **Protocol flexibility** — long poll and webhook on both ingress and egress, in any combination.
-- **Framework-agnostic** — works with any Telegram bot framework on the downstream side.
-- **Horizontal scaling** — add bot instances without touching their code.
-- **Zero-downtime deployments** — restart or replace downstream bots without dropping updates.
-- **Microservices-friendly** — fan updates out to specialized services in a distributed setup.
-- **Production-ready primitives** — health monitoring, retries, and failover handling baked in.
+- **Framework-agnostic** — works with any bot framework that can receive webhooks or point its `getUpdates` call at a custom URL.
+- **Horizontal scaling** — add or remove downstream instances at runtime through the management API.
+- **Buffering for long-poll bots** — while a long-poll downstream restarts, tgin keeps its updates in a bounded per-route buffer (`max_buffered_updates`). Webhook routes have no retries: an update sent to a webhook bot that is down is lost.
+- **Microservices-friendly** — fan every update out to several specialized services with `AllLB`.
+- **Operational basics** — `/livez` and `/readyz` probes, Prometheus `/metrics`, JSON logs, and a graceful drain on shutdown. There are no downstream health checks or failover yet: round-robin keeps sending a dead downstream its share.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ Updates arrive over a long-poll or webhook ingress, traverse a tree of routes an
 
 ## Quick start
 
-Requires a stable Rust toolchain (edition 2021 — see `Cargo.toml`).
+Building from source requires Rust 1.88 or newer (`rust-version` in `Cargo.toml`) and a C compiler for `aws-lc-sys`, the TLS crypto backend. Prebuilt binaries and a container image are described under [Install a release](#install-a-release).
 
 ### 1. Clone and build
 
@@ -90,13 +90,15 @@ cargo build --release
 )
 ```
 
-`${VAR}` placeholders are substituted from the process environment before parsing; missing variables abort startup.
+`${VAR}` placeholders are substituted from the process environment before parsing; if any are unset, tgin lists them on stderr and exits with code `1`.
 
 ### 3. Run
 
 ```bash
 TOKEN=123456:ABC ./target/release/tgin -f tgin.ron
 ```
+
+This config has no `api` block, so it needs no `auth_token`. The `tgin.ron` shipped in the repository enables the management API and also reads `TGIN_AUTH_TOKEN`; tgin only requires it to be non-blank, so generate a strong one, e.g. `openssl rand -hex 32`.
 
 Or run the bundled docker-compose example:
 
@@ -105,16 +107,24 @@ cd examples/simple
 TOKEN=... TGIN_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
 ```
 
+### Install a release
+
+Each GitHub release carries archives for Linux (glibc and static musl), macOS and Windows on x86_64 and aarch64, shell and PowerShell installers, checksums and a CycloneDX SBOM. The container image is published as `ghcr.io/arynyklas/tgin` for `linux/amd64` and `linux/arm64`; see [DOCS.md → Running in Docker](DOCS.md#running-in-docker) for how to run it. Release archives and images carry build provenance attestations; [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify them.
+
+The image runs as uid/gid `65532` and contains no shell: a mounted config file (and TLS key) must be readable by uid `65532` (e.g. `chmod 0644 tgin.ron`), and health checks probe `/livez` and `/readyz` over HTTP from outside the container.
+
 ## Documentation
 
-- [DOCS.md](DOCS.md) — configuration reference, runtime behavior, HTTP management API, TLS setup.
-- [PERF.md](PERF.md) — benchmark methodology and latest numbers.
+- [DOCS.md](DOCS.md) — configuration reference, delivery semantics, HTTP management API, observability, shutdown, Docker and TLS.
+- [PERF.md](PERF.md) — benchmark methodology, charts and the known limits of the current numbers.
+- [CHANGELOG.md](CHANGELOG.md) — changes per release, including breaking ones.
+- [SECURITY.md](SECURITY.md) — supported versions, private vulnerability reporting, release verification.
 - [examples/simple](examples/simple) — minimal docker-compose deployment with two long-poll bots and one webhook bot.
 - [integrations/pytgin](integrations/pytgin) — Python `aiogram` shim that reroutes `getUpdates` through tgin.
 
 ## Performance
 
-Headline scale-out runs — full charts (overhead and per-metric breakdowns for both transports) live in [PERF.md](PERF.md).
+Headline scale-out runs — full charts (overhead and per-metric breakdowns for both transports) live in [PERF.md](PERF.md). These numbers come from a harness with known measurement defects and will be re-measured; read the warning at the top of PERF.md before relying on them.
 
 <table>
   <tr>
@@ -137,7 +147,7 @@ Headline scale-out runs — full charts (overhead and per-metric breakdowns for 
 
 - [ ] Complete management API
 - [ ] Expanded test and performance coverage
-- [ ] Structured, production-grade logging
+- [x] Structured, production-grade logging
 - [ ] Anti-DDoS guard
 - [ ] Message-broker support
 - [ ] First-class microservices patterns

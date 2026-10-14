@@ -12,9 +12,10 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ### Security
 
-- Bot tokens no longer leak into logs or startup banners. HTTP client errors
-  are logged without their request URL (which carries the token), and the
-  `WebhookRoute` banner redacts its URL like the other banners.
+- Bot tokens in Bot API and downstream URLs no longer leak into logs or
+  startup banners. HTTP client errors are logged without their request URL
+  (which carries the token), and the `WebhookRoute` banner redacts its URL
+  like the other banners.
 - `WebhookUpdate` now sends its `secret_token` to `setWebhook` when it
   registers the webhook, so Telegram includes the
   `X-Telegram-Bot-Api-Secret-Token` header that tgin checks. Previously a
@@ -28,16 +29,19 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ### Fixed
 
-- Shutdown no longer loses updates that were already acknowledged to
-  Telegram. On a shutdown signal tgin reports not-ready on `/readyz`, keeps
+- Shutdown drains updates that were already acknowledged to Telegram instead
+  of dropping them (best effort; DOCS.md lists the remaining gap). On a
+  shutdown signal tgin reports not-ready on `/readyz`, keeps
   accepting connections for a short lame-duck period (5 s), stops ingesting,
   answers webhook ingress with `503` and `Retry-After`, and keeps serving
   buffered updates to long-poll routes until they are drained or a 15 s grace
-  period ends. Parked long polls return an empty batch right away.
+  period ends. A long poll on an empty buffer is answered with an empty batch
+  within 500 ms instead of being held for its full timeout.
 - Long-poll ingress recovers from `409 Conflict` instead of retrying it as a
   transient error. If a webhook is active, tgin deletes it (at most once per
-  60 s) and resumes polling; if another process polls the same token, tgin
-  backs off and logs that only one poller per token can run.
+  60 s, and only when the poll URL ends in `/getUpdates`) and resumes
+  polling; if another process polls the same token, tgin backs off for 5 s
+  and logs that only one poller per token can run.
 - tgin exits with code 2 when every long-poll ingress has failed permanently
   and there is no webhook ingress, instead of running with nothing to route.
 - Long-poll routes clamp `getUpdates` parameters to Telegram's bounds: `limit`
@@ -80,12 +84,13 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ### Dependencies
 
-- All Rust dependencies moved to their latest releases, including axum 0.8,
-  axum-server 0.8, reqwest 0.13 and rand 0.10. reqwest is built with rustls
-  only, so OpenSSL, native-tls and ring are out of the build graph; one
-  aws-lc-rs provider is shared by the HTTP client and the TLS listener.
-  `once_cell` was replaced by `std::sync::LazyLock`.
-- Known advisories against the lockfile went from 11 affected packages to 0.
+- All Rust dependencies were updated, including axum 0.8, axum-server 0.8,
+  reqwest 0.13 and rand 0.10. reqwest is built with rustls only, so OpenSSL,
+  native-tls and ring are out of the build graph; one aws-lc-rs provider is
+  shared by the HTTP client and the TLS listener. tgin's own code uses
+  `std::sync::LazyLock` instead of `once_cell`.
+- `cargo deny check advisories` reports no known RustSec advisories against
+  the lockfile; CI runs `cargo deny check` on every push and pull request.
 - The benchmark harness, examples and Docker base images were updated as well.
 
 ### Docs
