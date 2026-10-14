@@ -12,18 +12,6 @@ x-bench-healthcheck: &bench-healthcheck
   timeout: 1s
   retries: 30
 
-x-tgin-healthcheck-3000: &tgin-healthcheck-3000
-  test: ["CMD-SHELL", "grep -q ':0BB8 ' /proc/net/tcp /proc/net/tcp6"]
-  interval: 2s
-  timeout: 1s
-  retries: 30
-
-x-tgin-healthcheck-3030: &tgin-healthcheck-3030
-  test: ["CMD-SHELL", "grep -q ':0BD6 ' /proc/net/tcp /proc/net/tcp6"]
-  interval: 2s
-  timeout: 1s
-  retries: 30
-
 services:
   tgin_webhook:
     build:
@@ -36,7 +24,6 @@ services:
         condition: service_healthy
       webhook_bot2:
         condition: service_healthy
-    healthcheck: *tgin-healthcheck-3000
     ports:
       - "3000:3000"
     networks:
@@ -52,7 +39,6 @@ services:
     depends_on:
       webhook_bot1:
         condition: service_healthy
-    healthcheck: *tgin-healthcheck-3000
     ports:
       - "3000:3000"
     networks:
@@ -70,7 +56,6 @@ services:
     depends_on:
       bench:
         condition: service_healthy
-    healthcheck: *tgin-healthcheck-3030
     ports:
       - "3030:3030"
     networks:
@@ -88,7 +73,6 @@ services:
     depends_on:
       bench:
         condition: service_healthy
-    healthcheck: *tgin-healthcheck-3030
     ports:
       - "3030:3030"
     networks:
