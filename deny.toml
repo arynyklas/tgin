@@ -4,9 +4,14 @@
 [graph]
 all-features = false
 
-# Advisories: RustSec database, default severity handling (vulnerable,
-# unmaintained, unsound and yanked crates are errors).
+# Advisories: RustSec database. Vulnerability advisories are always errors;
+# unmaintained and unsound advisories are errors for every crate in the graph
+# (0.20 defaults unsound to the workspace only), and yanked crates are errors
+# (0.20 defaults to a warning).
 [advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
 
 [licenses]
 # Exactly the licenses the current dependency graph needs. Each entry names the

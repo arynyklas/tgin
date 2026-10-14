@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    # Dependabot branches are covered by their pull_request run.
+    branches-ignore: ["dependabot/**"]
   pull_request:
 
 permissions:
