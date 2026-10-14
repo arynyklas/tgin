@@ -107,6 +107,19 @@ pub trait Routeable: Send + Sync {
         drop(target);
         Err(RemoveRouteError::NotFound)
     }
+
+    /// Enter drain mode: shutdown has stopped ingest and the process will
+    /// exit once buffered updates are consumed. Leaves that hold consumers
+    /// open (a parked long poll) answer them now; load balancers forward to
+    /// every child. The default is a no-op.
+    fn begin_drain(&self) {}
+
+    /// Updates accepted into this node and still waiting for a downstream
+    /// consumer. Shutdown waits for this to reach `0` before closing the
+    /// HTTP plane. Load balancers sum their children; the default is `0`.
+    fn pending(&self) -> usize {
+        0
+    }
 }
 #[async_trait]
 pub trait Serverable {

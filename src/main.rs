@@ -115,10 +115,27 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
     // instead of treating it as a clean shutdown.
     let health_counter = Arc::new(AtomicUsize::new(0));
 
+    // Ingress shape for the all-ingress-failed shutdown: it fires only when
+    // every long-poll updater has failed and no webhook can still deliver.
+    let long_poll_updaters = conf
+        .updates
+        .iter()
+        .filter(|upd| matches!(upd, UpdateConfig::LongPollUpdate { .. }))
+        .count();
+    let has_webhook_ingress = conf
+        .updates
+        .iter()
+        .any(|upd| matches!(upd, UpdateConfig::WebhookUpdate { .. }));
+
     let inputs = build_updates(conf.updates, &http_client, &health_counter);
     let lb = build_route(conf.route, &http_client);
 
     let mut tgin = Tgin::new(inputs, lb, conf.dark_threads, conf.server_port);
+    tgin.set_ingress_health(
+        health_counter.clone(),
+        long_poll_updaters,
+        has_webhook_ingress,
+    );
 
     let (auth_token, blank_token) = effective_auth_token(conf.auth_token);
     if blank_token {

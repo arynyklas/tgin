@@ -82,7 +82,7 @@ Long-polls Telegram for updates and dispatches each one into the routing tree.
 Failure handling: `LongPollUpdate` distinguishes transient from permanent upstream failures.
 
 - **Transient** (network errors, 5xx, body-read errors, JSON-parse errors, 429): retry with full-jitter exponential backoff capped at 1 s. After ~60 consecutive failures the updater emits a single `long-poll prolonged outage` warning so a sustained outage is loud, then keeps retrying. Telegram's own multi-minute incidents are riden out, not abandoned.
-- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `long-poll permanent failure` error line, increments a process-wide health counter, and stops. When the binary eventually exits with no remaining producers, a non-zero permanent-failure count produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
+- **Permanent** (401 Unauthorized, 403 Forbidden, 404 Not Found from `bot<token>/getUpdates`): the token is wrong, revoked, or malformed and no amount of retrying recovers it. The updater logs a `long-poll permanent failure` error line, increments a process-wide health counter, and stops. Once every long-poll updater has stopped this way and no `WebhookUpdate` is configured, nothing can deliver updates any more: tgin shuts itself down (graceful drain, see [Lifecycle & shutdown](#lifecycle--shutdown)) within about a second. A non-zero permanent-failure count at exit produces exit code `2` (distinct from the generic startup-failure exit `1`) so an orchestrator (systemd, Docker, k8s) can alert or restart.
 
 #### `WebhookUpdate`
 
@@ -267,9 +267,16 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
 
 **Startup.** With `server_port` set, tgin binds `0.0.0.0:<server_port>` on the main task before serving. A bind failure (port already in use, bad address) or an unreadable TLS certificate is reported as a single `tgin: <error>` line on stderr and the process exits `1` — it does not start a half-initialized process with no HTTP plane.
 
-**Graceful shutdown.** On `SIGTERM` (Unix) or `Ctrl-C` (all platforms) tgin logs `shutdown signal received; draining` and drains in order: long-poll ingest stops pulling new updates from Telegram; the HTTP server finishes in-flight requests (bounded to a 10 s deadline, so a parked downstream connection cannot block exit indefinitely); the worker pool then processes the buffered backlog and exits. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start, so no acknowledged update is lost across a restart.
+**Graceful shutdown.** On `SIGTERM` or `SIGINT` (Unix), on Ctrl-C, Ctrl-Break, console close, or system shutdown (Windows), or once every ingress has failed permanently, tgin logs `shutdown started; draining` and drains in order:
 
-**Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped; see [Failure handling](#longpollupdate).
+1. **Lame duck (5 s).** `/readyz` answers `503` so load balancers stop routing here; everything else keeps working normally, including webhook ingress.
+2. **Stop ingest.** Long-poll updaters stop pulling from Telegram; webhook ingress answers `503` with `Retry-After: 5`, so Telegram redelivers those updates later rather than having them acknowledged by a process about to exit.
+3. **Drain (up to 15 s).** Updates already accepted keep flowing through the routing tree, and long-poll routes keep serving their buffers to downstream bots. A poll on an empty buffer is answered with an empty batch at once (a parked poll is woken), so consumers are not held for their full `timeout`. The drain ends as soon as the dispatch queue and every long-poll buffer are empty.
+4. **Close.** The HTTP plane closes (in-flight requests get 1 s), the worker pool finishes any remaining backlog, and the process exits. Updates still sitting in a long-poll buffer at that point are logged as `abandoned`.
+
+When the console window is closed on Windows, which kills the process about 5 s later, the lame duck is skipped and the drain is capped at 4 s. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start.
+
+**Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped, including the self-initiated shutdown once all ingress has failed; see [Failure handling](#longpollupdate).
 
 ## Configuration example
 

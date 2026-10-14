@@ -934,15 +934,20 @@ mod tests {
     /// rather than an axum duplicate-route panic at bind time.
     #[test]
     fn test_probe_paths_reserved() {
-        let cfg = base_config(RouteConfig::LongPollRoute {
-            path: "/readyz".to_string(),
-            max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
-        });
-        let errs = validate(&cfg).expect_err("route on /readyz rejected");
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::DuplicatePath { path, .. } if path == "/readyz"
-        )));
+        for probe in ["/livez", "/readyz"] {
+            let cfg = base_config(RouteConfig::LongPollRoute {
+                path: probe.to_string(),
+                max_buffered_updates: crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES,
+            });
+            let errs = validate(&cfg).expect_err("route on a probe path rejected");
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::DuplicatePath { path, .. } if path == probe
+                )),
+                "{probe}: {errs:?}"
+            );
+        }
     }
 
     /// A present-but-blank `auth_token` resolves to disabled auth (`None`),

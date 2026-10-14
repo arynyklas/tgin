@@ -138,6 +138,16 @@ impl Routeable for AllLB {
             Err(RemoveRouteError::NotFound)
         }
     }
+
+    fn begin_drain(&self) {
+        for route in self.routes.load().iter() {
+            route.begin_drain();
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.routes.load().iter().map(|route| route.pending()).sum()
+    }
 }
 
 #[async_trait]
@@ -196,6 +206,37 @@ mod tests {
 
         let json = lb.json_struct().await;
         assert_eq!(json["routes"].as_array().unwrap().len(), 0);
+    }
+
+    /// `pending` sums the children and `begin_drain` reaches each of them:
+    /// after it, an empty long-poll leaf answers a long poll immediately.
+    #[tokio::test]
+    async fn test_drain_forwards_to_children() {
+        use crate::route::longpull::{GetUpdatesParams, LongPollRoute};
+
+        let leaves: Vec<Arc<LongPollRoute>> = ["/a", "/b"]
+            .into_iter()
+            .map(|path| Arc::new(LongPollRoute::new(path.to_string())))
+            .collect();
+        let lb = AllLB::new(vec![leaves[0].clone(), leaves[1].clone()]);
+
+        lb.process(update_bytes(json!({"update_id": 1}))).await;
+        assert_eq!(lb.pending(), 2);
+
+        lb.begin_drain();
+
+        let long_poll = || GetUpdatesParams {
+            offset: None,
+            timeout: Some(30),
+            limit: None,
+        };
+        for leaf in &leaves {
+            leaf.handle_request(long_poll()).await;
+            tokio::time::timeout(Duration::from_millis(500), leaf.handle_request(long_poll()))
+                .await
+                .unwrap_or_else(|_| panic!("{} did not receive begin_drain", leaf.path));
+        }
+        assert_eq!(lb.pending(), 0);
     }
 
     #[tokio::test]

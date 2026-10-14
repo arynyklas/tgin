@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::post,
@@ -18,7 +18,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use serde_json::json;
 use serde_json::value::RawValue;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
@@ -34,6 +34,10 @@ use tokio_util::sync::CancellationToken;
 /// `Bytes` extractor stops reading and returns 413 once the limit is
 /// exceeded.
 const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
+
+/// `Retry-After` (seconds) on a 503 while shutting down: Telegram redelivers
+/// the update, by then to the replacement instance.
+const DRAINING_RETRY_AFTER_SECS: &str = "5";
 
 pub struct RegistrationWebhookConfig {
     public_ip: String,
@@ -60,6 +64,9 @@ pub struct WebhookUpdate {
     secret_token: Option<String>,
     registration: Option<RegistrationWebhookConfig>,
     metrics: Arc<UpdaterMetrics>,
+    /// The ingest token received in [`Updater::start`]. The handler, built
+    /// earlier in `set_server`, answers 503 once it is cancelled.
+    ingest: Arc<OnceLock<CancellationToken>>,
 }
 
 impl WebhookUpdate {
@@ -70,6 +77,7 @@ impl WebhookUpdate {
             secret_token: None,
             registration: None,
             metrics,
+            ingest: Arc::new(OnceLock::new()),
         }
     }
 
@@ -116,7 +124,10 @@ impl WebhookUpdate {
 
 #[async_trait]
 impl Updater for WebhookUpdate {
-    async fn start(&self, _tx: Sender<Bytes>, _shutdown: CancellationToken) {
+    async fn start(&self, _tx: Sender<Bytes>, shutdown: CancellationToken) {
+        // Before registration, which can take a while: shutdown may begin
+        // meanwhile and the handler must see it.
+        let _ = self.ingest.set(shutdown);
         if let Some(config) = &self.registration {
             self.register_webhook(config).await;
         } else {
@@ -183,21 +194,32 @@ impl Serverable for WebhookUpdate {
         // response on any `LongPollRoute` downstream and the consuming
         // bot's client library aborts the whole batch.
         let metrics = self.metrics.clone();
+        let ingest = self.ingest.clone();
         let handler_func = move |State(tx): State<Sender<Bytes>>, body: Bytes| {
             let metrics = metrics.clone();
+            let ingest = ingest.clone();
             async move {
+                // Ingest stopped (shutdown past its lame duck): refuse rather
+                // than acknowledge an update this process may never deliver.
+                if ingest.get().is_some_and(CancellationToken::is_cancelled) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(header::RETRY_AFTER, DRAINING_RETRY_AFTER_SECS)],
+                    )
+                        .into_response();
+                }
                 if serde_json::from_slice::<&RawValue>(&body).is_err() {
-                    return StatusCode::BAD_REQUEST;
+                    return StatusCode::BAD_REQUEST.into_response();
                 }
                 match tx.send(body).await {
                     Ok(()) => {
                         metrics.record_update();
-                        StatusCode::OK
+                        StatusCode::OK.into_response()
                     }
                     // Channel closed: the dispatcher is gone (shutdown). Telling Telegram
                     // 200 here would silently drop the update because Telegram never re-
                     // delivers an acknowledged update. 503 makes it retry.
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 }
             }
         };
@@ -412,6 +434,44 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Once the ingest token handed to `start` is cancelled (shutdown past
+    /// its lame duck), ingress answers 503 + `Retry-After: 5` without
+    /// accepting the update, so Telegram redelivers it to the next instance
+    /// instead of it being acknowledged into a process about to exit.
+    #[tokio::test]
+    async fn test_handler_returns_503_once_ingest_cancelled() {
+        let updater = WebhookUpdate::new("/bot/update".to_string());
+        let (tx, mut rx) = mpsc::channel(10);
+        let app = updater
+            .set_server(Router::new())
+            .await
+            .with_state(tx.clone());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/bot/update")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"update_id": 1})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let ingest = CancellationToken::new();
+        updater.start(tx, ingest.clone()).await;
+
+        let accepted = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_ok());
+
+        ingest.cancel();
+
+        let rejected = app.oneshot(request()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers().get("retry-after").unwrap(), "5");
+        assert!(rx.try_recv().is_err(), "rejected update must not be queued");
     }
 
     /// Secret-token check: missing / wrong header -> 401, correct header -> 200.

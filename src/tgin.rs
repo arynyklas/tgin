@@ -8,10 +8,11 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, WeakSender};
 
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
@@ -37,6 +38,8 @@ pub struct Tgin {
     api: Option<Api>,
 
     auth_token: Option<String>,
+
+    ingress_health: Option<IngressHealth>,
 }
 
 impl Tgin {
@@ -55,6 +58,7 @@ impl Tgin {
             ssl_key: None,
             api: None,
             auth_token: None,
+            ingress_health: None,
         }
     }
 
@@ -69,6 +73,23 @@ impl Tgin {
 
     pub fn set_auth_token(&mut self, auth_token: Option<String>) {
         self.auth_token = auth_token;
+    }
+
+    /// Share the long-poll permanent-failure counter so shutdown can fire
+    /// [`ShutdownCause::AllIngressFailed`] once no ingress can deliver
+    /// updates any more: every one of the `long_poll_updaters` long-poll
+    /// updaters has failed permanently and there is no webhook ingress.
+    pub fn set_ingress_health(
+        &mut self,
+        permanent_failures: Arc<AtomicUsize>,
+        long_poll_updaters: usize,
+        has_webhook_ingress: bool,
+    ) {
+        self.ingress_health = Some(IngressHealth {
+            permanent_failures,
+            long_poll_updaters,
+            has_webhook_ingress,
+        });
     }
 
     pub fn run(self) -> std::io::Result<()> {
@@ -88,7 +109,20 @@ impl Tgin {
         runtime.block_on(self.run_async())
     }
 
+    /// Serve until a process signal, then drain with the default timing.
     pub async fn run_async(self) -> std::io::Result<()> {
+        self.run_until(shutdown_signal(), ShutdownTiming::default())
+            .await
+    }
+
+    /// Serve until `shutdown_cause` resolves or every ingress has failed
+    /// permanently, then drain as paced by `timing` (see the coordinator
+    /// below) and return.
+    pub async fn run_until(
+        self,
+        shutdown_cause: impl Future<Output = ShutdownCause> + Send + 'static,
+        timing: ShutdownTiming,
+    ) -> std::io::Result<()> {
         // Bounded buffer: a small queue is flow control. The previous
         // 1_000_000-slot channel was not — it was a runway for OOM that
         // hid downstream slowness from producers until memory ran out.
@@ -102,11 +136,13 @@ impl Tgin {
         let api = self.api;
         let auth_token = self.auth_token;
 
-        let shutdown = CancellationToken::new();
-        // Released only after the HTTP server has finished its graceful drain,
-        // so the worker pool and the control-plane loop keep consuming updates
-        // produced by in-flight webhook handlers right up until the server is
-        // done — then drain the backlog and exit.
+        // Cancelled after the lame duck: long-poll updaters stop pulling from
+        // Telegram and webhook ingress starts answering 503.
+        let ingest = CancellationToken::new();
+        // Released only after the HTTP server has closed, so the worker pool
+        // and the control-plane loop keep consuming updates produced by
+        // in-flight webhook handlers right up until the server is done —
+        // then drain the backlog and exit.
         let drain = CancellationToken::new();
         // Set by the shutdown coordinator as its first action, flipping
         // `/readyz` to 503 so load balancers stop routing to this instance.
@@ -133,9 +169,14 @@ impl Tgin {
                 // and `/readyz` stay open for orchestrator probes.
                 router = router.merge(observability_routes(auth_token.clone(), draining.clone()));
 
+                let status_metrics = if auth_token.is_some() {
+                    "bearer-guarded"
+                } else {
+                    "unauthenticated"
+                };
                 tracing::info!(
-                    authenticated = auth_token.is_some(),
-                    "observability endpoints mounted (/status, /metrics, /livez, /readyz)"
+                    "observability endpoints mounted: /status and /metrics \
+                     ({status_metrics}), /livez and /readyz (open)"
                 );
 
                 let app = router.with_state(tx.clone());
@@ -194,34 +235,55 @@ impl Tgin {
                 crate::observe::register_updater(m);
             }
             let tx_clone = tx.clone();
-            let shutdown = shutdown.clone();
+            let ingest = ingest.clone();
             tokio::spawn(async move {
-                provider.start(tx_clone, shutdown).await;
+                provider.start(tx_clone, ingest).await;
             });
         }
 
-        // Graceful shutdown coordinator. On a shutdown cause:
-        //   1. set `draining` so `/readyz` answers 503;
-        //   2. cancel `shutdown` so long-poll ingest stops pulling new updates
-        //      from Telegram;
-        //   3. start the HTTP server's bounded graceful drain and wait for it
-        //      to finish, so in-flight requests complete and no further
-        //      webhook updates are produced;
-        //   4. cancel `drain` so the worker pool and control-plane loop finish
-        //      the buffered backlog and exit, letting `run_async` return.
-        // The worker pool deliberately outlives the HTTP drain so updates
-        // pushed by draining webhook handlers are still consumed, not dropped.
+        // Shutdown coordinator. On a cause (a signal, or every ingress having
+        // failed permanently):
+        //   1. set `draining` so `/readyz` answers 503, and keep serving as
+        //      usual for `lame_duck` while load balancers move traffic away;
+        //   2. cancel `ingest`: long-poll updaters stop pulling from Telegram
+        //      and webhook ingress answers 503 so Telegram redelivers later;
+        //   3. `begin_drain` the routing tree, answering parked long polls;
+        //   4. keep the HTTP plane up until the update channel is empty and
+        //      no route holds pending updates, or `grace` elapses, so
+        //      consumers still fetch what was already acknowledged;
+        //   5. close the HTTP plane (in-flight requests get
+        //      `HTTP_CLOSE_GRACE`), then cancel `drain` so the worker pool
+        //      and control-plane loop finish any backlog and exit.
+        // The coordinator holds only a weak sender, so it never keeps the
+        // update channel open.
         {
-            let shutdown = shutdown.clone();
+            let ingest = ingest.clone();
             let drain = drain.clone();
             let draining = draining.clone();
+            let route = self.route.clone();
+            let updates = tx.downgrade();
+            let ingress_health = self.ingress_health;
             tokio::spawn(async move {
-                let cause = shutdown_signal().await;
+                let cause = tokio::select! {
+                    cause = shutdown_cause => cause,
+                    () = all_ingress_failed(ingress_health) => ShutdownCause::AllIngressFailed,
+                };
+                let timing = timing.for_cause(cause);
                 draining.store(true, Ordering::SeqCst);
-                tracing::info!(?cause, "shutdown signal received; draining");
-                shutdown.cancel();
+                tracing::info!(
+                    ?cause,
+                    lame_duck = ?timing.lame_duck,
+                    grace = ?timing.grace,
+                    "shutdown started; draining"
+                );
+                tokio::time::sleep(timing.lame_duck).await;
+                ingest.cancel();
+                route.begin_drain();
+                let _ =
+                    tokio::time::timeout(timing.grace, backlog_drained(&updates, route.as_ref()))
+                        .await;
                 if let Some(handle) = server_handle {
-                    handle.graceful_shutdown(Some(cause.http_drain_grace()));
+                    handle.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
                 }
                 if let Some(task) = server_task {
                     let _ = task.await;
@@ -323,6 +385,16 @@ impl Tgin {
             }
         }
 
+        // Whatever is still buffered for long-poll consumers is lost with
+        // the process.
+        let abandoned = self.route.pending();
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "exiting with updates no long-poll consumer fetched before the drain deadline"
+            );
+        }
+
         Ok(())
     }
 }
@@ -334,17 +406,100 @@ impl Tgin {
 /// behind.
 const UPDATE_CHANNEL_CAPACITY: usize = 1024;
 
-/// Hard deadline for draining in-flight HTTP connections on graceful
-/// shutdown. Bounds the wait so a parked long-poll downstream connection or
-/// a wedged request cannot block exit indefinitely, while leaving headroom
-/// under the common 30 s orchestrator (k8s/systemd) kill window.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Shutdown pacing. On a cause, `/readyz` flips to 503 and the listeners keep
+/// accepting for `lame_duck`, so load balancers stop routing here before
+/// ingest stops; then buffered updates get up to `grace` to reach their
+/// consumers before the HTTP plane closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownTiming {
+    pub lame_duck: Duration,
+    pub grace: Duration,
+}
 
-/// HTTP drain deadline after the console window is closed. Windows kills
-/// the process about 5 s after `CTRL_CLOSE_EVENT`, so the drain must finish
-/// inside that window.
-#[cfg(windows)]
-const CTRL_CLOSE_GRACE: Duration = Duration::from_secs(4);
+impl Default for ShutdownTiming {
+    /// 5 s + 15 s (+ the final 1 s HTTP close) fits the common 30 s
+    /// orchestrator (k8s/systemd) kill window.
+    fn default() -> Self {
+        Self {
+            lame_duck: Duration::from_secs(5),
+            grace: Duration::from_secs(15),
+        }
+    }
+}
+
+impl ShutdownTiming {
+    /// Timing for one cause. Windows kills the process about 5 s after
+    /// `CTRL_CLOSE_EVENT`, so closing the console skips the lame duck and
+    /// caps the grace at 4 s to finish inside that window.
+    fn for_cause(self, cause: ShutdownCause) -> ShutdownTiming {
+        match cause {
+            #[cfg(windows)]
+            ShutdownCause::CtrlClose => ShutdownTiming {
+                lame_duck: Duration::ZERO,
+                grace: self.grace.min(Duration::from_secs(4)),
+            },
+            _ => self,
+        }
+    }
+}
+
+/// Inputs for [`ShutdownCause::AllIngressFailed`]; see
+/// [`Tgin::set_ingress_health`].
+struct IngressHealth {
+    permanent_failures: Arc<AtomicUsize>,
+    long_poll_updaters: usize,
+    has_webhook_ingress: bool,
+}
+
+impl IngressHealth {
+    /// True when at least one long-poll updater exists, there is no webhook
+    /// ingress, and every long-poll updater has failed permanently.
+    fn all_failed(&self) -> bool {
+        self.long_poll_updaters > 0
+            && !self.has_webhook_ingress
+            && self.permanent_failures.load(Ordering::Relaxed) >= self.long_poll_updaters
+    }
+}
+
+/// How often [`all_ingress_failed`] re-checks the permanent-failure counter.
+const INGRESS_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often [`backlog_drained`] re-checks the channel and the routes.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Deadline for in-flight HTTP requests once the backlog is drained (or the
+/// grace has elapsed) and the HTTP plane closes.
+const HTTP_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Resolves once every ingress has failed permanently; never resolves
+/// without [`Tgin::set_ingress_health`].
+async fn all_ingress_failed(health: Option<IngressHealth>) {
+    let Some(health) = health else {
+        return std::future::pending().await;
+    };
+    let mut tick = tokio::time::interval(INGRESS_HEALTH_INTERVAL);
+    loop {
+        tick.tick().await;
+        if health.all_failed() {
+            return;
+        }
+    }
+}
+
+/// Resolves once the update channel is empty and `route` holds no pending
+/// updates. The channel also counts as empty once every sender is gone: the
+/// workers then drain it on their own.
+async fn backlog_drained(updates: &WeakSender<Bytes>, route: &dyn RouteableComponent) {
+    loop {
+        let channel_empty = updates
+            .upgrade()
+            .is_none_or(|tx| tx.capacity() == tx.max_capacity());
+        if channel_empty && route.pending() == 0 {
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+}
 
 /// Always-on observability routes. `/livez` always answers 200 while the
 /// process serves HTTP; `/readyz` answers 200 until `draining` is set, then
@@ -380,10 +535,10 @@ fn observability_routes(
         .merge(guarded)
 }
 
-/// What triggered shutdown. Variants are gated to the platform that can
-/// deliver them.
+/// What triggered shutdown. Signal variants are gated to the platform that
+/// can deliver them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShutdownCause {
+pub enum ShutdownCause {
     /// SIGTERM.
     #[cfg(unix)]
     Terminate,
@@ -399,17 +554,8 @@ enum ShutdownCause {
     /// `CTRL_SHUTDOWN_EVENT`: the system is shutting down.
     #[cfg(windows)]
     CtrlShutdown,
-}
-
-impl ShutdownCause {
-    /// Deadline for the HTTP server's graceful drain.
-    fn http_drain_grace(self) -> Duration {
-        #[cfg(windows)]
-        if self == ShutdownCause::CtrlClose {
-            return CTRL_CLOSE_GRACE;
-        }
-        SHUTDOWN_GRACE
-    }
+    /// Every ingress has failed permanently; nothing can deliver updates.
+    AllIngressFailed,
 }
 
 /// Await one signal listener, or never resolve if it could not be
@@ -841,5 +987,358 @@ mod tests {
             get_status_code(app, "/metrics").await,
             axum::http::StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// Drain timing for end-to-end tests: no lame duck, a grace long enough
+    /// that hitting it fails the `run_until` deadline checks.
+    const TEST_TIMING: ShutdownTiming = ShutdownTiming {
+        lame_duck: Duration::ZERO,
+        grace: Duration::from_secs(5),
+    };
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Poll `cond` every 10 ms until it holds, failing after `within`.
+    async fn wait_until(within: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + within;
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A live `WebhookUpdate("/hook")` -> `LongPollRoute("/poll")` instance on
+    /// a free port; shutdown fires when [`HookToPoll::fire`] is called.
+    struct HookToPoll {
+        base: String,
+        client: reqwest::Client,
+        route: Arc<crate::route::longpull::LongPollRoute>,
+        fire: Option<tokio::sync::oneshot::Sender<()>>,
+        run: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl HookToPoll {
+        async fn start(timing: ShutdownTiming) -> Self {
+            use crate::route::longpull::LongPollRoute;
+            use crate::update::webhook::WebhookUpdate;
+
+            let port = free_port();
+            let route = Arc::new(LongPollRoute::new("/poll".to_string()));
+            let updates: Vec<Box<dyn UpdaterComponent>> =
+                vec![Box::new(WebhookUpdate::new("/hook".to_string()))];
+            let tgin = Tgin::new(updates, route.clone(), 2, Some(port));
+
+            let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+            let shutdown = async move {
+                let _ = fired.await;
+                ShutdownCause::CtrlC
+            };
+            let run = tokio::spawn(tgin.run_until(shutdown, timing));
+
+            let base = format!("http://127.0.0.1:{port}");
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let up = client
+                    .get(format!("{base}/livez"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+                if up {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "listener never came up"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            Self {
+                base,
+                client,
+                route,
+                fire: Some(fire),
+                run,
+            }
+        }
+
+        async fn post_update(&self, update_id: u64) -> reqwest::Response {
+            self.client
+                .post(format!("{}/hook", self.base))
+                .json(&json!({ "update_id": update_id }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn poll(&self, timeout: u64) -> Value {
+            self.client
+                .post(format!("{}/poll", self.base))
+                .json(&json!({ "timeout": timeout }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        }
+
+        /// Wait until the long-poll route buffers exactly `n` updates.
+        async fn wait_buffered(&self, n: usize) {
+            let route = self.route.clone();
+            wait_until(Duration::from_secs(2), "updates to reach the route", || {
+                route.pending() == n
+            })
+            .await;
+        }
+
+        fn fire(&mut self) {
+            let _ = self.fire.take().expect("shutdown already fired").send(());
+        }
+
+        /// Assert `run_until` returns `Ok` within `within`.
+        async fn assert_exits_within(self, within: Duration) {
+            tokio::time::timeout(within, self.run)
+                .await
+                .expect("run_until did not return in time")
+                .expect("run_until panicked")
+                .expect("run_until returned an error");
+        }
+    }
+
+    /// An update acknowledged to Telegram (200 on the webhook) and buffered
+    /// for a long-poll consumer is still served after shutdown fires: the
+    /// HTTP plane stays up until the buffer is drained, then the process
+    /// exits promptly instead of waiting out the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_shutdown_serves_buffered_updates_before_exit() {
+        let mut app = HookToPoll::start(TEST_TIMING).await;
+
+        assert_eq!(app.post_update(1).await.status(), reqwest::StatusCode::OK);
+        app.wait_buffered(1).await;
+
+        app.fire();
+
+        let body = app.poll(0).await;
+        assert_eq!(body, json!({ "ok": true, "result": [{ "update_id": 1 }] }));
+
+        app.assert_exits_within(Duration::from_secs(2)).await;
+    }
+
+    /// Once ingest is cancelled, webhook ingress answers 503 + `Retry-After`
+    /// so Telegram redelivers later instead of the update being acknowledged
+    /// into a process that is about to exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_webhook_ingress_rejects_while_draining() {
+        let mut app = HookToPoll::start(TEST_TIMING).await;
+
+        assert_eq!(app.post_update(1).await.status(), reqwest::StatusCode::OK);
+        app.wait_buffered(1).await;
+
+        app.fire();
+
+        // With no lame duck, ingest is cancelled right after the cause; an
+        // update accepted in that instant is buffered and drained below.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let rejected = loop {
+            let resp = app.post_update(2).await;
+            if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                break resp;
+            }
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "webhook never started rejecting"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            rejected
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
+
+        let body = app.poll(0).await;
+        assert_eq!(body["result"][0], json!({ "update_id": 1 }));
+
+        app.assert_exits_within(Duration::from_secs(2)).await;
+    }
+
+    /// During the lame duck `/readyz` already answers 503, but webhook
+    /// ingress keeps accepting: load balancers are still moving traffic away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_webhook_ingress_accepts_during_lame_duck() {
+        let mut app = HookToPoll::start(ShutdownTiming {
+            lame_duck: Duration::from_secs(1),
+            ..TEST_TIMING
+        })
+        .await;
+
+        app.fire();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let status = app
+                .client
+                .get(format!("{}/readyz", app.base))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "/readyz never flipped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(app.post_update(1).await.status(), reqwest::StatusCode::OK);
+        app.wait_buffered(1).await;
+
+        let body = app.poll(0).await;
+        assert_eq!(body["result"][0], json!({ "update_id": 1 }));
+
+        app.assert_exits_within(Duration::from_secs(3)).await;
+    }
+
+    /// A consumer parked in a long poll on an empty buffer is answered with
+    /// an empty batch as soon as the drain starts, so it neither pins the
+    /// shutdown for its full timeout nor sees a dropped connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_parked_poll_returns_empty_on_drain() {
+        let mut app = HookToPoll::start(TEST_TIMING).await;
+
+        let parked = {
+            let client = app.client.clone();
+            let url = format!("{}/poll", app.base);
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .json(&json!({ "timeout": 30 }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        app.fire();
+
+        let body = tokio::time::timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("parked poll was not answered within 1 s of shutdown")
+            .unwrap();
+        assert_eq!(body, json!({ "ok": true, "result": [] }));
+
+        app.assert_exits_within(Duration::from_secs(2)).await;
+    }
+
+    /// With only long-poll ingress and every updater stopped on a permanent
+    /// failure, nothing can deliver updates any more: the process shuts
+    /// itself down (and `main` maps the counter to exit code 2) instead of
+    /// idling forever behind a still-open HTTP listener.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_all_pollers_permanently_failed_triggers_exit() {
+        use crate::mock::routes::MockCallsRoute;
+        use crate::update::longpull::LongPollUpdate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let telegram = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/botMYTOKEN/getUpdates"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&telegram)
+            .await;
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut updater = LongPollUpdate::new("MYTOKEN".to_string(), client);
+        updater.set_url(format!("{}/botMYTOKEN/getUpdates", telegram.uri()));
+        updater.set_health_counter(failures.clone());
+
+        let route: Arc<dyn RouteableComponent> = Arc::new(MockCallsRoute::new("sink"));
+        let mut tgin = Tgin::new(vec![Box::new(updater)], route, 2, Some(free_port()));
+        tgin.set_ingress_health(failures.clone(), 1, false);
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tgin.run_until(std::future::pending(), TEST_TIMING),
+        )
+        .await
+        .expect("run_until kept running after every ingress failed")
+        .expect("run_until returned an error");
+
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_ingress_health_all_failed() {
+        let health = |failed: usize, long_poll_updaters: usize, has_webhook_ingress: bool| {
+            IngressHealth {
+                permanent_failures: Arc::new(AtomicUsize::new(failed)),
+                long_poll_updaters,
+                has_webhook_ingress,
+            }
+            .all_failed()
+        };
+        assert!(health(1, 1, false));
+        assert!(health(2, 2, false));
+        assert!(!health(1, 2, false), "one poller still running");
+        assert!(!health(1, 1, true), "webhook ingress can still deliver");
+        assert!(!health(0, 0, false), "no long-poll updaters to fail");
+    }
+
+    #[test]
+    fn test_shutdown_timing_for_cause() {
+        let timing = ShutdownTiming::default();
+        assert_eq!(
+            timing,
+            ShutdownTiming {
+                lame_duck: Duration::from_secs(5),
+                grace: Duration::from_secs(15),
+            }
+        );
+        assert_eq!(timing.for_cause(ShutdownCause::CtrlC), timing);
+        assert_eq!(timing.for_cause(ShutdownCause::AllIngressFailed), timing);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                timing.for_cause(ShutdownCause::CtrlClose),
+                ShutdownTiming {
+                    lame_duck: Duration::ZERO,
+                    grace: Duration::from_secs(4),
+                }
+            );
+            let short = ShutdownTiming {
+                lame_duck: Duration::from_secs(1),
+                grace: Duration::from_secs(2),
+            };
+            assert_eq!(
+                short.for_cause(ShutdownCause::CtrlClose).grace,
+                Duration::from_secs(2)
+            );
+        }
     }
 }
