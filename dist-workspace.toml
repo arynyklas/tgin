@@ -36,7 +36,10 @@ allow-dirty = ["ci"]
 # Build arm64 Windows natively. dist's default cross-compiles it with
 # cargo-xwin in a container, which is a different toolchain from every other
 # target (the aws-lc-sys C build in particular).
+# dist 0.32.0 builds aarch64-apple-darwin on macos-14, which GitHub retires on
+# 2026-11-02.
 [dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
 aarch64-pc-windows-msvc = "windows-11-arm"
 
 # Pin the actions used by the generated release workflow to commits.
