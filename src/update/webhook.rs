@@ -199,28 +199,43 @@ impl Serverable for WebhookUpdate {
             let metrics = metrics.clone();
             let ingest = ingest.clone();
             async move {
-                // Ingest stopped (shutdown past its lame duck): refuse rather
-                // than acknowledge an update this process may never deliver.
-                if ingest.get().is_some_and(CancellationToken::is_cancelled) {
-                    return (
+                // 503 + `Retry-After`: Telegram redelivers the update later,
+                // by then to the replacement instance.
+                let retry_later = || {
+                    (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [(header::RETRY_AFTER, DRAINING_RETRY_AFTER_SECS)],
                     )
-                        .into_response();
+                        .into_response()
+                };
+                let ingest_stopped = || ingest.get().is_some_and(CancellationToken::is_cancelled);
+                // Ingest stopped (shutdown past its lame duck): refuse rather
+                // than acknowledge an update this process may never deliver.
+                if ingest_stopped() {
+                    return retry_later();
                 }
                 if serde_json::from_slice::<&RawValue>(&body).is_err() {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
-                match tx.send(body).await {
-                    Ok(()) => {
-                        metrics.record_update();
-                        StatusCode::OK.into_response()
-                    }
-                    // Channel closed: the dispatcher is gone (shutdown). Telling Telegram
-                    // 200 here would silently drop the update because Telegram never re-
-                    // delivers an acknowledged update. 503 makes it retry.
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                // Channel closed: the dispatcher is gone (shutdown). Telling
+                // Telegram 200 here would silently drop the update because
+                // Telegram never re-delivers an acknowledged update. 503
+                // makes it retry.
+                let Ok(permit) = tx.reserve().await else {
+                    return retry_later();
+                };
+                // Re-check while holding the slot. A handler that still sees
+                // ingest running here is ordered before `cancel()`, and its
+                // permit keeps the channel non-empty, so the shutdown
+                // coordinator cannot close the HTTP plane between this check
+                // and the 200. Cancelled while waiting for capacity: refuse,
+                // releasing the slot.
+                if ingest_stopped() {
+                    return retry_later();
                 }
+                permit.send(body);
+                metrics.record_update();
+                StatusCode::OK.into_response()
             }
         };
 
@@ -471,6 +486,54 @@ mod tests {
         let rejected = app.oneshot(request()).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(rejected.headers().get("retry-after").unwrap(), "5");
+        assert!(rx.try_recv().is_err(), "rejected update must not be queued");
+    }
+
+    /// A handler that passed the ingest check while the channel was full and
+    /// is still waiting for capacity when ingest is cancelled must not
+    /// acknowledge: once capacity frees it re-checks and answers 503, so the
+    /// shutdown coordinator never sees an empty channel while a 200 is still
+    /// on its way to Telegram.
+    ///
+    /// Deterministic: the request body is in memory and the runtime is
+    /// single-threaded, so the first poll runs the whole handler chain up to
+    /// the wait for channel capacity (the only suspension point).
+    #[tokio::test]
+    async fn test_handler_rechecks_ingest_after_waiting_for_capacity() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let updater = WebhookUpdate::new("/bot/update".to_string());
+        let (tx, mut rx) = mpsc::channel(1);
+        let app = updater
+            .set_server(Router::new())
+            .await
+            .with_state(tx.clone());
+        let ingest = CancellationToken::new();
+        updater.start(tx.clone(), ingest.clone()).await;
+
+        let filler = Bytes::from_static(br#"{"update_id":0}"#);
+        tx.try_send(filler.clone()).unwrap();
+
+        let mut request = Box::pin(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/bot/update")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"update_id":1}"#))
+                    .unwrap(),
+            ),
+        );
+        let parked = poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx).is_pending())).await;
+        assert!(parked, "handler must wait for channel capacity");
+
+        ingest.cancel();
+        assert_eq!(rx.recv().await.unwrap(), filler);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "5");
         assert!(rx.try_recv().is_err(), "rejected update must not be queued");
     }
 

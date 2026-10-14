@@ -209,7 +209,8 @@ mod tests {
     }
 
     /// `pending` sums the children and `begin_drain` reaches each of them:
-    /// after it, an empty long-poll leaf answers a long poll immediately.
+    /// after it, an empty long-poll leaf answers a long poll within its
+    /// short drain hold instead of its 30 s timeout.
     #[tokio::test]
     async fn test_drain_forwards_to_children() {
         use crate::route::longpull::{GetUpdatesParams, LongPollRoute};
@@ -232,7 +233,7 @@ mod tests {
         };
         for leaf in &leaves {
             leaf.handle_request(long_poll()).await;
-            tokio::time::timeout(Duration::from_millis(500), leaf.handle_request(long_poll()))
+            tokio::time::timeout(Duration::from_secs(2), leaf.handle_request(long_poll()))
                 .await
                 .unwrap_or_else(|_| panic!("{} did not receive begin_drain", leaf.path));
         }

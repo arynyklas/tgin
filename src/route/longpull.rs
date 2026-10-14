@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Notify;
-use tokio::time::timeout as tokio_timeout;
+use tokio::time::{timeout_at, Instant};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct GetUpdatesParams {
@@ -125,8 +125,8 @@ impl LongPollRoute {
         let updates = self.updates.clone();
         let notify = self.notify.clone();
 
-        let duration = effective_timeout(params.timeout);
-        let start_time = tokio::time::Instant::now();
+        let mut deadline = Instant::now() + effective_timeout(params.timeout);
+        let mut drain_hold_applied = false;
 
         loop {
             // Create the wakeup future before checking the buffer and the
@@ -157,15 +157,22 @@ impl LongPollRoute {
                 return build_get_updates_response(&batch);
             }
 
-            if self.draining.load(Ordering::SeqCst)
-                || duration.is_zero()
-                || start_time.elapsed() >= duration
-            {
+            // Draining: no new updates will arrive once the backlog is
+            // through, so cut the hold to `DRAINING_EMPTY_POLL_HOLD` from the
+            // moment the drain is seen (a poll parked before `begin_drain`
+            // is woken by it and lands here). Still waiting briefly rather
+            // than answering at once keeps a re-polling consumer from
+            // spinning while other routes drain.
+            if !drain_hold_applied && self.draining.load(Ordering::SeqCst) {
+                drain_hold_applied = true;
+                deadline = deadline.min(Instant::now() + DRAINING_EMPTY_POLL_HOLD);
+            }
+
+            if Instant::now() >= deadline {
                 return build_get_updates_response(&[]);
             }
 
-            let remaining = duration.saturating_sub(start_time.elapsed());
-            let _ = tokio_timeout(remaining, notified).await;
+            let _ = timeout_at(deadline, notified).await;
         }
     }
 
@@ -187,6 +194,12 @@ const GET_UPDATES_MAX_LIMIT: usize = 100;
 /// Upper bound on a long-poll hold. Telegram's documented ceiling is 50 s;
 /// an unbounded client value would pin a connection and a task indefinitely.
 const GET_UPDATES_MAX_TIMEOUT: Duration = Duration::from_secs(50);
+
+/// Longest a long poll on an empty buffer is held once the route is
+/// draining: long enough that a consumer re-polling during the drain does
+/// not spin, short enough that it is answered before the HTTP plane closes
+/// (1 s after the backlog has drained).
+const DRAINING_EMPTY_POLL_HOLD: Duration = Duration::from_millis(500);
 
 /// Batch size for a `getUpdates` poll: Telegram's semantics — default 100,
 /// clamped to `1..=100`.
@@ -517,8 +530,8 @@ mod tests {
         assert!(duration.as_millis() >= 1000);
     }
 
-    /// `begin_drain` answers a poll parked on an empty buffer with an empty
-    /// batch right away, instead of holding it for its full timeout.
+    /// `begin_drain` releases a poll parked on an empty buffer within the
+    /// drain hold, instead of holding it for its full timeout.
     #[tokio::test]
     async fn test_begin_drain_wakes_parked_poll() {
         let route = LongPollRoute::new("/test".to_string());
@@ -546,10 +559,11 @@ mod tests {
     }
 
     /// While draining, buffered updates are still served (with the usual
-    /// limit) and `pending` tracks what is left; an empty buffer answers a
-    /// long poll immediately.
+    /// limit) and `pending` tracks what is left; a long poll on an empty
+    /// buffer is then held only for [`DRAINING_EMPTY_POLL_HOLD`], so the
+    /// consumer neither waits out its timeout nor spins on empty answers.
     #[tokio::test]
-    async fn test_draining_serves_buffer_then_answers_empty_immediately() {
+    async fn test_draining_serves_buffer_then_holds_empty_poll_briefly() {
         let route = LongPollRoute::new("/test".to_string());
         for i in 0..3 {
             route.process(update_bytes(json!({"id": i}))).await;
@@ -570,12 +584,11 @@ mod tests {
         assert_eq!(body["result"][0]["id"], 2);
         assert_eq!(route.pending(), 0);
 
-        let empty = tokio::time::timeout(
-            Duration::from_millis(500),
-            route.handle_request(long_poll()),
-        )
-        .await
-        .expect("draining poll on an empty buffer must not park");
+        let start = tokio::time::Instant::now();
+        let empty = tokio::time::timeout(Duration::from_secs(2), route.handle_request(long_poll()))
+            .await
+            .expect("draining poll on an empty buffer must not wait out its timeout");
+        let held = start.elapsed();
         assert_eq!(
             read_body_json(empty).await["result"]
                 .as_array()
@@ -583,6 +596,53 @@ mod tests {
                 .len(),
             0
         );
+        assert!(
+            held >= DRAINING_EMPTY_POLL_HOLD,
+            "empty poll answered after {held:?}, before the drain hold"
+        );
+
+        // A short poll still answers at once.
+        let short = tokio::time::timeout(
+            Duration::from_millis(100),
+            route.handle_request(default_params()),
+        )
+        .await
+        .expect("timeout=0 poll must answer at once while draining");
+        assert_eq!(
+            read_body_json(short).await["result"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// An update pushed while a draining poll is held is delivered to it.
+    #[tokio::test]
+    async fn test_draining_poll_receives_update_pushed_during_hold() {
+        let route = LongPollRoute::new("/test".to_string());
+        route.begin_drain();
+
+        let held = {
+            let route = route.clone();
+            tokio::spawn(async move {
+                route
+                    .handle_request(GetUpdatesParams {
+                        timeout: Some(30),
+                        ..default_params()
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        route.process(update_bytes(json!({"id": 7}))).await;
+
+        let response = tokio::time::timeout(Duration::from_secs(1), held)
+            .await
+            .expect("held poll not answered")
+            .unwrap();
+        let body = read_body_json(response).await;
+        assert_eq!(body["result"], json!([{ "id": 7 }]));
     }
 
     #[tokio::test]
@@ -656,7 +716,7 @@ mod tests {
     /// in production, where bots issue one `getUpdates` and park for
     /// many seconds before any update arrives. It does NOT cover the
     /// race window between dropping the empty-check `Mutex` guard and
-    /// registering the `Notify` future inside `tokio_timeout`: that
+    /// registering the `Notify` future awaited by the poll: that
     /// window is ~50 ns of synchronous Rust and is too narrow to hit by
     /// scheduling alone, even with thousands of trial iterations on a
     /// multi-thread runtime. The fix for that race is the choice of

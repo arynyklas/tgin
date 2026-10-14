@@ -225,11 +225,6 @@ impl Tgin {
                 None
             };
 
-        let (server_handle, server_task) = match server {
-            Some((handle, task)) => (Some(handle), Some(task)),
-            None => (None, None),
-        };
-
         for provider in self.updates {
             if let Some(m) = provider.metrics() {
                 crate::observe::register_updater(m);
@@ -254,8 +249,10 @@ impl Tgin {
         //   5. close the HTTP plane (in-flight requests get
         //      `HTTP_CLOSE_GRACE`), then cancel `drain` so the worker pool
         //      and control-plane loop finish any backlog and exit.
-        // The coordinator holds only a weak sender, so it never keeps the
-        // update channel open.
+        // Without an HTTP plane there is no traffic to move away and nobody
+        // to fetch buffered updates, so steps 1 and 3-5 are skipped. The
+        // coordinator holds only a weak sender, so it never keeps the update
+        // channel open.
         {
             let ingest = ingest.clone();
             let drain = drain.clone();
@@ -267,6 +264,12 @@ impl Tgin {
                 let cause = tokio::select! {
                     cause = shutdown_cause => cause,
                     () = all_ingress_failed(ingress_health) => ShutdownCause::AllIngressFailed,
+                };
+                let Some((handle, task)) = server else {
+                    tracing::info!(?cause, "shutdown started; no HTTP plane, stopping ingest");
+                    ingest.cancel();
+                    drain.cancel();
+                    return;
                 };
                 let timing = timing.for_cause(cause);
                 draining.store(true, Ordering::SeqCst);
@@ -282,12 +285,8 @@ impl Tgin {
                 let _ =
                     tokio::time::timeout(timing.grace, backlog_drained(&updates, route.as_ref()))
                         .await;
-                if let Some(handle) = server_handle {
-                    handle.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
-                }
-                if let Some(task) = server_task {
-                    let _ = task.await;
-                }
+                handle.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
+                let _ = task.await;
                 drain.cancel();
             });
         }
@@ -489,6 +488,12 @@ async fn all_ingress_failed(health: Option<IngressHealth>) {
 /// Resolves once the update channel is empty and `route` holds no pending
 /// updates. The channel also counts as empty once every sender is gone: the
 /// workers then drain it on their own.
+///
+/// Known residual: an update a worker has taken from the channel but not
+/// yet pushed into its route is visible to neither check. If this samples
+/// in that window (a synchronous push for long-poll routes), the HTTP plane
+/// may close one update early; that update is then reported in the
+/// `abandoned` count logged when `run_until` returns.
 async fn backlog_drained(updates: &WeakSender<Bytes>, route: &dyn RouteableComponent) {
     loop {
         let channel_empty = updates
@@ -1118,6 +1123,11 @@ mod tests {
                 .expect("run_until panicked")
                 .expect("run_until returned an error");
         }
+
+        /// Stop the instance without waiting for its drain.
+        fn abort(self) {
+            self.run.abort();
+        }
     }
 
     /// An update acknowledged to Telegram (200 on the webhook) and buffered
@@ -1141,7 +1151,8 @@ mod tests {
 
     /// Once ingest is cancelled, webhook ingress answers 503 + `Retry-After`
     /// so Telegram redelivers later instead of the update being acknowledged
-    /// into a process that is about to exit.
+    /// into a process that is about to exit. Every update acknowledged with
+    /// 200 is still served.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_webhook_ingress_rejects_while_draining() {
         let mut app = HookToPoll::start(TEST_TIMING).await;
@@ -1152,19 +1163,18 @@ mod tests {
         app.fire();
 
         // With no lame duck, ingest is cancelled right after the cause; an
-        // update accepted in that instant is buffered and drained below.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // update accepted before that is acknowledged and must be served.
+        // The plane stays open meanwhile: update 1 is still buffered.
+        let mut accepted = vec![1];
         let rejected = loop {
-            let resp = app.post_update(2).await;
+            let update_id = accepted.len() as u64 + 1;
+            let resp = app.post_update(update_id).await;
             if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 break resp;
             }
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "webhook never started rejecting"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            accepted.push(update_id);
+            assert!(accepted.len() < 1000, "webhook never started rejecting");
         };
         assert_eq!(
             rejected
@@ -1174,25 +1184,36 @@ mod tests {
             "5"
         );
 
+        // A 200 means the update was queued before ingest stopped; wait for
+        // all of them to reach the route, then fetch them in one batch.
+        app.wait_buffered(accepted.len()).await;
         let body = app.poll(0).await;
-        assert_eq!(body["result"][0], json!({ "update_id": 1 }));
+        let served: Vec<u64> = body["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["update_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(served, accepted);
 
         app.assert_exits_within(Duration::from_secs(2)).await;
     }
 
     /// During the lame duck `/readyz` already answers 503, but webhook
-    /// ingress keeps accepting: load balancers are still moving traffic away.
+    /// ingress keeps accepting and long-poll routes keep serving: load
+    /// balancers are still moving traffic away. The lame duck is long enough
+    /// that the checks below never race its end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_webhook_ingress_accepts_during_lame_duck() {
         let mut app = HookToPoll::start(ShutdownTiming {
-            lame_duck: Duration::from_secs(1),
+            lame_duck: Duration::from_secs(60),
             ..TEST_TIMING
         })
         .await;
 
         app.fire();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let status = app
                 .client
@@ -1216,15 +1237,22 @@ mod tests {
         let body = app.poll(0).await;
         assert_eq!(body["result"][0], json!({ "update_id": 1 }));
 
-        app.assert_exits_within(Duration::from_secs(3)).await;
+        app.abort();
     }
 
     /// A consumer parked in a long poll on an empty buffer is answered with
-    /// an empty batch as soon as the drain starts, so it neither pins the
-    /// shutdown for its full timeout nor sees a dropped connection.
+    /// an empty batch soon after the drain starts, so it neither pins the
+    /// shutdown for its full timeout nor sees a dropped connection. The lame
+    /// duck keeps the plane open while the poll connects, and a poll that
+    /// arrives during it parks (ingest is not draining yet).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_parked_poll_returns_empty_on_drain() {
-        let mut app = HookToPoll::start(TEST_TIMING).await;
+        let lame_duck = Duration::from_millis(500);
+        let mut app = HookToPoll::start(ShutdownTiming {
+            lame_duck,
+            ..TEST_TIMING
+        })
+        .await;
 
         let parked = {
             let client = app.client.clone();
@@ -1241,17 +1269,50 @@ mod tests {
                     .unwrap()
             })
         };
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
         app.fire();
 
-        let body = tokio::time::timeout(Duration::from_secs(1), parked)
+        let body = tokio::time::timeout(lame_duck + Duration::from_secs(1), parked)
             .await
-            .expect("parked poll was not answered within 1 s of shutdown")
+            .expect("parked poll was not answered within lame_duck + 1 s of shutdown")
             .unwrap();
         assert_eq!(body, json!({ "ok": true, "result": [] }));
 
         app.assert_exits_within(Duration::from_secs(2)).await;
+    }
+
+    /// Holds its sender until ingest is cancelled, like a long-poll updater
+    /// with nothing to fetch.
+    struct IdleUpdater;
+
+    #[async_trait]
+    impl crate::update::base::Updater for IdleUpdater {
+        async fn start(&self, _tx: Sender<Bytes>, ingest: CancellationToken) {
+            ingest.cancelled().await;
+        }
+    }
+
+    impl Serverable for IdleUpdater {}
+    impl Printable for IdleUpdater {}
+
+    /// Without an HTTP plane there is no traffic to move away and nothing to
+    /// serve buffered updates, so shutdown skips the lame duck and the
+    /// pending wait even with the default timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_shutdown_without_http_plane_is_immediate() {
+        use crate::route::longpull::LongPollRoute;
+
+        let route = Arc::new(LongPollRoute::new("/poll".to_string()));
+        route.process(update_bytes(json!({ "update_id": 1 }))).await;
+        let tgin = Tgin::new(vec![Box::new(IdleUpdater)], route, 1, None);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tgin.run_until(async { ShutdownCause::CtrlC }, ShutdownTiming::default()),
+        )
+        .await
+        .expect("server-less shutdown waited for the lame duck or the backlog")
+        .expect("run_until returned an error");
     }
 
     /// With only long-poll ingress and every updater stopped on a permanent

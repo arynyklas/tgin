@@ -207,7 +207,7 @@ mod tests {
     /// `pending` sums over the whole subtree and `begin_drain` reaches every
     /// leaf, including those behind a nested load balancer: after it, each
     /// long-poll leaf serves its buffer and then answers an empty long poll
-    /// immediately.
+    /// within its short drain hold instead of its 30 s timeout.
     #[tokio::test]
     async fn test_drain_forwards_through_nested_lbs() {
         use crate::lb::all::AllLB;
@@ -237,7 +237,7 @@ mod tests {
         };
         for leaf in &leaves {
             leaf.handle_request(long_poll()).await;
-            tokio::time::timeout(Duration::from_millis(500), leaf.handle_request(long_poll()))
+            tokio::time::timeout(Duration::from_secs(2), leaf.handle_request(long_poll()))
                 .await
                 .unwrap_or_else(|_| panic!("{} did not receive begin_drain", leaf.path));
         }
