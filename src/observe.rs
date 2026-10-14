@@ -9,11 +9,10 @@
 //! [`struct@REGISTRY`] (set once at startup, read-only after) and the
 //! [`struct@LB_DROPPED_EMPTY`] counter.
 //!
-//! Token redaction ([`TELEGRAM_TOKEN_RE`]) is applied to every metric label
-//! and `source` identity so a misconfigured route URL carrying a bot token
-//! never leaks through `/status` or `/metrics`.
+//! Token redaction ([`redact`]) is applied to every metric label and `source`
+//! identity so a misconfigured route URL or path carrying a bot token never
+//! leaks through `/status` or `/metrics`.
 
-use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -27,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::base::RouteableComponent;
 use crate::config::schema::LogFormat;
-use crate::utils::defaults::TELEGRAM_TOKEN_RE;
+use crate::utils::defaults::redact;
 
 /// Install the process-global `tracing` subscriber. Called exactly once from
 /// `main::run` after config validation; calling it twice panics inside
@@ -150,11 +149,6 @@ fn lb_dropped() -> u64 {
 #[cfg(test)]
 pub fn lb_dropped_for_test() -> u64 {
     lb_dropped()
-}
-
-/// Redact any Telegram token embedded in `s`.
-fn redact(s: &str) -> Cow<'_, str> {
-    TELEGRAM_TOKEN_RE.replace_all(s, "#####")
 }
 
 /// Redact, then escape for a Prometheus label value (`\`, `"`, newline).
@@ -501,6 +495,34 @@ mod tests {
         assert_eq!(v["routes"]["type"], "load-balancer");
         assert_eq!(v["updaters"][0]["type"], "longpoll");
         assert_eq!(v["load_balancer"]["dropped_empty_total"], 7);
+    }
+
+    /// Webhook ingress paths and long-poll route paths may carry a bot
+    /// token. `/status` (updater `source`, route `options.path`) and
+    /// `/api/routes` (the route's `json_struct`) must redact it.
+    #[tokio::test]
+    async fn test_status_and_routes_redact_token_paths() {
+        use crate::base::Printable;
+        use crate::route::longpull::LongPollRoute;
+        use crate::update::base::Updater;
+        use crate::update::webhook::WebhookUpdate;
+
+        const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let webhook = WebhookUpdate::new(format!("/bot123456789:{SECRET}/hook"));
+        let route = LongPollRoute::new(format!("/bot123456789:{SECRET}/getUpdates"));
+
+        let routes = route.json_struct().await;
+        let status = build_status(&[webhook.metrics().unwrap()], Some(&routes), 0);
+
+        assert_eq!(status["updaters"][0]["source"], "0.0.0.0/bot#####/hook");
+        assert_eq!(status["routes"]["options"]["path"], "/bot#####/getUpdates");
+        for (what, body) in [
+            ("/status", status.to_string()),
+            ("/api/routes", routes.to_string()),
+        ] {
+            assert!(!body.contains(SECRET), "{what} leaks the token: {body}");
+            assert!(body.contains("#####"), "{what} lacks the marker: {body}");
+        }
     }
 
     #[test]

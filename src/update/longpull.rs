@@ -1,7 +1,7 @@
 use crate::base::{Printable, Serverable};
 use crate::observe::UpdaterMetrics;
 use crate::update::base::Updater;
-use crate::utils::defaults::TELEGRAM_TOKEN_RE;
+use crate::utils::defaults::redact;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -88,10 +88,7 @@ pub struct LongPollUpdate {
 impl LongPollUpdate {
     pub fn new(token: String, client: Client) -> Self {
         let url = format!("https://api.telegram.org/bot{}/getUpdates", token);
-        let metrics = UpdaterMetrics::new(
-            "longpoll",
-            TELEGRAM_TOKEN_RE.replace_all(&url, "#####").to_string(),
-        );
+        let metrics = UpdaterMetrics::new("longpoll", redact(&url).into_owned());
         Self {
             client,
             url,
@@ -109,10 +106,7 @@ impl LongPollUpdate {
         // Rebuild so the Prometheus `source` label tracks the override.
         // Counters reset to zero, which is harmless: this only runs during
         // construction in `build_updates`, before the updater task starts.
-        self.metrics = UpdaterMetrics::new(
-            "longpoll",
-            TELEGRAM_TOKEN_RE.replace_all(&url, "#####").to_string(),
-        );
+        self.metrics = UpdaterMetrics::new("longpoll", redact(&url).into_owned());
         self.url = url;
     }
 
@@ -156,7 +150,7 @@ impl LongPollUpdate {
     /// inside `WEBHOOK_REDELETE_GUARD` and backs off. Returns `true` when
     /// shutdown won the race.
     async fn delete_webhook(&self, url: &str, shutdown: &CancellationToken) -> bool {
-        let redacted = TELEGRAM_TOKEN_RE.replace_all(url, "#####");
+        let redacted = redact(url);
         let request = self
             .client
             .post(url)
@@ -190,9 +184,7 @@ impl Updater for LongPollUpdate {
         let backoff_base_ms = self.error_timeout_sleep.max(BACKOFF_FLOOR_MS);
         let mut backoff_ms = backoff_base_ms;
         let request_timeout = self.request_timeout();
-        let redacted_url = TELEGRAM_TOKEN_RE
-            .replace_all(&self.url, "#####")
-            .to_string();
+        let redacted_url = redact(&self.url).into_owned();
 
         // Outage bookkeeping. `consecutive_failures` is reset on every
         // successful 2xx parse; it tracks transient failures only (network
@@ -518,7 +510,7 @@ impl Serverable for LongPollUpdate {}
 #[async_trait]
 impl Printable for LongPollUpdate {
     async fn print(&self) -> String {
-        let token = TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####");
+        let token = redact(&self.url);
         format!(
             "longpull: {} timeout={} limit={} sleep={}/{}",
             token,

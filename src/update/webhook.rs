@@ -2,7 +2,7 @@ use crate::base::{Printable, Serverable};
 use crate::observe::UpdaterMetrics;
 use crate::update::base::Updater;
 
-use crate::utils::defaults::TELEGRAM_TOKEN_RE;
+use crate::utils::defaults::redact;
 
 use async_trait::async_trait;
 use axum::{
@@ -71,7 +71,7 @@ pub struct WebhookUpdate {
 
 impl WebhookUpdate {
     pub fn new(path: String) -> Self {
-        let metrics = UpdaterMetrics::new("webhook", format!("0.0.0.0{path}"));
+        let metrics = UpdaterMetrics::new("webhook", format!("0.0.0.0{}", redact(&path)));
         Self {
             path,
             secret_token: None,
@@ -107,14 +107,14 @@ impl WebhookUpdate {
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    tracing::info!(path = %self.path, "webhook registered with Telegram");
+                    tracing::info!(path = %redact(&self.path), "webhook registered with Telegram");
                 } else {
-                    tracing::error!(path = %self.path, status = resp.status().as_u16(), "failed to set webhook");
+                    tracing::error!(path = %redact(&self.path), status = resp.status().as_u16(), "failed to set webhook");
                 }
             }
             Err(e) => tracing::error!(
-                path = %self.path,
-                url = %TELEGRAM_TOKEN_RE.replace_all(&config.set_webhook_url, "#####"),
+                path = %redact(&self.path),
+                url = %redact(&config.set_webhook_url),
                 error = ?e.without_url(),
                 "network error setting webhook"
             ),
@@ -131,7 +131,7 @@ impl Updater for WebhookUpdate {
         if let Some(config) = &self.registration {
             self.register_webhook(config).await;
         } else {
-            tracing::info!(path = %self.path, "webhook started in passive mode (no auto-registration)");
+            tracing::info!(path = %redact(&self.path), "webhook started in passive mode (no auto-registration)");
         }
     }
 
@@ -259,13 +259,10 @@ impl Serverable for WebhookUpdate {
 impl Printable for WebhookUpdate {
     async fn print(&self) -> String {
         let reg_text = match &self.registration {
-            Some(reg) => format!(
-                "REGISTERED ON {}",
-                &TELEGRAM_TOKEN_RE.replace_all(&reg.set_webhook_url, "#####")
-            ),
+            Some(reg) => format!("REGISTERED ON {}", redact(&reg.set_webhook_url)),
             None => "".to_string(),
         };
-        format!("webhook: 0.0.0.0{} {}", self.path, reg_text)
+        format!("webhook: 0.0.0.0{} {}", redact(&self.path), reg_text)
     }
 }
 
@@ -337,6 +334,75 @@ mod tests {
             !logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             "logs: {logs}"
         );
+    }
+
+    /// The ingress path may embed a bot token. Every log line that names it
+    /// (registered, rejected, network error, passive start) and the startup
+    /// banner redact it.
+    #[tokio::test]
+    async fn test_ingress_path_redacted_in_logs_and_banner() {
+        const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let path = format!("/bot123456789:{SECRET}/hook");
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let ok = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ok)
+            .await;
+        let rejected = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&rejected)
+            .await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let set_webhook_urls = [
+            format!("{}/setWebhook", ok.uri()),
+            format!("{}/setWebhook", rejected.uri()),
+            format!("http://127.0.0.1:{closed}/setWebhook"),
+        ];
+
+        let mut updater = WebhookUpdate::new(path.clone());
+        let mut logs = String::new();
+        for url in set_webhook_urls {
+            let mut reg = RegistrationWebhookConfig::new(
+                "TOKEN123".to_string(),
+                "https://example.com".to_string(),
+                client.clone(),
+            );
+            reg.set_webhook_url(url);
+            let ((), captured) =
+                crate::utils::testlog::capture_logs(updater.register_webhook(&reg)).await;
+            logs.push_str(&captured);
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        let ((), captured) =
+            crate::utils::testlog::capture_logs(updater.start(tx, CancellationToken::new())).await;
+        logs.push_str(&captured);
+
+        for line in [
+            "webhook registered with Telegram",
+            "failed to set webhook",
+            "network error setting webhook",
+            "webhook started in passive mode",
+        ] {
+            assert!(logs.contains(line), "missing {line:?}: {logs}");
+        }
+        assert!(!logs.contains(SECRET), "logs leak the token: {logs}");
+        assert_eq!(logs.matches("/bot#####/hook").count(), 4, "{logs}");
+
+        updater.set_registration(RegistrationWebhookConfig::new(
+            "TOKEN123".to_string(),
+            "https://example.com".to_string(),
+            client,
+        ));
+        let banner = updater.print().await;
+        assert!(banner.contains("0.0.0.0/bot#####/hook"), "{banner}");
+        assert!(!banner.contains(SECRET), "{banner}");
     }
 
     fn registration_for(server: &MockServer) -> RegistrationWebhookConfig {

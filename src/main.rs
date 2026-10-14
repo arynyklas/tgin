@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::config::schema::UpdateConfig;
 use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
 use crate::tgin::{ShutdownOutcome, Tgin};
+use crate::utils::defaults::redact;
 use crate::utils::http::build_shared_client;
 
 use clap::{Arg, Command};
@@ -105,21 +106,7 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
 
     crate::observe::init(&conf.log_level, conf.log_format);
 
-    // An unsigned webhook ingress accepts any POST as a Telegram update.
-    // Allowed (a reverse proxy may guard it), but never silently.
-    for upd in &conf.updates {
-        if let UpdateConfig::WebhookUpdate {
-            path,
-            secret_token: None,
-            ..
-        } = upd
-        {
-            tracing::warn!(
-                "WebhookUpdate has no secret_token: anyone who can reach {path} can inject \
-                 updates; set secret_token"
-            );
-        }
-    }
+    warn_unsigned_webhooks(&conf.updates);
 
     // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
     // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,
@@ -201,9 +188,46 @@ fn run_outcome(shutdown: ShutdownOutcome, permanent_failures: usize) -> RunOutco
     }
 }
 
+/// An unsigned webhook ingress accepts any POST as a Telegram update.
+/// Allowed (a reverse proxy may guard it), but never silently.
+fn warn_unsigned_webhooks(updates: &[UpdateConfig]) {
+    for upd in updates {
+        if let UpdateConfig::WebhookUpdate {
+            path,
+            secret_token: None,
+            ..
+        } = upd
+        {
+            tracing::warn!(
+                "WebhookUpdate has no secret_token: anyone who can reach {} can inject \
+                 updates; set secret_token",
+                redact(path)
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning names the path, so a token embedded in it is redacted.
+    #[tokio::test]
+    async fn test_unsigned_webhook_warning_redacts_token_path() {
+        const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let updates = vec![UpdateConfig::WebhookUpdate {
+            path: format!("/bot123456789:{SECRET}/hook"),
+            registration: None,
+            secret_token: None,
+        }];
+
+        let ((), logs) =
+            crate::utils::testlog::capture_logs(async { warn_unsigned_webhooks(&updates) }).await;
+
+        assert!(logs.contains("WebhookUpdate has no secret_token"), "{logs}");
+        assert!(logs.contains("/bot#####/hook"), "{logs}");
+        assert!(!logs.contains(SECRET), "{logs}");
+    }
 
     #[test]
     fn test_cli_version_flag() {

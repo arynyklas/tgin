@@ -1,5 +1,5 @@
 use crate::base::{Printable, RouteId, Routeable, Serverable};
-use crate::utils::defaults::TELEGRAM_TOKEN_RE;
+use crate::utils::defaults::redact;
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::header::CONTENT_TYPE;
@@ -63,7 +63,7 @@ impl Routeable for WebhookRoute {
             Ok(resp) => {
                 self.http_failure.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
+                    route = %redact(&self.url),
                     status = resp.status().as_u16(),
                     "webhook downstream returned non-success"
                 );
@@ -71,7 +71,7 @@ impl Routeable for WebhookRoute {
             Err(err) => {
                 self.http_error.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    route = %TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####"),
+                    route = %redact(&self.url),
                     error = ?err.without_url(),
                     "webhook downstream request failed"
                 );
@@ -89,17 +89,14 @@ impl Serverable for WebhookRoute {}
 #[async_trait]
 impl Printable for WebhookRoute {
     async fn print(&self) -> String {
-        format!(
-            "webhook: {}",
-            TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####")
-        )
+        format!("webhook: {}", redact(&self.url))
     }
 
     async fn json_struct(&self) -> Value {
         json!({
             "type": "webhook",
             "options": {
-                "url": TELEGRAM_TOKEN_RE.replace_all(&self.url, "#####").as_ref()
+                "url": redact(&self.url)
             },
             "metrics": {
                 "dispatched_total": self.dispatched.load(Ordering::Relaxed),

@@ -1,4 +1,5 @@
 use crate::base::{Printable, RouteId, Routeable, Serverable};
+use crate::utils::defaults::redact;
 use async_trait::async_trait;
 
 use std::collections::VecDeque;
@@ -327,7 +328,7 @@ impl Routeable for LongPollRoute {
                 .is_ok()
         {
             tracing::warn!(
-                route = %self.path,
+                route = %redact(&self.path),
                 depth = depth_after_push,
                 cap = self.max_buffered_updates,
                 "long-poll route crossed buffer high-watermark; downstream may be offline"
@@ -399,7 +400,7 @@ impl Serverable for LongPollRoute {
 #[async_trait]
 impl Printable for LongPollRoute {
     async fn print(&self) -> String {
-        format!("longpull: http://0.0.0.0{}", self.path)
+        format!("longpull: http://0.0.0.0{}", redact(&self.path))
     }
 
     async fn json_struct(&self) -> Value {
@@ -408,7 +409,7 @@ impl Printable for LongPollRoute {
         json!({
             "type": "longpoll",
             "options": {
-                "path": self.path,
+                "path": redact(&self.path),
                 "max_buffered_updates": self.max_buffered_updates
             },
             "metrics": {
@@ -822,6 +823,30 @@ mod tests {
         assert_eq!(json["metrics"]["queue_depth"], 0);
         assert_eq!(json["metrics"]["queue_dropped_total"], 0);
         assert_eq!(json["metrics"]["served_total"], 0);
+    }
+
+    /// The route path may embed a bot token: `json_struct` (which feeds
+    /// `/status` and `/api/routes`), the startup banner and the
+    /// high-watermark warning redact it.
+    #[tokio::test]
+    async fn test_token_path_redacted() {
+        const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut route = LongPollRoute::new(format!("/bot123456789:{SECRET}/getUpdates"));
+        route.set_max_buffered_updates(1);
+
+        let json = route.json_struct().await;
+        assert_eq!(json["options"]["path"], "/bot#####/getUpdates");
+
+        let banner = route.print().await;
+        assert_eq!(banner, "longpull: http://0.0.0.0/bot#####/getUpdates");
+
+        let ((), logs) = crate::utils::testlog::capture_logs(
+            route.process(update_bytes(json!({"update_id": 1}))),
+        )
+        .await;
+        assert!(logs.contains("crossed buffer high-watermark"), "{logs}");
+        assert!(logs.contains("/bot#####/getUpdates"), "{logs}");
+        assert!(!logs.contains(SECRET), "{logs}");
     }
 
     /// `served_total` counts updates drained out via `getUpdates`.
