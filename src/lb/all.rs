@@ -75,8 +75,9 @@ impl Routeable for AllLB {
                 if e.is_panic() {
                     tracing::error!(error = %e, "AllLB child panicked during fanout");
                 }
-                // `JoinError::is_cancelled` only fires when the `JoinSet`
-                // is dropped mid-flight, which we don't do during drain.
+                // `JoinError::is_cancelled` cannot surface here: the set is
+                // dropped mid-flight only when the shutdown deadline aborts
+                // this whole dispatch, and dropping it aborts every child.
             }
         }
     }

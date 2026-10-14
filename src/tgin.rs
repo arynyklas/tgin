@@ -18,6 +18,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use tokio::runtime::Builder;
@@ -92,7 +93,7 @@ impl Tgin {
         });
     }
 
-    pub fn run(self) -> std::io::Result<()> {
+    pub fn run(self) -> std::io::Result<ShutdownOutcome> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(self.dark_threads)
             .enable_all()
@@ -106,23 +107,29 @@ impl Tgin {
             tracing::info!(routing = %self.route.print().await, "routing tree configured");
         });
 
-        runtime.block_on(self.run_async())
+        let outcome = runtime.block_on(self.run_async());
+        if matches!(outcome, Ok(ShutdownOutcome::Forced)) {
+            // Exit now: do not wait for dispatches still in flight.
+            runtime.shutdown_background();
+        }
+        outcome
     }
 
     /// Serve until a process signal, then drain with the default timing.
-    pub async fn run_async(self) -> std::io::Result<()> {
-        self.run_until(shutdown_signal(), ShutdownTiming::default())
+    pub async fn run_async(self) -> std::io::Result<ShutdownOutcome> {
+        self.run_until(OsSignals::default(), ShutdownTiming::default())
             .await
     }
 
-    /// Serve until `shutdown_cause` resolves or every ingress has failed
-    /// permanently, then drain as paced by `timing` (see the coordinator
-    /// below) and return.
+    /// Serve until `signals` delivers a shutdown cause or every ingress has
+    /// failed permanently, then drain as paced by `timing` (see the
+    /// coordinator below) and return. A signal received once shutdown has
+    /// started cuts the drain short ([`ShutdownOutcome::Forced`]).
     pub async fn run_until(
         self,
-        shutdown_cause: impl Future<Output = ShutdownCause> + Send + 'static,
+        signals: impl ShutdownSignals,
         timing: ShutdownTiming,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<ShutdownOutcome> {
         // Bounded buffer: a small queue is flow control. The previous
         // 1_000_000-slot channel was not — it was a runway for OOM that
         // hid downstream slowness from producers until memory ran out.
@@ -142,8 +149,13 @@ impl Tgin {
         // Released only after the HTTP server has closed, so the worker pool
         // and the control-plane loop keep consuming updates produced by
         // in-flight webhook handlers right up until the server is done —
-        // then drain the backlog and exit.
+        // then the workers drain the backlog until `stop`.
         let drain = CancellationToken::new();
+        // Cancelled at the drain deadline: workers abort the dispatch in
+        // hand and exit, leaving the rest of the queue.
+        let stop = CancellationToken::new();
+        // Cancelled on a second shutdown signal: `run_until` returns at once.
+        let forced = CancellationToken::new();
         // Set by the shutdown coordinator as its first action, flipping
         // `/readyz` to 503 so load balancers stop routing to this instance.
         let draining = Arc::new(AtomicBool::new(false));
@@ -242,53 +254,88 @@ impl Tgin {
         //      usual for `lame_duck` while load balancers move traffic away;
         //   2. cancel `ingest`: long-poll updaters stop pulling from Telegram
         //      and webhook ingress answers 503 so Telegram redelivers later;
-        //   3. `begin_drain` the routing tree, answering parked long polls;
+        //   3. `begin_drain` the routing tree: parked long polls wake, and a
+        //      poll on an empty buffer is answered with an empty batch within
+        //      `DRAINING_EMPTY_POLL_HOLD` instead of its full timeout;
         //   4. keep the HTTP plane up until the update channel is empty and
         //      no route holds pending updates, or `grace` elapses, so
         //      consumers still fetch what was already acknowledged;
         //   5. close the HTTP plane (in-flight requests get
         //      `HTTP_CLOSE_GRACE`), then cancel `drain` so the worker pool
-        //      and control-plane loop finish any backlog and exit.
+        //      and control-plane loop finish any backlog and exit;
+        //   6. at the drain deadline (see `drain_deadline`) cancel `stop`:
+        //      workers abort the dispatch in hand and exit, so a slow or dead
+        //      downstream cannot hold the process past the deadline.
         // Without an HTTP plane there is no traffic to move away and nobody
         // to fetch buffered updates, so steps 1, 3 and 4 and the HTTP close
-        // are skipped: ingest and `drain` are cancelled at once. The
-        // coordinator holds only a weak sender, so it never keeps the update
-        // channel open.
+        // are skipped: ingest and `drain` are cancelled at once and `stop`
+        // follows after `grace`. A signal received at any point after the
+        // cause cancels `forced` instead, and `run_until` returns at once.
+        // The coordinator holds only a weak sender, so it never keeps the
+        // update channel open.
         {
             let ingest = ingest.clone();
             let drain = drain.clone();
+            let stop = stop.clone();
+            let forced = forced.clone();
             let draining = draining.clone();
             let route = self.route.clone();
             let updates = tx.downgrade();
             let ingress_health = self.ingress_health;
+            let mut signals = signals;
             tokio::spawn(async move {
                 let cause = tokio::select! {
-                    cause = shutdown_cause => cause,
+                    cause = signals.recv() => cause,
                     () = all_ingress_failed(ingress_health) => ShutdownCause::AllIngressFailed,
                 };
-                let Some((handle, task)) = server else {
-                    tracing::info!(?cause, "shutdown started; no HTTP plane, stopping ingest");
-                    ingest.cancel();
-                    drain.cancel();
-                    return;
-                };
                 let timing = timing.for_cause(cause);
-                draining.store(true, Ordering::SeqCst);
-                tracing::info!(
-                    ?cause,
-                    lame_duck = ?timing.lame_duck,
-                    grace = ?timing.grace,
-                    "shutdown started; draining"
-                );
-                tokio::time::sleep(timing.lame_duck).await;
-                ingest.cancel();
-                route.begin_drain();
-                let _ =
-                    tokio::time::timeout(timing.grace, backlog_drained(&updates, route.as_ref()))
-                        .await;
-                handle.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
-                let _ = task.await;
-                drain.cancel();
+                let sequence = async {
+                    let deadline = match server {
+                        None => {
+                            tracing::info!(
+                                ?cause,
+                                grace = ?timing.grace,
+                                "shutdown started; no HTTP plane, stopping ingest"
+                            );
+                            ingest.cancel();
+                            drain.cancel();
+                            Instant::now() + timing.grace
+                        }
+                        Some((handle, task)) => {
+                            draining.store(true, Ordering::SeqCst);
+                            tracing::info!(
+                                ?cause,
+                                lame_duck = ?timing.lame_duck,
+                                grace = ?timing.grace,
+                                "shutdown started; draining"
+                            );
+                            tokio::time::sleep(timing.lame_duck).await;
+                            ingest.cancel();
+                            route.begin_drain();
+                            let drain_start = Instant::now();
+                            let _ = tokio::time::timeout(
+                                timing.grace,
+                                backlog_drained(&updates, route.as_ref()),
+                            )
+                            .await;
+                            let close_start = Instant::now();
+                            handle.graceful_shutdown(Some(HTTP_CLOSE_GRACE));
+                            let deadline = drain_deadline(drain_start, timing.grace, close_start);
+                            let _ = tokio::time::timeout_at(deadline, task).await;
+                            drain.cancel();
+                            deadline
+                        }
+                    };
+                    tokio::time::sleep_until(deadline).await;
+                    stop.cancel();
+                };
+                tokio::select! {
+                    () = sequence => {}
+                    _ = signals.recv() => {
+                        tracing::warn!("second shutdown signal; exiting without completing the drain");
+                        forced.cancel();
+                    }
+                }
             });
         }
 
@@ -303,21 +350,20 @@ impl Tgin {
         // `dark_threads`. Workers stop when the channel closes on the clean
         // no-signal path, or when `drain` is cancelled (after the HTTP server
         // has finished draining), at which point they finish the buffered
-        // backlog and exit. They never wait on every `Sender` clone dropping,
-        // which the axum router does not guarantee on shutdown.
-        let workers = spawn_worker_pool(rx, self.route.clone(), self.dark_threads, drain.clone());
+        // backlog and exit, or stop early at the drain deadline. They never
+        // wait on every `Sender` clone dropping, which the axum router does
+        // not guarantee on shutdown.
+        let pool = spawn_worker_pool(
+            rx,
+            self.route.clone(),
+            self.dark_threads,
+            drain.clone(),
+            stop,
+        );
 
-        match api {
-            None => {
-                // Workers exit when the channel closes (every ingress
-                // producer dropped its `Sender` clone). Wait for clean
-                // drain so the runtime doesn't tear down mid-dispatch.
-                for w in workers {
-                    let _ = w.await;
-                }
-            }
-
-            Some(api) => {
+        let route = self.route;
+        let finished = async {
+            if let Some(api) = api {
                 // Control plane runs alongside the worker pool. Move the
                 // receiver out of `Api`, dropping its own `Sender` clone — on
                 // the no-server path that is the last sender, so `recv`
@@ -338,7 +384,7 @@ impl Tgin {
                     };
                     match api_msg {
                         ApiMessage::GetRoutes(tx_response) => {
-                            let _ = tx_response.send(self.route.json_struct().await);
+                            let _ = tx_response.send(route.json_struct().await);
                         }
 
                         // Run synchronously in the API loop and plumb the
@@ -348,13 +394,12 @@ impl Tgin {
                         // synchronous handling is what lets the trait-level
                         // `AddRouteError` surface as an honest 4xx instead of
                         // a silent 200.
-                        ApiMessage::AddRoute { route, resp } => {
-                            let result =
-                                self.route.add_route(route).await.map_err(|err| match err {
-                                    AddRouteError::Conflict => ApiError::Conflict(
-                                        "top-level route does not accept dynamic children".into(),
-                                    ),
-                                });
+                        ApiMessage::AddRoute { route: added, resp } => {
+                            let result = route.add_route(added).await.map_err(|err| match err {
+                                AddRouteError::Conflict => ApiError::Conflict(
+                                    "top-level route does not accept dynamic children".into(),
+                                ),
+                            });
                             let _ = resp.send(result);
                         }
 
@@ -365,37 +410,45 @@ impl Tgin {
                         // `RemoveRouteError::NotFound` surface as a 404.
                         ApiMessage::RmRoute { target, resp } => {
                             let result =
-                                self.route
-                                    .remove_route(target)
-                                    .await
-                                    .map_err(|err| match err {
-                                        RemoveRouteError::NotFound => ApiError::NotFound(
-                                            "no route in the tree matched the supplied target"
-                                                .into(),
-                                        ),
-                                    });
+                                route.remove_route(target).await.map_err(|err| match err {
+                                    RemoveRouteError::NotFound => ApiError::NotFound(
+                                        "no route in the tree matched the supplied target".into(),
+                                    ),
+                                });
                             let _ = resp.send(result);
                         }
                     }
                 }
-
-                for w in workers {
-                    let _ = w.await;
-                }
             }
-        }
 
-        // Whatever is still buffered for long-poll consumers is lost with
-        // the process.
-        let abandoned = self.route.pending();
+            // Without the API, workers exit when the channel closes (every
+            // ingress producer dropped its `Sender` clone) or at the drain.
+            // Wait for them so the runtime doesn't tear down mid-dispatch.
+            pool.join().await
+        };
+
+        let left = tokio::select! {
+            biased;
+            () = forced.cancelled() => return Ok(ShutdownOutcome::Forced),
+            left = finished => left,
+        };
+
+        // Updates still queued or aborted mid-dispatch at the deadline, and
+        // whatever long-poll consumers did not fetch, are lost with the
+        // process.
+        let buffered = route.pending();
+        let abandoned = left.queued + left.aborted + buffered;
         if abandoned > 0 {
             tracing::warn!(
                 abandoned,
-                "exiting with updates no long-poll consumer fetched before the drain deadline"
+                queued = left.queued,
+                aborted = left.aborted,
+                buffered,
+                "exiting with updates not delivered before the drain deadline"
             );
         }
 
-        Ok(())
+        Ok(ShutdownOutcome::Completed { abandoned })
     }
 }
 
@@ -409,7 +462,9 @@ const UPDATE_CHANNEL_CAPACITY: usize = 1024;
 /// Shutdown pacing. On a cause, `/readyz` flips to 503 and the listeners keep
 /// accepting for `lame_duck`, so load balancers stop routing here before
 /// ingest stops; then buffered updates get up to `grace` to reach their
-/// consumers before the HTTP plane closes.
+/// consumers before the HTTP plane closes, and dispatch stops at the
+/// [`drain_deadline`]. The whole shutdown takes at most about
+/// `lame_duck + grace + HTTP_CLOSE_GRACE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownTiming {
     pub lame_duck: Duration,
@@ -470,6 +525,15 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Deadline for in-flight HTTP requests once the backlog is drained (or the
 /// grace has elapsed) and the HTTP plane closes.
 const HTTP_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// When the workers stop: the end of the grace that began at `drain_start`
+/// or, if the grace is already spent, `HTTP_CLOSE_GRACE` after the HTTP
+/// close began at `close_start`. The close begins no later than the end of
+/// the grace, so the deadline is at most `grace + HTTP_CLOSE_GRACE` after
+/// `drain_start`.
+fn drain_deadline(drain_start: Instant, grace: Duration, close_start: Instant) -> Instant {
+    (drain_start + grace).max(close_start + HTTP_CLOSE_GRACE)
+}
 
 /// Resolves once every ingress has failed permanently; never resolves
 /// without [`Tgin::set_ingress_health`].
@@ -565,48 +629,164 @@ pub enum ShutdownCause {
     AllIngressFailed,
 }
 
-/// Await one signal listener, or never resolve if it could not be
-/// registered, so a registration failure does not shut the process down.
-macro_rules! signal_or_pending {
-    ($listener:expr, $name:literal) => {
+/// How [`Tgin::run_until`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// The drain ran to completion or to its deadline. `abandoned` counts
+    /// the updates it did not deliver: still queued for dispatch, aborted
+    /// mid-dispatch at the deadline, or left in long-poll buffers.
+    Completed { abandoned: usize },
+    /// A second shutdown signal cut the drain short.
+    Forced,
+}
+
+/// Source of shutdown signals for [`Tgin::run_until`]. The first signal
+/// starts the drain; any signal after that forces exit.
+pub trait ShutdownSignals: Send + 'static {
+    /// Resolves with the next signal.
+    fn recv(&mut self) -> impl Future<Output = ShutdownCause> + Send;
+}
+
+/// The process's own shutdown signals: SIGINT and SIGTERM on Unix; Ctrl-C,
+/// Ctrl-Break, console close and system shutdown on Windows. Listeners are
+/// registered on the first [`ShutdownSignals::recv`] and stay registered
+/// for the rest of the run, so a second signal reaches tgin. On Windows,
+/// that is what keeps a second Ctrl-C from the default handler, which
+/// would kill the process outright.
+#[derive(Default)]
+pub struct OsSignals {
+    listeners: Option<SignalListeners>,
+}
+
+impl ShutdownSignals for OsSignals {
+    async fn recv(&mut self) -> ShutdownCause {
+        self.listeners
+            .get_or_insert_with(SignalListeners::register)
+            .recv()
+            .await
+    }
+}
+
+/// `Some(listener)`, or `None` with a warning if it could not be registered:
+/// a registration failure must not shut the process down.
+fn listen<T>(listener: std::io::Result<T>, name: &str) -> Option<T> {
+    listener
+        .inspect_err(|err| tracing::warn!(error = %err, signal = name, "cannot listen for signal"))
+        .ok()
+}
+
+/// Await the next event on an `&mut Option<listener>`, or never resolve
+/// without a listener.
+macro_rules! recv_or_pending {
+    ($listener:expr) => {
         async {
             match $listener {
-                Ok(mut sig) => {
+                Some(sig) => {
                     sig.recv().await;
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, signal = $name, "cannot listen for signal");
-                    std::future::pending::<()>().await;
-                }
+                None => std::future::pending::<()>().await,
             }
         }
     };
 }
 
-/// Resolves with the first SIGTERM or SIGINT.
 #[cfg(unix)]
-async fn shutdown_signal() -> ShutdownCause {
-    use tokio::signal::unix::{signal, SignalKind};
+struct SignalListeners {
+    interrupt: Option<tokio::signal::unix::Signal>,
+    terminate: Option<tokio::signal::unix::Signal>,
+}
 
-    tokio::select! {
-        _ = signal_or_pending!(signal(SignalKind::interrupt()), "SIGINT") => ShutdownCause::CtrlC,
-        _ = signal_or_pending!(signal(SignalKind::terminate()), "SIGTERM") => ShutdownCause::Terminate,
+#[cfg(unix)]
+impl SignalListeners {
+    fn register() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        Self {
+            interrupt: listen(signal(SignalKind::interrupt()), "SIGINT"),
+            terminate: listen(signal(SignalKind::terminate()), "SIGTERM"),
+        }
+    }
+
+    /// Resolves with the next SIGINT or SIGTERM.
+    async fn recv(&mut self) -> ShutdownCause {
+        let Self {
+            interrupt,
+            terminate,
+        } = self;
+        tokio::select! {
+            () = recv_or_pending!(interrupt) => ShutdownCause::CtrlC,
+            () = recv_or_pending!(terminate) => ShutdownCause::Terminate,
+        }
     }
 }
 
-/// Resolves with the first console control event: Ctrl-C, Ctrl-Break,
-/// console close, or system shutdown. For close and shutdown, tokio holds
-/// the OS handler open, so the process keeps running only until Windows'
-/// own kill deadline.
 #[cfg(windows)]
-async fn shutdown_signal() -> ShutdownCause {
-    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+struct SignalListeners {
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    ctrl_close: Option<tokio::signal::windows::CtrlClose>,
+    ctrl_shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
 
-    tokio::select! {
-        _ = signal_or_pending!(ctrl_c(), "ctrl_c") => ShutdownCause::CtrlC,
-        _ = signal_or_pending!(ctrl_break(), "ctrl_break") => ShutdownCause::CtrlBreak,
-        _ = signal_or_pending!(ctrl_close(), "ctrl_close") => ShutdownCause::CtrlClose,
-        _ = signal_or_pending!(ctrl_shutdown(), "ctrl_shutdown") => ShutdownCause::CtrlShutdown,
+#[cfg(windows)]
+impl SignalListeners {
+    fn register() -> Self {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+
+        Self {
+            ctrl_c: listen(ctrl_c(), "ctrl_c"),
+            ctrl_break: listen(ctrl_break(), "ctrl_break"),
+            ctrl_close: listen(ctrl_close(), "ctrl_close"),
+            ctrl_shutdown: listen(ctrl_shutdown(), "ctrl_shutdown"),
+        }
+    }
+
+    /// Resolves with the next console control event. For close and
+    /// shutdown, tokio holds the OS handler open, so the process keeps
+    /// running only until Windows' own kill deadline.
+    async fn recv(&mut self) -> ShutdownCause {
+        let Self {
+            ctrl_c,
+            ctrl_break,
+            ctrl_close,
+            ctrl_shutdown,
+        } = self;
+        tokio::select! {
+            () = recv_or_pending!(ctrl_c) => ShutdownCause::CtrlC,
+            () = recv_or_pending!(ctrl_break) => ShutdownCause::CtrlBreak,
+            () = recv_or_pending!(ctrl_close) => ShutdownCause::CtrlClose,
+            () = recv_or_pending!(ctrl_shutdown) => ShutdownCause::CtrlShutdown,
+        }
+    }
+}
+
+/// The dispatch workers, plus what [`WorkerPool::join`] needs to count the
+/// updates they leave undelivered.
+struct WorkerPool {
+    workers: Vec<tokio::task::JoinHandle<()>>,
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
+    aborted: Arc<AtomicUsize>,
+}
+
+/// Updates a [`WorkerPool`] left undelivered when it stopped.
+#[derive(Debug, PartialEq, Eq)]
+struct LeftOver {
+    /// Still in the dispatch queue.
+    queued: usize,
+    /// Taken from the queue, then aborted mid-dispatch at the deadline.
+    aborted: usize,
+}
+
+impl WorkerPool {
+    /// Wait for every worker to exit, then count what they left behind.
+    async fn join(self) -> LeftOver {
+        for w in self.workers {
+            let _ = w.await;
+        }
+        LeftOver {
+            queued: self.rx.lock().await.len(),
+            aborted: self.aborted.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -616,52 +796,68 @@ async fn shutdown_signal() -> ShutdownCause {
 ///
 /// Termination is deterministic and does not rely on every `Sender` clone
 /// being dropped (the axum router retains state-sender clones past its own
-/// drop): a worker stops when the channel closes (clean no-signal path) or
-/// when `shutdown` is cancelled. On cancellation the biased `recv` still wins
-/// whenever an update is ready, so a backlog keeps draining; the worker exits
-/// only once the buffer is empty.
+/// drop): a worker stops when the channel closes (clean no-signal path),
+/// when `drain` is cancelled and the queue is empty, or when `stop` is
+/// cancelled. After `drain` the biased `recv` still wins whenever an update
+/// is ready, so a backlog keeps draining. `stop` wins over everything: the
+/// worker takes nothing more from the queue and drops the dispatch in hand,
+/// which aborts it (its outbound request, or an `AllLB` fanout).
 fn spawn_worker_pool(
     rx: mpsc::Receiver<Bytes>,
     route: Arc<dyn RouteableComponent>,
     worker_count: usize,
-    shutdown: CancellationToken,
-) -> Vec<tokio::task::JoinHandle<()>> {
+    drain: CancellationToken,
+    stop: CancellationToken,
+) -> WorkerPool {
     let worker_count = worker_count.max(1);
     // Shared via a `tokio::sync::Mutex`: the guard is held only across the
     // pick (`recv`), never across `route.process`, so N-1 workers can be
     // processing while one is parked waiting for the next update.
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let aborted = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let rx = rx.clone();
         let route = route.clone();
-        let shutdown = shutdown.clone();
+        let drain = drain.clone();
+        let stop = stop.clone();
+        let aborted = aborted.clone();
         workers.push(tokio::spawn(async move {
             loop {
                 let next = {
                     let mut guard = rx.lock().await;
                     tokio::select! {
                         biased;
+                        () = stop.cancelled() => None,
                         msg = guard.recv() => msg,
-                        // Cancelled: drain whatever is buffered (one per
+                        // Draining: take whatever is buffered (one per
                         // iteration via the biased `recv` above); `try_recv`
                         // yields `None` once empty, ending the worker.
-                        _ = shutdown.cancelled() => guard.try_recv().ok(),
+                        () = drain.cancelled() => guard.try_recv().ok(),
                     }
                 };
-                match next {
-                    // `Bytes::clone` inside the routing tree is one atomic op;
-                    // no `Value` allocation, no re-serialization on egress.
-                    Some(update) => {
-                        let span = crate::observe::dispatch_span(&update);
-                        route.process(update).instrument(span).await;
+                // `Bytes::clone` inside the routing tree is one atomic op; no
+                // `Value` allocation, no re-serialization on egress.
+                let Some(update) = next else {
+                    return;
+                };
+                let span = crate::observe::dispatch_span(&update);
+                tokio::select! {
+                    biased;
+                    () = route.process(update).instrument(span) => {}
+                    () = stop.cancelled() => {
+                        aborted.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
-                    None => return,
                 }
             }
         }));
     }
-    workers
+    WorkerPool {
+        workers,
+        rx,
+        aborted,
+    }
 }
 
 #[cfg(test)]
@@ -732,7 +928,13 @@ mod tests {
 
         let workers_n = 4;
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_worker_pool(rx, route_dyn, workers_n, CancellationToken::new());
+        let pool = spawn_worker_pool(
+            rx,
+            route_dyn,
+            workers_n,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
 
         for i in 0..workers_n {
             tx.send(update_bytes(json!({ "update_id": i })))
@@ -764,9 +966,7 @@ mod tests {
         probe.release.store(workers_n, Ordering::SeqCst);
         probe.gate.notify_waiters();
         drop(tx);
-        for w in workers {
-            let _ = w.await;
-        }
+        pool.join().await;
     }
 
     /// End-to-end through the public dispatch surface: spawn the worker
@@ -780,7 +980,13 @@ mod tests {
         let route_dyn: Arc<dyn RouteableComponent> = route.clone();
 
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_worker_pool(rx, route_dyn.clone(), 4, CancellationToken::new());
+        let pool = spawn_worker_pool(
+            rx,
+            route_dyn.clone(),
+            4,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
 
         for i in 0..32 {
             tx.send(update_bytes(json!({ "update_id": i })))
@@ -789,7 +995,7 @@ mod tests {
         }
         drop(tx);
 
-        for w in workers {
+        for w in pool.workers {
             w.await.unwrap();
         }
 
@@ -807,7 +1013,13 @@ mod tests {
 
         let workers_n = 2;
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
-        let workers = spawn_worker_pool(rx, route_dyn, workers_n, CancellationToken::new());
+        let pool = spawn_worker_pool(
+            rx,
+            route_dyn,
+            workers_n,
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
 
         // Fill the channel: workers are blocked on `gate`, so anything we
         // send beyond `worker_count + capacity` must be rejected.
@@ -849,9 +1061,7 @@ mod tests {
         probe.release.store(accepted, Ordering::SeqCst);
         probe.gate.notify_waiters();
         drop(tx);
-        for w in workers {
-            let _ = w.await;
-        }
+        pool.join().await;
     }
 
     /// Helper for tests that want a `Bytes` payload from a `serde_json::Value`.
@@ -895,7 +1105,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
         let shutdown = CancellationToken::new();
-        let workers = spawn_worker_pool(rx, route_dyn, 4, shutdown.clone());
+        let pool = spawn_worker_pool(rx, route_dyn, 4, shutdown.clone(), CancellationToken::new());
 
         for i in 0..16 {
             tx.send(update_bytes(json!({ "update_id": i })))
@@ -907,7 +1117,7 @@ mod tests {
         // token, not on the channel closing.
         shutdown.cancel();
 
-        for w in workers {
+        for w in pool.workers {
             tokio::time::timeout(std::time::Duration::from_secs(5), w)
                 .await
                 .expect("worker did not exit within 5s of shutdown despite a live sender")
@@ -916,6 +1126,51 @@ mod tests {
 
         // Every buffered update was drained before the workers exited.
         assert_eq!(route.count().await, 16);
+        drop(tx);
+    }
+
+    /// At the drain deadline `stop` ends the pool even though every worker
+    /// is parked in a dispatch that never completes: the dispatches in hand
+    /// are aborted, nothing more is taken from the queue, and `join` counts
+    /// both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_worker_pool_stop_aborts_in_flight_and_counts_leftovers() {
+        let probe = Arc::new(ConcurrencyProbe::new());
+        let route_dyn: Arc<dyn RouteableComponent> = probe.clone();
+
+        let workers_n = 2;
+        let (tx, rx) = mpsc::channel::<Bytes>(UPDATE_CHANNEL_CAPACITY);
+        let drain = CancellationToken::new();
+        let stop = CancellationToken::new();
+        let pool = spawn_worker_pool(rx, route_dyn, workers_n, drain.clone(), stop.clone());
+
+        for i in 0..5 {
+            tx.send(update_bytes(json!({ "update_id": i })))
+                .await
+                .unwrap();
+        }
+        let in_flight = probe.clone();
+        wait_until(
+            Duration::from_secs(2),
+            "every worker to be dispatching",
+            || in_flight.in_flight.load(Ordering::SeqCst) == workers_n,
+        )
+        .await;
+
+        drain.cancel();
+        stop.cancel();
+
+        let left = tokio::time::timeout(Duration::from_secs(2), pool.join())
+            .await
+            .expect("workers kept running after stop");
+        assert_eq!(
+            left,
+            LeftOver {
+                queued: 3,
+                aborted: workers_n
+            }
+        );
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 0);
         drop(tx);
     }
 
@@ -1023,14 +1278,39 @@ mod tests {
         }
     }
 
+    /// Shutdown signals injected by a test: every `send` is one signal; with
+    /// every sender dropped, no further signal ever arrives.
+    struct TestSignals(mpsc::UnboundedReceiver<ShutdownCause>);
+
+    impl ShutdownSignals for TestSignals {
+        async fn recv(&mut self) -> ShutdownCause {
+            match self.0.recv().await {
+                Some(cause) => cause,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn test_signals() -> (mpsc::UnboundedSender<ShutdownCause>, TestSignals) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (tx, TestSignals(rx))
+    }
+
+    /// Signals that deliver one `CtrlC` at once, then nothing.
+    fn immediate_shutdown() -> TestSignals {
+        let (tx, signals) = test_signals();
+        tx.send(ShutdownCause::CtrlC).unwrap();
+        signals
+    }
+
     /// A live `WebhookUpdate("/hook")` -> `LongPollRoute("/poll")` instance on
-    /// a free port; shutdown fires when [`HookToPoll::fire`] is called.
+    /// a free port; every [`HookToPoll::fire`] delivers one shutdown signal.
     struct HookToPoll {
         base: String,
         client: reqwest::Client,
         route: Arc<crate::route::longpull::LongPollRoute>,
-        fire: Option<tokio::sync::oneshot::Sender<()>>,
-        run: tokio::task::JoinHandle<std::io::Result<()>>,
+        signals: mpsc::UnboundedSender<ShutdownCause>,
+        run: tokio::task::JoinHandle<std::io::Result<ShutdownOutcome>>,
     }
 
     impl HookToPoll {
@@ -1053,12 +1333,8 @@ mod tests {
                 vec![Box::new(WebhookUpdate::new("/hook".to_string()))];
             let tgin = Tgin::new(updates, root(route.clone()), 2, Some(port));
 
-            let (fire, fired) = tokio::sync::oneshot::channel::<()>();
-            let shutdown = async move {
-                let _ = fired.await;
-                ShutdownCause::CtrlC
-            };
-            let run = tokio::spawn(tgin.run_until(shutdown, timing));
+            let (signals, injected) = test_signals();
+            let run = tokio::spawn(tgin.run_until(injected, timing));
 
             let base = format!("http://127.0.0.1:{port}");
             let client = reqwest::Client::builder()
@@ -1087,7 +1363,7 @@ mod tests {
                 base,
                 client,
                 route,
-                fire: Some(fire),
+                signals,
                 run,
             }
         }
@@ -1122,17 +1398,20 @@ mod tests {
             .await;
         }
 
+        /// Deliver one shutdown signal; the first starts the drain, a second
+        /// forces exit.
         fn fire(&mut self) {
-            let _ = self.fire.take().expect("shutdown already fired").send(());
+            self.signals.send(ShutdownCause::CtrlC).unwrap();
         }
 
-        /// Assert `run_until` returns `Ok` within `within`.
-        async fn assert_exits_within(self, within: Duration) {
+        /// Assert `run_until` returns `Ok` within `within`, and return how
+        /// it ended.
+        async fn assert_exits_within(self, within: Duration) -> ShutdownOutcome {
             tokio::time::timeout(within, self.run)
                 .await
                 .expect("run_until did not return in time")
                 .expect("run_until panicked")
-                .expect("run_until returned an error");
+                .expect("run_until returned an error")
         }
 
         /// Stop the instance without waiting for its drain.
@@ -1157,7 +1436,10 @@ mod tests {
         let body = app.poll(0).await;
         assert_eq!(body, json!({ "ok": true, "result": [{ "update_id": 1 }] }));
 
-        app.assert_exits_within(Duration::from_secs(2)).await;
+        assert_eq!(
+            app.assert_exits_within(Duration::from_secs(2)).await,
+            ShutdownOutcome::Completed { abandoned: 0 }
+        );
     }
 
     /// Once ingest is cancelled, webhook ingress answers 503 + `Retry-After`
@@ -1207,7 +1489,10 @@ mod tests {
             .collect();
         assert_eq!(served, accepted);
 
-        app.assert_exits_within(Duration::from_secs(2)).await;
+        assert_eq!(
+            app.assert_exits_within(Duration::from_secs(2)).await,
+            ShutdownOutcome::Completed { abandoned: 0 }
+        );
     }
 
     /// During the lame duck `/readyz` already answers 503, but webhook
@@ -1317,7 +1602,92 @@ mod tests {
             .unwrap();
         assert_eq!(rest["result"], json!([{ "update_id": 1 }]));
 
-        app.assert_exits_within(Duration::from_secs(3)).await;
+        assert_eq!(
+            app.assert_exits_within(Duration::from_secs(3)).await,
+            ShutdownOutcome::Completed { abandoned: 0 }
+        );
+    }
+
+    /// A downstream that accepts connections and never answers; every
+    /// connection stays open until the returned task is aborted.
+    async fn silent_downstream() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/bot", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        (url, task)
+    }
+
+    /// Once the HTTP plane has closed, the workers get only the rest of the
+    /// grace (at least `HTTP_CLOSE_GRACE`): a webhook downstream that never
+    /// answers cannot hold the process for its 60 s request timeout per
+    /// update. Dispatches still in flight at the deadline are aborted and,
+    /// with the updates still queued, reported as abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_drain_deadline_bounds_hung_webhook_downstream() {
+        use crate::route::webhook::WebhookRoute;
+
+        const UPDATES: u64 = 5;
+        let (url, downstream) = silent_downstream().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let hung: Arc<dyn RouteableComponent> =
+            Arc::new(WebhookRoute::new(url, client, Duration::from_secs(60)));
+        let timing = ShutdownTiming {
+            lame_duck: Duration::ZERO,
+            grace: Duration::from_secs(1),
+        };
+        let mut app = HookToPoll::start_with_root(timing, |_poll| hung).await;
+
+        // Each 200 means the update is in the dispatch queue; two workers
+        // take one each into the hung downstream, the rest stay queued.
+        for update_id in 1..=UPDATES {
+            assert_eq!(
+                app.post_update(update_id).await.status(),
+                reqwest::StatusCode::OK
+            );
+        }
+
+        app.fire();
+
+        let outcome = app
+            .assert_exits_within(timing.grace + HTTP_CLOSE_GRACE + Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            outcome,
+            ShutdownOutcome::Completed {
+                abandoned: UPDATES as usize
+            }
+        );
+        downstream.abort();
+    }
+
+    /// A second signal once shutdown has started skips the rest of the drain:
+    /// `run_until` returns `Forced` at once, although a buffered update nobody
+    /// fetches would otherwise hold the HTTP plane open for the 60 s grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_second_signal_forces_exit() {
+        let mut app = HookToPoll::start(ShutdownTiming {
+            lame_duck: Duration::ZERO,
+            grace: Duration::from_secs(60),
+        })
+        .await;
+
+        assert_eq!(app.post_update(1).await.status(), reqwest::StatusCode::OK);
+        app.wait_buffered(1).await;
+
+        // Signals are read in order: the first starts the drain, the second
+        // arrives while it waits for the buffer.
+        app.fire();
+        app.fire();
+
+        assert_eq!(
+            app.assert_exits_within(Duration::from_secs(2)).await,
+            ShutdownOutcome::Forced
+        );
     }
 
     /// Holds its sender until ingest is cancelled, like a long-poll updater
@@ -1347,7 +1717,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            tgin.run_until(async { ShutdownCause::CtrlC }, ShutdownTiming::default()),
+            tgin.run_until(immediate_shutdown(), ShutdownTiming::default()),
         )
         .await
         .expect("server-less shutdown waited for the lame duck or the backlog")
@@ -1384,7 +1754,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(3),
-            tgin.run_until(std::future::pending(), TEST_TIMING),
+            tgin.run_until(test_signals().1, TEST_TIMING),
         )
         .await
         .expect("run_until kept running after every ingress failed")
@@ -1440,5 +1810,27 @@ mod tests {
                 Duration::from_secs(2)
             );
         }
+    }
+
+    #[test]
+    fn test_drain_deadline() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(15);
+        let ms = Duration::from_millis;
+        // Backlog drained early: the workers keep the rest of the grace.
+        assert_eq!(
+            drain_deadline(start, grace, start + ms(2000)),
+            start + grace
+        );
+        // Grace spent: the workers get `HTTP_CLOSE_GRACE` from the close.
+        assert_eq!(
+            drain_deadline(start, grace, start + grace),
+            start + grace + HTTP_CLOSE_GRACE
+        );
+        // Close shortly before the end of the grace: the floor still holds.
+        assert_eq!(
+            drain_deadline(start, grace, start + grace - ms(400)),
+            start + grace + ms(600)
+        );
     }
 }

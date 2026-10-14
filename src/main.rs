@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::config::schema::UpdateConfig;
 use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
-use crate::tgin::Tgin;
+use crate::tgin::{ShutdownOutcome, Tgin};
 use crate::utils::http::build_shared_client;
 
 use clap::{Arg, Command};
@@ -33,17 +33,18 @@ mod mock;
 /// startup-time panic. Stack traces are not for operators.
 fn main() -> ExitCode {
     match run() {
-        Ok(RunOutcome::Clean) => ExitCode::SUCCESS,
-        Ok(RunOutcome::PermanentUpdaterFailure(n)) => {
-            // Distinct from the generic exit-1 so an orchestrator can
-            // tell "tgin failed to start" from "a configured bot's
-            // token / URL is wrong". Both are operator-fixable, but only
-            // the latter has been running long enough to handle traffic.
-            tracing::error!(
-                updaters = n,
-                "updater(s) terminated with permanent failure; check earlier long-poll permanent-failure logs"
-            );
-            ExitCode::from(2)
+        Ok(outcome) => {
+            if let RunOutcome::PermanentUpdaterFailure(n) = outcome {
+                // Distinct from the generic exit-1 so an orchestrator can
+                // tell "tgin failed to start" from "a configured bot's
+                // token / URL is wrong". Both are operator-fixable, but only
+                // the latter has been running long enough to handle traffic.
+                tracing::error!(
+                    updaters = n,
+                    "updater(s) terminated with permanent failure; check earlier long-poll permanent-failure logs"
+                );
+            }
+            ExitCode::from(outcome.exit_code())
         }
         Err(err) => {
             eprintln!("tgin: {err}");
@@ -54,11 +55,26 @@ fn main() -> ExitCode {
 
 /// Outcome of a successful boot, distinguished so `main` picks the right
 /// exit code without parsing error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunOutcome {
     /// All updaters terminated cleanly (channel closed, normal shutdown).
     Clean,
     /// At least one updater hit a 401 / 403 / 404 and stopped retrying.
     PermanentUpdaterFailure(usize),
+    /// A second shutdown signal cut the drain short.
+    Forced,
+}
+
+impl RunOutcome {
+    /// 0 clean, 2 permanent ingress failure, 130 forced (128 + SIGINT, the
+    /// shell convention for an interrupted process). Startup errors exit 1.
+    fn exit_code(self) -> u8 {
+        match self {
+            RunOutcome::Clean => 0,
+            RunOutcome::PermanentUpdaterFailure(_) => 2,
+            RunOutcome::Forced => 130,
+        }
+    }
 }
 
 /// The command-line interface the binary parses. Shared with tests so they
@@ -159,17 +175,27 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
         tgin.set_ssl(ssl.cert, ssl.key);
     }
 
-    tgin.run()?;
+    let shutdown = tgin.run()?;
 
-    // `tgin.run()` returns once every producer has terminated and the
-    // worker pool drained. If any updater stopped because of a permanent
-    // failure, propagate that distinction to `main` so the exit code
-    // tells the truth.
-    let permanent = health_counter.load(Ordering::Relaxed);
-    if permanent > 0 {
-        Ok(RunOutcome::PermanentUpdaterFailure(permanent))
-    } else {
-        Ok(RunOutcome::Clean)
+    // `tgin.run()` returns once the drain has finished (or a second signal
+    // cut it short). If any updater stopped because of a permanent failure,
+    // propagate that distinction to `main` so the exit code tells the truth.
+    Ok(run_outcome(
+        shutdown,
+        health_counter.load(Ordering::Relaxed),
+    ))
+}
+
+/// Combine how the run ended with the number of long-poll updaters that
+/// stopped on a permanent failure. A forced exit wins: the operator asked
+/// for it.
+fn run_outcome(shutdown: ShutdownOutcome, permanent_failures: usize) -> RunOutcome {
+    match shutdown {
+        ShutdownOutcome::Forced => RunOutcome::Forced,
+        ShutdownOutcome::Completed { .. } if permanent_failures > 0 => {
+            RunOutcome::PermanentUpdaterFailure(permanent_failures)
+        }
+        ShutdownOutcome::Completed { .. } => RunOutcome::Clean,
     }
 }
 
@@ -188,5 +214,19 @@ mod tests {
             rendered.contains(env!("CARGO_PKG_VERSION")),
             "version output missing crate version: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn test_run_outcome_exit_codes() {
+        let completed = ShutdownOutcome::Completed { abandoned: 3 };
+        assert_eq!(run_outcome(completed, 0), RunOutcome::Clean);
+        assert_eq!(run_outcome(completed, 0).exit_code(), 0);
+        assert_eq!(
+            run_outcome(completed, 2),
+            RunOutcome::PermanentUpdaterFailure(2)
+        );
+        assert_eq!(run_outcome(completed, 2).exit_code(), 2);
+        assert_eq!(run_outcome(ShutdownOutcome::Forced, 0), RunOutcome::Forced);
+        assert_eq!(run_outcome(ShutdownOutcome::Forced, 1).exit_code(), 130);
     }
 }
