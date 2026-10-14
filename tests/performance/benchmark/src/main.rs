@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{rejection::QueryRejection, Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -354,8 +354,7 @@ async fn take_updates_for_request(stream: &UpdateStream, params: &GetUpdatesPara
     let limit = params
         .limit
         .unwrap_or(TELEGRAM_GET_UPDATES_LIMIT_MAX)
-        .min(TELEGRAM_GET_UPDATES_LIMIT_MAX)
-        .max(1);
+        .clamp(1, TELEGRAM_GET_UPDATES_LIMIT_MAX);
     let timeout_secs = params
         .timeout
         .unwrap_or(0)
@@ -436,10 +435,10 @@ async fn main() {
 
     let server_state = state.clone();
     let app = Router::new()
-        .route("/bot:token/sendMessage", post(handle_send_message))
-        .route("/bot:token/getMe", get(handle_get_me).post(handle_get_me))
+        .route("/bot{token}/sendMessage", post(handle_send_message))
+        .route("/bot{token}/getMe", get(handle_get_me).post(handle_get_me))
         .route(
-            "/bot:token/getUpdates",
+            "/bot{token}/getUpdates",
             get(handle_get_updates).post(handle_get_updates),
         )
         .with_state(server_state);
@@ -644,9 +643,9 @@ async fn handle_send_message(State(state): State<Arc<BenchState>>, body: Bytes) 
 async fn handle_get_updates(
     State(state): State<Arc<BenchState>>,
     Path(token): Path<String>,
-    query: Option<Query<GetUpdatesParams>>,
+    query: Result<Query<GetUpdatesParams>, QueryRejection>,
 ) -> Json<Value> {
-    let params = query.map(|Query(p)| p).unwrap_or_default();
+    let params = query.ok().map(|Query(p)| p).unwrap_or_default();
     let stream = state.stream(&token);
     let updates = take_updates_for_request(&stream, &params).await;
     state.record_batch(updates.len());

@@ -1,11 +1,8 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y curl && apt-get clean
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-
-ENV PATH="/root/.local/bin:$PATH"
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /uvx /bin/
 
 COPY pyproject.toml uv.lock* ./
 

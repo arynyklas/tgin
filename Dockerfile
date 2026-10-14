@@ -1,4 +1,4 @@
-FROM rust:slim-bookworm AS builder
+FROM rust:1.99.0-slim-trixie AS builder
 
 RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev && \
@@ -17,7 +17,7 @@ RUN touch src/main.rs
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && \
     apt-get install -y libssl3 ca-certificates && \
