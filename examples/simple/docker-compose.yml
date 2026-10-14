@@ -2,6 +2,8 @@ services:
   tgin:
     build: ../../
     container_name: tgin_server
+    # Shutdown drains for up to about 21 s; Docker's default 10 s cuts it short.
+    stop_grace_period: 30s
     ports:
       # Loopback only: the management API must not be reachable from the network.
       - "127.0.0.1:3000:3000"

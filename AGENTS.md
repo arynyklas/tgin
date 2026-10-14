@@ -10,7 +10,7 @@ Telegram ──► UpdaterComponent (ingress) ──► mpsc<Bytes> (1024) ─�
                                                                           ApiMessage (mpsc) for hot-reconfig, api::Api loop
 ```
 
-Pipeline stages, all glued together by `src/tgin.rs::Tgin::run_until` (`run_async` = `run_until(shutdown_signal(), ShutdownTiming::default())`):
+Pipeline stages, all glued together by `src/tgin.rs::Tgin::run_until` (`run_async` = `run_until(OsSignals::default(), ShutdownTiming::default())`):
 
 1. **Ingress** (`src/update/`): each `Box<dyn UpdaterComponent>` runs as a `tokio::spawn`ed task that pushes each update's raw JSON as `bytes::Bytes` into a shared bounded `mpsc::Sender<Bytes>` (`UPDATE_CHANNEL_CAPACITY` = 1024). Updates are never parsed into `serde_json::Value` on the hot path; ingress validates the JSON shape once and the bytes are forwarded verbatim.
    - `LongPollUpdate` polls `https://api.telegram.org/bot<token>/getUpdates` (or the full `url` override) via `reqwest`, with jittered backoff, `Retry-After` on 429, 409 recovery and permanent-failure detection (401/403/404).
@@ -21,7 +21,7 @@ Pipeline stages, all glued together by `src/tgin.rs::Tgin::run_until` (`run_asyn
    - Inner nodes: `RoundRobinLB` (atomic cursor → one child per update), `AllLB` (fans out to every child on a `JoinSet` and waits for all).
 4. **HTTP plane** (axum): every component implements `Serverable::set_server(Router<Sender<Bytes>>) -> Router<Sender<Bytes>>`; `Tgin` chains the `set_server` calls, merges `observability_routes`, then binds on `0.0.0.0:<server_port>` on the calling task (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so long-poll routes added at runtime resolve through `LONGPOLL_REGISTRY`. `/livez` and `/readyz` are always open; `/status` and `/metrics` are wrapped by `utils::auth::guard` and need `Authorization: Bearer <auth_token>` when `auth_token` is set, as does `/<base_path>/*`. The data plane (webhook ingress, long-poll routes) is never gated.
 5. **Management API** (`src/api/`): owns its own `mpsc` pair; HTTP handlers send `ApiMessage::{GetRoutes, AddRoute, RmRoute}` with a `oneshot` reply, and the loop in `run_until` mutates the routing tree (`add_route` / `remove_route` on `Routeable`) and maps `AddRouteError` / `RemoveRouteError` to `ApiError` (409 / 404).
-6. **Shutdown**: a coordinator task waits for a `ShutdownCause` (signal, or `AllIngressFailed` from `IngressHealth`), then runs lame duck → cancel `ingest` → `begin_drain` → wait for `backlog_drained` (bounded by `ShutdownTiming::grace`) → close HTTP → cancel `drain`. Without `server_port` it cancels both tokens at once. `main` maps the outcome to exit codes 0 / 1 / 2.
+6. **Shutdown**: a coordinator task waits for a `ShutdownCause` from the injected `ShutdownSignals` source (`OsSignals` in production) or `AllIngressFailed` from `IngressHealth`, then runs lame duck → cancel `ingest` → `begin_drain` → wait for `backlog_drained` (bounded by `ShutdownTiming::grace`) → close HTTP → cancel `drain` → at `drain_deadline` cancel `stop` (workers abort in-flight dispatches and exit). Without `server_port` it cancels `ingest` and `drain` at once and `stop` after the grace. A further signal during any of this cancels `forced` and `run_until` returns `ShutdownOutcome::Forced`; otherwise it returns `Completed { abandoned }`. `main` maps the outcome to exit codes 0 / 1 / 2 / 130.
 
 ### Core traits (`src/base.rs`, `src/update/base.rs`)
 
@@ -37,8 +37,8 @@ All async trait methods use `#[async_trait]`.
 
 | Path | Role |
 | --- | --- |
-| `src/main.rs` | clap CLI (`-f/--file`, default `tgin.ron`; `--version`), `load_config` → `observe::init` → `build_updates` / `build_route` → `Tgin::run`; exit codes 0 / 1 / 2. Declares the musl-only global allocator: `#[global_allocator]` `mimalloc::MiMalloc` under `#[cfg(target_env = "musl")]`, with the `mimalloc` dependency in Cargo.toml's `[target.'cfg(target_env = "musl")'.dependencies]`. |
-| `src/tgin.rs` | `Tgin` struct: runtime, bind, worker pool, API loop, shutdown coordinator (`ShutdownTiming`, `ShutdownCause`, `IngressHealth`), `observability_routes`. |
+| `src/main.rs` | clap CLI (`-f/--file`, default `tgin.ron`; `--version`), `load_config` → `observe::init` → `build_updates` / `build_route` → `Tgin::run`; exit codes 0 / 1 / 2 / 130 (`RunOutcome::exit_code`). Declares the musl-only global allocator: `#[global_allocator]` `mimalloc::MiMalloc` under `#[cfg(target_env = "musl")]`, with the `mimalloc` dependency in Cargo.toml's `[target.'cfg(target_env = "musl")'.dependencies]`. |
+| `src/tgin.rs` | `Tgin` struct: runtime, bind, worker pool (`WorkerPool`), API loop, shutdown coordinator (`ShutdownTiming`, `ShutdownCause`, `ShutdownSignals` / `OsSignals`, `ShutdownOutcome`, `IngressHealth`), `observability_routes`. |
 | `src/base.rs` | Trait definitions, `RouteId`, `AddRouteError` / `RemoveRouteError`, component supertraits. |
 | `src/config/schema.rs` | RON-deserialized types: `TginConfig`, `UpdateConfig`, `RouteConfig`, `SslConfig`, `ApiConfig`, `RegistrationWebhookConfig`, `LogFormat`. |
 | `src/config/setup.rs` | `load_config`, `${VAR}` substitution (regex `\$\{(\w+)\}`; collects every unset variable), `validate`, `effective_auth_token`, `build_updates`, recursive `build_route`. |
@@ -62,9 +62,9 @@ All async trait methods use `#[async_trait]`.
 - `Cargo.toml` — single binary, edition 2021, `rust-version = "1.88"` (MSRV, checked in CI). `[profile.release]` sets `lto = true` and `codegen-units = 1`; `[profile.dist]` inherits it for release archives.
 - `tgin.ron` — root example config; reads `${TOKEN}` and `${TGIN_AUTH_TOKEN}` (it enables `api`).
 - `Dockerfile` — BuildKit multi-stage: builder `rust:1.99.0-alpine3.24` and runtime `gcr.io/distroless/static-debian13`, both pinned by digest. Builds a static musl binary, runs as numeric `65532:65532`, no shell in the image. `ENTRYPOINT ["/usr/local/bin/tgin"]`, `CMD ["-f","/etc/tgin/config.ron"]`, OCI labels from build args `VERSION`/`REVISION`/`CREATED`.
-- `.github/workflows/ci.yml` — `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test` on Linux, macOS and Windows, MSRV `cargo check`, `cargo deny check`, static musl build, Docker build, and clippy + tests for `tests/performance/benchmark`.
+- `.github/workflows/ci.yml` — `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test` on Linux, macOS and Windows, MSRV `cargo check`, `cargo deny check`, static musl build, build-only Docker image on native amd64 and arm64 runners, and clippy + tests for `tests/performance/benchmark`.
 - `.github/workflows/release.yml` — generated by dist (cargo-dist 0.32.0) from `dist-workspace.toml`, with hand edits listed in its header. To regenerate, follow the steps in the `allow-dirty` comment in `dist-workspace.toml`, then re-apply the hand edits from the `release.yml` header.
-- `.github/workflows/image.yml` — on `v*` semver tags, builds amd64/arm64 images natively, publishes the multi-arch index to `ghcr.io/arynyklas/tgin` and attests it.
+- `.github/workflows/image.yml` — on `v*` semver tags, builds amd64/arm64 images natively, publishes the multi-arch index to `ghcr.io/arynyklas/tgin` and attests it. `latest` goes only to the highest stable `vX.Y.Z` tag.
 - `deny.toml` — cargo-deny policy: advisories (unmaintained, unsound, yanked are errors), license allow-list, bans on `openssl`, `openssl-sys`, `native-tls`, `ring`, crates.io only.
 - `.github/dependabot.yml` — weekly grouped updates for cargo, GitHub Actions, Docker, uv and pip.
 - `DOCS.md`, `PERF.md`, `CHANGELOG.md`, `SECURITY.md` — user docs, benchmarks, release notes, security policy.
@@ -127,7 +127,7 @@ There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses sto
 )
 ```
 
-Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is `#[serde(deny_unknown_fields)]`, so a misspelt field is a parse error, never a silent default. `validate` collects every semantic error in one pass (e.g. `ValidationError::ApiWithoutAuthToken` for `api` without a non-blank `auth_token`, `InvalidPath`, `DuplicatePath` including the reserved `/status`, `/metrics`, `/livez`, `/readyz`). The HTTP API `POST /<base_path>/route` body uses `"type": "Longpull"` or `"Webhook"` (matching `AddRouteTypeSch`, **not** "Longpoll").
+Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is `#[serde(deny_unknown_fields)]`, so a misspelt field is a parse error, never a silent default. `validate` collects every semantic error in one pass (e.g. `ValidationError::ApiWithoutAuthToken` for `api` without a non-blank `auth_token`, `RequiresServerPort` for a `WebhookUpdate`, `LongPollRoute` or `api` without `server_port`, `InvalidPath`, `DuplicatePath` including the reserved `/status`, `/metrics`, `/livez`, `/readyz`). The HTTP API `POST /<base_path>/route` body uses `"type": "Longpull"` or `"Webhook"` (matching `AddRouteTypeSch`, **not** "Longpoll").
 
 ## Code Conventions & Patterns
 
