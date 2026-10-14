@@ -32,13 +32,13 @@ pub struct GetUpdatesParams {
     pub limit: Option<u64>,
 }
 
-/// Default cap on the per-route buffer. Telegram already buffers ~24 h of
-/// undelivered updates server-side and re-delivers them via `getUpdates` once
-/// the consuming bot returns, so tgin does not need to be authoritative for
-/// downstreams that go offline. The cap exists to turn a downstream outage
-/// from a slow-motion OOM (see `longpoll-route-buffer-unbounded`) into a
-/// loud, observable signal: oldest updates are evicted FIFO, the eviction
-/// counter increments, and the operator sees the depth on `/routes`.
+/// Default cap on the per-route buffer. tgin confirms each long-poll batch to
+/// Telegram with its next `getUpdates`, so Telegram's own retention does not
+/// back this buffer: an update in it exists only here. The cap turns a
+/// downstream outage from a slow-motion OOM into a loud, observable signal:
+/// oldest updates are evicted FIFO and lost, the eviction counter
+/// increments, and the operator sees the depth on `/api/routes` and
+/// `/status`.
 pub const DEFAULT_MAX_BUFFERED_UPDATES: usize = 10_000;
 
 /// Fraction of `max_buffered_updates` at which we log a one-time warning.
@@ -192,8 +192,9 @@ impl LongPollRoute {
 /// Telegram's `getUpdates` default and maximum batch size.
 const GET_UPDATES_MAX_LIMIT: usize = 100;
 
-/// Upper bound on a long-poll hold. Telegram's documented ceiling is 50 s;
-/// an unbounded client value would pin a connection and a task indefinitely.
+/// Upper bound on a long-poll hold: 50 s is the Bot API server's own limit
+/// on the `getUpdates` timeout. An unbounded client value would pin a
+/// connection and a task indefinitely.
 const GET_UPDATES_MAX_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Longest a long poll on an empty buffer is held once the route is
@@ -290,14 +291,13 @@ impl Routeable for LongPollRoute {
         // section. Drop the lock first, then notify.
         //
         // The buffer is bounded by `max_buffered_updates`. When the cap is
-        // reached, evict the oldest entry FIFO before pushing the new one:
-        // freshness wins because Telegram already buffers undelivered
-        // updates server-side, so `LongPollRoute` is best-effort recovery,
-        // not the system of record. Refusing to accept (the alternative
-        // strategy in the recommended-fix doc) would require an LB above
-        // us to react — today the LBs do not, so a refusal would just
-        // bubble up to the worker pool and stall it. Eviction keeps the
-        // dispatch hot path moving.
+        // reached, evict the oldest entry FIFO before pushing the new one.
+        // The evicted update is lost (tgin has already confirmed it to
+        // Telegram, which will not redeliver it), but freshness wins over a
+        // stalled pipeline. Refusing to accept would require an LB above us
+        // to react; today the LBs do not, so a refusal would just bubble up
+        // to the worker pool and stall it. Eviction keeps the dispatch hot
+        // path moving, and the eviction counter makes the loss visible.
         let mut evicted: u64 = 0;
         let depth_after_push;
         {

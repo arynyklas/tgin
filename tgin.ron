@@ -21,8 +21,9 @@
         routes: [
             // `max_buffered_updates` defaults to 10_000. The per-route buffer
             // evicts oldest-first when full and surfaces depth + dropped counts
-            // on `GET /api/routes`. Bump only if a downstream that briefly
-            // disconnects must be replayed beyond Telegram's own ~24 h buffer.
+            // on `GET /api/routes`. tgin has already confirmed buffered updates
+            // to Telegram, so evicted ones are lost; raise the cap if a
+            // downstream may stay offline longer than the buffer covers.
             LongPollRoute(path: "/bot1/getUpdates", max_buffered_updates: 10000),
         ],
     ),

@@ -105,8 +105,9 @@ pub enum RouteConfig {
     LongPollRoute {
         path: String,
         /// Cap on per-route in-memory buffer depth. When reached, oldest
-        /// updates are evicted FIFO (Telegram already buffers ~24 h
-        /// server-side, so tgin is best-effort recovery, not authoritative).
+        /// updates are evicted FIFO and lost: tgin has already confirmed them
+        /// to Telegram with its next `getUpdates`, so Telegram cannot
+        /// redeliver them.
         /// Default: [`crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES`].
         #[serde(default = "default_max_buffered_updates")]
         max_buffered_updates: usize,
