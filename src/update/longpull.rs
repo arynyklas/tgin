@@ -13,7 +13,7 @@ use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Telegram caps `getUpdates?timeout=` at 50 seconds.
@@ -50,6 +50,17 @@ const BACKOFF_FLOOR_MS: u64 = 50;
 /// abandon.
 const PROLONGED_OUTAGE_THRESHOLD: u32 = 60;
 
+/// Default sleep after a 409 Conflict that re-polling cannot fix by itself
+/// (another process polling the token, or a webhook we must not delete).
+const DEFAULT_CONFLICT_BACKOFF: Duration = Duration::from_secs(5);
+/// Minimum wall-clock gap between two `deleteWebhook` calls within one
+/// `start` run. A webhook that reappears faster than this is being re-set
+/// by another process (e.g. a downstream framework calling `setWebhook`);
+/// deleting it in a loop would just fight that process.
+const WEBHOOK_REDELETE_GUARD: Duration = Duration::from_secs(60);
+/// HTTP deadline for the `deleteWebhook` call made on a webhook-active 409.
+const DELETE_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct LongPollUpdate {
     client: Client,
     url: String,
@@ -70,6 +81,8 @@ pub struct LongPollUpdate {
     /// Per-updater ingress counters surfaced on `/status` and `/metrics`.
     /// `source` is the redacted poll URL.
     metrics: Arc<UpdaterMetrics>,
+    /// Sleep after a 409 Conflict that re-polling cannot fix by itself.
+    conflict_backoff: Duration,
 }
 
 impl LongPollUpdate {
@@ -88,6 +101,7 @@ impl LongPollUpdate {
             long_poll_limit: TELEGRAM_LONG_POLL_LIMIT_MAX,
             health_counter: Arc::new(AtomicUsize::new(0)),
             metrics,
+            conflict_backoff: DEFAULT_CONFLICT_BACKOFF,
         }
     }
 
@@ -115,6 +129,14 @@ impl LongPollUpdate {
         self.long_poll_timeout = timeout.min(TELEGRAM_LONG_POLL_TIMEOUT_MAX);
         self.long_poll_limit = limit.clamp(1, TELEGRAM_LONG_POLL_LIMIT_MAX);
     }
+
+    /// Sleep after a 409 Conflict that an immediate re-poll cannot fix
+    /// (default 5 s). Production keeps the default; tests shorten it.
+    #[cfg(test)]
+    pub fn set_conflict_backoff(&mut self, d: Duration) {
+        self.conflict_backoff = d;
+    }
+
     /// Override the per-updater health counter so the binary can observe
     /// permanent failures across all updaters and exit non-zero. The
     /// default counter is local to this `LongPollUpdate`; in production
@@ -127,6 +149,37 @@ impl LongPollUpdate {
     /// Per-request HTTP deadline: long-poll server hold + slack.
     fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.long_poll_timeout) + REQUEST_TIMEOUT_SLACK
+    }
+
+    /// `POST {"drop_pending_updates": false}` to `url` (a `deleteWebhook`
+    /// endpoint). Failures are only logged: the next poll's 409 then falls
+    /// inside `WEBHOOK_REDELETE_GUARD` and backs off. Returns `true` when
+    /// shutdown won the race.
+    async fn delete_webhook(&self, url: &str, shutdown: &CancellationToken) -> bool {
+        let redacted = TELEGRAM_TOKEN_RE.replace_all(url, "#####");
+        let request = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({ "drop_pending_updates": false }))
+            .timeout(DELETE_WEBHOOK_TIMEOUT)
+            .send();
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return true,
+            r = request => r,
+        };
+        match result {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(url = %redacted, status = status.as_u16(), body = %body, "deleteWebhook failed");
+            }
+            Err(err) => {
+                tracing::warn!(url = %redacted, error = ?err.without_url(), "deleteWebhook failed");
+            }
+        }
+        false
     }
 }
 
@@ -147,12 +200,17 @@ impl Updater for LongPollUpdate {
         // is *not* permanent). `prolonged_outage_logged` is sticky for the
         // duration of one outage so a hot retry loop cannot spam stderr,
         // and is cleared on recovery so the *next* outage gets its own
-        // announcement. 429 (rate-limit) is intentionally excluded from the
-        // counter -- Telegram is healthy and explicitly telling us to
-        // wait, which is not the same kind of incident as a flapping
-        // upstream.
+        // announcement. 429 (rate-limit) and 409 (conflict) are
+        // intentionally excluded from the counter -- Telegram is healthy
+        // and explicitly telling us to wait or why it refuses, which is not
+        // the same kind of incident as a flapping upstream.
         let mut consecutive_failures: u32 = 0;
         let mut prolonged_outage_logged: bool = false;
+
+        // 409 bookkeeping: where to delete a stale webhook (None for custom
+        // URLs) and when we last tried, for `WEBHOOK_REDELETE_GUARD`.
+        let delete_url = delete_webhook_url(&self.url);
+        let mut last_webhook_delete: Option<Instant> = None;
 
         loop {
             let params = [
@@ -200,6 +258,36 @@ impl Updater for LongPollUpdate {
                     return;
                 }
                 backoff_ms = next_backoff(backoff_ms, BACKOFF_CAP_MS);
+                continue;
+            }
+
+            if status == StatusCode::CONFLICT {
+                // Telegram's `description` tells the two causes apart. A
+                // non-JSON body or a missing description counts as "other".
+                let body = response.text().await.unwrap_or_default();
+                let webhook_active = serde_json::from_str::<ErrorResponse>(&body)
+                    .ok()
+                    .and_then(|e| e.description)
+                    .is_some_and(|d| d.contains("webhook is active"));
+                if webhook_active {
+                    let guard_elapsed =
+                        last_webhook_delete.is_none_or(|at| at.elapsed() >= WEBHOOK_REDELETE_GUARD);
+                    if let (Some(delete_url), true) = (delete_url.as_deref(), guard_elapsed) {
+                        last_webhook_delete = Some(Instant::now());
+                        tracing::warn!(url = %redacted_url, "long-poll 409: a webhook is active on this token; deleting it (pending updates kept) and polling again");
+                        if self.delete_webhook(delete_url, &shutdown).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    tracing::error!(url = %redacted_url, body = %body, "long-poll 409: webhook is active and tgin will not delete it (custom poll URL, or the webhook was re-set within 60 s by another process such as a downstream framework calling setWebhook)");
+                } else {
+                    tracing::warn!(url = %redacted_url, body = %body, "long-poll 409: another process is polling this token; run one tgin per token, e.g. Recreate strategy");
+                }
+                self.metrics.record_poll_failure();
+                if sleep_or_shutdown(self.conflict_backoff, &shutdown).await {
+                    return;
+                }
                 continue;
             }
 
@@ -350,11 +438,29 @@ struct UpdateIdOnly {
 ///   is just typing the wrong number louder.
 ///
 /// 5xx is *not* in this set: Telegram has multi-minute incidents we
-/// expect to ride out. 429 has its own dedicated path with `Retry-After`.
+/// expect to ride out. 429 has its own dedicated path with `Retry-After`,
+/// and 409 (webhook active / another poller) its own recovery path.
 fn is_permanent_status(status: StatusCode) -> bool {
     status == StatusCode::UNAUTHORIZED
         || status == StatusCode::FORBIDDEN
         || status == StatusCode::NOT_FOUND
+}
+
+/// Error envelope Telegram sends with non-2xx statuses. Only `description`
+/// is read, to tell the two 409 Conflict causes apart.
+#[derive(Deserialize)]
+struct ErrorResponse {
+    description: Option<String>,
+}
+
+/// Derive the `deleteWebhook` endpoint from a `getUpdates` poll URL by
+/// replacing the trailing `/getUpdates` path segment and dropping the
+/// query. `None` for custom URLs that do not end in `/getUpdates`: there is
+/// no Bot API to call next to them.
+fn delete_webhook_url(get_updates_url: &str) -> Option<String> {
+    let base = get_updates_url.split(['?', '#']).next()?;
+    base.strip_suffix("/getUpdates")
+        .map(|prefix| format!("{prefix}/deleteWebhook"))
 }
 
 /// Bookkeeping for one transient failure. Increments the consecutive-
@@ -433,7 +539,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use wiremock::matchers::{any, path};
+    use wiremock::matchers::{any, body_json, method, path};
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
     fn test_client() -> Client {
@@ -899,5 +1005,213 @@ mod tests {
         }
         assert_eq!(consecutive, PROLONGED_OUTAGE_THRESHOLD + 10);
         assert_eq!(logged, logged_before);
+    }
+
+    const WEBHOOK_ACTIVE_409: &str = "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first";
+    const OTHER_POLLER_409: &str =
+        "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running";
+
+    fn conflict_409(description: &str) -> ResponseTemplate {
+        ResponseTemplate::new(409)
+            .insert_header("content-type", "application/json")
+            .set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 409,
+                "description": description,
+            }))
+    }
+
+    async fn requests_to(server: &MockServer, request_path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == request_path)
+            .count()
+    }
+
+    /// Runs `updater.start` for 300 ms with captured logs, then shuts it
+    /// down. Panics if `start` returns on its own (409 is never terminal).
+    async fn run_for_300ms(updater: LongPollUpdate) -> String {
+        let (tx, _rx) = mpsc::channel(10);
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+        let started = tokio::time::Instant::now();
+        let ((), logs) = crate::utils::testlog::capture_logs(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                cancel.cancel();
+            });
+            updater.start(tx, shutdown).await;
+        })
+        .await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "start returned before shutdown; 409 must not stop the updater. logs: {logs}"
+        );
+        logs
+    }
+
+    /// A webhook left registered on the token makes every `getUpdates`
+    /// fail with 409. The updater MUST delete it (keeping pending updates)
+    /// and resume polling instead of retrying the 409 forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_409_webhook_active_deletes_webhook_then_polls() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path("/botMYTOKEN/getUpdates"))
+            .respond_with(conflict_409(WEBHOOK_ACTIVE_409))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(path("/botMYTOKEN/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": [{ "update_id": 42, "message": { "text": "after-409" } }]
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botMYTOKEN/deleteWebhook"))
+            .and(body_json(
+                serde_json::json!({ "drop_pending_updates": false }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true,
+                "description": "Webhook was deleted"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut updater = build_updater(&mock_server);
+        updater.set_conflict_backoff(Duration::from_millis(50));
+        let (tx, mut rx) = mpsc::channel(10);
+        let handle = tokio::spawn(async move {
+            updater.start(tx, CancellationToken::new()).await;
+        });
+
+        let update = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Timed out waiting for post-409 update")
+            .expect("Channel closed unexpectedly");
+        let update: Value = serde_json::from_slice(&update).unwrap();
+        assert_eq!(update["update_id"], 42);
+
+        handle.abort();
+        mock_server.verify().await;
+    }
+
+    /// "terminated by other getUpdates request" means a second process
+    /// polls the same token. Deleting the webhook cannot help; the updater
+    /// MUST back off by `conflict_backoff` and say why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_409_other_poller_backs_off_without_deleting_webhook() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path("/botMYTOKEN/getUpdates"))
+            .respond_with(conflict_409(OTHER_POLLER_409))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let mut updater = build_updater(&mock_server);
+        updater.set_conflict_backoff(Duration::from_millis(50));
+        let health = Arc::new(AtomicUsize::new(0));
+        updater.set_health_counter(health.clone());
+
+        let logs = run_for_300ms(updater).await;
+
+        let polls = requests_to(&mock_server, "/botMYTOKEN/getUpdates").await;
+        assert!((2..=10).contains(&polls), "polls: {polls}");
+        assert!(
+            logs.contains("another process is polling this token; run one tgin per token, e.g. Recreate strategy"),
+            "logs: {logs}"
+        );
+        assert_eq!(health.load(Ordering::Relaxed), 0);
+        mock_server.verify().await;
+    }
+
+    /// With a custom poll URL there is no `deleteWebhook` to derive, so a
+    /// webhook-active 409 MUST be error-logged and backed off, not spun on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_409_custom_url_does_not_spin() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path("/custom"))
+            .respond_with(conflict_409(WEBHOOK_ACTIVE_409))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let mut updater = build_updater(&mock_server);
+        updater.set_url(format!("{}/custom", mock_server.uri()));
+        updater.set_conflict_backoff(Duration::from_millis(50));
+
+        let logs = run_for_300ms(updater).await;
+
+        let polls = requests_to(&mock_server, "/custom").await;
+        assert!(polls <= 10, "polls: {polls}");
+        assert!(logs.contains("tgin will not delete it"), "logs: {logs}");
+        mock_server.verify().await;
+    }
+
+    /// A webhook that comes back right after we deleted it is being re-set
+    /// by another process. Within the 60 s guard the updater MUST NOT
+    /// delete it again; it error-logs and backs off instead of fighting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_409_webhook_reset_within_guard_backs_off() {
+        let mock_server = MockServer::start().await;
+        Mock::given(path("/botMYTOKEN/getUpdates"))
+            .respond_with(conflict_409(WEBHOOK_ACTIVE_409))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botMYTOKEN/deleteWebhook"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut updater = build_updater(&mock_server);
+        updater.set_conflict_backoff(Duration::from_millis(50));
+
+        let logs = run_for_300ms(updater).await;
+
+        let polls = requests_to(&mock_server, "/botMYTOKEN/getUpdates").await;
+        assert!(polls <= 10, "polls: {polls}");
+        assert!(logs.contains("tgin will not delete it"), "logs: {logs}");
+        mock_server.verify().await;
+    }
+
+    #[test]
+    fn test_delete_webhook_url_derivation() {
+        assert_eq!(
+            delete_webhook_url("https://api.telegram.org/bot1:x/getUpdates?offset=5"),
+            Some("https://api.telegram.org/bot1:x/deleteWebhook".to_string())
+        );
+        assert_eq!(
+            delete_webhook_url("https://api.telegram.org/bot1:x/getUpdates"),
+            Some("https://api.telegram.org/bot1:x/deleteWebhook".to_string())
+        );
+        assert_eq!(delete_webhook_url("http://127.0.0.1:8080/custom"), None);
+        assert_eq!(
+            delete_webhook_url("http://127.0.0.1:8080/custom/notgetUpdates"),
+            None
+        );
     }
 }
