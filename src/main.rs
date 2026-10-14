@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::config::schema::UpdateConfig;
 use crate::config::setup::{build_route, build_updates, effective_auth_token, load_config};
 use crate::tgin::Tgin;
 use crate::utils::http::build_shared_client;
@@ -56,8 +57,11 @@ enum RunOutcome {
     PermanentUpdaterFailure(usize),
 }
 
-fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
-    let cli = Command::new("tgin")
+/// The command-line interface the binary parses. Shared with tests so they
+/// exercise the exact `Command` `run()` uses.
+fn cli() -> Command {
+    Command::new("tgin")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("tgin is a telegram bot routing layer")
         .arg(
             Arg::new("file")
@@ -66,9 +70,11 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
                 .value_name("FILE")
                 .help("Path to the configuration file")
                 .default_value("tgin.ron"),
-        );
+        )
+}
 
-    let matches = cli.get_matches();
+fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
+    let matches = cli().get_matches();
 
     let config_path: &str = matches
         .get_one::<String>("file")
@@ -78,6 +84,22 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let conf = load_config(config_path)?;
 
     crate::observe::init(&conf.log_level, conf.log_format);
+
+    // An unsigned webhook ingress accepts any POST as a Telegram update.
+    // Allowed (a reverse proxy may guard it), but never silently.
+    for upd in &conf.updates {
+        if let UpdateConfig::WebhookUpdate {
+            path,
+            secret_token: None,
+            ..
+        } = upd
+        {
+            tracing::warn!(
+                "WebhookUpdate has no secret_token: anyone who can reach {path} can inject \
+                 updates; set secret_token"
+            );
+        }
+    }
 
     // One process-wide HTTP client. `Client::clone()` is `Arc`-internal, so
     // every adapter that needs HTTP egress (LongPollUpdate, WebhookRoute,
@@ -101,8 +123,8 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let (auth_token, blank_token) = effective_auth_token(conf.auth_token);
     if blank_token {
         tracing::warn!(
-            "auth_token is set but blank; ignoring it — the control plane \
-             (/status, /metrics, management API) is UNAUTHENTICATED"
+            "auth_token is set but blank; ignoring it — /status and /metrics are \
+             UNAUTHENTICATED"
         );
     }
     tgin.set_auth_token(auth_token.clone());
@@ -127,5 +149,23 @@ fn run() -> Result<RunOutcome, Box<dyn std::error::Error>> {
         Ok(RunOutcome::PermanentUpdaterFailure(permanent))
     } else {
         Ok(RunOutcome::Clean)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_version_flag() {
+        let err = cli()
+            .try_get_matches_from(["tgin", "--version"])
+            .expect_err("--version short-circuits parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(env!("CARGO_PKG_VERSION")),
+            "version output missing crate version: {rendered:?}"
+        );
     }
 }

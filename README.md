@@ -102,7 +102,7 @@ Or run the bundled docker-compose example:
 
 ```bash
 cd examples/simple
-TOKEN=... docker compose up --build
+TOKEN=... TGIN_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
 ```
 
 ## Documentation

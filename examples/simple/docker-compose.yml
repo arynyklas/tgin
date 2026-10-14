@@ -3,12 +3,14 @@ services:
     build: ../../
     container_name: tgin_server
     ports:
-      - "3000:3000"
+      # Loopback only: the management API must not be reachable from the network.
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./tgin.ron:/etc/tgin/config.ron
     environment:
       - TOKEN=${TOKEN}
       - WH_ENDPOINT=http://bot_3:3001/bot
+      - TGIN_AUTH_TOKEN=${TGIN_AUTH_TOKEN:?set TGIN_AUTH_TOKEN}
 
   bot_1:
     build: .

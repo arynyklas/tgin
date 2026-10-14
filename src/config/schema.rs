@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct TginConfig {
     #[serde(default = "default_workers")]
     pub dark_threads: usize,
@@ -14,10 +15,11 @@ pub struct TginConfig {
     pub log_level: String,
     #[serde(default)]
     pub log_format: LogFormat,
-    /// Optional shared secret for the control / observability plane. When set,
+    /// Shared secret for the control / observability plane. When set,
     /// `/status`, `/metrics`, and the management API (`/<api.base_path>/*`)
-    /// require `Authorization: Bearer <auth_token>`. Omit to leave them open
-    /// (the default), relying on network-layer isolation.
+    /// require `Authorization: Bearer <auth_token>`. Required (non-blank)
+    /// whenever `api` is set; without `api` it may be omitted to leave
+    /// `/status` and `/metrics` open, relying on network-layer isolation.
     #[serde(default)]
     pub auth_token: Option<String>,
 }
@@ -41,17 +43,20 @@ pub enum LogFormat {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct SslConfig {
     pub cert: String,
     pub key: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub base_path: String,
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub enum UpdateConfig {
     LongPollUpdate {
         token: String,
@@ -88,12 +93,14 @@ fn default_long_poll_limit() -> u64 {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RegistrationWebhookConfig {
     pub public_ip: String,
     pub set_webhook_url: Option<String>,
     pub token: String,
 }
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub enum RouteConfig {
     LongPollRoute {
         path: String,

@@ -42,11 +42,13 @@ cargo build --release
 ./target/release/tgin -f tgin.ron
 ```
 
-The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`). `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs; missing variables abort startup.
+The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs; missing variables abort startup.
 
 ## Configuration reference
 
 Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
+
+The schema is strict: an unknown field anywhere in the file (top level, inside a variant such as `LongPollUpdate(...)`, or in a nested struct) is a parse error that names the field, so a typo like `server_prot` fails startup instead of silently falling back to a default.
 
 ### Top-level fields
 
@@ -57,10 +59,10 @@ Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
 | `ssl`          | `Option<SslConfig { cert, key }>` | `None`  | Optional TLS certificate and private key (PEM file paths). When set, the listener serves HTTPS via rustls.                                                                                                                  |
 | `updates`      | `Vec<UpdateConfig>`               | —       | Ingress providers. Multiple providers can coexist; tgin merges updates from all of them.                                                                                                                                    |
 | `route`        | `RouteConfig`                     | —       | The single root of the routing tree. Either a leaf route or a load-balancer subtree.                                                                                                                                        |
-| `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress.                                                                                                   |
+| `api`          | `Option<ApiConfig { base_path }>` | `None`  | Optional management API base path (e.g. `/api`). Routes are nested under this prefix on the same listener as the ingress. Requires a non-blank `auth_token` (`ApiWithoutAuthToken` validation error otherwise).                |
 | `log_level`    | `String`                          | `"info"`  | Minimum log level: `trace`/`debug`/`info`/`warn`/`error`/`off`. `RUST_LOG` overrides it. |
 | `log_format`   | `"Compact"` \| `"Json"`           | `Compact` | `Compact` = human-readable single-line logs; `Json` = one JSON object per line for log shippers. |
-| `auth_token`   | `Option<String>`                  | `None`    | Optional shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. A present-but-blank value is ignored with a startup warning (auth stays disabled). |
+| `auth_token`   | `Option<String>`                  | `None`    | Shared secret for the control / observability plane. When set, `/status`, `/metrics`, and the management API require `Authorization: Bearer <auth_token>`. **Required when `api` is set.** Without `api`, a present-but-blank value is ignored with a startup warning (auth stays disabled). |
 
 ### Update providers (`updates`)
 
@@ -89,7 +91,7 @@ Exposes an HTTP endpoint on `server_port` that Telegram POSTs updates to.
 | Field          | Type                                | Default  | Description                                                                                                                                                                                                                                                                              |
 |----------------|-------------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `path`         | `String`                            | required | Local URL path Telegram should hit (e.g. `/bot/pull`).                                                                                                                                                                                                                                   |
-| `secret_token` | `Option<String>`                    | `None`   | When set, tgin requires every inbound POST to carry a matching `x-telegram-bot-api-secret-token` header. Mismatches are rejected.                                                                                                                                                        |
+| `secret_token` | `Option<String>`                    | `None`   | When set, tgin requires every inbound POST to carry a matching `x-telegram-bot-api-secret-token` header. Mismatches are rejected. When omitted, tgin logs a startup warning: anyone who can reach `path` can inject updates.                                                              |
 | `registration` | `Option<RegistrationWebhookConfig>` | `None`   | Enables automatic webhook registration at boot. tgin POSTs `setWebhook` to Telegram with `url = <public_ip><path>`. Override the registration endpoint via `set_webhook_url` (default `https://api.telegram.org/bot<token>/setWebhook`). Omit this block to manage the webhook yourself. |
 
 `RegistrationWebhookConfig` fields: `public_ip: String`, `token: String`, `set_webhook_url: Option<String>`.
@@ -140,19 +142,20 @@ Broadcast strategy: clones every update and dispatches it to every child concurr
 
 ## HTTP management API
 
-Enable the API by setting `api` in your config:
+Enable the API by setting `api` in your config, together with the `auth_token` it requires:
 
 ```ron
 api: Some(ApiConfig(
     base_path: "/api",
 )),
+auth_token: Some("${TGIN_AUTH_TOKEN}"),
 ```
 
 Routes are nested under `base_path` and share the same listener as the ingress endpoints.
 
 Every HTTP path (`WebhookUpdate.path`, `LongPollRoute.path`, `api.base_path`, and `Longpull` paths added via `POST /api/route`) is matched literally and must start with `/`; paths containing `{` or `}`, or with a segment starting with `:` or `*`, are rejected (an `InvalidPath` validation error at startup, `400` at runtime), and `api.base_path` may not be `/`.
 
-> **Authentication:** these endpoints are unauthenticated unless the top-level `auth_token` is set, in which case every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)). They mutate the routing tree, so restrict access at the network layer regardless.
+> **Authentication:** every request must carry `Authorization: Bearer <auth_token>` (see [Observability → Authentication](#authentication)); tgin refuses to start with `api` set and `auth_token` missing or blank. These endpoints mutate the routing tree, so restrict access at the network layer as well.
 
 | Endpoint      | Method   | Body                                     | Description                                                                                                                                                                                                                                                                             |
 |---------------|----------|------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -176,6 +179,7 @@ Add a webhook route at runtime:
 
 ```bash
 curl -X POST http://localhost:3000/api/route \
+  -H "Authorization: Bearer $TGIN_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"type": "Webhook", "url": "http://bot-b:9000/bot"}'
 ```
@@ -184,6 +188,7 @@ Add a long-poll route, then poll it as if it were Telegram:
 
 ```bash
 curl -X POST http://localhost:3000/api/route \
+  -H "Authorization: Bearer $TGIN_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"type": "Longpull", "path": "/bot-c/getUpdates"}'
 
@@ -200,7 +205,7 @@ tgin exposes structured logs plus two always-on HTTP endpoints. The endpoints ar
 
 ### Authentication
 
-The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is unauthenticated by default and assumes network-layer isolation (a private network or a reverse proxy). Set the top-level `auth_token` to require `Authorization: Bearer <auth_token>` on all three: a request without the exact credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time. A present-but-blank `auth_token` is ignored — auth stays disabled and tgin logs a startup warning so the misconfiguration is visible. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
+The control / observability plane — `/status`, `/metrics`, and the management API (`/<base_path>/*`) — is gated by the top-level `auth_token`: when set, a request without the exact `Authorization: Bearer <auth_token>` credential is rejected with `401 Unauthorized` before any handler runs. The credential is compared in constant time. The management API cannot run without it: setting `api` with a missing or blank `auth_token` fails validation at startup. Without `api`, `auth_token` is optional — `/status` and `/metrics` are then unauthenticated and assume network-layer isolation (a private network or a reverse proxy), and a present-but-blank value is ignored with a startup warning so the misconfiguration is visible. The data plane — webhook ingress and long-poll route endpoints — is never gated. Telegram tokens embedded in downstream route URLs are redacted in `/status`, `/metrics`, and `/api/routes`.
 
 For Prometheus, pass the secret through the scrape config's `authorization` block (`type: Bearer`, `credentials: <auth_token>`).
 
@@ -275,8 +280,8 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
     dark_threads: 6,
     server_port: Some(3000),
     // api: Some(ApiConfig(base_path: "/api")),
+    // auth_token: Some("change-me"),  // required when `api` is set
     // ssl: Some(SslConfig(cert: "/cert.pem", key: "/privkey.pem")),
-    // auth_token: Some("change-me"),
     updates: [
         LongPollUpdate(
             token: "${TOKEN}",

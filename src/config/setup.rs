@@ -195,6 +195,9 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
         } else {
             check_path(&api.base_path, "api.base_path", &mut errs);
         }
+        if effective_auth_token(cfg.auth_token.clone()).0.is_none() {
+            errs.push(ValidationError::ApiWithoutAuthToken);
+        }
     }
 
     if errs.is_empty() {
@@ -664,6 +667,7 @@ mod tests {
         cfg.api = Some(ApiConfig {
             base_path: "/*api".to_string(),
         });
+        cfg.auth_token = Some("s3cret".to_string());
         assert_invalid_path(&cfg, "/*api", "api.base_path");
     }
 
@@ -673,6 +677,7 @@ mod tests {
         cfg.api = Some(ApiConfig {
             base_path: "/".to_string(),
         });
+        cfg.auth_token = Some("s3cret".to_string());
         assert_invalid_path(&cfg, "/", "api.base_path");
     }
 
@@ -803,7 +808,96 @@ mod tests {
         cfg.api = Some(ApiConfig {
             base_path: "/api".to_string(),
         });
+        cfg.auth_token = Some("s3cret".to_string());
         validate(&cfg).expect("api config validates");
+    }
+
+    /// The management API rewrites the routing tree, so it must never be
+    /// mounted without a bearer gate. A blank token disables auth, so it counts
+    /// as missing.
+    #[test]
+    fn test_api_requires_auth_token() {
+        for token in [None, Some("   ".to_string())] {
+            let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+            cfg.api = Some(ApiConfig {
+                base_path: "/api".to_string(),
+            });
+            cfg.auth_token = token.clone();
+            let errs = validate(&cfg).expect_err("api without auth_token rejected");
+            assert_eq!(
+                errs,
+                vec![ValidationError::ApiWithoutAuthToken],
+                "token {token:?}"
+            );
+        }
+    }
+
+    // ---------- load_config ----------
+
+    /// Run `load_config` on `ron` written to a per-test temp file.
+    fn load_str(name: &str, ron: &str) -> Result<TginConfig, ConfigError> {
+        let path = env::temp_dir().join(format!("tgin-{}-{name}.ron", std::process::id()));
+        fs::write(&path, ron).expect("write temp config");
+        let res = load_config(path.to_str().expect("utf-8 temp path"));
+        let _ = fs::remove_file(&path);
+        res
+    }
+
+    fn assert_parse_error_mentions(res: Result<TginConfig, ConfigError>, field: &str) {
+        let err = res.expect_err("unknown field rejected");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "expected a parse error, got {msg}"
+        );
+        assert!(msg.contains(field), "error does not name {field:?}: {msg}");
+    }
+
+    /// A misspelt optional field must fail loudly instead of silently
+    /// falling back to its default.
+    #[test]
+    fn test_unknown_top_level_field_rejected() {
+        let res = load_str(
+            "unknown-top-level",
+            r#"(server_prot: Some(3000), updates: [], route: LongPollRoute(path: "/bot1/getUpdates"))"#,
+        );
+        assert_parse_error_mentions(res, "server_prot");
+    }
+
+    #[test]
+    fn test_unknown_variant_field_rejected() {
+        let res = load_str(
+            "unknown-variant-field",
+            r#"(updates: [LongPollUpdate(tokn: "x")], route: LongPollRoute(path: "/bot1/getUpdates"))"#,
+        );
+        assert_parse_error_mentions(res, "tokn");
+    }
+
+    /// Every config the repository ships must load under the strict schema.
+    #[test]
+    fn test_shipped_configs_load() {
+        env::set_var("TOKEN", "12345678:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+        env::set_var("WH_ENDPOINT", "http://127.0.0.1:3001/bot");
+        env::set_var("TGIN_AUTH_TOKEN", "test-auth-token");
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut configs = vec![root.join("tgin.ron"), root.join("examples/simple/tgin.ron")];
+        let perf_dir = root.join("tests/performance/cfgs");
+        let mut perf: Vec<PathBuf> = fs::read_dir(&perf_dir)
+            .expect("read perf cfgs dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ron"))
+            .collect();
+        assert!(!perf.is_empty(), "no .ron files in {}", perf_dir.display());
+        perf.sort();
+        configs.append(&mut perf);
+
+        for path in configs {
+            let p = path.to_str().expect("utf-8 path");
+            if let Err(e) = load_config(p) {
+                panic!("{p} failed to load: {e}");
+            }
+        }
     }
 
     /// `log_level` must be a recognised level; a typo is a clean config error.

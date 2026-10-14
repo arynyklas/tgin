@@ -14,6 +14,8 @@ BENCH_OUTPUT ?=
 COMPOSE_WAIT_TIMEOUT ?= 90
 TGIN_WEBHOOK_API := http://localhost:3000/api/routes
 TGIN_LONGPOLL_API := http://localhost:3030/api/routes
+# Must match `auth_token` in cfgs/*.ron; the management API rejects requests without it.
+TGIN_AUTH_HEADER := Authorization: Bearer bench
 
 .PHONY: clean build \
 	webhook-direct-1 webhook-tgin-1 webhook-tgin-scale-2 webhook-tgin-scale-3 webhook-tgin-scale-5 webhook-tgin-scale-10 \
@@ -57,20 +59,20 @@ while [ $$(date +%s) -lt $$deadline ]; do \
     if [ $$remaining -le 0 ]; then break; fi; \
     curl_timeout=$$remaining; \
     if [ $$curl_timeout -gt 2 ]; then curl_timeout=2; fi; \
-    if curl --fail --silent --connect-timeout 1 --max-time $$curl_timeout "$(1)" >/dev/null; then exit 0; fi; \
+    if curl --fail --silent --connect-timeout 1 --max-time $$curl_timeout --header "$(TGIN_AUTH_HEADER)" "$(1)" >/dev/null; then exit 0; fi; \
     sleep 1; \
 done; \
 echo "Timed out waiting for $(1)" >&2; \
-curl --fail --silent --show-error --connect-timeout 1 --max-time 2 "$(1)" >/dev/null; \
+curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --header "$(TGIN_AUTH_HEADER)" "$(1)" >/dev/null; \
 exit 1
 endef
 
 define ADD_WEBHOOK_ROUTE
-	@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST http://localhost:$(1)/api/route --data '{ "type": "Webhook", "url": "$(2)"}' --header "Content-Type: application/json" >/dev/null
+	@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST http://localhost:$(1)/api/route --data '{ "type": "Webhook", "url": "$(2)"}' --header "Content-Type: application/json" --header "$(TGIN_AUTH_HEADER)" >/dev/null
 endef
 
 define ADD_LONGPULL_ROUTE
-	@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST http://localhost:$(1)/api/route --data '{ "type": "Longpull", "path": "$(2)"}' --header "Content-Type: application/json" >/dev/null
+	@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST http://localhost:$(1)/api/route --data '{ "type": "Longpull", "path": "$(2)"}' --header "Content-Type: application/json" --header "$(TGIN_AUTH_HEADER)" >/dev/null
 endef
 
 clean:

@@ -106,6 +106,7 @@ The repo has no `rustfmt.toml`, `clippy.toml`, `rust-toolchain*`, or CI config. 
     server_port: Some(3000),                         // None disables all HTTP ingress
     ssl: Some(SslConfig(cert: "...", key: "...")),   // optional rustls
     api: Some(ApiConfig(base_path: "/api")),         // optional management API
+    auth_token: Some("${TGIN_AUTH_TOKEN}"),          // required when `api` is set
     updates: [ LongPollUpdate(token: "${TOKEN}") ],
     route: RoundRobinLB(routes: [
         LongPollRoute(path: "/bot1/getUpdates"),
@@ -114,7 +115,7 @@ The repo has no `rustfmt.toml`, `clippy.toml`, `rust-toolchain*`, or CI config. 
 )
 ```
 
-Variants must match `RouteConfig` / `UpdateConfig` exactly. The HTTP API `POST /<base_path>/route` body uses `"type": "Longpull"` or `"Webhook"` (matching `AddRouteTypeSch`, **not** "Longpoll").
+Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is `#[serde(deny_unknown_fields)]`, so a misspelt field is a parse error, never a silent default. `validate` rejects `api` without a non-blank `auth_token` (`ValidationError::ApiWithoutAuthToken`). The HTTP API `POST /<base_path>/route` body uses `"type": "Longpull"` or `"Webhook"` (matching `AddRouteTypeSch`, **not** "Longpoll").
 
 ## Code Conventions & Patterns
 
