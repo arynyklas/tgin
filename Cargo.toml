@@ -1,8 +1,16 @@
 [package]
 name = "tgin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
+description = "Routing layer between the Telegram Bot API and downstream bot instances"
+license = "MIT"
+repository = "https://github.com/arynyklas/tgin"
+publish = false
+
+# `publish = false` makes dist skip the package unless it is opted in.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 tokio = { version = "1.53.3", features = ["full"] }
@@ -32,3 +40,8 @@ http-body-util = "0.1.5"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The profile that 'dist' builds release archives with; it keeps the release
+# profile's fat LTO and single codegen unit.
+[profile.dist]
+inherits = "release"
