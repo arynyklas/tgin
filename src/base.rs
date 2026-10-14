@@ -110,8 +110,9 @@ pub trait Routeable: Send + Sync {
 
     /// Enter drain mode: shutdown has stopped ingest and the process will
     /// exit once buffered updates are consumed. Leaves that hold consumers
-    /// open (a parked long poll) answer them now; load balancers forward to
-    /// every child. The default is a no-op.
+    /// open (a parked long poll) release them shortly, instead of after
+    /// their full timeout; load balancers forward to every child. The
+    /// default is a no-op.
     fn begin_drain(&self) {}
 
     /// Updates accepted into this node and still waiting for a downstream

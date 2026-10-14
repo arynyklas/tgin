@@ -80,9 +80,9 @@ pub struct LongPollRoute {
     /// Cumulative count of updates served out via `getUpdates` responses.
     /// Monotonic; surfaced via [`Routeable::json_struct`].
     served: Arc<AtomicU64>,
-    /// Set once by [`Routeable::begin_drain`]: a poll on an empty buffer is
-    /// answered immediately instead of parking, since no new updates will
-    /// arrive.
+    /// Set once by [`Routeable::begin_drain`]: no new updates will arrive,
+    /// so a long poll on an empty buffer is held for at most
+    /// [`DRAINING_EMPTY_POLL_HOLD`] instead of its full timeout.
     draining: Arc<AtomicBool>,
 }
 
@@ -366,7 +366,8 @@ impl Routeable for LongPollRoute {
     fn begin_drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
         // Wake every parked poll (unlike `process`, which wakes one); each
-        // re-checks the buffer and, if it is empty, answers an empty batch.
+        // re-checks the buffer and, if it is empty, waits at most
+        // `DRAINING_EMPTY_POLL_HOLD` more before answering an empty batch.
         self.notify.notify_waiters();
     }
 }
@@ -530,9 +531,10 @@ mod tests {
         assert!(duration.as_millis() >= 1000);
     }
 
-    /// `begin_drain` releases a poll parked on an empty buffer within the
-    /// drain hold, instead of holding it for its full timeout.
-    #[tokio::test]
+    /// `begin_drain` releases a poll parked on an empty buffer after the
+    /// drain hold, instead of holding it for its full timeout. Paused clock:
+    /// timers fire in deadline order, so the hold cannot race the bound.
+    #[tokio::test(start_paused = true)]
     async fn test_begin_drain_wakes_parked_poll() {
         let route = LongPollRoute::new("/test".to_string());
         let parked = {
@@ -548,12 +550,14 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        let drain_started = tokio::time::Instant::now();
         route.begin_drain();
 
         let response = tokio::time::timeout(Duration::from_secs(1), parked)
             .await
             .expect("parked poll not woken by begin_drain")
             .unwrap();
+        assert_eq!(drain_started.elapsed(), DRAINING_EMPTY_POLL_HOLD);
         let body = read_body_json(response).await;
         assert_eq!(body["result"].as_array().unwrap().len(), 0);
     }
@@ -562,7 +566,7 @@ mod tests {
     /// limit) and `pending` tracks what is left; a long poll on an empty
     /// buffer is then held only for [`DRAINING_EMPTY_POLL_HOLD`], so the
     /// consumer neither waits out its timeout nor spins on empty answers.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_draining_serves_buffer_then_holds_empty_poll_briefly() {
         let route = LongPollRoute::new("/test".to_string());
         for i in 0..3 {
@@ -588,7 +592,7 @@ mod tests {
         let empty = tokio::time::timeout(Duration::from_secs(2), route.handle_request(long_poll()))
             .await
             .expect("draining poll on an empty buffer must not wait out its timeout");
-        let held = start.elapsed();
+        assert_eq!(start.elapsed(), DRAINING_EMPTY_POLL_HOLD);
         assert_eq!(
             read_body_json(empty).await["result"]
                 .as_array()
@@ -596,18 +600,11 @@ mod tests {
                 .len(),
             0
         );
-        assert!(
-            held >= DRAINING_EMPTY_POLL_HOLD,
-            "empty poll answered after {held:?}, before the drain hold"
-        );
 
         // A short poll still answers at once.
-        let short = tokio::time::timeout(
-            Duration::from_millis(100),
-            route.handle_request(default_params()),
-        )
-        .await
-        .expect("timeout=0 poll must answer at once while draining");
+        let start = tokio::time::Instant::now();
+        let short = route.handle_request(default_params()).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
         assert_eq!(
             read_body_json(short).await["result"]
                 .as_array()
@@ -618,7 +615,7 @@ mod tests {
     }
 
     /// An update pushed while a draining poll is held is delivered to it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_draining_poll_receives_update_pushed_during_hold() {
         let route = LongPollRoute::new("/test".to_string());
         route.begin_drain();
@@ -637,7 +634,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         route.process(update_bytes(json!({"id": 7}))).await;
 
-        let response = tokio::time::timeout(Duration::from_secs(1), held)
+        let response = tokio::time::timeout(DRAINING_EMPTY_POLL_HOLD / 2, held)
             .await
             .expect("held poll not answered")
             .unwrap();

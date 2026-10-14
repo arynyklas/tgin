@@ -208,7 +208,7 @@ mod tests {
     /// leaf, including those behind a nested load balancer: after it, each
     /// long-poll leaf serves its buffer and then answers an empty long poll
     /// within its short drain hold instead of its 30 s timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_drain_forwards_through_nested_lbs() {
         use crate::lb::all::AllLB;
         use crate::route::longpull::{GetUpdatesParams, LongPollRoute};

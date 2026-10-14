@@ -211,7 +211,7 @@ mod tests {
     /// `pending` sums the children and `begin_drain` reaches each of them:
     /// after it, an empty long-poll leaf answers a long poll within its
     /// short drain hold instead of its 30 s timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_drain_forwards_to_children() {
         use crate::route::longpull::{GetUpdatesParams, LongPollRoute};
 

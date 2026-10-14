@@ -267,14 +267,14 @@ tgin terminates TLS itself using rustls (`axum_server::tls_rustls`).
 
 **Startup.** With `server_port` set, tgin binds `0.0.0.0:<server_port>` on the main task before serving. A bind failure (port already in use, bad address) or an unreadable TLS certificate is reported as a single `tgin: <error>` line on stderr and the process exits `1` — it does not start a half-initialized process with no HTTP plane.
 
-**Graceful shutdown.** On `SIGTERM` or `SIGINT` (Unix), on Ctrl-C, Ctrl-Break, console close, or system shutdown (Windows), or once every ingress has failed permanently, tgin logs `shutdown started; draining` and drains in order:
+**Graceful shutdown.** On `SIGTERM` or `SIGINT` (Unix), on Ctrl-C, Ctrl-Break, console close, or system shutdown (Windows), or once every ingress has failed permanently, tgin logs `shutdown started; draining` (with the cause and timing) and drains in order:
 
 1. **Lame duck (5 s).** `/readyz` answers `503` so load balancers stop routing here; everything else keeps working normally, including webhook ingress.
 2. **Stop ingest.** Long-poll updaters stop pulling from Telegram; webhook ingress answers `503` with `Retry-After: 5`, so Telegram redelivers those updates later rather than having them acknowledged by a process about to exit.
 3. **Drain (up to 15 s).** Updates already accepted keep flowing through the routing tree, and long-poll routes keep serving their buffers to downstream bots. A long poll on an empty buffer is held for at most 500 ms (a parked poll is released within 500 ms of the drain starting) and then answered with an empty batch, so consumers are neither held for their full `timeout` nor spinning on empty answers. The drain ends as soon as the dispatch queue and every long-poll buffer are empty.
 4. **Close.** The HTTP plane closes (in-flight requests get 1 s), the worker pool finishes any remaining backlog, and the process exits. Updates still sitting in a long-poll buffer at that point are logged as `abandoned`.
 
-When the console window is closed on Windows, which kills the process about 5 s later, the lame duck is skipped and the drain is capped at 4 s. Without `server_port` there is no HTTP plane to drain, so shutdown stops ingest and finishes the worker backlog right away. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start.
+When the console window is closed on Windows, which kills the process about 5 s later, the lame duck is skipped and the drain is capped at 4 s. Without `server_port` there is no HTTP plane to drain: tgin logs `shutdown started; no HTTP plane, stopping ingest`, stops ingest and finishes the worker backlog right away. A clean drain exits `0`. Updates a shutting-down long-poll updater never confirms are redelivered by Telegram on the next start.
 
 **Exit codes.** `0` — clean shutdown (signal-driven drain, or every producer terminated normally). `1` — startup failure (bad config, bind/TLS error). `2` — at least one long-poll updater hit a permanent failure (401/403/404) and stopped, including the self-initiated shutdown once all ingress has failed; see [Failure handling](#longpollupdate).
 

@@ -250,7 +250,8 @@ impl Tgin {
         //      `HTTP_CLOSE_GRACE`), then cancel `drain` so the worker pool
         //      and control-plane loop finish any backlog and exit.
         // Without an HTTP plane there is no traffic to move away and nobody
-        // to fetch buffered updates, so steps 1 and 3-5 are skipped. The
+        // to fetch buffered updates, so steps 1, 3 and 4 and the HTTP close
+        // are skipped: ingest and `drain` are cancelled at once. The
         // coordinator holds only a weak sender, so it never keeps the update
         // channel open.
         {
@@ -489,11 +490,12 @@ async fn all_ingress_failed(health: Option<IngressHealth>) {
 /// updates. The channel also counts as empty once every sender is gone: the
 /// workers then drain it on their own.
 ///
-/// Known residual: an update a worker has taken from the channel but not
-/// yet pushed into its route is visible to neither check. If this samples
-/// in that window (a synchronous push for long-poll routes), the HTTP plane
-/// may close one update early; that update is then reported in the
-/// `abandoned` count logged when `run_until` returns.
+/// Known residual: updates workers have taken from the channel but not yet
+/// pushed into their routes (up to one per worker, so `dark_threads`) are
+/// visible to neither check. If this samples in that window (a synchronous
+/// push for long-poll routes), the HTTP plane may close with those updates
+/// still on their way; they are then reported in the `abandoned` count
+/// logged when `run_until` returns.
 async fn backlog_drained(updates: &WeakSender<Bytes>, route: &dyn RouteableComponent) {
     loop {
         let channel_empty = updates
@@ -1033,6 +1035,15 @@ mod tests {
 
     impl HookToPoll {
         async fn start(timing: ShutdownTiming) -> Self {
+            Self::start_with_root(timing, |poll| poll).await
+        }
+
+        /// As [`HookToPoll::start`], with the routing tree built around the
+        /// `/poll` leaf by `root`.
+        async fn start_with_root(
+            timing: ShutdownTiming,
+            root: impl FnOnce(Arc<crate::route::longpull::LongPollRoute>) -> Arc<dyn RouteableComponent>,
+        ) -> Self {
             use crate::route::longpull::LongPollRoute;
             use crate::update::webhook::WebhookUpdate;
 
@@ -1040,7 +1051,7 @@ mod tests {
             let route = Arc::new(LongPollRoute::new("/poll".to_string()));
             let updates: Vec<Box<dyn UpdaterComponent>> =
                 vec![Box::new(WebhookUpdate::new("/hook".to_string()))];
-            let tgin = Tgin::new(updates, route.clone(), 2, Some(port));
+            let tgin = Tgin::new(updates, root(route.clone()), 2, Some(port));
 
             let (fire, fired) = tokio::sync::oneshot::channel::<()>();
             let shutdown = async move {
@@ -1240,17 +1251,29 @@ mod tests {
         app.abort();
     }
 
-    /// A consumer parked in a long poll on an empty buffer is answered with
-    /// an empty batch soon after the drain starts, so it neither pins the
-    /// shutdown for its full timeout nor sees a dropped connection. The lame
-    /// duck keeps the plane open while the poll connects, and a poll that
-    /// arrives during it parks (ingest is not draining yet).
+    /// A consumer long-polling an empty buffer is answered with an empty
+    /// batch shortly after the drain starts, so it neither pins the shutdown
+    /// for its full timeout nor sees a dropped connection.
+    ///
+    /// Independent of when the poll arrives: a sibling leaf under an `AllLB`
+    /// holds one update nobody fetches until the end of the test, which keeps
+    /// the HTTP plane open (grace 60 s). A poll that parks before the drain
+    /// is woken by `begin_drain` (the usual case, given the head start
+    /// below); one arriving after it is held only briefly. Either way the
+    /// answer is `[]` well before the poll's 30 s timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_parked_poll_returns_empty_on_drain() {
-        let lame_duck = Duration::from_millis(500);
-        let mut app = HookToPoll::start(ShutdownTiming {
-            lame_duck,
-            ..TEST_TIMING
+        use crate::lb::all::AllLB;
+        use crate::route::longpull::LongPollRoute;
+
+        let keep = Arc::new(LongPollRoute::new("/keep".to_string()));
+        keep.process(update_bytes(json!({ "update_id": 1 }))).await;
+        let timing = ShutdownTiming {
+            lame_duck: Duration::ZERO,
+            grace: Duration::from_secs(60),
+        };
+        let mut app = HookToPoll::start_with_root(timing, |poll| {
+            Arc::new(AllLB::new(vec![poll, keep.clone()]))
         })
         .await;
 
@@ -1269,16 +1292,32 @@ mod tests {
                     .unwrap()
             })
         };
+        // Head start so the poll usually parks before the drain; correctness
+        // does not depend on it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         app.fire();
 
-        let body = tokio::time::timeout(lame_duck + Duration::from_secs(1), parked)
+        let body = tokio::time::timeout(Duration::from_secs(10), parked)
             .await
-            .expect("parked poll was not answered within lame_duck + 1 s of shutdown")
+            .expect("parked poll was held toward its 30 s timeout during the drain")
             .unwrap();
         assert_eq!(body, json!({ "ok": true, "result": [] }));
 
-        app.assert_exits_within(Duration::from_secs(2)).await;
+        // Fetching the last pending update ends the drain.
+        let rest: Value = app
+            .client
+            .post(format!("{}/keep", app.base))
+            .json(&json!({ "timeout": 0 }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rest["result"], json!([{ "update_id": 1 }]));
+
+        app.assert_exits_within(Duration::from_secs(3)).await;
     }
 
     /// Holds its sender until ingest is cancelled, like a long-poll updater
