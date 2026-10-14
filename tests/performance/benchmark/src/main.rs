@@ -461,11 +461,7 @@ async fn main() {
     let mut send_tasks: JoinSet<()> = JoinSet::new();
 
     let start_test = Instant::now();
-    let interval_micros = if args.rps > 0 {
-        1_000_000 / args.rps
-    } else {
-        100_000
-    };
+    let interval_micros = 1_000_000u64.checked_div(args.rps).unwrap_or(100_000);
     let mut ticker = interval(Duration::from_micros(interval_micros));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
