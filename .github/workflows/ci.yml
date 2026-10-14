@@ -50,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-14]
+        os: [ubuntu-24.04, windows-2025, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,8 +117,17 @@ jobs:
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
           "$bin" --help
 
+  # Build-only, natively on each architecture the release image ships for.
   docker:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,9 +136,10 @@ jobs:
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          platforms: linux/${{ matrix.arch }}
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
 
   bench-crate:
     runs-on: ubuntu-24.04
