@@ -138,10 +138,23 @@ pub fn validate(cfg: &TginConfig) -> Result<(), Vec<ValidationError>> {
     for (idx, upd) in cfg.updates.iter().enumerate() {
         match upd {
             UpdateConfig::WebhookUpdate {
-                path, registration, ..
+                path,
+                registration,
+                secret_token,
             } => {
                 let location = format!("updates[{idx}].WebhookUpdate");
                 check_path(path, &format!("{location}.path"), &mut errs);
+                if let Some(token) = secret_token {
+                    let valid = (1..=256).contains(&token.len())
+                        && token
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                    if !valid {
+                        errs.push(ValidationError::InvalidSecretToken {
+                            location: format!("{location}.secret_token"),
+                        });
+                    }
+                }
                 if let Some(prev) = paths.insert(path.clone(), "WebhookUpdate") {
                     errs.push(ValidationError::DuplicatePath {
                         path: path.clone(),
@@ -757,6 +770,29 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| matches!(e, ValidationError::InvalidPublicIp { .. })));
+    }
+
+    /// Telegram accepts `secret_token` only as 1–256 chars of `A-Za-z0-9_-`;
+    /// anything else makes `setWebhook` fail at runtime, so reject it at load.
+    #[test]
+    fn test_secret_token_charset_validated() {
+        for bad in ["bad token!".to_string(), "a".repeat(257)] {
+            let mut cfg = base_config(wh_route("http://127.0.0.1:8080/bot"));
+            cfg.updates = vec![UpdateConfig::WebhookUpdate {
+                path: "/bot".to_string(),
+                registration: None,
+                secret_token: Some(bad.clone()),
+            }];
+            let errs = validate(&cfg).expect_err("bad secret_token rejected");
+            assert!(
+                matches!(
+                    errs.as_slice(),
+                    [ValidationError::InvalidSecretToken { location }]
+                        if location == "updates[0].WebhookUpdate.secret_token"
+                ),
+                "token {bad:?}: unexpected errors: {errs:?}"
+            );
+        }
     }
 
     /// API present + valid config: regression guard that ApiConfig doesn't

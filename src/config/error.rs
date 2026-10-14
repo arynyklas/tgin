@@ -80,6 +80,9 @@ pub enum ValidationError {
         location: String,
         reason: &'static str,
     },
+    /// `WebhookUpdate.secret_token` breaks Telegram's rule (1–256 chars of
+    /// `A-Za-z0-9_-`); `setWebhook` would reject it at runtime.
+    InvalidSecretToken { location: String },
     /// `dark_threads: 0` panics deep inside `tokio::runtime::Builder`.
     DarkThreadsZero,
     /// `log_level` is not one of trace/debug/info/warn/error/off
@@ -154,6 +157,11 @@ impl fmt::Display for ValidationError {
                 "{location}: HTTP path {path:?} is invalid ({reason}) \
                  (hint: use a literal path starting with `/`, e.g. \"/bot\"; no `{{`, `}}`, \
                  or segments starting with `:` / `*`)"
+            ),
+            ValidationError::InvalidSecretToken { location } => write!(
+                f,
+                "{location}: secret_token is invalid (must be 1-256 characters of A-Z, a-z, 0-9, `_`, `-`) \
+                 (hint: generate one with e.g. `openssl rand -hex 32`)"
             ),
             ValidationError::InvalidWebhookUrl {
                 url,

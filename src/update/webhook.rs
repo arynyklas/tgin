@@ -84,7 +84,10 @@ impl WebhookUpdate {
     pub async fn register_webhook(&self, config: &RegistrationWebhookConfig) {
         let full_url = format!("{}{}", config.public_ip.trim_end_matches('/'), self.path);
 
-        let params = json!({ "url": full_url });
+        let mut params = json!({ "url": full_url });
+        if let Some(secret) = &self.secret_token {
+            params["secret_token"] = json!(secret);
+        }
 
         match config
             .client
@@ -237,7 +240,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
-    use wiremock::matchers::method;
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -297,6 +300,59 @@ mod tests {
             !logs.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             "logs: {logs}"
         );
+    }
+
+    fn registration_for(server: &MockServer) -> RegistrationWebhookConfig {
+        let client = Client::builder().no_proxy().build().unwrap();
+        let mut reg = RegistrationWebhookConfig::new(
+            "TOKEN123".to_string(),
+            "https://example.com".to_string(),
+            client,
+        );
+        reg.set_webhook_url(format!("{}/setWebhook", server.uri()));
+        reg
+    }
+
+    #[tokio::test]
+    async fn test_registration_sends_secret_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setWebhook"))
+            .and(body_partial_json(json!({
+                "url": "https://example.com/bot/pull",
+                "secret_token": "s3cret_-"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut updater = WebhookUpdate::new("/bot/pull".to_string());
+        updater.set_secret_token("s3cret_-".to_string());
+        updater.set_registration(registration_for(&server));
+        let (tx, _) = mpsc::channel(1);
+        updater.start(tx, CancellationToken::new()).await;
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_registration_without_secret_sends_url_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setWebhook"))
+            .and(body_json(json!({"url": "https://example.com/bot/pull"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut updater = WebhookUpdate::new("/bot/pull".to_string());
+        updater.set_registration(registration_for(&server));
+        let (tx, _) = mpsc::channel(1);
+        updater.start(tx, CancellationToken::new()).await;
+
+        server.verify().await;
     }
 
     #[tokio::test]
