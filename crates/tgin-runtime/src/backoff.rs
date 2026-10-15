@@ -70,6 +70,7 @@ mod tests {
     fn backoff_full_jitter_bounds() {
         let mut rng = StdRng::seed_from_u64(42);
         let mut b = Backoff::new(INITIAL, MAX, FLOOR);
+        let mut capped = Vec::new();
         for n in 0..1000u32 {
             assert_eq!(b.attempt(), n);
             let ceiling = INITIAL
@@ -80,7 +81,17 @@ mod tests {
                 d >= FLOOR && d <= ceiling.max(FLOOR),
                 "draw {n}: {d:?} outside [{FLOOR:?}, {ceiling:?}]"
             );
+            if ceiling == MAX {
+                capped.push(d);
+            }
         }
+        // Jitter spreads over the whole capped range rather than clustering.
+        assert!(capped.len() > 900);
+        assert!(capped.iter().any(|&d| d > MAX / 2));
+        assert!(capped.iter().any(|&d| d < MAX / 4));
+        capped.sort_unstable();
+        capped.dedup();
+        assert!(capped.len() >= 100, "{} distinct draws", capped.len());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Lock-free circuit breaker.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +30,20 @@ pub enum BreakerState {
 /// How far before construction `Breaker::offset` can still tell instants apart.
 const OFFSET_SHIFT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-const CLOSED: u8 = 0;
-const OPEN: u8 = 1;
-const HALF_OPEN: u8 = 2;
+/// The low two bits of the state word hold the state; the rest hold
+/// `opened_at`.
+const STATE_BITS: u32 = 2;
+const STATE_MASK: u64 = (1 << STATE_BITS) - 1;
+/// Largest `opened_at` the state word can hold (about 146 years).
+const MAX_OFFSET: u64 = u64::MAX >> STATE_BITS;
+
+const CLOSED: u64 = 0;
+const OPEN: u64 = 1;
+const HALF_OPEN: u64 = 2;
+
+fn pack(state: u64, opened_at: u64) -> u64 {
+    (opened_at << STATE_BITS) | state
+}
 
 /// Closed → Open after `failure_threshold` consecutive failures; Open →
 /// HalfOpen once `open_for` has elapsed, admitting exactly one probe whose
@@ -40,12 +51,12 @@ const HALF_OPEN: u8 = 2;
 #[derive(Debug)]
 pub struct Breaker {
     cfg: BreakerConfig,
-    /// Reference point for `opened_at`, which is stored as nanoseconds from
-    /// it; see [`Breaker::offset`].
+    /// Reference point for `opened_at`; see [`Breaker::offset`].
     base: Instant,
-    state: AtomicU8,
+    /// State and `opened_at` in one word (see [`pack`]), so every transition
+    /// is a single compare-exchange against the exact word it was decided on.
+    word: AtomicU64,
     failures: AtomicU32,
-    opened_at: AtomicU64,
 }
 
 impl Breaker {
@@ -53,23 +64,28 @@ impl Breaker {
         Self {
             cfg,
             base: Instant::now(),
-            state: AtomicU8::new(CLOSED),
+            word: AtomicU64::new(pack(CLOSED, 0)),
             failures: AtomicU32::new(0),
-            opened_at: AtomicU64::new(0),
         }
     }
 
     pub fn allow(&self, now: Instant) -> bool {
-        match self.state.load(Ordering::Acquire) {
+        let word = self.word.load(Ordering::Acquire);
+        match word & STATE_MASK {
             CLOSED => true,
             OPEN => {
-                let opened_at = self.opened_at.load(Ordering::Acquire);
+                let opened_at = word >> STATE_BITS;
                 let open_for = u64::try_from(self.cfg.open_for.as_nanos()).unwrap_or(u64::MAX);
                 if self.offset(now) < opened_at.saturating_add(open_for) {
                     return false;
                 }
-                self.state
-                    .compare_exchange(OPEN, HALF_OPEN, Ordering::AcqRel, Ordering::Acquire)
+                self.word
+                    .compare_exchange(
+                        word,
+                        pack(HALF_OPEN, opened_at),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
             }
             _ => false,
@@ -78,19 +94,20 @@ impl Breaker {
 
     pub fn on_success(&self) {
         self.failures.store(0, Ordering::Release);
-        self.state.store(CLOSED, Ordering::Release);
+        self.word.store(pack(CLOSED, 0), Ordering::Release);
     }
 
     pub fn on_failure(&self, now: Instant) {
-        match self.state.load(Ordering::Acquire) {
-            HALF_OPEN => self.open(HALF_OPEN, now),
+        let word = self.word.load(Ordering::Acquire);
+        match word & STATE_MASK {
+            HALF_OPEN => self.open(word, now),
             CLOSED => {
                 let failures = self
                     .failures
                     .fetch_add(1, Ordering::AcqRel)
                     .saturating_add(1);
                 if failures >= self.cfg.failure_threshold {
-                    self.open(CLOSED, now);
+                    self.open(word, now);
                 }
             }
             _ => {}
@@ -98,28 +115,34 @@ impl Breaker {
     }
 
     pub fn state(&self) -> BreakerState {
-        match self.state.load(Ordering::Acquire) {
+        match self.word.load(Ordering::Acquire) & STATE_MASK {
             CLOSED => BreakerState::Closed,
             OPEN => BreakerState::Open,
             _ => BreakerState::HalfOpen,
         }
     }
 
-    fn open(&self, from: u8, now: Instant) {
-        self.opened_at.store(self.offset(now), Ordering::Release);
-        let _ = self
-            .state
-            .compare_exchange(from, OPEN, Ordering::AcqRel, Ordering::Acquire);
+    /// Opens the breaker at `now` unless another caller already moved it
+    /// away from `from`; a lost race changes nothing.
+    fn open(&self, from: u64, now: Instant) {
+        let _ = self.word.compare_exchange(
+            from,
+            pack(OPEN, self.offset(now)),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    /// Nanoseconds from `base - OFFSET_SHIFT` to `t`. The shift lets callers
-    /// pass instants taken shortly before construction, and keeps `t` far
-    /// from `base` so the subtraction is exact (Windows rounds differences
-    /// within one clock tick to zero).
+    /// Nanoseconds from `base - OFFSET_SHIFT` to `t`, capped at
+    /// [`MAX_OFFSET`]. The shift lets callers pass instants taken shortly
+    /// before construction, and keeps `t` far from `base` so the subtraction
+    /// is exact (Windows rounds differences within one clock tick to zero).
     fn offset(&self, t: Instant) -> u64 {
         let shifted = t.checked_add(OFFSET_SHIFT).unwrap_or(t);
         let elapsed = shifted.saturating_duration_since(self.base);
-        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        u64::try_from(elapsed.as_nanos())
+            .unwrap_or(u64::MAX)
+            .min(MAX_OFFSET)
     }
 }
 
@@ -196,5 +219,31 @@ mod tests {
         b.on_failure(t0);
         b.on_failure(t0);
         assert_eq!(b.state(), BreakerState::Closed, "failure count was reset");
+    }
+
+    #[test]
+    fn breaker_half_open_admits_exactly_one_concurrent_probe() {
+        const THREADS: usize = 16;
+        let t0 = Instant::now();
+        let b = opened(t0);
+        let t1 = t0 + Duration::from_secs(30);
+        let barrier = std::sync::Barrier::new(THREADS);
+        let admitted = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        b.allow(t1)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|&ok| ok)
+                .count()
+        });
+        assert_eq!(admitted, 1);
+        assert_eq!(b.state(), BreakerState::HalfOpen);
     }
 }

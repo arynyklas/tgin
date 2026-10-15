@@ -87,7 +87,7 @@ impl Redactor {
             .collect();
         let secrets = (!patterns.is_empty()).then(|| {
             AhoCorasick::builder()
-                .match_kind(MatchKind::LeftmostLongest)
+                .match_kind(MatchKind::Standard)
                 .build(&patterns)
                 .expect("secret patterns fit the automaton size limits")
         });
@@ -95,23 +95,50 @@ impl Redactor {
     }
 
     /// `s` with every match replaced by `#####`; borrowed when nothing matched.
+    /// Overlapping or touching secret matches collapse into one mask, so no
+    /// part of any secret survives.
     pub fn redact<'a>(&self, s: &'a str) -> Cow<'a, str> {
         let masked = match &self.secrets {
-            Some(ac) if ac.is_match(s) => {
-                let mut out = String::with_capacity(s.len());
-                ac.replace_all_with(s, &mut out, |_, _, dst| {
-                    dst.push_str(MASK);
-                    true
-                });
-                Cow::Owned(out)
-            }
-            _ => Cow::Borrowed(s),
+            Some(ac) => mask_spans(s, ac),
+            None => Cow::Borrowed(s),
         };
         match masked {
             Cow::Borrowed(b) => TELEGRAM_TOKEN_RE.replace_all(b, MASK),
-            Cow::Owned(o) => Cow::Owned(TELEGRAM_TOKEN_RE.replace_all(&o, MASK).into_owned()),
+            Cow::Owned(o) if TELEGRAM_TOKEN_RE.is_match(&o) => {
+                Cow::Owned(TELEGRAM_TOKEN_RE.replace_all(&o, MASK).into_owned())
+            }
+            owned @ Cow::Owned(_) => owned,
         }
     }
+}
+
+/// `s` with the union of all (possibly overlapping) matches of `ac` masked.
+fn mask_spans<'a>(s: &'a str, ac: &AhoCorasick) -> Cow<'a, str> {
+    let mut spans: Vec<(usize, usize)> = ac
+        .find_overlapping_iter(s)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    if spans.is_empty() {
+        return Cow::Borrowed(s);
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut current = spans[0];
+    for &(start, end) in &spans[1..] {
+        if start <= current.1 {
+            current.1 = current.1.max(end);
+        } else {
+            out.push_str(&s[copied..current.0]);
+            out.push_str(MASK);
+            copied = current.1;
+            current = (start, end);
+        }
+    }
+    out.push_str(&s[copied..current.0]);
+    out.push_str(MASK);
+    out.push_str(&s[current.1..]);
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -146,10 +173,26 @@ mod tests {
     }
 
     #[test]
+    fn redactor_masks_overlapping_secrets() {
+        let r = Redactor::new(["abcdefgh".to_string(), "efghijkl".to_string()]);
+        assert_eq!(r.redact("x abcdefghijkl y"), "x ##### y");
+    }
+
+    #[test]
+    fn redactor_masks_overlapping_copies_of_one_secret() {
+        // Prefix "abcab" equals suffix, so two copies can share three bytes.
+        let r = Redactor::new(["abcabcab".to_string()]);
+        assert_eq!(r.redact("x abcabcabcab y"), "x ##### y");
+    }
+
+    #[test]
     fn redactor_ignores_short_secrets() {
-        let r = Redactor::new(["short".to_string()]);
-        let out = r.redact("a short line");
-        assert_eq!(out, "a short line");
+        let r = Redactor::new(["seven77".to_string()]);
+        let out = r.redact("a seven77 line");
+        assert_eq!(out, "a seven77 line");
         assert!(matches!(out, Cow::Borrowed(_)));
+
+        let r = Redactor::new(["eight888".to_string()]);
+        assert_eq!(r.redact("an eight888 line"), "an ##### line");
     }
 }
