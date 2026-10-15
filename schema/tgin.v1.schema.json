@@ -102,7 +102,7 @@
           "default": 5,
           "description": "Consecutive failures that open the breaker; at least 1.",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "open_for": {
@@ -114,7 +114,7 @@
       "type": "object"
     },
     "ByteSize": {
-      "description": "A size: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
+      "description": "A size of at least 1 byte: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
       "examples": [
         "64MiB",
         "512KiB",
@@ -122,11 +122,11 @@
       ],
       "oneOf": [
         {
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         {
-          "pattern": "^\\s*[0-9]+\\s*(B|KiB|MiB|GiB)?\\s*$",
+          "pattern": "^\\s*0*[1-9][0-9]*\\s*(B|KiB|MiB|GiB)?\\s*$",
           "type": "string"
         }
       ]
@@ -184,7 +184,7 @@
         "30s",
         "5m"
       ],
-      "pattern": "^\\s*([0-9]+\\s*[a-zA-Zµ]+\\s*)+$",
+      "pattern": "^\\s*([0-9]+\\s*(nanos|nsec|ns|usec|us|µs|millis|msec|ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)\\s*)+$",
       "type": "string"
     },
     "Endpoint": {
@@ -361,8 +361,9 @@
         },
         "commands": {
           "default": [],
-          "description": "Commands, with or without the leading `/`; no `@bot` suffix.",
+          "description": "Commands, with or without the leading `/`: 1 to 32 ASCII letters,\ndigits or `_`, with no `@bot` suffix.",
           "items": {
+            "pattern": "^/?[A-Za-z0-9_]{1,32}$",
             "type": "string"
           },
           "type": "array"
@@ -432,8 +433,9 @@
       "properties": {
         "aliases": {
           "default": [],
-          "description": "Extra HTTP paths serving this consumer.",
+          "description": "Extra HTTP paths serving this consumer. Each supports `${env:…}`\nand `${file:…}`.",
           "items": {
+            "minLength": 1,
             "type": "string"
           },
           "type": "array"
@@ -453,7 +455,7 @@
           "default": 10000,
           "description": "Most queued updates.",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "capacity_bytes": {
@@ -495,7 +497,7 @@
           "default": 10000,
           "description": "Most queued updates.",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "capacity_bytes": {
@@ -514,7 +516,7 @@
           "default": 32,
           "description": "Most requests in flight over all endpoints.",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "on_full": {
@@ -584,7 +586,7 @@
           "default": 10,
           "description": "Attempts before the update is dead-lettered; at least 1.",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         }
       },
@@ -669,7 +671,7 @@
           "default": 10000,
           "description": "Most open connections.",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         },
         "tls": {
@@ -709,7 +711,7 @@
           "description": "One weight per `among` entry, each above 0; only with `weighted`.",
           "items": {
             "format": "uint32",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "type": [
@@ -902,7 +904,8 @@
           ]
         },
         "path": {
-          "description": "HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.",
+          "description": "HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.\nSupports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
           "type": [
             "string",
             "null"

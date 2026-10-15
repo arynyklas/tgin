@@ -68,9 +68,9 @@ fn known(primary: Location, fallback: Location) -> Location {
     }
 }
 
-/// Validates `raw`. Returns, per bot and rule, whether the rule is free of
-/// errors, so that only those are compiled.
-pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) -> Vec<Vec<bool>> {
+/// Validates `raw`. HTTP paths and interpolated fields need the
+/// environment, so `resolve` checks them.
+pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) {
     if raw.version.value != 1 {
         diag.error(
             "version",
@@ -123,12 +123,11 @@ pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) -> Vec<Vec<bool>
     }
     duration(diag, "reload.drain_timeout", &raw.reload.drain_timeout);
 
-    let mut paths = HttpPaths::default();
-    consumers(raw, diag, &mut paths);
-    bots(raw, diag, &mut paths)
+    consumers(raw, diag);
+    bots(raw, diag);
 }
 
-fn consumers(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) {
+fn consumers(raw: &RawConfig, diag: &mut Diagnostics) {
     for (name, consumer) in &raw.consumers {
         let path = format!("consumers.{}", name.as_str());
         check_name(diag, &path, name.as_str(), consumer.location);
@@ -145,14 +144,6 @@ fn consumers(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) {
                 at_least_one(diag, format!("{path}.capacity"), &pull.capacity);
                 at_least_one_byte(diag, format!("{path}.capacity_bytes"), &pull.capacity_bytes);
                 duration(diag, format!("{path}.lease_timeout"), &pull.lease_timeout);
-                for (k, alias) in pull.aliases.iter().enumerate() {
-                    paths.add(
-                        diag,
-                        format!("{path}.aliases[{k}]"),
-                        &alias.value,
-                        alias.location,
-                    );
-                }
             }
             Consumer::Push(push) => {
                 self::push(diag, &format!("{path}.push"), consumer.location, push)
@@ -199,11 +190,10 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
     );
 }
 
-fn bots(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) -> Vec<Vec<bool>> {
+fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
     let mut names: HashMap<&str, usize> = HashMap::new();
     // The bot that first targets each pull consumer.
     let mut pull_owner: HashMap<usize, &str> = HashMap::new();
-    let mut rules_ok = Vec::with_capacity(raw.bots.len());
     for (i, bot) in raw.bots.iter().enumerate() {
         let path = format!("bots[{i}]");
         let name = bot.name.value.as_str();
@@ -219,23 +209,23 @@ fn bots(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) -> Vec<V
         }
 
         if let Some(ingress) = &bot.ingress {
-            self::ingress(raw, diag, paths, &path, name, ingress);
+            self::ingress(raw, diag, &path, ingress);
         }
 
         let mut reached = Vec::new();
-        let mut bot_rules_ok = Vec::with_capacity(bot.routes.len());
         for (j, route) in bot.routes.iter().enumerate() {
-            let before = diag.errors.len();
+            let path = format!("{path}.routes[{j}]");
+            if let Some(m) = &route.value.r#match {
+                commands(diag, &path, &m.commands);
+            }
             targets(
                 diag,
                 &raw.consumers,
                 &route.value.to,
-                &format!("{path}.routes[{j}].to"),
+                &format!("{path}.to"),
                 &mut reached,
             );
-            bot_rules_ok.push(diag.errors.len() == before);
         }
-        rules_ok.push(bot_rules_ok);
         // One report per consumer and bot, at its first reference.
         let mut seen = HashSet::new();
         reached.retain(|(consumer, _, _)| seen.insert(*consumer));
@@ -276,17 +266,9 @@ fn bots(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) -> Vec<V
             }
         }
     }
-    rules_ok
 }
 
-fn ingress(
-    raw: &RawConfig,
-    diag: &mut Diagnostics,
-    paths: &mut HttpPaths,
-    path: &str,
-    name: &str,
-    ingress: &At<Ingress>,
-) {
+fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ingress>) {
     match &ingress.value {
         Ingress::LongPoll(poll) => {
             let path = format!("{path}.ingress.long_poll");
@@ -325,15 +307,6 @@ fn ingress(
                     max,
                     ingress.location,
                 );
-            }
-            match &hook.path {
-                Some(http) => paths.add(diag, format!("{path}.path"), &http.value, http.location),
-                None => paths.add(
-                    diag,
-                    format!("{path}.path"),
-                    &format!("/webhook/{name}"),
-                    ingress.location,
-                ),
             }
         }
     }
@@ -445,6 +418,27 @@ fn check_name(diag: &mut Diagnostics, path: &str, name: &str, location: Location
     }
 }
 
+/// Whether `command`, without one optional leading `/`, is a name Telegram
+/// can send: `[A-Za-z0-9_]{1,32}`.
+pub(super) fn valid_command(command: &str) -> bool {
+    let name = command.strip_prefix('/').unwrap_or(command);
+    (1..=32).contains(&name.len()) && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn commands(diag: &mut Diagnostics, path: &str, commands: &[At<String>]) {
+    for (k, command) in commands.iter().enumerate() {
+        if !valid_command(&command.value) {
+            diag.errors.push(
+                ConfigError::new(format!("invalid command `{}`", command.value))
+                    .at(located(format!("{path}.match.commands[{k}]"), command.location))
+                    .hint(
+                        "a command is 1 to 32 ASCII letters, digits or `_`, optionally after `/`, with no `@bot` suffix",
+                    ),
+            );
+        }
+    }
+}
+
 /// Rejects humantime's month and year units.
 fn duration(diag: &mut Diagnostics, path: impl Into<String>, value: &At<HumanDuration>) {
     if let Some(unit) = value.value.calendar_unit() {
@@ -482,24 +476,31 @@ fn in_range(diag: &mut Diagnostics, path: String, value: &At<u32>, fallback: Loc
     }
 }
 
-/// Every configured HTTP path, keyed by path, with the YAML path of its
-/// first use.
+/// Every configured HTTP path, keyed by its expanded value, with the YAML
+/// path of its first use. Expanded paths may hold secrets, so messages
+/// never quote them.
 #[derive(Default)]
-struct HttpPaths {
+pub(super) struct HttpPaths {
     seen: HashMap<String, String>,
 }
 
 impl HttpPaths {
-    fn add(&mut self, diag: &mut Diagnostics, yaml_path: String, http: &str, location: Location) {
+    pub(super) fn add(
+        &mut self,
+        diag: &mut Diagnostics,
+        yaml_path: String,
+        http: &str,
+        location: Location,
+    ) {
         if let Some(problem) = path_problem(http) {
-            diag.error(yaml_path, location, format!("path `{http}` {problem}"));
+            diag.error(yaml_path, location, format!("the path {problem}"));
             return;
         }
         if let Some(first) = self.seen.get(http) {
             diag.error(
                 yaml_path,
                 location,
-                format!("path `{http}` is already used by {first}"),
+                format!("the path is already used by {first}"),
             );
         } else {
             self.seen.insert(http.to_owned(), yaml_path);

@@ -108,6 +108,7 @@ pub struct Server {
     /// Proxies whose `X-Forwarded-For` is trusted, as networks.
     pub trusted_proxies: Vec<Cidr>,
     /// Most open connections.
+    #[schemars(range(min = 1))]
     pub max_connections: At<usize>,
     /// How long a client may take to send the request headers.
     pub header_read_timeout: At<HumanDuration>,
@@ -198,8 +199,9 @@ pub struct LongPoll {
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Webhook {
     /// HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.
+    /// Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<At<String>>,
+    pub path: Option<Template>,
     /// The public HTTPS URL of `path`, for `setWebhook`. Supports `${env:…}`
     /// and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,8 +251,10 @@ pub struct Match {
     pub chat_ids: Vec<i64>,
     pub chat_types: Vec<ChatType>,
     pub user_ids: Vec<i64>,
-    /// Commands, with or without the leading `/`; no `@bot` suffix.
-    pub commands: Vec<String>,
+    /// Commands, with or without the leading `/`: 1 to 32 ASCII letters,
+    /// digits or `_`, with no `@bot` suffix.
+    #[schemars(inner(regex(pattern = "^/?[A-Za-z0-9_]{1,32}$")))]
+    pub commands: Vec<At<String>>,
     /// Message text or caption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextMatch>,
@@ -309,6 +313,7 @@ pub struct Split {
     pub among: Vec<At<Target>>,
     /// One weight per `among` entry, each above 0; only with `weighted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(range(min = 1)))]
     pub weights: Option<At<Vec<At<u32>>>>,
 }
 
@@ -339,6 +344,7 @@ pub enum Consumer {
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Pull {
     /// Most queued updates.
+    #[schemars(range(min = 1))]
     pub capacity: At<usize>,
     /// Most queued bytes.
     pub capacity_bytes: At<ByteSize>,
@@ -350,8 +356,9 @@ pub struct Pull {
     /// Bearer token pollers must send.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<SecretText>,
-    /// Extra HTTP paths serving this consumer.
-    pub aliases: Vec<At<String>>,
+    /// Extra HTTP paths serving this consumer. Each supports `${env:…}`
+    /// and `${file:…}`.
+    pub aliases: Vec<Template>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -363,11 +370,13 @@ pub struct Push {
     pub balance: Balance,
     /// Most requests in flight over all endpoints.
     #[serde(default = "defaults::max_in_flight")]
+    #[schemars(range(min = 1))]
     pub max_in_flight: At<usize>,
     #[serde(default = "defaults::ordering")]
     pub ordering: Ordering,
     /// Most queued updates.
     #[serde(default = "defaults::capacity")]
+    #[schemars(range(min = 1))]
     pub capacity: At<usize>,
     /// Most queued bytes.
     #[serde(default = "defaults::capacity_bytes")]
@@ -429,6 +438,7 @@ pub struct Retry {
     /// Longest backoff.
     pub max: At<HumanDuration>,
     /// Attempts before the update is dead-lettered; at least 1.
+    #[schemars(range(min = 1))]
     pub max_attempts: At<u32>,
     /// Age after which the update is dead-lettered.
     pub max_age: At<HumanDuration>,
@@ -439,6 +449,7 @@ pub struct Retry {
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Breaker {
     /// Consecutive failures that open the breaker; at least 1.
+    #[schemars(range(min = 1))]
     pub failure_threshold: At<u32>,
     /// How long the breaker stays open.
     pub open_for: At<HumanDuration>,
@@ -526,10 +537,18 @@ impl Serialize for SecretText {
     }
 }
 
-/// A URL or file path as written, before `${env:…}`/`${file:…}` expansion.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// A URL or path as written, before `${env:…}`/`${file:…}` expansion.
+/// `Debug` masks URL credentials and bot tokens.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Template(pub At<String>);
+
+impl fmt::Debug for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redactor = tgin_runtime::secret::Redactor::new(Vec::new());
+        fmt::Debug::fmt(&super::sensitive::mask_written(&self.0.value, &redactor), f)
+    }
+}
 
 /// A duration such as `30s`, `5m` or `1h 30m`, keeping its text.
 #[derive(Clone, Debug, PartialEq, Eq)]

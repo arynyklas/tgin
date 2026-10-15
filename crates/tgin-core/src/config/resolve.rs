@@ -1,6 +1,7 @@
 //! The resolved config: secrets expanded, URLs parsed, names replaced by
-//! dense ids and routes compiled-checked.
+//! dense ids and rules compile-checked.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,14 @@ use indexmap::IndexMap;
 use ipnet::IpNet;
 use serde_saphyr::Location;
 use tgin_runtime::breaker::BreakerConfig;
-use tgin_runtime::config::{ConfigError, Env, InterpError, interpolate};
+use tgin_runtime::config::{ConfigError, Env, interpolate};
 use tgin_runtime::queue::{self, QueueConfig};
 use tgin_runtime::secret::Secret;
 use url::Url;
 
 use super::model::{self as raw, At, Name, RawConfig, SecretText, Template};
-use super::validate::{Diagnostics, located};
+use super::sensitive::{Masker, Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
+use super::validate::{Diagnostics, HttpPaths, located, valid_command};
 use crate::facts::ChatType;
 use crate::ids::{ConsumerId, SourceId};
 use crate::rules::{self, Predicates, RouteTable, RuleError, RuleSpec, TargetSpec};
@@ -24,7 +26,10 @@ use crate::rules::{self, Predicates, RouteTable, RuleError, RuleSpec, TargetSpec
 pub use super::model::{Balance, LogFormat, LogLevel};
 
 /// A loaded, valid configuration. Its rules compile into a [`RouteTable`].
-#[derive(Clone, Debug)]
+///
+/// `Debug` never shows secrets: they are [`Secret`]s, and URLs and paths
+/// are [`Sensitive`].
+#[derive(Clone)]
 pub struct Config {
     pub runtime: Runtime,
     pub log: Log,
@@ -41,6 +46,24 @@ pub struct Config {
     /// The config as written, for `/v1/config` (see
     /// [`redacted_json`](super::redacted_json)).
     pub raw: RawConfig,
+    /// Masks the config's secrets in [`redacted_json`](super::redacted_json).
+    pub(super) masker: Masker,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `raw` holds URLs and paths as written; it is left out.
+        f.debug_struct("Config")
+            .field("runtime", &self.runtime)
+            .field("log", &self.log)
+            .field("server", &self.server)
+            .field("admin", &self.admin)
+            .field("reload", &self.reload)
+            .field("bots", &self.bots)
+            .field("consumers", &self.consumers)
+            .field("warnings", &self.warnings)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,8 +91,8 @@ pub struct Server {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tls {
-    pub cert_file: PathBuf,
-    pub key_file: PathBuf,
+    pub cert_file: SensitivePath,
+    pub key_file: SensitivePath,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,13 +114,17 @@ pub struct Bot {
     pub id: SourceId,
     pub name: String,
     pub token: Secret<String>,
-    pub api_url: Url,
+    pub api_url: SensitiveUrl,
     pub ingress: Option<Ingress>,
     /// In order; the first match wins.
     pub rules: Vec<RuleSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once per config load; boxing would only complicate callers"
+)]
 pub enum Ingress {
     LongPoll(LongPoll),
     Webhook(Webhook),
@@ -113,16 +140,16 @@ pub struct LongPoll {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Webhook {
-    pub path: String,
+    pub path: SensitiveRoute,
     /// Always `https`.
-    pub public_url: Option<Url>,
+    pub public_url: Option<SensitiveUrl>,
     pub register: bool,
     pub secret_token: WebhookSecret,
     pub allowed_updates: Option<Vec<String>>,
     pub max_connections: Option<u32>,
     pub drop_pending_updates: bool,
     pub ip_address: Option<IpAddr>,
-    pub certificate_file: Option<PathBuf>,
+    pub certificate_file: Option<SensitivePath>,
     pub ip_allowlist: IpAllowlist,
 }
 
@@ -158,7 +185,7 @@ pub enum ConsumerKind {
 pub struct Pull {
     pub queue: QueueConfig,
     pub auth_token: Option<Secret<String>>,
-    pub aliases: Vec<String>,
+    pub aliases: Vec<SensitiveRoute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,7 +204,7 @@ pub struct Push {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     /// `http` or `https`.
-    pub url: Url,
+    pub url: SensitiveUrl,
     pub secret_token: Option<Secret<String>>,
     pub timeout: Duration,
 }
@@ -190,23 +217,24 @@ pub struct Retry {
     pub max_age: Duration,
 }
 
-/// Expands secrets, URLs and file paths, resolves names to ids and compiles
-/// the rules of each bot whose `rules_ok` entry is set. Errors go to `diag`;
-/// the returned config is only meaningful if there are none.
+/// Expands secrets, URLs and paths, checks HTTP paths, resolves names to
+/// ids and compiles every rule. Errors go to `diag`; the returned config is
+/// only meaningful if there are none.
 pub(super) fn resolve(
     raw: RawConfig,
     env: &dyn Env,
     base_dir: &Path,
-    rules_ok: &[Vec<bool>],
     diag: &mut Diagnostics,
 ) -> Config {
     let mut r = Resolver {
         env,
         base_dir,
         diag,
+        secrets: Vec::new(),
+        paths: HttpPaths::default(),
     };
     let consumers = r.consumers(&raw.consumers);
-    let bots = r.bots(&raw, rules_ok);
+    let bots = r.bots(&raw);
     let server = raw.server.as_ref().map(|server| r.server(server));
     let admin = Admin {
         listen: raw.admin.listen.iter().map(|a| a.value).collect(),
@@ -220,7 +248,8 @@ pub(super) fn resolve(
     if r.diag.errors.is_empty() {
         r.compile_all(&raw, &bots);
     }
-    Config {
+    let masker = Masker::new(r.secrets);
+    let mut config = Config {
         runtime: Runtime {
             worker_threads: match raw.runtime.worker_threads {
                 raw::WorkerThreads::Auto => None,
@@ -244,6 +273,45 @@ pub(super) fn resolve(
         consumers,
         warnings: Vec::new(),
         raw,
+        masker,
+    };
+    mask(&mut config);
+    config
+}
+
+/// Renders every [`Sensitive`] field with the config's secrets masked.
+fn mask(config: &mut Config) {
+    let redactor = config.masker.clone();
+    let redactor = redactor.redactor();
+    if let Some(tls) = config.server.as_mut().and_then(|s| s.tls.as_mut()) {
+        tls.cert_file.mask(redactor);
+        tls.key_file.mask(redactor);
+    }
+    for bot in &mut config.bots {
+        bot.api_url.mask(redactor);
+        if let Some(Ingress::Webhook(hook)) = &mut bot.ingress {
+            hook.path.mask(redactor);
+            if let Some(url) = &mut hook.public_url {
+                url.mask(redactor);
+            }
+            if let Some(file) = &mut hook.certificate_file {
+                file.mask(redactor);
+            }
+        }
+    }
+    for consumer in &mut config.consumers {
+        match &mut consumer.kind {
+            ConsumerKind::Pull(pull) => {
+                for alias in &mut pull.aliases {
+                    alias.mask(redactor);
+                }
+            }
+            ConsumerKind::Push(push) => {
+                for endpoint in &mut push.endpoints {
+                    endpoint.url.mask(redactor);
+                }
+            }
+        }
     }
 }
 
@@ -251,32 +319,32 @@ struct Resolver<'a> {
     env: &'a dyn Env,
     base_dir: &'a Path,
     diag: &'a mut Diagnostics,
+    /// Every expanded secret, for masking.
+    secrets: Vec<String>,
+    paths: HttpPaths,
 }
 
 impl Resolver<'_> {
-    /// Expands references in a secret. Errors never quote the value.
+    /// Expands references in a secret. Errors never quote any of its text:
+    /// an unknown scheme or a variable name may be part of the secret.
     fn secret(&mut self, path: impl Into<String>, text: &SecretText) -> Option<Secret<String>> {
         let path = path.into();
-        let value = match interpolate(&text.0.value, self.env, self.base_dir) {
-            Ok(value) => value,
-            Err(InterpError::BadSyntax(_)) => {
-                self.diag.errors.push(
-                    ConfigError::new("bad interpolation: a `${…}` reference is malformed")
-                        .at(located(path, text.0.location))
-                        .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
-                );
-                return None;
-            }
-            Err(err) => {
-                self.diag.error(path, text.0.location, err.to_string());
-                return None;
-            }
+        let Ok(value) = interpolate(&text.0.value, self.env, self.base_dir) else {
+            self.diag.errors.push(
+                ConfigError::new(
+                    "cannot expand the secret: a `${…}` reference is malformed, names an unset variable or an unreadable file",
+                )
+                .at(located(path, text.0.location))
+                .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
+            );
+            return None;
         };
         if value.is_empty() {
             self.diag
                 .error(path, text.0.location, "the secret is empty");
             return None;
         }
+        self.secrets.push(value.clone());
         Some(Secret::new(value))
     }
 
@@ -290,12 +358,25 @@ impl Resolver<'_> {
         }
     }
 
-    fn file(&mut self, path: &str, text: &Template) -> Option<PathBuf> {
-        self.template(path, text).map(PathBuf::from)
+    fn file(&mut self, path: &str, text: &Template) -> Option<SensitivePath> {
+        let value = self.template(path, text)?;
+        if value.is_empty() {
+            self.diag
+                .error(path, text.0.location, "the file path is empty");
+            return None;
+        }
+        Some(Sensitive::new(PathBuf::from(value), &text.0.value))
+    }
+
+    /// An HTTP route path, checked against every other configured path.
+    fn route(&mut self, path: String, text: &Template) -> Option<SensitiveRoute> {
+        let value = self.template(&path, text)?;
+        self.paths.add(self.diag, path, &value, text.0.location);
+        Some(Sensitive::new(value, &text.0.value))
     }
 
     /// An `http` or `https` URL; only `https` if `https_only`.
-    fn url(&mut self, path: &str, text: &Template, https_only: bool) -> Option<Url> {
+    fn url(&mut self, path: &str, text: &Template, https_only: bool) -> Option<SensitiveUrl> {
         let value = self.template(path, text)?;
         // The URL may carry credentials, so the error does not quote it.
         let url = match Url::parse(&value) {
@@ -320,7 +401,7 @@ impl Resolver<'_> {
             );
             return None;
         }
-        Some(url)
+        Some(Sensitive::new(url, &text.0.value))
     }
 
     fn server(&mut self, server: &raw::Server) -> Server {
@@ -349,20 +430,31 @@ impl Resolver<'_> {
                 break;
             };
             let kind = match &consumer.value {
-                raw::Consumer::Pull(pull) => ConsumerKind::Pull(Pull {
-                    queue: QueueConfig {
-                        capacity: pull.capacity.value,
-                        capacity_bytes: bytes(pull.capacity_bytes.value),
-                        lease_timeout: pull.lease_timeout.value.get(),
-                        ordering: ordering(pull.ordering),
-                        on_full: on_full(pull.on_full),
-                    },
-                    auth_token: pull
+                raw::Consumer::Pull(pull) => {
+                    let auth_token = pull
                         .auth_token
                         .as_ref()
-                        .and_then(|t| self.secret(format!("{path}.pull.auth_token"), t)),
-                    aliases: pull.aliases.iter().map(|a| a.value.clone()).collect(),
-                }),
+                        .and_then(|t| self.secret(format!("{path}.pull.auth_token"), t));
+                    let aliases = pull
+                        .aliases
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, alias)| {
+                            self.route(format!("{path}.pull.aliases[{k}]"), alias)
+                        })
+                        .collect();
+                    ConsumerKind::Pull(Pull {
+                        queue: QueueConfig {
+                            capacity: pull.capacity.value,
+                            capacity_bytes: bytes(pull.capacity_bytes.value),
+                            lease_timeout: pull.lease_timeout.value.get(),
+                            ordering: ordering(pull.ordering),
+                            on_full: on_full(pull.on_full),
+                        },
+                        auth_token,
+                        aliases,
+                    })
+                }
                 raw::Consumer::Push(push) => ConsumerKind::Push(self.push(&path, push)),
             };
             out.push(Consumer {
@@ -412,7 +504,7 @@ impl Resolver<'_> {
         }
     }
 
-    fn bots(&mut self, raw: &RawConfig, rules_ok: &[Vec<bool>]) -> Vec<Bot> {
+    fn bots(&mut self, raw: &RawConfig) -> Vec<Bot> {
         let mut out = Vec::with_capacity(raw.bots.len());
         for (index, bot) in raw.bots.iter().enumerate() {
             let path = format!("bots[{index}]");
@@ -424,20 +516,11 @@ impl Resolver<'_> {
             let ingress = bot
                 .ingress
                 .as_ref()
-                .map(|ingress| self.ingress(&path, bot.name.value.as_str(), &ingress.value));
+                .map(|ingress| self.ingress(&path, bot.name.value.as_str(), ingress));
             let mut rules = Vec::with_capacity(bot.routes.len());
             for (j, route) in bot.routes.iter().enumerate() {
-                let Some(spec) = rule_spec(&route.value, &raw.consumers) else {
-                    continue;
-                };
-                let ok = rules_ok
-                    .get(index)
-                    .and_then(|bot| bot.get(j))
-                    .copied()
-                    .unwrap_or(false);
-                if ok {
-                    self.compile_rule(&format!("{path}.routes[{j}]"), route.location, &spec);
-                }
+                let spec = rule_spec(&route.value, &raw.consumers);
+                self.compile_rule(&format!("{path}.routes[{j}]"), route.location, &spec);
                 rules.push(spec);
             }
             if let (Some(token), Some(api_url)) = (token, api_url) {
@@ -454,8 +537,8 @@ impl Resolver<'_> {
         out
     }
 
-    fn ingress(&mut self, path: &str, name: &str, ingress: &raw::Ingress) -> Ingress {
-        match ingress {
+    fn ingress(&mut self, path: &str, name: &str, ingress: &At<raw::Ingress>) -> Ingress {
+        match &ingress.value {
             raw::Ingress::LongPoll(poll) => Ingress::LongPoll(LongPoll {
                 timeout: poll.timeout.value.get(),
                 limit: poll.limit.value,
@@ -464,11 +547,18 @@ impl Resolver<'_> {
             }),
             raw::Ingress::Webhook(hook) => {
                 let path = format!("{path}.ingress.webhook");
+                let route = match &hook.path {
+                    Some(text) => self.route(format!("{path}.path"), text),
+                    None => {
+                        let default = Template(At {
+                            value: format!("/webhook/{name}"),
+                            location: ingress.location,
+                        });
+                        self.route(format!("{path}.path"), &default)
+                    }
+                };
                 Ingress::Webhook(Webhook {
-                    path: hook
-                        .path
-                        .as_ref()
-                        .map_or_else(|| format!("/webhook/{name}"), |p| p.value.clone()),
+                    path: route.unwrap_or_else(|| Sensitive::new(String::new(), "")),
                     public_url: hook
                         .public_url
                         .as_ref()
@@ -543,13 +633,41 @@ impl Resolver<'_> {
                 self.diag
                     .error(format!("bots[{index}].routes[{rule}]"), location, message);
             }
-            RuleError::DuplicateSource(_) | RuleError::RegexSet(_) => {
-                self.diag
-                    .errors
-                    .push(ConfigError::new(format!("routing rules: {message}")));
+            RuleError::RegexSet(_) => {
+                let (path, location) = first_regex_route(raw).unwrap_or_else(|| bots_at(raw));
+                self.diag.errors.push(
+                    ConfigError::new(message)
+                        .at(located(path, location))
+                        .hint("the regex size limits apply to the `regex` matches of every bot and rule together"),
+                );
+            }
+            RuleError::DuplicateSource(_) => {
+                let (path, location) = bots_at(raw);
+                self.diag.error(path, location, message);
             }
         }
     }
+}
+
+/// The first rule with a `regex` match, as (path, location).
+fn first_regex_route(raw: &RawConfig) -> Option<(String, Location)> {
+    let is_regex = |m: &Option<raw::TextMatch>| matches!(m, Some(raw::TextMatch::Regex(_)));
+    raw.bots.iter().enumerate().find_map(|(i, bot)| {
+        bot.routes.iter().enumerate().find_map(|(j, route)| {
+            let m = route.value.r#match.as_ref()?;
+            (is_regex(&m.text) || is_regex(&m.callback_data))
+                .then(|| (format!("bots[{i}].routes[{j}]"), route.location))
+        })
+    })
+}
+
+/// The `bots` list, located at its first bot.
+fn bots_at(raw: &RawConfig) -> (String, Location) {
+    let location = raw
+        .bots
+        .first()
+        .map_or(Location::UNKNOWN, |bot| bot.name.location);
+    ("bots".to_owned(), location)
 }
 
 /// The reason of a rule error, without the source and rule numbers that the
@@ -561,12 +679,15 @@ fn rule_message(err: &RuleError) -> String {
     }
 }
 
-/// The rule, or `None` if a target names an unknown consumer (which
-/// validation reports).
-fn rule_spec(
-    route: &raw::Route,
-    consumers: &IndexMap<Name, At<raw::Consumer>>,
-) -> Option<RuleSpec> {
+/// Stands in for a consumer that does not exist, so that the rule's other
+/// problems are still found. Validation reports the unknown name.
+const PLACEHOLDER: ConsumerId = ConsumerId(u16::MAX);
+
+/// The rule as the engine runs it. Parts that validation already rejected
+/// (unknown consumers, invalid commands, bad weights) are replaced with
+/// stand-ins so that compiling the rule reports only its other problems;
+/// for a valid config the result is exact.
+fn rule_spec(route: &raw::Route, consumers: &IndexMap<Name, At<raw::Consumer>>) -> RuleSpec {
     let predicates = route
         .r#match
         .as_ref()
@@ -575,50 +696,59 @@ fn rule_spec(
             chat_ids: m.chat_ids.clone(),
             chat_types: m.chat_types.iter().map(|t| chat_type(*t)).collect(),
             user_ids: m.user_ids.clone(),
-            commands: m.commands.clone(),
+            commands: m
+                .commands
+                .iter()
+                .filter(|c| valid_command(&c.value))
+                .map(|c| c.value.clone())
+                .collect(),
             text: m.text.as_ref().map(text_match),
             callback_data: m.callback_data.as_ref().map(text_match),
         });
-    let targets = route
-        .to
-        .iter()
-        .map(|t| target_spec(t, consumers))
-        .collect::<Option<Vec<_>>>()?;
-    Some(RuleSpec {
+    RuleSpec {
         predicates,
-        targets,
-    })
+        targets: route.to.iter().map(|t| target_spec(t, consumers)).collect(),
+    }
 }
 
 fn target_spec(
     target: &At<raw::Target>,
     consumers: &IndexMap<Name, At<raw::Consumer>>,
-) -> Option<TargetSpec> {
-    let children = |list: &[At<raw::Target>]| {
-        list.iter()
-            .map(|t| target_spec(t, consumers))
-            .collect::<Option<Vec<_>>>()
+) -> TargetSpec {
+    let children = |list: &[At<raw::Target>]| -> Vec<TargetSpec> {
+        list.iter().map(|t| target_spec(t, consumers)).collect()
     };
-    Some(match &target.value {
-        raw::Target::Consumer(name) => {
-            let index = consumers.get_index_of(name.as_str())?;
-            TargetSpec::Consumer(ConsumerId(u16::try_from(index).ok()?))
-        }
-        raw::Target::All(list) => TargetSpec::All(children(list)?),
-        raw::Target::Split(split) => TargetSpec::Split {
-            strategy: match split.strategy.value {
-                raw::SplitStrategy::RoundRobin => rules::SplitStrategy::RoundRobin,
-                raw::SplitStrategy::HashChat => rules::SplitStrategy::HashChat,
-                raw::SplitStrategy::Weighted => rules::SplitStrategy::Weighted,
-            },
-            among: children(&split.among)?,
-            weights: split
+    match &target.value {
+        raw::Target::Consumer(name) => TargetSpec::Consumer(
+            consumers
+                .get_index_of(name.as_str())
+                .and_then(|index| u16::try_from(index).ok())
+                .map_or(PLACEHOLDER, ConsumerId),
+        ),
+        raw::Target::All(list) => TargetSpec::All(children(list)),
+        raw::Target::Split(split) => {
+            let among = children(&split.among);
+            let weights: Vec<u32> = split
                 .weights
                 .as_ref()
                 .map(|w| w.value.iter().map(|w| w.value).collect())
-                .unwrap_or_default(),
-        },
-    })
+                .unwrap_or_default();
+            let (strategy, weights) = match split.strategy.value {
+                raw::SplitStrategy::RoundRobin => (rules::SplitStrategy::RoundRobin, Vec::new()),
+                raw::SplitStrategy::HashChat => (rules::SplitStrategy::HashChat, Vec::new()),
+                raw::SplitStrategy::Weighted => {
+                    let valid = weights.len() == among.len() && !weights.contains(&0);
+                    let weights = if valid { weights } else { vec![1; among.len()] };
+                    (rules::SplitStrategy::Weighted, weights)
+                }
+            };
+            TargetSpec::Split {
+                strategy,
+                among,
+                weights,
+            }
+        }
+    }
 }
 
 fn chat_type(t: raw::ChatType) -> ChatType {

@@ -88,7 +88,7 @@ impl JsonSchema for HumanDuration {
         json_schema!({
             "description": "A duration such as `500ms`, `30s`, `5m` or `1h 30m`. Month (`M`) and year (`y`) units are rejected.",
             "type": "string",
-            "pattern": "^\\s*([0-9]+\\s*[a-zA-Zµ]+\\s*)+$",
+            "pattern": "^\\s*([0-9]+\\s*(nanos|nsec|ns|usec|us|µs|millis|msec|ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)\\s*)+$",
             "examples": ["30s", "5m"]
         })
     }
@@ -101,10 +101,10 @@ impl JsonSchema for ByteSize {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "A size: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
+            "description": "A size of at least 1 byte: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
             "oneOf": [
-                { "type": "integer", "minimum": 0 },
-                { "type": "string", "pattern": "^\\s*[0-9]+\\s*(B|KiB|MiB|GiB)?\\s*$" }
+                { "type": "integer", "minimum": 1 },
+                { "type": "string", "pattern": "^\\s*0*[1-9][0-9]*\\s*(B|KiB|MiB|GiB)?\\s*$" }
             ],
             "examples": ["64MiB", "512KiB", 1048576]
         })

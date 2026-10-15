@@ -49,14 +49,16 @@ fn render(errors: &[ConfigError]) -> String {
         .join("\n")
 }
 
-/// The 1-based line and column of the first `needle` in `text`.
+/// The 1-based line and column (in characters) of the first `needle` in
+/// `text`.
 fn pos(text: &str, needle: &str) -> (u32, u32) {
     let offset = text
         .find(needle)
         .unwrap_or_else(|| panic!("`{needle}` is not in the text"));
     let before = &text[..offset];
     let line = before.matches('\n').count() + 1;
-    let column = offset - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let column = before[line_start..].chars().count() + 1;
     (line as u32, column as u32)
 }
 
@@ -122,8 +124,8 @@ fn example_full_config_loads() {
         ["0.0.0.0:8080".parse::<SocketAddr>().unwrap()]
     );
     let tls = server.tls.as_ref().unwrap();
-    assert_eq!(tls.cert_file, Path::new("/tls/tls.crt"));
-    assert_eq!(tls.key_file, Path::new("/tls/tls.key"));
+    assert_eq!(tls.cert_file.expose(), Path::new("/tls/tls.crt"));
+    assert_eq!(tls.key_file.expose(), Path::new("/tls/tls.key"));
     assert_eq!(server.trusted_proxies, ["10.0.0.0/8".parse().unwrap()]);
     assert_eq!(
         cfg.admin.token.as_ref().map(|t| t.expose().as_str()),
@@ -140,7 +142,10 @@ fn example_full_config_loads() {
     assert_eq!(workers.queue.lease_timeout, secs(120));
     assert_eq!(push(&cfg, "analytics").on_full, OnFull::DropOldest);
     let admin = push(&cfg, "admin");
-    assert_eq!(admin.endpoints[0].url.as_str(), "http://admin:8080/hook");
+    assert_eq!(
+        admin.endpoints[0].url.expose().as_str(),
+        "http://admin:8080/hook"
+    );
     assert_eq!(
         admin.endpoints[0]
             .secret_token
@@ -155,7 +160,7 @@ fn example_full_config_loads() {
     };
     assert_eq!(shop.name, "shop");
     assert_eq!(shop.token.expose(), "123456:shop-token-value");
-    assert_eq!(shop.api_url.as_str(), "https://api.telegram.org/");
+    assert_eq!(shop.api_url.expose().as_str(), "https://api.telegram.org/");
     let Some(Ingress::LongPoll(poll)) = &shop.ingress else {
         panic!("{:?}", shop.ingress);
     };
@@ -224,7 +229,10 @@ fn defaults_applied() {
     assert_eq!(cfg.reload.drain_timeout, secs(30));
 
     let poller = &cfg.bots[0];
-    assert_eq!(poller.api_url.as_str(), "https://api.telegram.org/");
+    assert_eq!(
+        poller.api_url.expose().as_str(),
+        "https://api.telegram.org/"
+    );
     let Some(Ingress::LongPoll(poll)) = &poller.ingress else {
         panic!("{:?}", poller.ingress);
     };
@@ -236,7 +244,7 @@ fn defaults_applied() {
     let Some(Ingress::Webhook(hook)) = &cfg.bots[1].ingress else {
         panic!("{:?}", cfg.bots[1].ingress);
     };
-    assert_eq!(hook.path, "/webhook/hooked");
+    assert_eq!(hook.path.expose(), "/webhook/hooked");
     assert_eq!(hook.public_url, None);
     assert!(!hook.register);
     assert_eq!(hook.secret_token, WebhookSecret::Auto);
@@ -594,7 +602,7 @@ consumers:
     );
     assert_message(
         &errors[0],
-        "`/webhook/a` is already used by consumers.q.pull.aliases[0]",
+        "the path is already used by consumers.q.pull.aliases[0]",
     );
     assert_at(
         &errors[1],
@@ -826,8 +834,6 @@ bots:
   - name: a
     token: t
     routes:
-      - match: { commands: ["/start@other"] }
-        to: [p]
       - match: { text: { prefix: [] } }
         to: [p]
       - to: [{ all: [] }]
@@ -840,9 +846,8 @@ consumers:
   p: { push: { endpoints: [{ url: "http://p/" }] } }
 "#;
     let errors = errors(yaml);
-    assert_eq!(errors.len(), 6, "{}", render(&errors));
+    assert_eq!(errors.len(), 5, "{}", render(&errors));
     let expected = [
-        ("match: { commands", "invalid command \"/start@other\""),
         ("match: { text: { prefix", "a text match has an empty list"),
         ("to: [{ all", "an `all` or `split` target has no children"),
         ("match: { text: { regex", "invalid regex \"(\""),
@@ -853,6 +858,84 @@ consumers:
         assert_at(err, &format!("bots[0].routes[{j}]"), pos(yaml, needle));
         assert_message(err, message);
     }
+}
+
+/// A rule with a bad target is still compiled, and each problem is
+/// reported once.
+#[test]
+fn rule_with_bad_target_still_compiled() {
+    let yaml = r#"version: 1
+bots:
+  - name: a
+    token: t
+    routes:
+      - match: { text: { regex: ["("] }, commands: ["a@b"] }
+        to: [nope, { split: { strategy: hash_chat, among: [p], weights: [1] } }, { all: [] }]
+consumers:
+  p: { push: { endpoints: [{ url: "http://p/" }] } }
+"#;
+    let errors = errors(yaml);
+    let paths: Vec<_> = errors
+        .iter()
+        .map(|e| e.at.as_ref().unwrap().path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "bots[0].routes[0]",
+            "bots[0].routes[0].match.commands[0]",
+            "bots[0].routes[0].to[0]",
+            "bots[0].routes[0].to[1].split.weights",
+        ],
+        "{}",
+        render(&errors)
+    );
+    // Compiling stops at the rule's first problem: here the regex.
+    assert_message(&errors[0], "invalid regex \"(\"");
+    assert_message(&errors[2], "unknown consumer `nope`");
+}
+
+#[test]
+fn rule_commands_are_telegram_names() {
+    let yaml = r#"version: 1
+bots:
+  - name: a
+    token: t
+    routes:
+      - match: { commands: [start, /help_me, "/старт", "a@bot", "/", aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, A_1] }
+        to: [p]
+consumers:
+  p: { push: { endpoints: [{ url: "http://p/" }] } }
+"#;
+    let errors = errors(yaml);
+    assert_eq!(errors.len(), 4, "{}", render(&errors));
+    for (err, (k, needle)) in errors.iter().zip([
+        (2, "\"/старт\""),
+        (3, "\"a@bot\""),
+        (4, "\"/\""),
+        (5, "aaaa"),
+    ]) {
+        assert_at(
+            err,
+            &format!("bots[0].routes[0].match.commands[{k}]"),
+            pos(yaml, needle),
+        );
+        assert_message(err, "invalid command");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("1 to 32 ASCII letters, digits or `_`")),
+            "{err}"
+        );
+    }
+    let cfg = loads(&yaml.replace(
+        r#", "/старт", "a@bot", "/", aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"#,
+        "",
+    ));
+    assert_eq!(
+        cfg.bots[0].rules[0].predicates.commands,
+        ["start", "/help_me", "A_1"]
+    );
 }
 
 #[test]
@@ -907,11 +990,11 @@ consumers:
 
     assert_eq!(cfg.admin.token.as_ref().unwrap().expose(), "admin-token");
     let tls = cfg.server.as_ref().unwrap().tls.as_ref().unwrap();
-    assert_eq!(tls.cert_file, Path::new("/tls/tls.crt"));
-    assert_eq!(tls.key_file, Path::new("/tls/tls.key"));
+    assert_eq!(tls.cert_file.expose(), Path::new("/tls/tls.crt"));
+    assert_eq!(tls.key_file.expose(), Path::new("/tls/tls.key"));
     let bot = &cfg.bots[0];
     assert_eq!(bot.token.expose(), "1:bot-token");
-    assert_eq!(bot.api_url.as_str(), "http://bot-api:8081/");
+    assert_eq!(bot.api_url.expose().as_str(), "http://bot-api:8081/");
     let Some(Ingress::Webhook(hook)) = &bot.ingress else {
         panic!("{:?}", bot.ingress);
     };
@@ -924,7 +1007,7 @@ consumers:
         "literal-$-token"
     );
     let p = push(&cfg, "p");
-    assert_eq!(p.endpoints[0].url.as_str(), "https://p.example/tg");
+    assert_eq!(p.endpoints[0].url.expose().as_str(), "https://p.example/tg");
     assert_eq!(
         p.endpoints[0].secret_token.as_ref().unwrap().expose(),
         "pre-fix"
@@ -940,7 +1023,7 @@ bots:
     token: t
     ingress: { long_poll: { allowed_updates: ["${env:NOT_EXPANDED}"] } }
     routes:
-      - match: { commands: ["${env:NOT_EXPANDED}"] }
+      - match: { text: { equals: ["${env:NOT_EXPANDED}"] } }
         to: [p]
       - to: [p]
 consumers:
@@ -955,8 +1038,8 @@ consumers:
         Some(&["${env:NOT_EXPANDED}".to_owned()][..])
     );
     assert_eq!(
-        cfg.bots[0].rules[0].predicates.commands,
-        ["${env:NOT_EXPANDED}"]
+        cfg.bots[0].rules[0].predicates.text,
+        Some(TextMatch::Equals(vec!["${env:NOT_EXPANDED}".into()]))
     );
 }
 
@@ -971,7 +1054,9 @@ bots:
     let errors = errors(yaml);
     assert_eq!(errors.len(), 2, "{}", render(&errors));
     assert_at(&errors[0], "bots[0].token", pos(yaml, "\"${env:NOPE}"));
-    assert_message(&errors[0], "environment variable NOPE is not set");
+    // A secret's error never quotes its text, not even a variable name.
+    assert_message(&errors[0], "cannot expand the secret");
+    assert!(!errors[0].to_string().contains("NOPE"), "{}", errors[0]);
     assert_at(&errors[1], "bots[0].api_url", pos(yaml, "\"${file:"));
     assert_message(&errors[1], "missing.txt");
 }
@@ -1104,4 +1189,187 @@ bots:
     let err = single_error(yaml);
     assert_message(&err, "exactly one key");
     assert_eq!(err.at.as_ref().map(|at| at.line), Some(6), "{err}");
+}
+
+fn env(vars: &[(&str, &str)]) -> MapEnv {
+    let mut env = MapEnv::default();
+    for (k, v) in vars {
+        env.vars.insert((*k).into(), (*v).into());
+    }
+    env
+}
+
+#[test]
+fn http_paths_interpolate() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: t
+    ingress: { webhook: { path: "/hook/${env:HOOK_SEGMENT}" } }
+consumers:
+  q: { pull: { aliases: ["${env:ALIAS}"] } }
+"#;
+    let env = env(&[("HOOK_SEGMENT", "s3cret-segment"), ("ALIAS", "/queue/q")]);
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let Some(Ingress::Webhook(hook)) = &cfg.bots[0].ingress else {
+        panic!("{:?}", cfg.bots[0].ingress);
+    };
+    assert_eq!(hook.path.expose(), "/hook/s3cret-segment");
+    assert_eq!(pull(&cfg, "q").aliases[0].expose(), "/queue/q");
+    // Debug shows the path as written.
+    let debug = format!("{cfg:?}");
+    assert!(!debug.contains("s3cret-segment"), "{debug}");
+    assert!(debug.contains("/hook/${env:HOOK_SEGMENT}"), "{debug}");
+}
+
+#[test]
+fn interpolated_path_checked_after_expansion() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: t
+    ingress: { webhook: { path: "${env:HOOK_PATH}" } }
+consumers:
+  q: { pull: { aliases: ["${env:ALIAS}"] } }
+"#;
+    let env = env(&[
+        ("HOOK_PATH", "/v1/s3cret-hook"),
+        ("ALIAS", "/webhook/s3cret-dup"),
+    ]);
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", render(&errors));
+    assert_at(
+        &errors[0],
+        "bots[0].ingress.webhook.path",
+        pos(yaml, "\"${env:HOOK_PATH}"),
+    );
+    assert_message(&errors[0], "which tgin reserves");
+    assert!(!render(&errors).contains("s3cret"), "{}", render(&errors));
+
+    // Uniqueness compares expanded paths.
+    let env = self::env(&[
+        ("HOOK_PATH", "/webhook/s3cret-dup"),
+        ("ALIAS", "/webhook/s3cret-dup"),
+    ]);
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", render(&errors));
+    assert_at(
+        &errors[0],
+        "bots[0].ingress.webhook.path",
+        pos(yaml, "\"${env:HOOK_PATH}"),
+    );
+    assert_message(&errors[0], "already used by consumers.q.pull.aliases[0]");
+    assert!(!render(&errors).contains("s3cret"), "{}", render(&errors));
+}
+
+#[test]
+fn urls_and_paths_masked_in_debug_and_json() {
+    let yaml = r#"version: 1
+server: {}
+admin: { token: configured-admin-token }
+bots:
+  - name: a
+    token: "1:t"
+    api_url: "${env:API_URL}"
+  - name: b
+    token: "2:t"
+    ingress: { webhook: { public_url: "https://bot.example/hook?key=qu3ry-secret", register: true } }
+consumers:
+  p:
+    push:
+      endpoints:
+        - url: "${env:PUSH_URL}"
+        - url: "https://api.telegram.org/bot123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq/sendMessage"
+        - url: "http://hooks.example/configured-admin-token/x"
+"#;
+    let env = env(&[
+        ("API_URL", "https://user:pa55word@bot-api.internal/"),
+        ("PUSH_URL", "https://push.example/tg?token=env-qu3ry"),
+    ]);
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let p = push(&cfg, "p");
+    assert_eq!(p.endpoints[0].url.expose().query(), Some("token=env-qu3ry"));
+    assert_eq!(cfg.bots[0].api_url.expose().password(), Some("pa55word"));
+
+    let debug = format!("{cfg:?}");
+    // `RawConfig`'s own Debug masks URL credentials and bot tokens; it does
+    // not know the config's secrets.
+    let raw_debug = format!("{:?}", cfg.raw);
+    let json = config::redacted_json(&cfg).to_string();
+    for leaked in [
+        "pa55word",
+        "env-qu3ry",
+        "qu3ry-secret",
+        "AAbbccddeeffgghhiijjkkllmmnnoopp_qq",
+        "configured-admin-token",
+    ] {
+        assert!(!debug.contains(leaked), "{leaked} in {debug}");
+        assert!(
+            leaked == "configured-admin-token" || !raw_debug.contains(leaked),
+            "{leaked} in {raw_debug}"
+        );
+        assert!(!json.contains(leaked), "{leaked} in {json}");
+    }
+    let json = config::redacted_json(&cfg);
+    let endpoints = &json["consumers"]["p"]["push"]["endpoints"];
+    assert_eq!(endpoints[0]["url"], "${env:PUSH_URL}");
+    assert_eq!(
+        endpoints[1]["url"],
+        "https://api.telegram.org/bot#####/sendMessage"
+    );
+    assert_eq!(endpoints[2]["url"], "http://hooks.example/#####/x");
+    assert_eq!(
+        json["bots"][1]["ingress"]["webhook"]["public_url"],
+        "https://bot.example/hook?[redacted]"
+    );
+}
+
+#[test]
+fn secret_errors_never_quote_the_secret() {
+    let yaml = "version: 1\nbots:\n  - name: a\n    token: \"p4ss${w0rd:x}\"\n";
+    let err = single_error(yaml);
+    assert_at(&err, "bots[0].token", pos(yaml, "\"p4ss"));
+    assert_message(&err, "cannot expand the secret");
+    for part in ["p4ss", "w0rd"] {
+        assert!(!err.to_string().contains(part), "{err}");
+    }
+}
+
+#[test]
+fn empty_file_path_rejected() {
+    let yaml = "version: 1\nserver:\n  tls: { cert_file: \"${env:EMPTY}\", key_file: /k }\n";
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env(&[("EMPTY", "")])).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", render(&errors));
+    assert_at(
+        &errors[0],
+        "server.tls.cert_file",
+        pos(yaml, "\"${env:EMPTY}"),
+    );
+    assert_message(&errors[0], "the file path is empty");
+}
+
+/// A combined-regex failure has no single rule; it is reported at the
+/// first rule with a regex.
+#[test]
+fn regex_set_error_located() {
+    // Each pattern compiles alone; together they exceed the NFA size limit.
+    let pattern = r"\w{150}";
+    let rules: String = (0..3)
+        .map(|_| {
+            format!("      - match: {{ text: {{ regex: ['{pattern}'] }} }}\n        to: [p]\n")
+        })
+        .collect();
+    let yaml = format!(
+        "version: 1\nbots:\n  - name: a\n    token: t\n    routes:\n      - to: [p]\n{rules}consumers:\n  p: {{ push: {{ endpoints: [{{ url: \"http://p/\" }}] }} }}\n"
+    );
+    let err = single_error(&yaml);
+    assert_at(&err, "bots[0].routes[1]", pos(&yaml, "match: { text"));
+    assert!(
+        err.hint.as_deref().is_some_and(|h| h.contains("together")),
+        "{err}"
+    );
 }
