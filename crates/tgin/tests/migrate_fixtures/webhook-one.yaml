@@ -28,9 +28,9 @@ bots:
           - split:
               strategy: round_robin
               among:
-                - push-10-5-0-11-webhook
+                - push-10-5-0-11-8080
 consumers:
-  push-10-5-0-11-webhook:
+  push-10-5-0-11-8080:
     push:
       endpoints:
         - url: "http://10.5.0.11:8080/webhook"

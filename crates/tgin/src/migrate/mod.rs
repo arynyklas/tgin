@@ -43,13 +43,22 @@ const API_DROPPED: &str = "`api` was dropped: tgin 1.0 has no route-management A
 const ADMIN_NOTE: &str = "tgin 0.2's auth_token. The status and metrics endpoints moved from the data port to admin.listen (default 127.0.0.1:9090).";
 const PUSH_NOTE: &str = "tgin 0.2 made one delivery attempt and dropped what its downstream did not take, never pausing the source; delete on_full and retry for tgin 1.0's backpressure and retries.";
 
-/// A converted config.
-#[derive(Debug)]
+/// A converted config. `Debug` shows the warnings and the YAML's length,
+/// never the YAML, which holds the config's values.
 pub struct Migration {
     /// The YAML document, headed by a comment listing the warnings.
     pub yaml: String,
     /// What the conversion changed or could not carry over.
     pub warnings: Vec<String>,
+}
+
+impl std::fmt::Debug for Migration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Migration")
+            .field("yaml_len", &self.yaml.len())
+            .field("warnings", &self.warnings)
+            .finish()
+    }
 }
 
 /// Converts the 0.2 RON config `text`.
@@ -256,6 +265,22 @@ impl<'r> Migrator<'r> {
             Node::Seq(vec![Node::string(&format!("0.0.0.0:{port}"))]),
         );
         if let Some(ssl) = &cfg.ssl {
+            let relative: Vec<&str> = [("`ssl.cert`", &ssl.cert), ("`ssl.key`", &ssl.key)]
+                .into_iter()
+                .filter(|(_, path)| is_relative(path))
+                .map(|(field, _)| field)
+                .collect();
+            if !relative.is_empty() {
+                let (is, them) = if relative.len() == 1 {
+                    ("is a relative path", "it")
+                } else {
+                    ("are relative paths", "them")
+                };
+                self.warnings.push(format!(
+                    "{} {is}: tgin 0.2 resolved {them} against its working directory, tgin 1.0 resolves {them} against the YAML file's directory; make {them} absolute or move the files",
+                    relative.join(" and "),
+                ));
+            }
             server = server.field(
                 "tls",
                 Node::map()
@@ -450,13 +475,17 @@ impl<'r> Migrator<'r> {
                 request_timeout_ms,
             } => {
                 self.pushes += 1;
+                // Only the origin names the consumer: 0.2 users often
+                // authenticated a downstream with a secret path segment, and
+                // names show up in logs, metrics and /v1/status.
                 let slug = if PLACEHOLDER.is_match(url) {
                     None
                 } else {
                     match url::Url::parse(url) {
-                        Ok(parsed) => parsed
-                            .host_str()
-                            .and_then(|host| self.slug_of(&format!("{host}{}", parsed.path()))),
+                        Ok(parsed) => parsed.host_str().and_then(|host| match parsed.port() {
+                            Some(port) => self.slug_of(&format!("{host}:{port}")),
+                            None => self.slug_of(host),
+                        }),
                         Err(_) => {
                             self.errors.push(format!("{at}.url is not a valid URL"));
                             None
@@ -584,6 +613,13 @@ fn bot_api_base<'u>(url: &'u str, token: &str, method: &str) -> Option<&'u str> 
 fn bot_api_base_and_token<'u>(url: &'u str, method: &str) -> Option<(&'u str, &'u str)> {
     let (base, token) = url.strip_suffix(method)?.rsplit_once("/bot")?;
     (!base.is_empty() && !token.is_empty() && !token.contains('/')).then_some((base, token))
+}
+
+/// Whether the written file path `text` is relative. One that starts with a
+/// placeholder may expand to either, so it is not reported.
+fn is_relative(text: &str) -> bool {
+    let path = Path::new(text);
+    !text.starts_with("${") && !path.is_absolute() && !path.has_root()
 }
 
 /// Lowercase ASCII letters and digits, with every other run of characters

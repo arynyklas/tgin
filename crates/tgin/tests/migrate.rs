@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use tgin::migrate::{Migration, migrate};
-use tgin_core::config::{self, Config, ConsumerKind, Ingress, WebhookSecret};
+use tgin_core::config::{self, Config, ConsumerKind, Ingress, LogFormat, LogLevel, WebhookSecret};
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::queue::OnFull;
 
@@ -197,7 +197,7 @@ fn multi_bot_with_pull_is_error() {
     assert_eq!(cfg.bots[0].name, "bot-1");
     assert_eq!(cfg.bots[1].name, "bot-2");
     assert_eq!(cfg.consumers.len(), 1);
-    assert_eq!(cfg.consumers[0].name, "push-a-example-hook");
+    assert_eq!(cfg.consumers[0].name, "push-a-example");
     for bot in &cfg.bots {
         assert_eq!(bot.rules.len(), 1, "{}: one catch-all rule", bot.name);
     }
@@ -377,7 +377,7 @@ fn placeholder_outside_a_string_is_error() {
 
 #[test]
 fn consumer_names_are_slugged_and_unique() {
-    let long = "x".repeat(80);
+    let long = format!("{0}.{0}.example", "x".repeat(40));
     let ron = format!(
         r#"(
         server_port: Some(3000),
@@ -385,35 +385,199 @@ fn consumer_names_are_slugged_and_unique() {
         route: AllLB(routes: [
             LongPollRoute(path: "/Bot1/getUpdates"),
             LongPollRoute(path: "/bot1//getupdates"),
+            LongPollRoute(path: "/poll/bot{TOKEN}"),
             WebhookRoute(url: "http://Hook.Example:1/x"),
-            WebhookRoute(url: "http://hook.example:2/x"),
-            WebhookRoute(url: "http://hook.example/bot{TOKEN}/x"),
-            RoundRobinLB(routes: [WebhookRoute(url: "http://h.example/{long}")]),
+            WebhookRoute(url: "http://hook.example:1/y"),
+            WebhookRoute(url: "http://hook.example/x"),
+            WebhookRoute(url: "https://hook.example:443/y"),
+            RoundRobinLB(routes: [WebhookRoute(url: "http://{long}/")]),
         ]),
     )"#
     );
     let out = migrated(&ron);
     let cfg = load(&out.yaml);
     let names: Vec<&str> = cfg.consumers.iter().map(|c| c.name.as_str()).collect();
-    let truncated = format!(
-        "push-h-example-{}",
-        "x".repeat(63 - "push-h-example-".len())
-    );
+    let truncated = format!("push-{}", "x".repeat(40) + "-" + &"x".repeat(17));
     assert_eq!(
         names,
         [
             "pull-bot1-getupdates",
             "pull-bot1-getupdates-2",
-            "push-hook-example-x",
-            "push-hook-example-x-2",
             // A token-shaped path never becomes part of a name.
-            "push-3",
+            "pull-3",
+            // Push consumers are named by host and explicit port only.
+            "push-hook-example-1",
+            "push-hook-example-1-2",
+            "push-hook-example",
+            // 443 is https's default port, so the URL names no port.
+            "push-hook-example-2",
             truncated.as_str(),
         ]
     );
     for name in &names {
         assert!(!name.contains("123456789"), "{name}");
     }
+}
+
+/// 0.2 sent no secret header, so a secret path segment often authenticated
+/// a push downstream; only the endpoint `url` may carry it.
+#[test]
+fn push_url_path_appears_only_in_the_endpoint_url() {
+    let ron = r#"(
+        updates: [LongPollUpdate(token: "1:a")],
+        route: AllLB(routes: [
+            WebhookRoute(url: "http://hook.example:8080/hook/s3cretpath"),
+            WebhookRoute(url: "http://hook.example:8080/other/s3cretpath2"),
+        ]),
+    )"#;
+    let out = migrated(ron);
+    let lines: Vec<&str> = out
+        .yaml
+        .lines()
+        .filter(|line| line.contains("s3cretpath"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            r#"        - url: "http://hook.example:8080/hook/s3cretpath""#,
+            r#"        - url: "http://hook.example:8080/other/s3cretpath2""#,
+        ],
+        "{}",
+        out.yaml
+    );
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("s3cret")),
+        "{:?}",
+        out.warnings
+    );
+    let cfg = load(&out.yaml);
+    let names: Vec<&str> = cfg.consumers.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["push-hook-example-8080", "push-hook-example-8080-2"]
+    );
+}
+
+/// The branches no shipped config reaches: TLS, log settings, long-poll
+/// parameters and dropped sleeps.
+#[test]
+fn settings_without_a_golden_map_and_warn() {
+    let ron = r#"(
+        server_port: Some(8443),
+        ssl: Some((cert: "certs/tls.crt", key: "/etc/tls/tls.key")),
+        log_level: "OFF",
+        log_format: Json,
+        updates: [
+            LongPollUpdate(token: "1:a", long_poll_timeout: 0, long_poll_limit: 0, default_timeout_sleep: 100),
+            LongPollUpdate(token: "2:b", long_poll_timeout: 90, long_poll_limit: 500, default_timeout_sleep: 7, error_timeout_sleep: 5),
+            LongPollUpdate(token: "3:c", long_poll_timeout: 10, long_poll_limit: 20),
+        ],
+        route: WebhookRoute(url: "http://a.example/"),
+    )"#;
+    let out = migrated(ron);
+    let w = &out.warnings;
+    assert_eq!(w.len(), 5, "{w:?}");
+    assert!(w[0].contains("`log_level` off"), "{}", w[0]);
+    assert!(
+        w[1].starts_with("`ssl.cert` is a relative path") && !w[1].contains("ssl.key"),
+        "{}",
+        w[1]
+    );
+    assert!(!w[1].contains("certs/tls.crt"), "{}", w[1]);
+    assert!(
+        w[2].starts_with("updates[0]: `default_timeout_sleep` was dropped"),
+        "{}",
+        w[2]
+    );
+    assert!(
+        w[3].starts_with("updates[0]: `long_poll_timeout: 0` is now 1s"),
+        "{}",
+        w[3]
+    );
+    assert!(
+        w[4].starts_with(
+            "updates[1]: `default_timeout_sleep` and `error_timeout_sleep` were dropped"
+        ),
+        "{}",
+        w[4]
+    );
+
+    let cfg = config::load(
+        &out.yaml,
+        &Path::new("/etc/tgin").join("tgin.yaml"),
+        &MapEnv::default(),
+    )
+    .unwrap_or_else(|errors| panic!("{errors:?}\n{}", out.yaml));
+    assert_eq!(cfg.log.level, LogLevel::Error);
+    assert_eq!(cfg.log.format, LogFormat::Json);
+    let tls = cfg
+        .server
+        .as_ref()
+        .and_then(|s| s.tls.as_ref())
+        .expect("tls");
+    assert_eq!(
+        tls.cert_file.expose(),
+        &Path::new("/etc/tgin").join("certs/tls.crt")
+    );
+    assert_eq!(tls.key_file.expose(), Path::new("/etc/tls/tls.key"));
+    let polls: Vec<(u64, u32)> = cfg
+        .bots
+        .iter()
+        .map(|bot| match &bot.ingress {
+            Some(Ingress::LongPoll(poll)) => (poll.timeout.as_secs(), poll.limit),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    // 0.2 capped at Telegram's limits (50 s, 1 to 100); v1 rejects beyond.
+    assert_eq!(polls, [(1, 1), (50, 100), (10, 20)]);
+}
+
+#[test]
+fn unconvertible_webhook_and_placeholder_values_are_errors() {
+    // A setWebhook URL tgin 1.0 cannot rebuild from `api_url`.
+    let ron = r#"(server_port: Some(1), updates: [WebhookUpdate(path: "/hook", registration: Some((public_ip: "https://bot.example", set_webhook_url: Some("http://bot-api.internal/custom/setWebhook"), token: "1:a")))], route: WebhookRoute(url: "http://a/"))"#;
+    let found = errors(ron);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].starts_with("updates[0].registration.set_webhook_url:"),
+        "{}",
+        found[0]
+    );
+    assert!(!found[0].contains("bot-api.internal"), "{}", found[0]);
+
+    // `auto` and `none` are v1 keywords, not secrets.
+    for secret in ["auto", "none"] {
+        let ron = format!(
+            r#"(server_port: Some(1), updates: [WebhookUpdate(path: "/hook", secret_token: Some("{secret}"))], route: WebhookRoute(url: "http://a/"))"#
+        );
+        let errors = errors(&ron);
+        assert_eq!(errors.len(), 1, "{secret}: {errors:?}");
+        assert!(
+            errors[0].starts_with("updates[0].secret_token: `auto` and `none` are keywords"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    // 0.2 expanded `$${TOKEN}` to `$` + the value; in v1 `$${` is an escape.
+    let ron =
+        r#"(updates: [LongPollUpdate(token: "$${TOKEN}")], route: WebhookRoute(url: "http://a/"))"#;
+    let found = errors(ron);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].starts_with("updates[0].token: a `$` right before a placeholder"),
+        "{}",
+        found[0]
+    );
+}
+
+#[test]
+fn migration_debug_hides_the_yaml() {
+    let out = migrated(&read("longpull.ron"));
+    let debug = format!("{out:?}");
+    assert!(!debug.contains("123:test"), "{debug}");
+    assert!(!debug.contains("bench"), "{debug}");
+    assert!(debug.contains("api"), "warnings are shown: {debug}");
 }
 
 #[test]
