@@ -255,7 +255,13 @@ impl Reloader {
             tracing::warn!("{warning}");
         }
         let cfg = Arc::new(cfg);
-        self.shared.config.store(Arc::clone(&cfg));
+        let previous = self.shared.config.swap(Arc::clone(&cfg));
+        if self.shared.admin_exposed && previous.admin.token.is_some() && cfg.admin.token.is_none()
+        {
+            tracing::warn!(
+                "admin.token removed while the admin plane listens on a non-loopback address; protected endpoints refuse every request until restart"
+            );
+        }
         self.loaded = text.into_bytes();
 
         self.restart_sources(&cfg, &report).await;

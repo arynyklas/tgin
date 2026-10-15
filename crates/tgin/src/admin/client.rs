@@ -59,7 +59,13 @@ pub fn parse_url(text: &str) -> Result<Url, String> {
 
 /// Runs `command` and returns the process exit code.
 pub fn run(command: &Command) -> u8 {
-    let token = match &command.token_file {
+    // `health` reads an unauthenticated probe: a token file it cannot read
+    // (a secret the healthcheck's user may not see) must not fail it.
+    let token_file = command
+        .token_file
+        .as_ref()
+        .filter(|_| command.action != Action::Health);
+    let token = match token_file {
         Some(path) => match read_token(path) {
             Ok(token) => Some(token),
             Err(err) => {
@@ -126,7 +132,7 @@ async fn execute(command: &Command, token: Option<&str>) -> u8 {
         Action::Health => (Method::GET, vec!["readyz"]),
     };
     let mut request = client.request(method, endpoint(&command.url, &segments));
-    if let Some(token) = token.filter(|_| command.action != Action::Health) {
+    if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let sent = tokio::time::timeout(timeout, async {

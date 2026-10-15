@@ -219,7 +219,11 @@ async fn start(test: &str, yaml: &str) -> Tgin {
 fn running(app: App, file: PathBuf) -> Tgin {
     let (signals, rx) = mpsc::channel(4);
     let data = app.data_addrs()[0];
-    let admin = app.admin_addrs()[0];
+    let mut admin = app.admin_addrs()[0];
+    // A listener on every interface is reached through loopback.
+    if admin.ip().is_unspecified() {
+        admin.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
     let metrics = app.metrics();
     let redactor = app.redactor();
     let run = tokio::spawn(app.run(Signals::from_channel(rx)));
@@ -311,6 +315,22 @@ impl Tgin {
                 started.elapsed() < PATIENCE,
                 "generation {} never became {generation}",
                 status.generation
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the status satisfies `ok`; `what` names it on failure.
+    async fn wait_status(&self, what: &str, ok: impl Fn(&Status) -> bool) -> Status {
+        let started = Instant::now();
+        loop {
+            let status = self.status().await;
+            if ok(&status) {
+                return status;
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "{what} never held: {status:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -705,28 +725,36 @@ async fn watch_rereads_after_start() {
 async fn pause_stops_delivery_resume_restarts() {
     let telegram = telegram().await;
     let (down, mut seen) = downstream().await;
+    // `probe` gets every update too, never paused: its delivery shows that
+    // the paused consumer's dispatcher had its chance.
     let tgin = start(
         "pause_stops_delivery_resume_restarts",
         &config(&format!(
-            "bots:\n{}consumers:\n  down: {{ push: {{ endpoints: [{{ url: \"{}/bot\" }}] }} }}\n",
-            hook_bot(&telegram, "hooked", TOKEN, "/hook", "down"),
-            down.uri()
+            "bots:\n{}consumers:\n  down: {{ push: {{ endpoints: [{{ url: \"{url}/bot\" }}] }} }}\n  probe: {{ push: {{ endpoints: [{{ url: \"{url}/bot?probe\" }}] }} }}\n",
+            hook_bot(&telegram, "hooked", TOKEN, "/hook", "down, probe"),
+            url = down.uri()
         )),
     )
     .await;
+    let is_probe = |req: &Request| req.url.query() == Some("probe");
 
     let paused = tgin
         .admin_post("/v1/consumers/down/pause", Some(ADMIN_TOKEN))
         .await;
     assert_eq!((paused.status, paused.body.as_str()), (204, ""));
     tgin.deliver("/hook", &[1]).await;
+    let first = next(&mut seen).await;
+    assert!(is_probe(&first), "delivered while paused: {}", first.url);
     let consumer = tgin.status().await.consumers[0].clone();
     assert_eq!(
-        (consumer.paused, consumer.depth, consumer.in_flight),
-        (true, 1, 0)
+        (
+            consumer.name.as_str(),
+            consumer.paused,
+            consumer.depth,
+            consumer.in_flight
+        ),
+        ("down", true, 1, 0)
     );
-    // Long enough for a dispatcher that ignored the pause to deliver.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(seen.try_recv().is_err(), "delivered while paused");
 
     let resumed = tgin
@@ -734,6 +762,7 @@ async fn pause_stops_delivery_resume_restarts() {
         .await;
     assert_eq!(resumed.status, 204);
     let delivered = next(&mut seen).await;
+    assert!(!is_probe(&delivered));
     assert_eq!(delivered.body, update(1, "text").as_bytes());
     assert!(!tgin.status().await.consumers[0].paused);
 
@@ -893,10 +922,13 @@ async fn reload_starts_added_and_stops_removed_sources() {
         assert!(started.elapsed() < PATIENCE, "source:polled stayed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Its task has ended, so it polls no more: three polls of the new
+    // source later, the old count has not moved.
     let polled = polls_of(&telegram, TOKEN).await;
-    while old_polls.try_recv().is_ok() {}
-    // Many idle polls' worth of time.
-    tokio::time::sleep(quick_polls * 6).await;
+    while new_polls.try_recv().is_ok() {}
+    for _ in 0..3 {
+        next(&mut new_polls).await;
+    }
     assert_eq!(
         polls_of(&telegram, TOKEN).await,
         polled,
@@ -923,6 +955,207 @@ async fn reload_starts_added_and_stops_removed_sources() {
         .into()
     );
     assert_eq!(ready["ready"], true);
+    tgin.stop().await;
+}
+
+/// The readiness components `/readyz` lists.
+async fn components(tgin: &Tgin) -> BTreeSet<String> {
+    let ready = tgin.admin_get("/readyz", None).await.json();
+    assert_eq!(ready["ready"], true, "{ready}");
+    ready["components"]
+        .as_object()
+        .expect("components")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// The state of the supervised task `name`, if listed.
+fn task_state(status: &Status, name: &str) -> Option<String> {
+    status
+        .tasks
+        .iter()
+        .find(|t| t.name == name)
+        .map(|t| t.state.clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_restarts_changed_sources() {
+    let quick_polls = Duration::from_millis(50);
+    let telegram = MockServer::start().await;
+    let mut rot_old = mount_bot(&telegram, TOKEN, me("rot_bot"), quick_polls).await;
+    let mut rot_new = mount_bot(&telegram, THIRD_TOKEN, me("rot_bot"), quick_polls).await;
+    let mut sw_polls = mount_bot(&telegram, OTHER_TOKEN, me("sw_bot"), quick_polls).await;
+    let consumers = "consumers:\n  rot: { pull: {} }\n  sw: { pull: {} }\n";
+    let tgin = start(
+        "reload_restarts_changed_sources",
+        &config(&format!(
+            "bots:\n{}{}{consumers}",
+            poll_bot(&telegram, "rot", TOKEN, "rot"),
+            poll_bot(&telegram, "sw", OTHER_TOKEN, "sw"),
+        )),
+    )
+    .await;
+    next(&mut rot_old).await;
+    next(&mut sw_polls).await;
+    let expected: BTreeSet<String> = [
+        "admin_plane",
+        "data_plane",
+        "engine",
+        "source:rot",
+        "source:sw",
+    ]
+    .map(str::to_owned)
+    .into();
+
+    // `rot` gets a new token, `sw` becomes a webhook.
+    tgin.rewrite(&config(&format!(
+        "bots:\n{}{}{consumers}",
+        poll_bot(&telegram, "rot", THIRD_TOKEN, "rot"),
+        hook_bot(&telegram, "sw", OTHER_TOKEN, "/sw", "sw"),
+    )));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.json()["sources_restarted"], json!(["rot", "sw"]));
+    next(&mut rot_new).await;
+    // `sw`'s long poll leaves the task list; `rot`'s new one runs.
+    let status = tgin
+        .wait_status("source:sw gone, source:rot running", |s| {
+            task_state(s, "source:sw").is_none()
+                && task_state(s, "source:rot").as_deref() == Some("running")
+        })
+        .await;
+    let sw = status.sources.iter().find(|s| s.name == "sw").unwrap();
+    assert_eq!(
+        (sw.ingress.as_deref(), sw.state.as_str()),
+        (Some("webhook"), "running")
+    );
+    assert_eq!(components(&tgin).await, expected);
+    // The old token and the old long poll stopped: three polls of the new
+    // token later, their counts have not moved.
+    let (old_rot, old_sw) = (
+        polls_of(&telegram, TOKEN).await,
+        polls_of(&telegram, OTHER_TOKEN).await,
+    );
+    while rot_new.try_recv().is_ok() {}
+    for _ in 0..3 {
+        next(&mut rot_new).await;
+    }
+    assert_eq!(
+        polls_of(&telegram, TOKEN).await,
+        old_rot,
+        "the old token polls"
+    );
+    assert_eq!(
+        polls_of(&telegram, OTHER_TOKEN).await,
+        old_sw,
+        "sw still polls"
+    );
+    tgin.deliver("/sw", &[1]).await;
+    assert_eq!(tgin.poll_ids("/c/sw/getUpdates").await, vec![1]);
+
+    // And back: `sw` polls again, its webhook is gone.
+    tgin.rewrite(&config(&format!(
+        "bots:\n{}{}{consumers}",
+        poll_bot(&telegram, "rot", THIRD_TOKEN, "rot"),
+        poll_bot(&telegram, "sw", OTHER_TOKEN, "sw"),
+    )));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.json()["sources_restarted"], json!(["sw"]));
+    while sw_polls.try_recv().is_ok() {}
+    next(&mut sw_polls).await;
+    tgin.wait_status("source:sw running", |s| {
+        task_state(s, "source:sw").as_deref() == Some("running")
+    })
+    .await;
+    assert_eq!(tgin.post_update("/sw", update(2, "late")).await, 404);
+    assert_eq!(components(&tgin).await, expected);
+    tgin.stop().await;
+}
+
+/// A reload that restarts the only healthy source, while the other has
+/// failed for good, does not shut tgin down: the restarted source counts as
+/// starting until it has started again (here: its getMe takes 2 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_does_not_count_as_failed() {
+    let telegram = MockServer::start().await;
+    let rejected = ResponseTemplate::new(401).set_body_json(json!({
+        "ok": false, "error_code": 401, "description": "Unauthorized"
+    }));
+    mount_bot(&telegram, TOKEN, rejected, Duration::from_secs(3600)).await;
+    mount_bot(
+        &telegram,
+        OTHER_TOKEN,
+        me("slow_bot").set_delay(Duration::from_secs(2)),
+        Duration::from_secs(3600),
+    )
+    .await;
+    let consumers = "consumers:\n  dead: { pull: {} }\n  slow: { pull: {} }\n";
+    let tgin = start(
+        "restart_does_not_count_as_failed",
+        &config(&format!(
+            "bots:\n{}{}{consumers}",
+            poll_bot(&telegram, "dead", TOKEN, "dead"),
+            poll_bot(&telegram, "slow", OTHER_TOKEN, "slow"),
+        )),
+    )
+    .await;
+    tgin.wait_status("source:dead failed", |s| {
+        task_state(s, "source:dead").as_deref() == Some("failed")
+    })
+    .await;
+
+    tgin.rewrite(&config(&format!(
+        "bots:\n{}{}{consumers}",
+        poll_bot(&telegram, "dead", TOKEN, "dead"),
+        hook_bot(&telegram, "slow", OTHER_TOKEN, "/slow", "slow"),
+    )));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    // The reload waited the 2 s getMe out, past a 1 s failure check.
+    assert!(!tgin.run.is_finished(), "tgin shut down");
+    assert_eq!(tgin.status().await.phase, "running");
+    assert_eq!(tgin.readiness().await, 200);
+    tgin.stop().await;
+}
+
+/// R40: once a reload drops `admin.token` while a non-loopback admin
+/// listener stays bound (`admin.listen` changes need a restart), every
+/// protected endpoint refuses every request; the probes stay open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_auth_fails_closed_after_token_removal() {
+    let telegram = telegram().await;
+    let loopback_admin = "admin: { listen: [\"127.0.0.1:0\"]";
+    let tokened = hooked(&telegram, "");
+    let tgin = start(
+        "admin_auth_fails_closed_after_token_removal",
+        &tokened.replace(loopback_admin, "admin: { listen: [\"0.0.0.0:0\"]"),
+    )
+    .await;
+    assert_eq!(tgin.admin_get("/v1/status", None).await.status, 401);
+
+    tgin.rewrite(&tokened.replace(
+        &format!("{loopback_admin}, token: {ADMIN_TOKEN} }}"),
+        "admin: { listen: [\"127.0.0.1:0\"] }",
+    ));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    assert_eq!(reload.json()["restart_required"], json!(["admin.listen"]));
+
+    let unauthorized = json!({ "error": "unauthorized" });
+    // Neither without a token nor with the removed one.
+    for token in [None, Some(ADMIN_TOKEN)] {
+        for path in ["/v1/status", "/v1/config", "/metrics"] {
+            let answer = tgin.admin_get(path, token).await;
+            assert_eq!(answer.status, 401, "{path} {token:?}");
+        }
+        for path in ["/v1/consumers/workers/purge", "/v1/reload"] {
+            let answer = tgin.admin_post(path, token).await;
+            assert_eq!(answer.status, 401, "{path} {token:?}");
+            assert_eq!(answer.json(), unauthorized);
+        }
+    }
+    assert_eq!(tgin.admin_get("/livez", None).await.status, 200);
+    assert_eq!(tgin.readiness().await, 200);
     tgin.stop().await;
 }
 
@@ -1098,31 +1331,38 @@ async fn reload_during_drain_refused() {
 async fn resume_ends_a_drain() {
     let telegram = telegram().await;
     let tgin = start("resume_ends_a_drain", &hooked(&telegram, "")).await;
-    let route = tgin.data_url("/c/workers/getUpdates?timeout=5");
+    // A long poll on the empty queue: its answer time tells whether the
+    // consumer drains (500 ms hold) or waits the poll's 3 s timeout out.
+    let route = tgin.data_url("/c/workers/getUpdates?timeout=3");
+    let poll = || async {
+        let started = Instant::now();
+        let body = answer(tgin.http.get(&route)).await.body;
+        (ids(&body), started.elapsed())
+    };
 
     let drained = tgin
         .admin_post("/v1/consumers/workers/drain", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(drained.status, 204);
-    // Draining: a long poll on the empty queue answers within the hold.
-    let started = Instant::now();
-    assert_eq!(
-        ids(&answer(tgin.http.get(&route)).await.body),
-        Vec::<i64>::new()
+    let (got, took) = poll().await;
+    assert_eq!(got, Vec::<i64>::new());
+    assert!(
+        took < Duration::from_millis(1500),
+        "drained poll took {took:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
 
     let resumed = tgin
         .admin_post("/v1/consumers/workers/resume", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(resumed.status, 204);
-    // Long polls wait again: one still parked after the drain hold gets
-    // the next update.
-    let http = tgin.http.clone();
-    let poll = tokio::spawn(async move { ids(&answer(http.get(&route)).await.body) });
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (got, took) = poll().await;
+    assert_eq!(got, Vec::<i64>::new());
+    assert!(took >= Duration::from_secs(3), "resumed poll took {took:?}");
     tgin.deliver("/hook", &[1]).await;
-    assert_eq!(timeout(PATIENCE, poll).await.unwrap().unwrap(), vec![1]);
+    assert_eq!(
+        tgin.poll_ids("/c/workers/getUpdates?timeout=0").await,
+        vec![1]
+    );
     tgin.stop().await;
 }
 
@@ -1391,6 +1631,16 @@ async fn admin_cli_health_exit_codes() {
         serde_json::from_str::<Value>(&json.stdout).unwrap()["ready"],
         true
     );
+    // Nor a readable token file: health never reads it.
+    let missing = scratch("admin_cli_health_exit_codes").join("no-such-token");
+    let mut flag = binary(&["admin", "--url", &url, "--token-file"]);
+    flag.arg(&missing).arg("health");
+    let mut env = binary(&["admin", "--url", &url, "health"]);
+    env.env("TGIN_ADMIN_TOKEN_FILE", &missing);
+    for command in [flag, env] {
+        let out = output(command).await;
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+    }
 
     tgin.signal(SignalKind::Terminate).await;
     tgin.wait_until_not_ready().await;

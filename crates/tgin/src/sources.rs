@@ -3,7 +3,7 @@
 //! Sources start with the app and as reloads add them, and each one stops
 //! on its own token, a child of the process ingest token.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,7 +58,16 @@ pub(crate) struct Sources {
     client: reqwest::Client,
     ingest: CancellationToken,
     force: CancellationToken,
-    started: Arc<Mutex<BTreeMap<String, Started>>>,
+    registry: Arc<Mutex<Registry>>,
+}
+
+/// The sources that run, and the bots whose source is on its way up.
+#[derive(Default)]
+struct Registry {
+    started: BTreeMap<String, Started>,
+    /// Bots between their stop (a restart) or their preparation and the end
+    /// of their start: neither running nor failed.
+    starting: BTreeSet<String>,
 }
 
 /// A source that runs.
@@ -115,23 +124,32 @@ impl Sources {
             client,
             ingest,
             force,
-            started: Arc::default(),
+            registry: Arc::default(),
         }
     }
 
     /// Readies `bot`'s source to start, with the engine's id of the bot,
     /// its API client and a stop token of its own, and reports it not ready
-    /// until it starts.
+    /// (and starting, never failed) until it starts.
     ///
     /// # Errors
     ///
     /// The engine has no source for the bot, or its API client cannot be
-    /// set up.
+    /// set up; the bot is no longer starting then.
     pub(crate) fn prepare(&self, bot: &Bot) -> Result<Prepared, StartError> {
+        self.registry.lock().starting.insert(bot.name.clone());
         self.health.set(
             &source_task(&bot.name),
             Readiness::NotReady("starting".to_owned()),
         );
+        let prepared = self.prepared(bot);
+        if prepared.is_err() {
+            self.registry.lock().starting.remove(&bot.name);
+        }
+        prepared
+    }
+
+    fn prepared(&self, bot: &Bot) -> Result<Prepared, StartError> {
         let id = self
             .engine
             .source_id(&bot.name)
@@ -199,7 +217,8 @@ impl Sources {
             .collect();
         for bot in &webhooks {
             bot.metrics.set_state(SourceStateLabel::Running);
-            self.started.lock().insert(
+            let mut registry = self.registry.lock();
+            registry.started.insert(
                 bot.name.to_string(),
                 Started {
                     kind: Kind::Webhook,
@@ -207,6 +226,7 @@ impl Sources {
                     metrics: bot.metrics.clone(),
                 },
             );
+            registry.starting.remove(&*bot.name);
         }
         let registrations = webhooks.iter().filter_map(|bot| {
             let hook = bot.webhook()?;
@@ -248,7 +268,7 @@ impl Sources {
                 identity_engine.set_username(id, user.username.clone());
             }),
         ));
-        self.started.lock().insert(
+        self.registry.lock().started.insert(
             name.to_string(),
             Started {
                 kind: Kind::LongPoll,
@@ -273,14 +293,29 @@ impl Sources {
                 async move { source.run(stop).await }
             },
         );
+        // Only now: until the new task is supervised, the supervisor may
+        // still list the instance this one replaces, failed.
+        self.registry.lock().starting.remove(&**name);
         self.health.set(&source_task(name), Readiness::Ready);
     }
 
-    /// Stops the source of the bot `name`, if it runs. A `removed` bot is
-    /// forgotten too: its readiness component goes, and its tasks leave the
-    /// supervisor's list once they have ended.
+    /// Stops the source of the bot `name`, if it runs. A bot that is not
+    /// `removed` restarts: it counts as starting until it has started
+    /// again. A `removed` bot is forgotten too: its readiness component
+    /// goes. The tasks of the stopped source leave the supervisor's list
+    /// once they have ended, unless the bot polls again by then.
     pub(crate) fn stop(&self, name: &str, removed: bool) {
-        let Some(started) = self.started.lock().remove(name) else {
+        let started = {
+            let mut registry = self.registry.lock();
+            if !removed {
+                registry.starting.insert(name.to_owned());
+            }
+            registry.started.remove(name)
+        };
+        if removed {
+            self.health.remove(&source_task(name));
+        }
+        let Some(started) = started else {
             return;
         };
         started.stop.cancel();
@@ -288,29 +323,37 @@ impl Sources {
             started.metrics.set_state(SourceStateLabel::Stopped);
         }
         // An ended background `getMe` is of no use, also for a bot that
-        // starts again; a long poll leaves only once its bot is gone.
+        // starts again.
         self.reap(identity_task(name), None);
-        if removed {
-            self.health.remove(&source_task(name));
+        if started.kind == Kind::LongPoll {
             self.reap(source_task(name), Some(name.to_owned()));
         }
     }
 
     /// Forgets the supervised task `task` once its current instance has
-    /// ended, unless the bot `unless_started` has started again by then.
-    fn reap(&self, task: String, unless_started: Option<String>) {
+    /// ended, unless the bot `unless_polling` polls again by then: its new
+    /// long poll then owns the name. (An entry removed while the bot is
+    /// still starting is simply created again by its new long poll.)
+    fn reap(&self, task: String, unless_polling: Option<String>) {
         let Some(mut state) = self.supervisor.subscribe(&task) else {
             return;
         };
         let supervisor = Arc::clone(&self.supervisor);
-        let started = Arc::clone(&self.started);
+        let registry = Arc::clone(&self.registry);
         tokio::spawn(async move {
             let ended = state
                 .wait_for(|state| matches!(state, TaskState::Stopped | TaskState::Failed { .. }));
             if tokio::time::timeout(REAP_WAIT, ended).await.is_err() {
                 return;
             }
-            if unless_started.is_none_or(|bot| !started.lock().contains_key(&bot)) {
+            let polling = |bot: &String| {
+                registry
+                    .lock()
+                    .started
+                    .get(bot)
+                    .is_some_and(|s| s.kind == Kind::LongPoll)
+            };
+            if !unless_polling.as_ref().is_some_and(polling) {
                 supervisor.remove(&task);
             }
         });
@@ -318,7 +361,16 @@ impl Sources {
 
     /// How the bot `name` receives updates, if its source runs.
     pub(crate) fn kind(&self, name: &str) -> Option<Kind> {
-        self.started.lock().get(name).map(|started| started.kind)
+        self.registry
+            .lock()
+            .started
+            .get(name)
+            .map(|started| started.kind)
+    }
+
+    /// Whether the source of the bot `name` is on its way up.
+    pub(crate) fn is_starting(&self, name: &str) -> bool {
+        self.registry.lock().starting.contains(name)
     }
 
     /// Whether ingest has stopped, so that no source runs any more.
@@ -328,7 +380,7 @@ impl Sources {
 
     /// Reports the webhook sources stopped, once ingest has stopped.
     pub(crate) fn webhooks_stopped(&self) {
-        for started in self.started.lock().values() {
+        for started in self.registry.lock().started.values() {
             if started.kind == Kind::Webhook {
                 started.metrics.set_state(SourceStateLabel::Stopped);
             }
@@ -337,23 +389,23 @@ impl Sources {
 
     /// Whether every source has failed for good. Only long-poll sources
     /// fail, so this holds only when every source is one, at least one
-    /// runs, and no webhook could still deliver updates.
+    /// runs, no webhook could still deliver updates and no source is on its
+    /// way up (a reload restarting or adding one).
     pub(crate) fn all_failed(&self) -> bool {
-        let tasks: Vec<String> = {
-            let started = self.started.lock();
-            if started.values().any(|s| s.kind == Kind::Webhook) {
-                return false;
-            }
-            started.keys().map(|name| source_task(name)).collect()
-        };
-        if tasks.is_empty() {
+        // Held while the states are read, so a restart cannot slip between.
+        let registry = self.registry.lock();
+        if !registry.starting.is_empty()
+            || registry.started.is_empty()
+            || registry.started.values().any(|s| s.kind == Kind::Webhook)
+        {
             return false;
         }
         let states = self.supervisor.states();
-        tasks.iter().all(|task| {
+        registry.started.keys().all(|bot| {
+            let task = source_task(bot);
             states
                 .iter()
-                .any(|(name, state)| **name == **task && matches!(state, TaskState::Failed { .. }))
+                .any(|(name, state)| **name == *task && matches!(state, TaskState::Failed { .. }))
         })
     }
 

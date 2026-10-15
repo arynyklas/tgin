@@ -167,6 +167,10 @@ pub(crate) struct Shared {
     pub(crate) config: ArcSwap<Config>,
     pub(crate) sources: Sources,
     pub(crate) reloads: ReloadQueue,
+    /// Whether an admin listener is bound to a non-loopback address. The
+    /// listeners are bound once, from the start-up config: a reload that
+    /// changes `admin.listen` takes effect only after a restart.
+    pub(crate) admin_exposed: bool,
 }
 
 /// What a starting app shares with whoever stops it, so that a start cut
@@ -279,6 +283,7 @@ impl App {
                 force,
             ),
             reloads: handles.reloads.clone(),
+            admin_exposed: cfg.admin.listen.iter().any(|addr| !addr.ip().is_loopback()),
         });
 
         // Before any source starts, so the probes answer during a slow

@@ -46,12 +46,15 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
-/// Whether `headers` carry the admin token of the running config; any
-/// request is authorized when it has none.
+/// Whether `headers` carry the admin token of the running config (so a
+/// rotated token applies at once). Without a token, a request is
+/// authorized only while every admin listener is on loopback: a reload may
+/// drop the token while a non-loopback listener stays bound until a
+/// restart, and then nothing is authorized (R40).
 fn authorized(shared: &Shared, headers: &HeaderMap) -> bool {
     match &shared.config.load().admin.token {
         Some(token) => bearer_matches(headers, token),
-        None => true,
+        None => !shared.admin_exposed,
     }
 }
 
@@ -171,7 +174,13 @@ fn status_of(shared: &Shared) -> Status {
                 Some(Ingress::Webhook(_)) => {
                     let serving = shared.sources.kind(&bot.name) == Some(Kind::Webhook)
                         && !shared.sources.ingest_stopped();
-                    let state = if serving { "running" } else { "stopped" };
+                    let state = if serving {
+                        "running"
+                    } else if shared.sources.is_starting(&bot.name) {
+                        "starting"
+                    } else {
+                        "stopped"
+                    };
                     ((state, None), Some("webhook"))
                 }
                 None => (("stopped", None), None),
