@@ -13,10 +13,15 @@ workspace = true
 
 [dependencies]
 aho-corasick.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
 subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+proptest.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
