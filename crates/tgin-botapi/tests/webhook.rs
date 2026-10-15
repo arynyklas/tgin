@@ -120,13 +120,14 @@ impl Hook {
         opts: WebhookOptions,
         policy: impl Fn(i64) -> Admit + Send + Sync + 'static,
     ) -> Self {
-        Self::serve(opts, policy, true).await
+        Self::serve(opts, policy, true, CancellationToken::new()).await
     }
 
     async fn serve(
         opts: WebhookOptions,
         policy: impl Fn(i64) -> Admit + Send + Sync + 'static,
         connect_info: bool,
+        ingest: CancellationToken,
     ) -> Self {
         let mut registry = Registry::with_prefix("tgin");
         let metrics = CoreMetrics::register(&mut registry).source("wh");
@@ -134,7 +135,6 @@ impl Hook {
             policy: Box::new(policy),
             calls: Mutex::default(),
         });
-        let ingest = CancellationToken::new();
         let app = webhook_router(
             SOURCE,
             Arc::from("wh"),
@@ -532,10 +532,11 @@ async fn allowlist_blocks_and_trusted_proxy_header_used() {
         },
         admitted,
         false,
+        CancellationToken::new(),
     )
     .await;
     assert_status(blind.send(update(8)).await, StatusCode::FORBIDDEN).await;
-    let open = Hook::serve(options(), admitted, false).await;
+    let open = Hook::serve(options(), admitted, false, CancellationToken::new()).await;
     assert_status(open.send(update(8)).await, StatusCode::OK).await;
 }
 
@@ -579,6 +580,60 @@ async fn draining_503_retry_after() {
 
     assert!(hook.sink.calls().is_empty());
     hook.assert_metrics(&[r#"tgin_source_updates_total{source="wh"} 0"#]);
+}
+
+#[tokio::test]
+async fn cancelled_during_admission_503_retry_after() {
+    // Ingest stops while the sink commits the update: the drain may already
+    // have found nothing pending, so the update is refused for Telegram to
+    // deliver again; the committed copy may still go out (at least once).
+    let ingest = CancellationToken::new();
+    let cancel = ingest.clone();
+    let hook = Hook::serve(
+        options(),
+        move |_| {
+            cancel.cancel();
+            Admit::Admitted
+        },
+        true,
+        ingest,
+    )
+    .await;
+    assert_status(hook.send(update(1)).await, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(hook.sink.ids(), [1]);
+    hook.assert_metrics(&[r#"tgin_source_updates_total{source="wh"} 1"#]);
+
+    // An unroutable update has nowhere to go on any instance: acknowledged.
+    let ingest = CancellationToken::new();
+    let cancel = ingest.clone();
+    let hook = Hook::serve(
+        options(),
+        move |_| {
+            cancel.cancel();
+            Admit::Unroutable
+        },
+        true,
+        ingest,
+    )
+    .await;
+    assert_status(hook.send(update(2)).await, StatusCode::OK).await;
+    assert_eq!(hook.sink.ids(), [2]);
+}
+
+#[tokio::test]
+async fn broken_body_400_counts_network() {
+    let hook = Hook::start(options(), admitted).await;
+    let broken = format!(
+        "{}zz\r\nabc\r\n",
+        hook.head(SECRET, "Transfer-Encoding: chunked\r\n")
+    );
+    let (status, _) = hook.raw(broken.as_bytes()).await;
+    assert_eq!(status, 400);
+    assert!(hook.sink.calls().is_empty());
+    hook.assert_metrics(&[
+        r#"tgin_source_errors_total{source="wh",reason="network"} 1"#,
+        r#"tgin_source_errors_total{source="wh",reason="decode"} 0"#,
+    ]);
 }
 
 #[tokio::test]

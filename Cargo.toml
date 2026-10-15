@@ -21,6 +21,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+ipnet = "2.12.2"
 notify-debouncer-full = "0.7.0"
 parking_lot = "0.12.5"
 prometheus-client = "0.25.1"

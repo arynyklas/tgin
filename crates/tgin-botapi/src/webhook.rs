@@ -5,7 +5,6 @@ use std::fmt;
 use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -16,6 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::{Bytes, BytesMut};
+use ipnet::IpNet;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::{SourceErrorReason, SourceMetrics};
 use tgin_core::sink::{Admit, Sink};
@@ -38,110 +38,9 @@ const FORWARDED_FOR: &str = "x-forwarded-for";
 
 /// The networks Telegram sends webhooks from.
 const TELEGRAM_NETS: [IpNet; 2] = [
-    IpNet {
-        ip: IpAddr::V4(Ipv4Addr::new(149, 154, 160, 0)),
-        prefix: 20,
-    },
-    IpNet {
-        ip: IpAddr::V4(Ipv4Addr::new(91, 108, 4, 0)),
-        prefix: 22,
-    },
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(149, 154, 160, 0)), 20),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(91, 108, 4, 0)), 22),
 ];
-
-/// An IP network in CIDR notation. Host bits are cleared, so `10.1.2.3/8`
-/// is `10.0.0.0/8`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct IpNet {
-    ip: IpAddr,
-    prefix: u8,
-}
-
-/// Why a string is not an [`IpNet`].
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum IpNetError {
-    #[error("expected an IP address or a CIDR network such as 10.0.0.0/8")]
-    Syntax,
-    #[error("prefix length {prefix} is longer than the address ({max} bits)")]
-    Prefix { prefix: u8, max: u8 },
-}
-
-impl IpNet {
-    pub fn new(ip: IpAddr, prefix: u8) -> Result<Self, IpNetError> {
-        let max = match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        if prefix > max {
-            return Err(IpNetError::Prefix { prefix, max });
-        }
-        let ip = match ip {
-            IpAddr::V4(a) => IpAddr::V4(mask_v4(a.to_bits(), prefix).into()),
-            IpAddr::V6(a) => IpAddr::V6(mask_v6(a.to_bits(), prefix).into()),
-        };
-        Ok(Self { ip, prefix })
-    }
-
-    /// The network address.
-    pub fn ip(&self) -> IpAddr {
-        self.ip
-    }
-
-    pub fn prefix(&self) -> u8 {
-        self.prefix
-    }
-
-    /// Whether `addr` is in the network. An IPv4-mapped IPv6 address
-    /// (`::ffff:a.b.c.d`) counts as its IPv4 address.
-    pub fn contains(&self, addr: IpAddr) -> bool {
-        match (self.ip, addr) {
-            (IpAddr::V4(net), IpAddr::V4(a)) => mask_v4(a.to_bits(), self.prefix) == net.to_bits(),
-            (IpAddr::V4(net), IpAddr::V6(a)) => a
-                .to_ipv4_mapped()
-                .is_some_and(|a| mask_v4(a.to_bits(), self.prefix) == net.to_bits()),
-            (IpAddr::V6(net), IpAddr::V6(a)) => mask_v6(a.to_bits(), self.prefix) == net.to_bits(),
-            (IpAddr::V6(_), IpAddr::V4(_)) => false,
-        }
-    }
-}
-
-fn mask_v4(bits: u32, prefix: u8) -> u32 {
-    bits & u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
-}
-
-fn mask_v6(bits: u128, prefix: u8) -> u128 {
-    bits & u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
-}
-
-/// `a.b.c.d/n`, `x::y/n`, or a bare address (a single-host network).
-impl FromStr for IpNet {
-    type Err = IpNetError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (ip, prefix) = match s.split_once('/') {
-            Some((ip, prefix)) => {
-                // Digits only: `u8::from_str` would also take a `+` sign.
-                if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(IpNetError::Syntax);
-                }
-                let prefix = prefix.parse().map_err(|_| IpNetError::Syntax)?;
-                (ip, Some(prefix))
-            }
-            None => (s, None),
-        };
-        let ip: IpAddr = ip.parse().map_err(|_| IpNetError::Syntax)?;
-        let prefix = prefix.unwrap_or(match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        });
-        Self::new(ip, prefix)
-    }
-}
-
-impl fmt::Display for IpNet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.ip, self.prefix)
-    }
-}
 
 /// Which client addresses may post updates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -156,11 +55,14 @@ pub enum IpAllowlist {
 }
 
 impl IpAllowlist {
+    /// Whether `addr` may post. An IPv4-mapped IPv6 address
+    /// (`::ffff:a.b.c.d`) counts as its IPv4 address.
     pub fn allows(&self, addr: IpAddr) -> bool {
+        let addr = addr.to_canonical();
         match self {
             Self::None => true,
-            Self::Telegram => TELEGRAM_NETS.iter().any(|n| n.contains(addr)),
-            Self::Cidrs(nets) => nets.iter().any(|n| n.contains(addr)),
+            Self::Telegram => TELEGRAM_NETS.iter().any(|n| n.contains(&addr)),
+            Self::Cidrs(nets) => nets.iter().any(|n| n.contains(&addr)),
         }
     }
 }
@@ -220,10 +122,13 @@ struct Ingress<S> {
 /// 2. 403 if the client address is not in `opts.ip_allowlist`;
 /// 3. 401 without the right `X-Telegram-Bot-Api-Secret-Token`;
 /// 4. 503 with `Retry-After: 5` once `ingest` is cancelled;
-/// 5. 413 for a body over `opts.body_limit`;
+/// 5. 413 for a body over `opts.body_limit`, 400 for a body the client
+///    fails to send;
 /// 6. 400 for a body that is not a JSON object with an integer `update_id`;
-/// 7. 503 with `Retry-After: 5` when the sink pushes back, so Telegram
-///    delivers the update again later;
+/// 7. 503 with `Retry-After: 5` when the sink pushes back, or when `ingest`
+///    was cancelled by the time an update is admitted, so Telegram delivers
+///    the update again later (the admitted copy may still be delivered too:
+///    at least once);
 /// 8. otherwise 200 with an empty body, also when no rule matches.
 ///
 /// Checks 1 to 4 run on the request head alone: the body is read only for
@@ -300,7 +205,11 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
     let body = match read_body(body, ingress.body_limit).await {
         Ok(body) => body,
         Err(BodyError::TooLarge) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        Err(BodyError::Read) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(BodyError::Read) => {
+            ingress.metrics.error(SourceErrorReason::Network);
+            tracing::debug!(source = %ingress.name, "webhook request body could not be read");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
     let (update_id, facts) = match extract(&body) {
         Ok(read) => read,
@@ -310,11 +219,7 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    // Reading the body awaited; ingest may have stopped since. `admit` does
-    // not await, so nothing can change between this check and its answer,
-    // and none of its answers depends on ingest: an admitted update is
-    // queued and acknowledged, an unroutable one has nowhere to go on any
-    // instance, and a refused one is retried either way.
+    // Reading the body awaited; ingest may have stopped since.
     if ingress.ingest.is_cancelled() {
         return retry_later();
     }
@@ -322,7 +227,25 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
         .sink
         .admit(ingress.id, update_id, body.clone(), &facts)
     {
-        Admit::Admitted | Admit::Unroutable => {
+        Admit::Admitted => {
+            ingress.metrics.update();
+            // Ingest may stop on another thread while `admit` commits, and
+            // the shutdown coordinator may then find nothing pending and
+            // close the HTTP plane. So a 200 needs `ingest` still running
+            // after the commit: the commit and this check happen before
+            // `cancel()` (the token's internal lock orders them), which
+            // happens before the coordinator's `pending()` check, so every
+            // update acknowledged here is visible to the drain. Otherwise
+            // Telegram retries; the queued copy may still be delivered, so
+            // the update may arrive twice.
+            if ingress.ingest.is_cancelled() {
+                return retry_later();
+            }
+            StatusCode::OK.into_response()
+        }
+        // No rule matches it, here or on any other instance: a retry cannot
+        // route it.
+        Admit::Unroutable => {
             ingress.metrics.update();
             StatusCode::OK.into_response()
         }
@@ -363,7 +286,7 @@ impl<S> Ingress<S> {
     }
 
     fn trusted(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies.iter().any(|n| n.contains(ip))
+        self.trusted_proxies.iter().any(|n| n.contains(&ip))
     }
 
     fn secret_matches(&self, headers: &HeaderMap) -> bool {
@@ -459,60 +382,28 @@ mod tests {
     }
 
     #[test]
-    fn ipnet_parses_and_masks() {
-        assert_eq!(net("10.1.2.3/8").to_string(), "10.0.0.0/8");
-        assert_eq!(net("10.1.2.3").to_string(), "10.1.2.3/32");
-        assert_eq!(net("2001:db8::1/32").to_string(), "2001:db8::/32");
-        assert_eq!(net("::1").to_string(), "::1/128");
-        assert_eq!(net("0.0.0.0/0").prefix(), 0);
-        assert_eq!(net("192.168.0.0/16").ip(), ip("192.168.0.0"));
-        assert_eq!(
-            "10.0.0.0/33".parse::<IpNet>(),
-            Err(IpNetError::Prefix {
-                prefix: 33,
-                max: 32
-            })
-        );
-        assert_eq!(
-            "::/129".parse::<IpNet>(),
-            Err(IpNetError::Prefix {
-                prefix: 129,
-                max: 128
-            })
-        );
-        for bad in [
-            "",
-            "/8",
-            "10.0.0.0/",
-            "10.0.0.0/+8",
-            "10.0.0.0/256",
-            "10.0.0/8",
-            "host/8",
-            " 10.0.0.0/8",
-        ] {
-            assert_eq!(bad.parse::<IpNet>(), Err(IpNetError::Syntax), "{bad:?}");
-        }
-    }
+    fn allowlist_cidrs_match_v4_mapped_peers() {
+        let v4 = IpAllowlist::Cidrs(vec![net("149.154.160.0/20")]);
+        assert!(v4.allows(ip("149.154.160.0")));
+        assert!(v4.allows(ip("149.154.175.255")));
+        assert!(!v4.allows(ip("149.154.176.0")));
+        assert!(!v4.allows(ip("149.154.159.255")));
+        assert!(v4.allows(ip("::ffff:149.154.161.1")));
+        assert!(!v4.allows(ip("2001:db8::1")));
 
-    #[test]
-    fn ipnet_contains() {
-        let v4 = net("149.154.160.0/20");
-        assert!(v4.contains(ip("149.154.160.0")));
-        assert!(v4.contains(ip("149.154.175.255")));
-        assert!(!v4.contains(ip("149.154.176.0")));
-        assert!(!v4.contains(ip("149.154.159.255")));
-        assert!(v4.contains(ip("::ffff:149.154.161.1")));
-        assert!(!v4.contains(ip("2001:db8::1")));
+        let v6 = IpAllowlist::Cidrs(vec![net("2001:db8::/32")]);
+        assert!(v6.allows(ip("2001:db8:ffff::1")));
+        assert!(!v6.allows(ip("2001:db9::1")));
+        assert!(!v6.allows(ip("32.1.13.184")));
 
-        let v6 = net("2001:db8::/32");
-        assert!(v6.contains(ip("2001:db8:ffff::1")));
-        assert!(!v6.contains(ip("2001:db9::1")));
-        assert!(!v6.contains(ip("32.1.13.184")));
-
-        assert!(net("0.0.0.0/0").contains(ip("255.255.255.255")));
-        assert!(net("::/0").contains(ip("::1")));
-        assert!(net("10.0.0.7/32").contains(ip("10.0.0.7")));
-        assert!(!net("10.0.0.7/32").contains(ip("10.0.0.8")));
+        // Host bits in a configured network are ignored.
+        assert!(IpAllowlist::Cidrs(vec![net("10.1.2.3/8")]).allows(ip("10.200.0.1")));
+        let any = IpAllowlist::Cidrs(vec![net("0.0.0.0/0"), net("::/0")]);
+        assert!(any.allows(ip("255.255.255.255")));
+        assert!(any.allows(ip("::1")));
+        let host = IpAllowlist::Cidrs(vec![net("10.0.0.7/32")]);
+        assert!(host.allows(ip("10.0.0.7")));
+        assert!(!host.allows(ip("10.0.0.8")));
     }
 
     #[test]
@@ -541,7 +432,7 @@ mod tests {
 
     #[test]
     fn forwarded_client_picks_rightmost_untrusted() {
-        let trusted = |ip: IpAddr| net("10.0.0.0/8").contains(ip);
+        let trusted = |ip: IpAddr| net("10.0.0.0/8").contains(&ip);
         let pick = |lines: &[&str]| {
             let mut headers = HeaderMap::new();
             for line in lines {

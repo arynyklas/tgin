@@ -48,8 +48,9 @@ pub struct BotUser {
     pub username: Option<String>,
 }
 
-/// A `setWebhook` request.
-#[derive(Clone, Debug)]
+/// A `setWebhook` request. `Debug` shows only the URL's origin (its path
+/// and query may carry a secret) and hides the secret token.
+#[derive(Clone)]
 pub struct SetWebhook {
     pub url: Url,
     pub secret_token: Option<Secret<String>>,
@@ -60,6 +61,38 @@ pub struct SetWebhook {
     /// A PEM certificate to upload, for self-signed webhook endpoints. When
     /// set, the request is sent as `multipart/form-data`.
     pub certificate: Option<Bytes>,
+}
+
+impl std::fmt::Debug for SetWebhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetWebhook")
+            .field("url", &url_origin(&self.url))
+            .field("secret_token", &self.secret_token)
+            .field("allowed_updates", &self.allowed_updates)
+            .field("max_connections", &self.max_connections)
+            .field("drop_pending_updates", &self.drop_pending_updates)
+            .field("ip_address", &self.ip_address)
+            .field("certificate", &self.certificate)
+            .finish()
+    }
+}
+
+/// `scheme://host[:port]`, plus `/…` when credentials, a path, a query or a
+/// fragment were left out.
+fn url_origin(url: &Url) -> String {
+    let mut shown = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        shown.push_str(&format!(":{port}"));
+    }
+    let elided = !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some();
+    if elided {
+        shown.push_str("/…");
+    }
+    shown
 }
 
 /// One bot's Bot API client; clones share the connection pool. `Debug` shows
@@ -818,5 +851,49 @@ mod tests {
                 Err(ApiError::Config(_))
             ));
         }
+    }
+
+    #[test]
+    fn set_webhook_debug_shows_origin_only() {
+        let req = |url: &str| SetWebhook {
+            url: url.parse().unwrap(),
+            secret_token: Some(Secret::new("hush-hush-value".to_owned())),
+            allowed_updates: Some(vec!["message".to_owned()]),
+            max_connections: Some(40),
+            drop_pending_updates: true,
+            ip_address: Some("1.2.3.4".parse().unwrap()),
+            certificate: None,
+        };
+        let shown = format!(
+            "{:?}",
+            req("https://user:pw@hook.example:8443/bot/PathSecret?q=QuerySecret#Frag")
+        );
+        assert!(
+            shown.contains(r#"url: "https://hook.example:8443/…""#),
+            "{shown}"
+        );
+        for hidden in ["user", "pw", "PathSecret", "QuerySecret", "Frag", "hush"] {
+            assert!(!shown.contains(hidden), "{hidden} in {shown}");
+        }
+        assert!(shown.contains("secret_token: Some([redacted])"), "{shown}");
+        assert!(
+            shown.contains(r#"allowed_updates: Some(["message"])"#),
+            "{shown}"
+        );
+        assert!(shown.contains("max_connections: Some(40)"), "{shown}");
+        assert!(shown.contains("drop_pending_updates: true"), "{shown}");
+        assert!(shown.contains("ip_address: Some(1.2.3.4)"), "{shown}");
+        assert!(shown.contains("certificate: None"), "{shown}");
+
+        // Nothing elided: no ellipsis, and the default port is implied.
+        let shown = format!("{:?}", req("https://hook.example/"));
+        assert!(shown.contains(r#"url: "https://hook.example""#), "{shown}");
+        let shown = format!("{:?}", req("http://[::1]:8080"));
+        assert!(shown.contains(r#"url: "http://[::1]:8080""#), "{shown}");
+        let shown = format!("{:?}", req("https://hook.example/?"));
+        assert!(
+            shown.contains(r#"url: "https://hook.example/…""#),
+            "{shown}"
+        );
     }
 }
