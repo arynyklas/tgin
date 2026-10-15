@@ -2179,6 +2179,14 @@ version = "1.0.0-dev"
 [[package]]
 name = "tgin-core"
 version = "1.0.0-dev"
+dependencies = [
+ "aho-corasick",
+ "bytes",
+ "prometheus-client",
+ "regex-automata",
+ "smallvec",
+ "thiserror",
+]
 
 [[package]]
 name = "tgin-runtime"
