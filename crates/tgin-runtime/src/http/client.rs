@@ -4,7 +4,7 @@ use std::error::Error as _;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// Timeouts and redirect handling for [`client`].
+/// Timeouts, redirect and proxy handling for [`client`].
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
     /// Bound on establishing the TCP connection and TLS session.
@@ -18,6 +18,13 @@ pub struct ClientOptions {
     /// following one turns a POST into a GET and can carry credential
     /// headers to another host.
     pub follow_redirects: bool,
+    /// A proxy for every request, in addition to those of the environment
+    /// (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, with `NO_PROXY`).
+    pub proxy: Option<reqwest::Proxy>,
+    /// Send every request straight to its server: no proxy from the
+    /// environment and not [`ClientOptions::proxy`] either. For requests
+    /// whose credentials must not pass through a proxy.
+    pub no_proxy: bool,
 }
 
 impl Default for ClientOptions {
@@ -27,6 +34,8 @@ impl Default for ClientOptions {
             request_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(90),
             follow_redirects: false,
+            proxy: None,
+            no_proxy: false,
         }
     }
 }
@@ -40,13 +49,7 @@ impl Default for ClientOptions {
 /// servers against the platform's trust roots and cannot be built without
 /// them.
 pub fn client(opts: &ClientOptions) -> reqwest::Client {
-    client_with(opts, false)
-}
-
-/// [`client`]'s builder; `no_proxy` lets tests ignore proxy variables in
-/// their environment.
-fn client_with(opts: &ClientOptions, no_proxy: bool) -> reqwest::Client {
-    let builder = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(opts.connect_timeout)
         .timeout(opts.request_timeout)
         .pool_idle_timeout(opts.pool_idle_timeout)
@@ -55,11 +58,13 @@ fn client_with(opts: &ClientOptions, no_proxy: bool) -> reqwest::Client {
         } else {
             reqwest::redirect::Policy::none()
         });
-    let builder = if no_proxy {
-        builder.no_proxy()
-    } else {
-        builder
-    };
+    if let Some(proxy) = &opts.proxy {
+        builder = builder.proxy(proxy.clone());
+    }
+    // Last: it drops every proxy added before it, the environment's too.
+    if opts.no_proxy {
+        builder = builder.no_proxy();
+    }
     builder
         .build()
         .expect("a system CA certificate store is required to build the HTTP client")
@@ -108,6 +113,15 @@ pub fn describe_error(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    /// Direct, so an HTTP_PROXY or ALL_PROXY in the test environment cannot
+    /// reroute the request.
+    fn direct() -> ClientOptions {
+        ClientOptions {
+            no_proxy: true,
+            ..ClientOptions::default()
+        }
+    }
+
     #[test]
     fn client_builds() {
         // Building sends nothing, so proxy variables cannot affect it.
@@ -137,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn client_does_not_follow_redirects_by_default() {
         let server = redirecting().await;
-        let response = client_with(&ClientOptions::default(), true)
+        let response = client(&direct())
             .post(format!("{}/from", server.uri()))
             .send()
             .await
@@ -152,9 +166,9 @@ mod tests {
         let server = redirecting().await;
         let opts = ClientOptions {
             follow_redirects: true,
-            ..ClientOptions::default()
+            ..direct()
         };
-        let response = client_with(&opts, true)
+        let response = client(&opts)
             .post(format!("{}/from", server.uri()))
             .send()
             .await
@@ -168,9 +182,7 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/bot1:SECRET/getMe", silent.local_addr().unwrap());
 
-        // `no_proxy` so an HTTP_PROXY or ALL_PROXY in the test environment
-        // cannot reroute the request.
-        let err = client_with(&ClientOptions::default(), true)
+        let err = client(&direct())
             .get(&url)
             .timeout(Duration::from_millis(100))
             .send()
@@ -191,7 +203,7 @@ mod tests {
             .port();
         let url = format!("http://127.0.0.1:{closed_port}/bot123456789:AAAAexampleSecretToken/x");
 
-        let err = client_with(&ClientOptions::default(), true)
+        let err = client(&direct())
             .get(&url)
             .send()
             .await
@@ -208,5 +220,43 @@ mod tests {
             "URL leaked: {described}"
         );
         assert!(described.contains("connect"), "kind missing: {described}");
+    }
+
+    /// `no_proxy` drops a proxy given in the options, as it drops the
+    /// environment's; without it, the request goes through that proxy.
+    #[tokio::test]
+    async fn no_proxy_sends_directly() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        for server in [&target, &proxy] {
+            Mock::given(path("/probe"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(server)
+                .await;
+        }
+        let via_proxy = |no_proxy| ClientOptions {
+            proxy: Some(reqwest::Proxy::all(proxy.uri()).expect("a proxy URL")),
+            no_proxy,
+            ..ClientOptions::default()
+        };
+        async fn seen(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .expect("recording on")
+                .len()
+        }
+        let url = format!("{}/probe", target.uri());
+
+        let proxied = client(&via_proxy(false)).get(&url).send().await;
+        assert_eq!(proxied.expect("response").status().as_u16(), 200);
+        assert_eq!((seen(&target).await, seen(&proxy).await), (0, 1));
+
+        let direct = client(&via_proxy(true)).get(&url).send().await;
+        assert_eq!(direct.expect("response").status().as_u16(), 200);
+        assert_eq!((seen(&target).await, seen(&proxy).await), (1, 1));
     }
 }

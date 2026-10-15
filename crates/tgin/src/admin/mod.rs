@@ -9,13 +9,15 @@
 //! | `GET /v1/status` | token | [`Status`] |
 //! | `GET /v1/config` | token | the running config, secrets redacted |
 //! | `POST /v1/reload` | token | 200 reload report; 422 `{"errors":[…]}` |
-//! | `POST /v1/consumers/{name}/pause`, `/resume`, `/drain` | token | 204 |
+//! | `POST /v1/consumers/{name}/pause`, `/drain` | token | 204 |
+//! | `POST /v1/consumers/{name}/resume` | token | 204: unpaused, and an admin drain ended |
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
 //! `admin.token` (loopback listeners only) the API needs none. Failures
 //! answer `{"error":"…"}`: 401 `unauthorized`, 404 `unknown consumer`, 503
-//! `draining` for a reload during the shutdown.
+//! `draining` for a reload during the shutdown, 409 `draining` for a resume
+//! during it.
 
 mod api;
 pub mod client;

@@ -61,7 +61,9 @@ pub struct ReloadReport {
     /// them.
     pub sources_restarted: Vec<String>,
     /// Changed settings that take effect only after a restart:
-    /// `server.listen`, `admin.listen`, `runtime.worker_threads`.
+    /// `server.listen`, `server.max_connections`,
+    /// `server.header_read_timeout`, `server.tls` (turned on or off),
+    /// `admin.listen`, `runtime.worker_threads`, `log.format`.
     pub restart_required: Vec<String>,
 }
 
@@ -303,6 +305,7 @@ impl Plan {
             &mut report.sources_added,
             &mut report.sources_removed,
             &mut report.sources_restarted,
+            &mut report.restart_required,
         ] {
             list.sort();
         }
@@ -581,18 +584,39 @@ fn options(push: &config::Push, source_names: &Arc<[Arc<str>]>) -> PushOptions {
     }
 }
 
-/// The settings that changed and need a restart.
+/// The settings that changed and need a restart: what the process sets up
+/// once at start. Every other setting applies live, in the engine or the
+/// app.
 fn restart_required(old: &Config, new: &Config) -> Vec<String> {
-    let listen = |cfg: &Config| cfg.server.as_ref().map(|s| s.listen.clone());
+    let (was, is) = (old.server.as_ref(), new.server.as_ref());
+    let tls = |server: Option<&config::Server>| server.is_some_and(|s| s.tls.is_some());
     let mut out = Vec::new();
-    if listen(old) != listen(new) {
-        out.push("server.listen".to_owned());
-    }
-    if old.admin.listen != new.admin.listen {
-        out.push("admin.listen".to_owned());
-    }
-    if old.runtime.worker_threads != new.runtime.worker_threads {
-        out.push("runtime.worker_threads".to_owned());
+    for (name, differs) in [
+        (
+            "server.listen",
+            was.map(|s| &s.listen) != is.map(|s| &s.listen),
+        ),
+        (
+            "server.max_connections",
+            was.map(|s| s.max_connections) != is.map(|s| s.max_connections),
+        ),
+        (
+            "server.header_read_timeout",
+            was.map(|s| s.header_read_timeout) != is.map(|s| s.header_read_timeout),
+        ),
+        // A changed certificate or key file reloads live; TLS on or off
+        // does not.
+        ("server.tls", tls(was) != tls(is)),
+        ("admin.listen", old.admin.listen != new.admin.listen),
+        (
+            "runtime.worker_threads",
+            old.runtime.worker_threads != new.runtime.worker_threads,
+        ),
+        ("log.format", old.log.format != new.log.format),
+    ] {
+        if differs {
+            out.push(name.to_owned());
+        }
     }
     out
 }

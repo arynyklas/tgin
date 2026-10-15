@@ -662,13 +662,30 @@ impl Engine {
         true
     }
 
-    /// Leases to the consumer `name` again. `false` if there is no such
-    /// consumer.
+    /// Leases to the consumer `name` again, and ends a drain that
+    /// [`Engine::drain`] began, unless the whole engine drains (shutdown).
+    /// `false` if there is no such consumer.
     pub fn resume(&self, name: &str) -> bool {
+        // Serialized with `begin_drain`, so a shutdown drain is never undone.
+        let _write = self.shared.write.lock();
         let Some(consumer) = self.consumer(name) else {
             return false;
         };
         consumer.resume();
+        if !self.shared.draining.load(Ordering::SeqCst) {
+            consumer.end_drain();
+        }
+        true
+    }
+
+    /// Starts the drain of the consumer `name` alone: pull polls on its
+    /// empty queue answer within the drain hold, so its clients wind down;
+    /// [`Engine::resume`] ends it. `false` if there is no such consumer.
+    pub fn drain(&self, name: &str) -> bool {
+        let Some(consumer) = self.consumer(name) else {
+            return false;
+        };
+        consumer.begin_drain();
         true
     }
 

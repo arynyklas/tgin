@@ -97,17 +97,25 @@ struct Answer {
     body: String,
 }
 
+/// The admin client's options: `timeout` for connecting and for the whole
+/// request, and no proxy ever (R34): the bearer token would reach the
+/// proxy in cleartext, and the health check would depend on it.
+fn client_options(timeout: Duration) -> ClientOptions {
+    ClientOptions {
+        connect_timeout: timeout,
+        request_timeout: timeout,
+        no_proxy: true,
+        ..ClientOptions::default()
+    }
+}
+
 async fn execute(command: &Command, token: Option<&str>) -> u8 {
     let timeout = if command.action == Action::Health {
         HEALTH_TIMEOUT
     } else {
         REQUEST_TIMEOUT
     };
-    let client = http::client(&ClientOptions {
-        connect_timeout: timeout,
-        request_timeout: timeout,
-        ..ClientOptions::default()
-    });
+    let client = http::client(&client_options(timeout));
     let (method, segments): (Method, Vec<&str>) = match &command.action {
         Action::Status | Action::Consumers => (Method::GET, vec!["v1", "status"]),
         Action::Reload => (Method::POST, vec!["v1", "reload"]),
@@ -409,6 +417,38 @@ fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The admin token must never pass through a proxy, nor may the health
+    /// check depend on one: a proxy the environment (here: the options)
+    /// names is not used.
+    #[tokio::test]
+    async fn admin_requests_bypass_proxies() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let admin = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        for server in [&admin, &proxy] {
+            Mock::given(path("/readyz"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(server)
+                .await;
+        }
+        let options = ClientOptions {
+            proxy: Some(reqwest::Proxy::all(proxy.uri()).expect("a proxy URL")),
+            ..client_options(HEALTH_TIMEOUT)
+        };
+        let response = http::client(&options)
+            .get(format!("{}/readyz", admin.uri()))
+            .bearer_auth("admin-token")
+            .send()
+            .await
+            .expect("an answer");
+        assert_eq!(response.status(), StatusCode::OK);
+        let admin_seen = admin.received_requests().await.expect("recording on");
+        let proxy_seen = proxy.received_requests().await.expect("recording on");
+        assert_eq!((admin_seen.len(), proxy_seen.len()), (1, 0));
+    }
 
     #[test]
     fn table_aligns_columns() {

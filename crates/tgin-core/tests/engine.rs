@@ -855,13 +855,22 @@ async fn reload_reports_restart_required() {
     let changed = BASE
         .replace(
             "server: {}\n",
-            "server: { listen: [\"127.0.0.1:8081\"] }\nadmin: { listen: [\"127.0.0.1:9191\"] }\nruntime: { worker_threads: 2 }\n",
+            "server: { listen: [\"127.0.0.1:8081\"], max_connections: 9, header_read_timeout: 3s, tls: { cert_file: c.pem, key_file: k.pem } }\nadmin: { listen: [\"127.0.0.1:9191\"] }\nruntime: { worker_threads: 2 }\nlog: { level: debug, format: json }\n",
         )
         .replace("token: \"1:aaa\"", "token: \"1:bbb\"");
     let report = h.engine.apply(&load(&changed)).expect("apply");
+    // Sorted; `log.level` applies live.
     assert_eq!(
         report.restart_required,
-        ["server.listen", "admin.listen", "runtime.worker_threads"]
+        [
+            "admin.listen",
+            "log.format",
+            "runtime.worker_threads",
+            "server.header_read_timeout",
+            "server.listen",
+            "server.max_connections",
+            "server.tls",
+        ]
     );
     assert_eq!(report.sources_restarted, ["a"]);
 

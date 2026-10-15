@@ -1080,12 +1080,129 @@ async fn reload_during_drain_refused() {
     let refused = tgin.reload().await;
     assert_eq!(refused.status, 503);
     assert_eq!(refused.json(), json!({ "error": "draining" }));
+    // So is an admin resume, which would end the consumers' drain.
+    let resume = tgin
+        .admin_post("/v1/consumers/workers/resume", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(resume.status, 409);
+    assert_eq!(resume.json(), json!({ "error": "draining" }));
     // The status stays readable during the drain.
     assert_eq!(tgin.status().await.phase, "draining");
 
     tgin.signal(SignalKind::Interrupt).await;
     let outcome = timeout(PATIENCE, tgin.run).await.unwrap().unwrap();
     assert_eq!(outcome, Outcome::Forced);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_ends_a_drain() {
+    let telegram = telegram().await;
+    let tgin = start("resume_ends_a_drain", &hooked(&telegram, "")).await;
+    let route = tgin.data_url("/c/workers/getUpdates?timeout=5");
+
+    let drained = tgin
+        .admin_post("/v1/consumers/workers/drain", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(drained.status, 204);
+    // Draining: a long poll on the empty queue answers within the hold.
+    let started = Instant::now();
+    assert_eq!(
+        ids(&answer(tgin.http.get(&route)).await.body),
+        Vec::<i64>::new()
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let resumed = tgin
+        .admin_post("/v1/consumers/workers/resume", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(resumed.status, 204);
+    // Long polls wait again: one still parked after the drain hold gets
+    // the next update.
+    let http = tgin.http.clone();
+    let poll = tokio::spawn(async move { ids(&answer(http.get(&route)).await.body) });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    tgin.deliver("/hook", &[1]).await;
+    assert_eq!(timeout(PATIENCE, poll).await.unwrap().unwrap(), vec![1]);
+    tgin.stop().await;
+}
+
+/// A pull consumer `name` (with `extra` settings) fed by `hooked`.
+fn pull_only(telegram: &MockServer, name: &str, extra: &str) -> String {
+    config(&format!(
+        "bots:\n{}consumers:\n  {name}: {{ pull: {{ {extra} }} }}\n",
+        hook_bot(telegram, "hooked", TOKEN, "/hook", name)
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_pull_aliases_drain_until_reused() {
+    const OLD_SECRET: &str = "old-alias-secret-value";
+    // As a migrated 0.2 client polls it (`/bot…` is reserved in v1).
+    const ALIAS: &str = "/legacy/one/getUpdates";
+    let telegram = telegram().await;
+    let tgin = start(
+        "retired_pull_aliases_drain_until_reused",
+        &pull_only(
+            &telegram,
+            "old",
+            &format!("auth_token: {OLD_SECRET}, aliases: [\"{ALIAS}\"]"),
+        ),
+    )
+    .await;
+    tgin.deliver("/hook", &[1, 2]).await;
+
+    tgin.rewrite(&pull_only(&telegram, "new", ""));
+    assert_eq!(tgin.reload().await.json()["removed"], json!(["old"]));
+    // The retired consumer's alias still serves its drain, with its token.
+    let route = format!("{ALIAS}?timeout=0");
+    assert_eq!(tgin.pull(&route, None).await.status, 401);
+    let drained = tgin
+        .pull(&route, Some(&format!("Bearer {OLD_SECRET}")))
+        .await;
+    assert_eq!(drained.status, 200, "{}", drained.body);
+    assert_eq!(ids(&drained.body), vec![1, 2]);
+
+    // A config that gives the path to another consumer wins it.
+    tgin.rewrite(&pull_only(
+        &telegram,
+        "other",
+        &format!("aliases: [\"{ALIAS}\"]"),
+    ));
+    assert_eq!(tgin.reload().await.json()["added"], json!(["other"]));
+    tgin.deliver("/hook", &[3]).await;
+    assert_eq!(tgin.poll_ids(&route).await, vec![3]);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_reports_restart_fields() {
+    let telegram = telegram().await;
+    let tgin = start("reload_reports_restart_fields", &hooked(&telegram, "")).await;
+
+    // `log.level` applies live; the rest needs a restart.
+    let changed = hooked(&telegram, "log: { level: debug, format: json }\n")
+        .replace(
+            QUICK,
+            "runtime: { lame_duck: 0s, shutdown_grace: 2s, worker_threads: 3 }",
+        )
+        .replace(
+            "server: { listen: [\"127.0.0.1:0\"] }",
+            "server: { listen: [\"127.0.0.1:0\"], max_connections: 77, header_read_timeout: 3s, tls: { cert_file: tls/cert.pem, key_file: tls/key.pem } }",
+        );
+    tgin.rewrite(&changed);
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    assert_eq!(
+        reload.json()["restart_required"],
+        json!([
+            "log.format",
+            "runtime.worker_threads",
+            "server.header_read_timeout",
+            "server.max_connections",
+            "server.tls",
+        ])
+    );
+    tgin.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1313,17 +1430,19 @@ fn admin_non_loopback_requires_token() {
     );
 }
 
+/// A free loopback port, found by binding port 0.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port()
+}
+
 /// Real SIGHUP to the binary: the reload shows in the generation.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn os_sighup_reloads() {
     let telegram = telegram().await;
-    let free_port = || {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("a free port")
-            .port()
-    };
     let (data_port, admin_port) = (free_port(), free_port());
     // No watch: the rewrite alone would reload.
     let yaml = |consumers: &str| {
@@ -1395,4 +1514,76 @@ async fn os_sighup_reloads() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(code, Some(0));
+}
+
+/// `log.level` follows reloads in the binary, whose logs go to stdout: a
+/// debug line appears once the level is `debug` and not after it is back
+/// to `info`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_level_follows_reloads() {
+    let telegram = telegram().await;
+    let admin_port = free_port();
+    let yaml = |level: &str| {
+        format!(
+            "version: 1\n{QUICK}\nlog: {{ level: {level} }}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:{admin_port}\"] }}\nbots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            hook_bot(&telegram, "hooked", TOKEN, "/hook", "workers")
+        )
+    };
+    let file = write_config("log_level_follows_reloads", &yaml("info"));
+    let log = file.with_file_name("tgin.log");
+    let sink = std::fs::File::create(&log).expect("the log file");
+    let mut child = binary(&["-c", file.to_str().unwrap()])
+        .env_remove("RUST_LOG")
+        .stderr(sink.try_clone().expect("the log file"))
+        .stdout(sink)
+        .spawn()
+        .expect("tgin starts");
+    let http = client();
+    let admin = format!("http://127.0.0.1:{admin_port}");
+    let logged = || std::fs::read_to_string(&log).unwrap_or_default();
+    // Waits for the `n`th reload's info line, written after its debug one.
+    let reloaded = |n: usize| async move {
+        let started = Instant::now();
+        while logged().matches("config reloaded").count() < n {
+            if started.elapsed() > PATIENCE {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    };
+
+    let mut outcome = Err("tgin never became ready".to_owned());
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        let ready = http.get(format!("{admin}/readyz")).send().await;
+        if ready.is_ok_and(|r| r.status() == 200) {
+            outcome = Ok(());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut debug_lines = Vec::new();
+    for (n, level) in [(1, "debug"), (2, "info")] {
+        if outcome.is_err() {
+            break;
+        }
+        std::fs::write(&file, yaml(level)).unwrap();
+        let status = http
+            .post(format!("{admin}/v1/reload"))
+            .send()
+            .await
+            .map(|r| r.status().as_u16());
+        outcome = match status {
+            Ok(200) if reloaded(n).await => Ok(()),
+            other => Err(format!("reload {n} ({level}): {other:?}")),
+        };
+        debug_lines.push(logged().matches("reload report").count());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(err) = outcome {
+        panic!("{err}; the log:\n{}", logged());
+    }
+    assert_eq!(debug_lines, [1, 1], "{}", logged());
 }

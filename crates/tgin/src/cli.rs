@@ -107,10 +107,10 @@ enum AdminCommand {
     Consumers,
     /// Stop handing out a consumer's updates; it still queues them.
     Pause { name: String },
-    /// Hand out a paused consumer's updates again.
+    /// Hand out a paused consumer's updates again; also ends a drain.
     Resume { name: String },
     /// Let a consumer's pollers wind down: polls on an empty queue return
-    /// at once.
+    /// at once, until `resume`.
     Drain { name: String },
     /// Drop a consumer's queued updates.
     Purge { name: String },
@@ -314,32 +314,35 @@ fn print(path: &Path) -> u8 {
 /// `tgin run`: loads the config, starts logging and the runtime, runs the
 /// app until it shuts down and returns its exit code.
 fn run(path: &Path) -> u8 {
-    let boot = match Boot::load(path, Arc::new(OsEnv)) {
+    let mut boot = match Boot::load(path, Arc::new(OsEnv)) {
         Ok(boot) => boot,
         Err(err) => {
             report(path, &err);
             return exit::FAILURE;
         }
     };
-    let cfg = &boot.cfg;
     let log = LogOptions {
-        level: level_name(cfg.log.level).to_owned(),
-        format: match cfg.log.format {
+        level: level_name(boot.cfg.log.level).to_owned(),
+        format: match boot.cfg.log.format {
             config::LogFormat::Text => LogFormat::Text,
             config::LogFormat::Json => LogFormat::Json,
         },
     };
-    if let Err(err) = init_tracing(&log, redacting(Arc::clone(&boot.redactor))) {
-        eprintln!("tgin: {err}");
-        return exit::FAILURE;
+    match init_tracing(&log, redacting(Arc::clone(&boot.redactor))) {
+        Ok(handle) => boot.log = Some(handle),
+        Err(err) => {
+            eprintln!("tgin: {err}");
+            return exit::FAILURE;
+        }
     }
     // From here on panics are logged through the redacting writer.
     install_panic_hook();
-    for warning in &cfg.warnings {
+    for warning in &boot.cfg.warnings {
         tracing::warn!("{warning}");
     }
 
-    let threads = cfg
+    let threads = boot
+        .cfg
         .runtime
         .worker_threads
         .unwrap_or_else(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN));
@@ -385,7 +388,8 @@ fn redacting(
     move |line| redactor.load().redact(line)
 }
 
-fn level_name(level: LogLevel) -> &'static str {
+/// The runtime's name of `level`.
+pub(crate) fn level_name(level: LogLevel) -> &'static str {
     match level {
         LogLevel::Trace => "trace",
         LogLevel::Debug => "debug",

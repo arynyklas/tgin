@@ -296,7 +296,12 @@ async fn pause(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> R
     }
 }
 
+/// Resumes the consumer and ends a drain `POST …/drain` began; refused
+/// while tgin shuts down, whose drain must not end.
 async fn resume(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> Response {
+    if shared.lifecycle.phase() >= Phase::Draining {
+        return error(StatusCode::CONFLICT, "draining");
+    }
     if shared.engine.resume(&name) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -305,12 +310,10 @@ async fn resume(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> 
 }
 
 async fn drain(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> Response {
-    match shared.engine.consumer(&name) {
-        Some(consumer) => {
-            consumer.begin_drain();
-            StatusCode::NO_CONTENT.into_response()
-        }
-        None => unknown_consumer(),
+    if shared.engine.drain(&name) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        unknown_consumer()
     }
 }
 

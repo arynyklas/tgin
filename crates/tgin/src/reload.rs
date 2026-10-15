@@ -13,11 +13,13 @@ use tgin_core::reload::ReloadReport;
 use tgin_runtime::config::{ConfigError, ConfigWatcher, Env, watch_config};
 use tgin_runtime::http::{ServerTls, TlsFiles};
 use tgin_runtime::lifecycle::{Lifecycle, Phase};
+use tgin_runtime::obs::LogHandle;
 use tgin_runtime::secret::Redactor;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{self, Shared};
+use crate::cli;
 use crate::data_server::DataRoutes;
 use crate::sources::Kind;
 
@@ -117,6 +119,9 @@ pub(crate) struct Reloader {
     /// Every secret of every config loaded so far: retired components may
     /// still log with old secrets while they drain, so none is forgotten.
     pub(crate) secrets: BTreeSet<String>,
+    /// Sets the log level of the process's subscriber; `None` when the app
+    /// runs without one (in tests).
+    pub(crate) log: Option<LogHandle>,
 }
 
 /// The bytes of a certificate file and its key file.
@@ -244,6 +249,8 @@ impl Reloader {
                 return Err(self.reject(trigger, vec![error]));
             }
         };
+        // First, so the rest of this reload logs at the new level.
+        self.set_level(&cfg);
         for warning in &cfg.warnings {
             tracing::warn!("{warning}");
         }
@@ -259,6 +266,7 @@ impl Reloader {
                 "these changed settings take effect only after a restart"
             );
         }
+        tracing::debug!(?report, "reload report");
         tracing::info!(
             ?trigger,
             generation = report.generation,
@@ -268,6 +276,19 @@ impl Reloader {
             "config reloaded"
         );
         Ok(report)
+    }
+
+    /// Applies `cfg`'s log level when it differs from the running one.
+    fn set_level(&self, cfg: &Config) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        if cfg.log.level == self.shared.config.load().log.level {
+            return;
+        }
+        if let Err(err) = log.set_level(cli::level_name(cfg.log.level)) {
+            tracing::warn!(error = %err, "the new log level could not be applied");
+        }
     }
 
     /// Counts and logs a rejected reload, in one line.
@@ -347,18 +368,12 @@ impl Reloader {
 
     /// Reloads the data plane's certificate when the bytes of its
     /// certificate or key file changed; a certificate that does not load
-    /// leaves the old one in use.
+    /// leaves the old one in use. TLS turned on or off is in the report's
+    /// `restart_required`.
     async fn reload_tls(&mut self, cfg: &Config) {
         let configured = cfg.server.as_ref().and_then(|server| server.tls.as_ref());
-        let (tls, loaded, files) = match (&mut self.tls, configured) {
-            (Some((tls, loaded)), Some(files)) => (tls, loaded, files),
-            (None, None) => return,
-            (Some(_), None) | (None, Some(_)) => {
-                tracing::warn!(
-                    "server.tls was added or removed; that takes effect only after a restart"
-                );
-                return;
-            }
+        let (Some((tls, loaded)), Some(files)) = (&mut self.tls, configured) else {
+            return;
         };
         let files = TlsFiles {
             cert: files.cert_file.expose().clone(),

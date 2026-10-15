@@ -17,7 +17,7 @@ use tgin_core::metrics::CoreMetrics;
 use tgin_runtime::config::Env;
 use tgin_runtime::http::{self, ClientOptions, RunningServer, ServerOptions, TlsFiles};
 use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
-use tgin_runtime::obs::{Health, MetricsRegistry, Readiness};
+use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
 use tgin_runtime::supervisor::Supervisor;
 use tokio::sync::mpsc;
@@ -77,6 +77,9 @@ pub struct Boot {
     pub env: Arc<dyn Env>,
     /// Masks secrets in logs; reloads add the secrets of each new config.
     pub redactor: Arc<ArcSwap<Redactor>>,
+    /// Sets the level of the process's log subscriber, so a reload applies
+    /// `log.level`; `None` without one.
+    pub log: Option<LogHandle>,
 }
 
 impl Boot {
@@ -98,6 +101,7 @@ impl Boot {
             loaded,
             env,
             redactor,
+            log: None,
         })
     }
 }
@@ -219,6 +223,7 @@ impl App {
             loaded,
             env,
             redactor,
+            log,
         } = boot;
         let health = Arc::new(Health::default());
         let starting = || Readiness::NotReady("starting".to_owned());
@@ -357,6 +362,7 @@ impl App {
                 env,
                 loaded,
                 secrets: known_secrets,
+                log,
             };
             tokio::spawn(reloader.run(requests, handles.stop_reloads.clone()));
         }

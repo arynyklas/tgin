@@ -5,7 +5,7 @@
 //! the router current in an `ArcSwap`, so a reload can change the routes
 //! without restarting the listeners.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -54,10 +54,19 @@ const MAX_INSTANCE_LEN: usize = 64;
 /// if it has one.
 pub(crate) type PullAuth = HashMap<Arc<str>, Option<Secret<String>>>;
 
+/// What a router serves of the pull consumers: who is served, with which
+/// token, and the alias paths that reach them.
+#[derive(Clone, Default)]
+struct Served {
+    auth: PullAuth,
+    /// Alias path → consumer.
+    aliases: BTreeMap<String, Arc<str>>,
+}
+
 /// The data plane's current routes, and the pull consumers they serve.
 pub(crate) struct DataRoutes {
     routes: Arc<ArcSwap<Router>>,
-    auth: Mutex<PullAuth>,
+    served: Mutex<Served>,
 }
 
 impl DataRoutes {
@@ -69,11 +78,11 @@ impl DataRoutes {
         engine: &Arc<Engine>,
         ingest: &CancellationToken,
     ) -> Self {
-        let auth = pull_auth(cfg, &PullAuth::new(), engine);
-        let router = router(cfg, server, engine, ingest, auth.clone());
+        let served = served(cfg, &Served::default(), engine);
+        let router = router(cfg, server, engine, ingest, served.clone());
         Self {
             routes: Arc::new(ArcSwap::from_pointee(router)),
-            auth: Mutex::new(auth),
+            served: Mutex::new(served),
         }
     }
 
@@ -87,10 +96,11 @@ impl DataRoutes {
     /// them from the next request on; requests already running finish on
     /// the old routes.
     ///
-    /// A pull consumer that `cfg` no longer has is still served, with the
-    /// token it had, while the engine drains it, so its clients can fetch
-    /// and ack what it holds; it is dropped from the routes at the first
-    /// rebuild after its drain.
+    /// A pull consumer that `cfg` no longer has is still served while the
+    /// engine drains it, on `/c/<name>/getUpdates` and on its aliases (a
+    /// path `cfg` gives to something else goes to the new owner), with the
+    /// token it had, so its clients can fetch and ack what it holds. It
+    /// leaves the routes at the first rebuild after its drain.
     pub(crate) fn rebuild(
         &self,
         cfg: &Config,
@@ -98,42 +108,68 @@ impl DataRoutes {
         engine: &Arc<Engine>,
         ingest: &CancellationToken,
     ) {
-        let mut current = self.auth.lock();
-        let auth = pull_auth(cfg, &current, engine);
-        self.routes
-            .store(Arc::new(router(cfg, server, engine, ingest, auth.clone())));
-        *current = auth;
+        let mut current = self.served.lock();
+        let served = served(cfg, &current, engine);
+        self.routes.store(Arc::new(router(
+            cfg,
+            server,
+            engine,
+            ingest,
+            served.clone(),
+        )));
+        *current = served;
     }
 }
 
-/// The pull consumers of `cfg` with their tokens, plus those of `previous`
-/// that `cfg` dropped but `engine` still drains, with the token they had.
-fn pull_auth(cfg: &Config, previous: &PullAuth, engine: &Engine) -> PullAuth {
-    let mut auth: PullAuth = cfg
-        .consumers
-        .iter()
-        .filter_map(|consumer| match &consumer.kind {
-            ConsumerKind::Pull(pull) => {
-                Some((Arc::from(consumer.name.as_str()), pull.auth_token.clone()))
-            }
-            ConsumerKind::Push(_) => None,
-        })
-        .collect();
-    for (name, token) in previous {
-        if !auth.contains_key(name) && engine.pull_consumer(name).is_some() {
-            auth.insert(Arc::clone(name), token.clone());
+/// The pull consumers of `cfg`, with their tokens and aliases, plus those
+/// of `previous` that `cfg` dropped but `engine` still drains, with the
+/// token and the aliases they had, except for paths `cfg` routes itself.
+fn served(cfg: &Config, previous: &Served, engine: &Engine) -> Served {
+    let mut served = Served::default();
+    for consumer in &cfg.consumers {
+        let ConsumerKind::Pull(pull) = &consumer.kind else {
+            continue;
+        };
+        let name: Arc<str> = Arc::from(consumer.name.as_str());
+        served
+            .auth
+            .insert(Arc::clone(&name), pull.auth_token.clone());
+        for alias in &pull.aliases {
+            served
+                .aliases
+                .insert(alias.expose().clone(), Arc::clone(&name));
         }
     }
-    auth
+    let current: HashSet<Arc<str>> = served.auth.keys().cloned().collect();
+    let webhooks: HashSet<&str> = cfg
+        .bots
+        .iter()
+        .filter_map(|bot| match &bot.ingress {
+            Some(Ingress::Webhook(hook)) => Some(hook.path.expose().as_str()),
+            _ => None,
+        })
+        .collect();
+    for (name, token) in &previous.auth {
+        if !current.contains(name) && engine.pull_consumer(name).is_some() {
+            served.auth.insert(Arc::clone(name), token.clone());
+        }
+    }
+    for (path, name) in &previous.aliases {
+        let retired = !current.contains(name) && served.auth.contains_key(name);
+        if retired && !served.aliases.contains_key(path) && !webhooks.contains(path.as_str()) {
+            served.aliases.insert(path.clone(), Arc::clone(name));
+        }
+    }
+    served
 }
 
-/// The routes of `cfg`; `auth` lists the pull consumers served.
+/// The routes of `cfg` and of the pull consumers `served` lists.
 fn router(
     cfg: &Config,
     server: &Server,
     engine: &Arc<Engine>,
     ingest: &CancellationToken,
-    auth: PullAuth,
+    served: Served,
 ) -> Router {
     let mut router = Router::new();
     for bot in &cfg.bots {
@@ -172,16 +208,7 @@ fn router(
         router = router.merge(with_timeout(webhook, WEBHOOK_REQUEST_TIMEOUT));
     }
 
-    let mut aliases = Vec::new();
-    for consumer in &cfg.consumers {
-        let ConsumerKind::Pull(pull) = &consumer.kind else {
-            continue;
-        };
-        let name: Arc<str> = Arc::from(consumer.name.as_str());
-        for alias in &pull.aliases {
-            aliases.push((alias.expose().clone(), Arc::clone(&name)));
-        }
-    }
+    let Served { auth, aliases } = served;
     let pull = Arc::new(PullRoutes {
         engine: Arc::clone(engine),
         auth,
