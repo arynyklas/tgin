@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=schema/tgin.v1.schema.json
+#
+# tgin configuration, version 1. Check it with `tgin config validate tgin.yaml`.
+version: 1
+
+# The data plane: webhook ingress and the pull endpoints downstream bots poll.
+server:
+  listen: ["0.0.0.0:8080"]
+
+bots:
+  - name: main
+    token: ${env:TOKEN}
+    ingress:
+      long_poll: {}
+    routes:
+      - to: [bots]
+
+consumers:
+  # Downstream bots call http://<tgin>:8080/c/bots/getUpdates instead of
+  # Telegram's getUpdates; instances compete for updates.
+  bots:
+    pull: {}

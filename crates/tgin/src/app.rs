@@ -21,7 +21,7 @@ use tgin_runtime::supervisor::{Supervisor, TaskState};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{COMMIT, VERSION};
+use crate::cli::{VERSION, commit};
 use crate::data_server::{self, Probes};
 use crate::exit::Outcome;
 
@@ -124,7 +124,7 @@ impl App {
             health.set(&source_task(&bot.name), starting());
         }
 
-        let mut registry = MetricsRegistry::new(VERSION, COMMIT.unwrap_or("unknown"));
+        let mut registry = MetricsRegistry::new(VERSION, commit().unwrap_or("unknown"));
         let core = CoreMetrics::register(registry.registry_mut());
         let metrics = Arc::new(registry);
         let client = http::client(&ClientOptions::default());
@@ -439,10 +439,10 @@ pub fn secrets(cfg: &Config) -> Vec<String> {
     let mut secrets = Vec::new();
     for bot in &cfg.bots {
         secrets.push(bot.token.expose().clone());
-        if let Some(Ingress::Webhook(hook)) = &bot.ingress {
-            if let Some(secret) = webhook_secret(bot, hook) {
-                secrets.push(secret.expose().clone());
-            }
+        if let Some(Ingress::Webhook(hook)) = &bot.ingress
+            && let Some(secret) = webhook_secret(bot, hook)
+        {
+            secrets.push(secret.expose().clone());
         }
     }
     if let Some(token) = &cfg.admin.token {

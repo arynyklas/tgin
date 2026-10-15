@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use tgin_core::config::{self, Config, LogLevel};
 use tgin_runtime::config::{ConfigError, OsEnv};
 use tgin_runtime::lifecycle::Signals;
-use tgin_runtime::obs::{init_tracing, LogFormat, LogOptions};
+use tgin_runtime::obs::{LogFormat, LogOptions, init_tracing};
 use tgin_runtime::secret::Redactor;
 
 use crate::app::{self, App};
@@ -22,8 +22,11 @@ use crate::exit;
 
 /// The tgin version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The commit tgin was built from, when the build set `TGIN_COMMIT`.
-pub const COMMIT: Option<&str> = option_env!("TGIN_COMMIT");
+/// The commit tgin was built from, when the build set a non-empty
+/// `TGIN_COMMIT`.
+pub fn commit() -> Option<&'static str> {
+    option_env!("TGIN_COMMIT").filter(|commit| !commit.is_empty())
+}
 
 /// How long the runtime may take to wind down its tasks after a run.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
@@ -158,7 +161,7 @@ where
 
 /// `tgin <version>`, with the commit when known.
 pub fn version() -> String {
-    match COMMIT.filter(|commit| !commit.is_empty()) {
+    match commit() {
         Some(commit) => format!("tgin {VERSION} ({commit})"),
         None => format!("tgin {VERSION}"),
     }
@@ -341,8 +344,8 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use clap::error::ErrorKind;
     use clap::CommandFactory;
+    use clap::error::ErrorKind;
 
     use super::*;
 

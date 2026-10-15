@@ -15,23 +15,23 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, MethodRouter};
-use axum::Router;
+use axum::routing::{MethodRouter, get};
 use http_body::{Frame, SizeHint};
-use serde_json::{json, Value};
-use tgin_botapi::{IpAllowlist, IpNet, WebhookOptions, DEFAULT_WEBHOOK_BODY_LIMIT};
+use serde_json::{Value, json};
+use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
 use tgin_core::consumer::pull::PollRequest;
 use tgin_core::engine::Engine;
 use tgin_runtime::lifecycle::{Lifecycle, Phase};
 use tgin_runtime::obs::{Health, Readiness};
 use tgin_runtime::queue::HolderId;
-use tgin_runtime::secret::{secret_eq, Secret};
+use tgin_runtime::secret::{Secret, secret_eq};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -237,10 +237,10 @@ impl PullRoutes {
             return telegram_error(StatusCode::NOT_FOUND, "Not Found");
         };
         let (parts, body) = req.into_parts();
-        if let Some(expected) = token {
-            if !bearer_matches(&parts.headers, expected) {
-                return telegram_error(StatusCode::UNAUTHORIZED, "Unauthorized");
-            }
+        if let Some(expected) = token
+            && !bearer_matches(&parts.headers, expected)
+        {
+            return telegram_error(StatusCode::UNAUTHORIZED, "Unauthorized");
         }
         let Some(consumer) = self.engine.pull_consumer(name) else {
             return telegram_error(StatusCode::NOT_FOUND, "Not Found");

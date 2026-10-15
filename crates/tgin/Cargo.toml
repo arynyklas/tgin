@@ -1,7 +1,7 @@
 [package]
 name = "tgin"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 description = "Routing layer between the Telegram Bot API and downstream bot instances"
 license.workspace = true
@@ -13,41 +13,33 @@ publish.workspace = true
 dist = true
 
 [dependencies]
-tokio = { version = "1.53.3", features = ["full"] }
-axum = "0.8.9"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "query"] }
-async-trait = "0.1.92"
-ron = "0.12.2"
+arc-swap.workspace = true
+axum.workspace = true
 clap.workspace = true
-regex = "1.13.1"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-rand = "0.10.3"
-serde_urlencoded = "0.7.1"
-subtle = "2.6.1"
-arc-swap = "1.9.2"
-bytes = "1.12.1"
-tokio-util = "0.7.20"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 http-body.workspace = true
 parking_lot.workspace = true
+# Only for reading 0.2 configs (`migrate`).
+ron.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tgin-botapi.workspace = true
 tgin-core.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }
+tokio-util.workspace = true
 tower.workspace = true
+tracing.workspace = true
 url.workspace = true
 
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false }
+mimalloc.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.53.3", features = ["test-util"] }
-wiremock = "0.6.5"
-http-body-util = "0.1.5"
 futures-util.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util", "time"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true

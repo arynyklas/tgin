@@ -1,3 +1,5 @@
+//! The tgin 0.2 RON config file, as 0.2 read it.
+
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
@@ -108,14 +110,14 @@ pub enum RouteConfig {
         /// updates are evicted FIFO and lost: tgin has already confirmed them
         /// to Telegram with its next `getUpdates`, so Telegram cannot
         /// redeliver them.
-        /// Default: [`crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES`].
+        /// Default: 10 000.
         #[serde(default = "default_max_buffered_updates")]
         max_buffered_updates: usize,
     },
     WebhookRoute {
         url: String,
         /// Per-request deadline (in milliseconds) for forwarding an update to
-        /// this downstream. Defaults to `WebhookRoute`'s `DEFAULT_REQUEST_TIMEOUT`.
+        /// this downstream. Default: 10 000 (10 s).
         #[serde(default = "default_webhook_request_timeout_ms")]
         request_timeout_ms: u64,
     },
@@ -128,10 +130,70 @@ pub enum RouteConfig {
     },
 }
 
+/// 0.2's `WebhookRoute` request timeout.
 fn default_webhook_request_timeout_ms() -> u64 {
-    crate::route::webhook::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64
+    10_000
 }
 
+/// 0.2's `LongPollRoute` buffer cap.
 fn default_max_buffered_updates() -> usize {
-    crate::route::longpull::DEFAULT_MAX_BUFFERED_UPDATES
+    10_000
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// The 0.2 configs still in the repository parse with these types.
+    #[test]
+    fn repository_ron_configs_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = vec![root.join("examples/simple/tgin.ron")];
+        let perf = root.join("tests/performance/cfgs");
+        for entry in std::fs::read_dir(&perf).expect("perf configs") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_some_and(|ext| ext == "ron") {
+                files.push(path);
+            }
+        }
+        assert!(files.len() > 1, "no RON config under {}", perf.display());
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("readable");
+            if let Err(err) = ron::from_str::<TginConfig>(&text) {
+                panic!("{}: {err}", file.display());
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_are_0_2_defaults() {
+        let config: TginConfig = ron::from_str(
+            r#"(server_port: None, updates: [], api: None, route: AllLB(routes: [
+                LongPollRoute(path: "/a"),
+                WebhookRoute(url: "http://b/"),
+            ]))"#,
+        )
+        .expect("parses");
+        assert_eq!(config.dark_threads, 4);
+        assert_eq!(config.log_level, "info");
+        let RouteConfig::AllLB { routes } = config.route else {
+            panic!("not AllLB");
+        };
+        assert!(matches!(
+            routes[0],
+            RouteConfig::LongPollRoute {
+                max_buffered_updates: 10_000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            routes[1],
+            RouteConfig::WebhookRoute {
+                request_timeout_ms: 10_000,
+                ..
+            }
+        ));
+    }
 }

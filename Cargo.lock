@@ -137,17 +137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.92"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1702,7 +1691,6 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -2189,24 +2177,16 @@ name = "tgin"
 version = "1.0.0-dev"
 dependencies = [
  "arc-swap",
- "async-trait",
  "axum",
- "axum-server",
- "bytes",
  "clap",
  "futures-util",
  "http-body",
- "http-body-util",
  "mimalloc",
  "parking_lot",
- "rand",
- "regex",
  "reqwest",
  "ron",
  "serde",
  "serde_json",
- "serde_urlencoded",
- "subtle",
  "tgin-botapi",
  "tgin-core",
  "tgin-runtime",
@@ -2215,7 +2195,6 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
- "tracing-subscriber",
  "url",
  "wiremock",
 ]
@@ -2393,7 +2372,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

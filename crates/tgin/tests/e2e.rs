@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tgin::app::{App, Connections};
 use tgin::exit::Outcome;
 use tgin_core::config;
@@ -839,4 +839,176 @@ consumers:
 
     app.signal(SignalKind::Terminate).await;
     assert_eq!(app.outcome().await, Outcome::Clean);
+}
+
+/// The `tgin` binary with `args`, `TGIN_CONFIG` unset unless given.
+fn tgin(args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tgin"));
+    command.args(args).env_remove("TGIN_CONFIG");
+    command
+}
+
+struct Output {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn output(command: &mut std::process::Command) -> Output {
+    let out = command.output().expect("tgin runs");
+    Output {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// A scratch directory of its own for `test`.
+fn scratch(test: &str) -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test);
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+#[test]
+fn legacy_file_flag_hint_exits_1() {
+    for args in [["-f", "tgin.ron"].as_slice(), &["--file=tgin.ron"]] {
+        let out = output(&mut tgin(args));
+        assert_eq!(out.code, Some(1), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains(
+                "tgin 1.0 reads YAML; convert with: tgin config migrate tgin.ron -o tgin.yaml"
+            ),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn usage_error_exits_64() {
+    for args in [
+        ["--bogus"].as_slice(),
+        &["frobnicate"],
+        &["config"],
+        &["-c", "a.yaml", "config", "schema"],
+    ] {
+        let out = output(&mut tgin(args));
+        assert_eq!(out.code, Some(64), "{args:?}: {}", out.stderr);
+        assert!(!out.stderr.is_empty(), "{args:?} printed no usage");
+    }
+    let help = output(&mut tgin(&["--help"]));
+    assert_eq!(help.code, Some(0));
+    assert!(help.stdout.contains("config"), "{}", help.stdout);
+}
+
+#[test]
+fn config_validate_lists_all_errors_exit_1() {
+    let dir = scratch("config_validate_lists_all_errors_exit_1");
+    let bad = dir.join("bad.yaml");
+    std::fs::write(
+        &bad,
+        "version: 1\nreload: { debounce: 9ms }\nbots:\n  - name: a\n    token: t\n    routes: [{ to: [nope] }]\n  - name: a\n    token: u\n",
+    )
+    .unwrap();
+    let out = output(&mut tgin(&["config", "validate", bad.to_str().unwrap()]));
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    for expected in [
+        "reload.debounce",
+        "minimum of 10ms",
+        "unknown consumer `nope`",
+        "bot name `a` is already used by bots[0]",
+    ] {
+        assert!(
+            out.stderr.contains(expected),
+            "missing {expected:?} in:\n{}",
+            out.stderr
+        );
+    }
+    assert_eq!(out.stderr.matches("error: ").count(), 3, "{}", out.stderr);
+
+    let good = dir.join("good.yaml");
+    std::fs::write(&good, "version: 1\n").unwrap();
+    let out = output(&mut tgin(&["config", "validate", good.to_str().unwrap()]));
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert!(out.stdout.contains("valid"), "{}", out.stdout);
+}
+
+#[test]
+fn config_print_redacts_and_schema_prints() {
+    let dir = scratch("config_print_redacts_and_schema_prints");
+    let file = dir.join("tgin.yaml");
+    std::fs::write(
+        &file,
+        "version: 1\nbots:\n  - name: a\n    token: ${env:PRINT_TEST_TOKEN}\n",
+    )
+    .unwrap();
+    let out =
+        output(tgin(&["config", "print", file.to_str().unwrap()]).env("PRINT_TEST_TOKEN", TOKEN));
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    let printed: Value = serde_json::from_str(&out.stdout).expect("JSON");
+    assert_eq!(printed["bots"][0]["token"], "[redacted]");
+    assert!(!out.stdout.contains("AAAAexample"), "{}", out.stdout);
+
+    let schema = output(&mut tgin(&["config", "schema"]));
+    assert_eq!(schema.code, Some(0));
+    let schema: Value = serde_json::from_str(&schema.stdout).expect("JSON schema");
+    assert_eq!(schema["title"], "tgin configuration, version 1");
+
+    let version = output(&mut tgin(&["version"]));
+    assert_eq!(version.code, Some(0));
+    assert!(
+        version
+            .stdout
+            .starts_with(&format!("tgin {}", env!("CARGO_PKG_VERSION"))),
+        "{}",
+        version.stdout
+    );
+}
+
+#[test]
+fn config_path_from_flag_then_env_then_default() {
+    let dir = scratch("config_path_from_flag_then_env_then_default");
+    let cases: [(&[&str], Option<&str>, &str); 4] = [
+        (
+            &["-c", "from-flag.yaml"],
+            Some("from-env.yaml"),
+            "from-flag.yaml",
+        ),
+        (
+            &["run", "--config", "from-flag.yaml"],
+            Some("from-env.yaml"),
+            "from-flag.yaml",
+        ),
+        (&[], Some("from-env.yaml"), "from-env.yaml"),
+        (&["run"], None, "tgin.yaml"),
+    ];
+    for (args, env, expected) in cases {
+        let mut command = tgin(args);
+        command.current_dir(&dir);
+        if let Some(env) = env {
+            command.env("TGIN_CONFIG", env);
+        }
+        let out = output(&mut command);
+        assert_eq!(out.code, Some(1), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr
+                .contains(&format!("cannot read the config file {expected}")),
+            "{args:?} {env:?}: {}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn shipped_config_is_valid() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tgin.yaml");
+    let text = std::fs::read_to_string(&file).expect("the root tgin.yaml");
+    let mut env = MapEnv::default();
+    env.vars.insert("TOKEN".to_owned(), TOKEN.to_owned());
+    let cfg = config::load(&text, &file, &env).unwrap_or_else(|errors| {
+        let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        panic!("{}", errors.join("\n"))
+    });
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
