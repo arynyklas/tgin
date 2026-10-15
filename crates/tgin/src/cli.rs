@@ -17,7 +17,7 @@ use tgin_runtime::lifecycle::Signals;
 use tgin_runtime::obs::{LogFormat, LogOptions, init_tracing};
 use tgin_runtime::secret::Redactor;
 
-use crate::app::{self, App};
+use crate::app;
 use crate::exit;
 
 /// The tgin version.
@@ -271,6 +271,7 @@ fn run(path: &Path) -> u8 {
         eprintln!("tgin: {err}");
         return exit::FAILURE;
     }
+    // From here on panics are logged through the redacting writer.
     install_panic_hook();
     for warning in &cfg.warnings {
         tracing::warn!("{warning}");
@@ -302,8 +303,8 @@ fn run(path: &Path) -> u8 {
         for (kind, err) in signals.failed() {
             tracing::warn!(signal = ?kind, error = %err, "a signal listener could not be registered; that signal is not handled");
         }
-        match App::start(cfg).await {
-            Ok(app) => app.run(signals).await.code(),
+        match app::launch(cfg, signals).await {
+            Ok(outcome) => outcome.code(),
             Err(err) => {
                 tracing::error!(error = %err, "tgin could not start");
                 exit::FAILURE
@@ -332,13 +333,29 @@ fn level_name(level: LogLevel) -> &'static str {
     }
 }
 
-/// Logs every panic through `tracing`, whose writer masks secrets, before
-/// the default hook runs.
-fn install_panic_hook() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        tracing::error!(panic = %info, "panicked");
-        default(info);
+/// Logs every panic, with its location, message and a backtrace (when
+/// `RUST_BACKTRACE` asks for one), through `tracing`, whose writer masks
+/// secrets. Replaces the default hook, which would print the message to
+/// stderr unmasked; install it only once `tracing` is set up.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        let location = info
+            .location()
+            .map_or_else(|| "unknown".to_owned(), ToString::to_string);
+        let thread = std::thread::current();
+        let backtrace = std::backtrace::Backtrace::capture();
+        tracing::error!(
+            thread = thread.name().unwrap_or("unnamed"),
+            location,
+            %backtrace,
+            "panicked: {message}"
+        );
     }));
 }
 
@@ -435,5 +452,56 @@ mod tests {
         ] {
             assert_eq!(level_name(level), name);
         }
+    }
+
+    /// Collects what a subscriber writes.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The hook logs the panic through `tracing` and replaces the previous
+    /// hook instead of chaining to it: the default hook would print the
+    /// message to stderr unmasked.
+    #[test]
+    fn panic_hook_logs_through_tracing_only() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let chained = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&chained);
+        std::panic::set_hook(Box::new(move |_| flag.store(true, Ordering::SeqCst)));
+        install_panic_hook();
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let panicked = tracing::subscriber::with_default(subscriber, || {
+            std::panic::catch_unwind(|| panic!("boom {}", 42))
+        });
+        // Back to the default hook for the other tests.
+        drop(std::panic::take_hook());
+
+        assert!(panicked.is_err());
+        assert!(!chained.load(Ordering::SeqCst), "the previous hook ran");
+        let logged = String::from_utf8(capture.0.lock().clone()).unwrap();
+        assert!(logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("panicked: boom 42"), "{logged}");
+        assert!(logged.contains("cli.rs"), "no location: {logged}");
+        assert!(
+            logged.contains("backtrace="),
+            "no backtrace field: {logged}"
+        );
     }
 }

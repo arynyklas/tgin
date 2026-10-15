@@ -2183,6 +2183,7 @@ dependencies = [
  "http-body",
  "mimalloc",
  "parking_lot",
+ "rand",
  "reqwest",
  "ron",
  "serde",
@@ -2195,6 +2196,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "wiremock",
 ]

@@ -140,13 +140,19 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+fn load(yaml: &str) -> config::Config {
+    config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).unwrap_or_else(|errors| {
+        let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        panic!("invalid test config:\n{}", errors.join("\n"))
+    })
+}
+
 async fn start(yaml: &str) -> Running {
-    let cfg =
-        config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).unwrap_or_else(|errors| {
-            let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
-            panic!("invalid test config:\n{}", errors.join("\n"))
-        });
-    let app = App::start(cfg).await.expect("tgin starts");
+    running(App::start(load(yaml)).await.expect("tgin starts"))
+}
+
+/// Runs `app` on signals the test sends.
+fn running(app: App) -> Running {
     let addr = app.data_addrs()[0];
     let metrics = app.metrics();
     let connections = app.connections();
@@ -653,8 +659,8 @@ async fn console_close_skips_lame_duck() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn all_sources_failed_exits_2() {
+/// Two long-poll bots whose tokens Telegram rejects.
+async fn failing_sources(runtime: &str) -> (MockServer, Running) {
     let telegram = MockServer::start().await;
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "ok": false, "error_code": 401, "description": "Unauthorized"
@@ -663,7 +669,7 @@ async fn all_sources_failed_exits_2() {
     mount_bot(&telegram, OTHER_TOKEN, unauthorized, Vec::new()).await;
     let app = start(&format!(
         r#"version: 1
-{QUICK}
+{runtime}
 server: {{ listen: ["127.0.0.1:0"] }}
 bots:
   - name: first
@@ -683,7 +689,229 @@ consumers:
         api = telegram.uri()
     ))
     .await;
+    (telegram, app)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_sources_failed_exits_2() {
+    let (_telegram, app) = failing_sources(QUICK).await;
     assert_eq!(app.outcome().await, Outcome::AllSourcesFailed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_while_sources_failed_keeps_draining() {
+    let lame_duck = Duration::from_millis(1500);
+    let (_telegram, app) =
+        failing_sources("runtime: { lame_duck: 1500ms, shutdown_grace: 2s }").await;
+    app.wait_until_not_ready().await;
+    let draining = Instant::now();
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::AllSourcesFailed);
+    // The signal did not cut the lame duck short.
+    assert!(
+        draining.elapsed() >= lame_duck - Duration::from_millis(100),
+        "exited after {:?}",
+        draining.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_signals_while_sources_failed_exit_130() {
+    let (_telegram, app) =
+        failing_sources("runtime: { lame_duck: 30s, shutdown_grace: 30s }").await;
+    app.wait_until_not_ready().await;
+    let started = Instant::now();
+    app.signal(SignalKind::Terminate).await;
+    app.signal(SignalKind::Interrupt).await;
+    assert_eq!(app.outcome().await, Outcome::Forced);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// A webhook bot whose `getMe` answers only after a minute, with a push
+/// consumer, so the start is still waiting when the test signals.
+async fn slow_start() -> (MockServer, config::Config) {
+    let telegram = MockServer::start().await;
+    mount_bot(
+        &telegram,
+        TOKEN,
+        me("tgin_bot").set_delay(Duration::from_secs(60)),
+        Vec::new(),
+    )
+    .await;
+    let (down, _seen) = downstream(ResponseTemplate::new(200)).await;
+    let cfg = load(&hooked(
+        &telegram,
+        QUICK,
+        "[{ to: [downstream] }]",
+        &format!(
+            r#"  downstream: {{ push: {{ endpoints: [{{ url: "{}/bot" }}] }} }}"#,
+            down.uri()
+        ),
+    ));
+    (telegram, cfg)
+}
+
+/// Launches `cfg` and waits until it asked Telegram for the bot's identity.
+async fn launch_until_get_me(
+    telegram: &MockServer,
+    cfg: config::Config,
+) -> (
+    mpsc::Sender<SignalKind>,
+    JoinHandle<Result<Outcome, tgin::app::StartError>>,
+) {
+    let (signals, rx) = mpsc::channel(4);
+    let launched = tokio::spawn(tgin::app::launch(cfg, Signals::from_channel(rx)));
+    let started = Instant::now();
+    while telegram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(started.elapsed() < PATIENCE, "getMe was never called");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (signals, launched)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signal_during_start_stops_cleanly() {
+    let (telegram, cfg) = slow_start().await;
+    let (signals, launched) = launch_until_get_me(&telegram, cfg).await;
+    let started = Instant::now();
+    signals.send(SignalKind::Terminate).await.unwrap();
+    let outcome = timeout(PATIENCE, launched).await.expect("in time").unwrap();
+    assert_eq!(outcome.expect("no start error"), Outcome::Clean);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_signal_during_start_exits_130() {
+    let (telegram, cfg) = slow_start().await;
+    let (signals, launched) = launch_until_get_me(&telegram, cfg).await;
+    let started = Instant::now();
+    signals.send(SignalKind::Terminate).await.unwrap();
+    signals.send(SignalKind::Interrupt).await.unwrap();
+    let outcome = timeout(PATIENCE, launched).await.expect("in time").unwrap();
+    assert_eq!(outcome.expect("no start error"), Outcome::Forced);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_routes_serves_the_next_request() {
+    let telegram = telegram_with_hooked_bot().await;
+    let config = |alias: &str| {
+        hooked(
+            &telegram,
+            QUICK,
+            "[{ to: [workers] }]",
+            &format!("  workers: {{ pull: {{ aliases: [{alias}] }} }}"),
+        )
+    };
+    let app = App::start(load(&config("/old")))
+        .await
+        .expect("tgin starts");
+    let addr = app.data_addrs()[0];
+    let http = client();
+    let status = |path: &'static str| {
+        let http = http.clone();
+        async move {
+            http.get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(status("/old").await, 200);
+    assert_eq!(status("/new").await, 404);
+
+    assert!(app.set_routes(&load(&config("/new"))));
+    assert_eq!(status("/old").await, 404);
+    assert_eq!(status("/new").await, 200);
+    assert_eq!(status("/c/workers/getUpdates").await, 200);
+
+    let app = running(app);
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::Clean);
+}
+
+/// Fails the first `failures` calls with a 500, then names the bot.
+struct FlakyGetMe {
+    calls: std::sync::atomic::AtomicUsize,
+    failures: usize,
+}
+
+impl Respond for FlakyGetMe {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < self.failures {
+            ResponseTemplate::new(500).set_body_json(json!({
+                "ok": false, "error_code": 500, "description": "Internal Server Error"
+            }))
+        } else {
+            me("tgin_bot")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_get_me_retried_until_username_known() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/getMe")))
+        .respond_with(FlakyGetMe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            failures: 2,
+        })
+        .mount(&telegram)
+        .await;
+    let app = start(&hooked(
+        &telegram,
+        QUICK,
+        "\n      - { match: { commands: [admin] }, to: [admin] }\n      - { to: [workers] }",
+        "  admin: { pull: {} }\n  workers: { pull: {} }",
+    ))
+    .await;
+    // Ready after the first, failed getMe.
+    assert_eq!(app.get("/readyz", None).await.0, 200);
+
+    // Until the username is known, `/admin@tgin_bot` is someone else's.
+    let started = Instant::now();
+    let mut id = 1;
+    loop {
+        app.deliver(&[(id, "/admin@tgin_bot")]).await;
+        let admin = app
+            .poll_ids(&format!("/c/admin/getUpdates?offset={id}"), None)
+            .await;
+        if admin == vec![id] {
+            break;
+        }
+        assert_eq!(admin, Vec::<i64>::new());
+        assert_eq!(
+            app.poll_ids(&format!("/c/workers/getUpdates?offset={id}"), None)
+                .await,
+            vec![id]
+        );
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the username was never learnt"
+        );
+        id += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let get_me = format!("/bot{TOKEN}/getMe");
+    let calls = telegram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == get_me)
+        .count();
+    assert_eq!(calls, 3);
+
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::Clean);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1011,4 +1239,120 @@ fn shipped_config_is_valid() {
         panic!("{}", errors.join("\n"))
     });
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+/// The `tgin` binary serving a webhook bot backed by `telegram`, on a port
+/// picked by binding port 0, with `runtime` timings; waits until ready.
+#[cfg(unix)]
+async fn spawn_tgin(
+    test: &str,
+    telegram: &MockServer,
+    runtime: &str,
+) -> (std::process::Child, String) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port();
+    let file = scratch(test).join("tgin.yaml");
+    std::fs::write(
+        &file,
+        format!(
+            r#"version: 1
+{runtime}
+server: {{ listen: ["127.0.0.1:{port}"] }}
+bots:
+  - name: hooked
+    token: "{TOKEN}"
+    api_url: {api}
+    ingress: {{ webhook: {{ path: /hook, secret_token: none }} }}
+    routes: [{{ to: [workers] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+"#,
+            api = telegram.uri()
+        ),
+    )
+    .unwrap();
+    let mut child = tgin(&["-c", file.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("tgin starts");
+    let base = format!("http://127.0.0.1:{port}");
+    let http = client();
+    let started = Instant::now();
+    while started.elapsed() < PATIENCE {
+        if let Ok(response) = http.get(format!("{base}/readyz")).send().await
+            && response.status() == 200
+        {
+            return (child, base);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("tgin never became ready");
+}
+
+#[cfg(unix)]
+fn kill(child: &std::process::Child, signal: &str) {
+    let status = std::process::Command::new("kill")
+        .args([signal, &child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill {signal} failed");
+}
+
+/// Waits for `child` to exit, within [`PATIENCE`].
+#[cfg(unix)]
+async fn exit_code(mut child: std::process::Child) -> Option<i32> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("waitable") {
+            return status.code();
+        }
+        if started.elapsed() > PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("tgin did not exit in time");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn os_sigterm_exits_0() {
+    let telegram = telegram_with_hooked_bot().await;
+    let (child, _base) = spawn_tgin("os_sigterm_exits_0", &telegram, QUICK).await;
+    kill(&child, "-TERM");
+    assert_eq!(exit_code(child).await, Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn os_sigterm_then_sigint_exits_130() {
+    let telegram = telegram_with_hooked_bot().await;
+    let (child, base) = spawn_tgin(
+        "os_sigterm_then_sigint_exits_130",
+        &telegram,
+        "runtime: { lame_duck: 30s, shutdown_grace: 30s }",
+    )
+    .await;
+    kill(&child, "-TERM");
+    let http = client();
+    let started = Instant::now();
+    while http
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .map(|r| r.status())
+        .ok()
+        != Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+    {
+        assert!(started.elapsed() < PATIENCE, "/readyz never turned 503");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    kill(&child, "-INT");
+    assert_eq!(exit_code(child).await, Some(130));
 }

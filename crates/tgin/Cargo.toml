@@ -18,6 +18,7 @@ axum.workspace = true
 clap.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 # Only for reading 0.2 configs (`migrate`).
 ron.workspace = true
 serde.workspace = true
@@ -39,6 +40,7 @@ mimalloc.workspace = true
 futures-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util", "time"] }
+tracing-subscriber.workspace = true
 wiremock.workspace = true
 
 [lints]
