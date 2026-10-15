@@ -149,12 +149,27 @@ where
 
 /// `level` as the default directive, overridden by any `RUST_LOG` directive.
 fn filter(level: &str, rust_log: Option<&str>) -> Result<EnvFilter, LogError> {
-    let level: LevelFilter = level
-        .parse()
-        .map_err(|_| LogError::InvalidLevel(level.to_owned()))?;
     Ok(EnvFilter::builder()
-        .with_default_directive(level.into())
+        .with_default_directive(parse_level(level)?.into())
         .parse_lossy(rust_log.unwrap_or_default()))
+}
+
+/// Accepts only the documented level names, in any case. `LevelFilter`'s own
+/// `FromStr` also takes `""` and the digits `0` to `5`.
+fn parse_level(level: &str) -> Result<LevelFilter, LogError> {
+    const LEVELS: [(&str, LevelFilter); 6] = [
+        ("off", LevelFilter::OFF),
+        ("error", LevelFilter::ERROR),
+        ("warn", LevelFilter::WARN),
+        ("info", LevelFilter::INFO),
+        ("debug", LevelFilter::DEBUG),
+        ("trace", LevelFilter::TRACE),
+    ];
+    LEVELS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(level))
+        .map(|&(_, filter)| filter)
+        .ok_or_else(|| LogError::InvalidLevel(level.to_owned()))
 }
 
 /// Hands out [`RedactingWriter`]s over `inner`'s writers.
@@ -414,14 +429,23 @@ mod tests {
 
     #[test]
     fn invalid_level_is_rejected() {
-        let result = subscriber(
-            &text("verbose"),
-            None,
-            false,
-            Capture::default(),
-            no_redaction,
-        );
-        assert!(matches!(result, Err(LogError::InvalidLevel(level)) if level == "verbose"));
+        for bad in ["verbose", "", " info", "0", "3", "5", "warning"] {
+            let result = subscriber(&text(bad), None, false, Capture::default(), no_redaction);
+            assert!(
+                matches!(&result, Err(LogError::InvalidLevel(level)) if level == bad),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn level_names_are_case_insensitive() {
+        for good in ["trace", "DEBUG", "Info", "warn", "ERROR", "off"] {
+            assert!(
+                subscriber(&text(good), None, false, Capture::default(), no_redaction).is_ok(),
+                "{good:?} was rejected"
+            );
+        }
     }
 
     #[test]

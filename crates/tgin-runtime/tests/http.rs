@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::get;
-use tgin_runtime::http::{
-    ClientOptions, RunningServer, ServerOptions, TlsFiles, describe_error, serve,
-};
+use tgin_runtime::http::{RunningServer, ServerOptions, TlsFiles, serve};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -191,6 +189,27 @@ async fn two_listeners_shutdown_together() {
     }
 }
 
+#[tokio::test]
+async fn shutdown_before_any_request() {
+    let grace = Duration::from_secs(1);
+    let server = start(ServerOptions {
+        listen: vec![loopback()],
+        ..ServerOptions::default()
+    })
+    .await;
+    let addr = server.local_addrs[0];
+
+    server.graceful_shutdown(grace);
+    timeout(grace + Duration::from_secs(1), server.wait())
+        .await
+        .expect("the server stops within the grace period");
+
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "{addr} still accepts connections"
+    );
+}
+
 fn write_pair(dir: &Path, pair: &rcgen::CertifiedKey<rcgen::KeyPair>) -> TlsFiles {
     let files = TlsFiles {
         cert: dir.join("cert.pem"),
@@ -247,41 +266,4 @@ async fn tls_reload_serves_new_certificate() {
     write_pair(&dir, &second);
     server.reload_tls().await.expect("reload succeeds");
     assert_eq!(&handshake(addr, &roots).await, second.cert.der());
-}
-
-#[tokio::test]
-async fn describe_error_has_no_url() {
-    let closed_port = std::net::TcpListener::bind(loopback())
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let url = format!("http://127.0.0.1:{closed_port}/bot123456789:AAAAexampleSecretToken/x");
-
-    // Built without `client()` so an HTTP_PROXY or ALL_PROXY in the test
-    // environment cannot reroute the request.
-    let opts = ClientOptions::default();
-    let err = reqwest::Client::builder()
-        .connect_timeout(opts.connect_timeout)
-        .timeout(opts.request_timeout)
-        .pool_idle_timeout(opts.pool_idle_timeout)
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get(&url)
-        .send()
-        .await
-        .expect_err("nothing listens on the port");
-    assert!(
-        format!("{err:?}").contains("AAAA"),
-        "precondition: reqwest's own Debug output carries the URL"
-    );
-
-    let described = describe_error(&err);
-    assert!(!described.contains("AAAA"), "token leaked: {described}");
-    assert!(
-        !described.contains("bot123456789"),
-        "URL leaked: {described}"
-    );
-    assert!(described.contains("connect"), "kind missing: {described}");
 }

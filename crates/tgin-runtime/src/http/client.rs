@@ -35,10 +35,22 @@ impl Default for ClientOptions {
 /// servers against the platform's trust roots and cannot be built without
 /// them.
 pub fn client(opts: &ClientOptions) -> reqwest::Client {
-    reqwest::Client::builder()
+    client_with(opts, false)
+}
+
+/// [`client`]'s builder; `no_proxy` lets tests ignore proxy variables in
+/// their environment.
+fn client_with(opts: &ClientOptions, no_proxy: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder()
         .connect_timeout(opts.connect_timeout)
         .timeout(opts.request_timeout)
-        .pool_idle_timeout(opts.pool_idle_timeout)
+        .pool_idle_timeout(opts.pool_idle_timeout);
+    let builder = if no_proxy {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .expect("a system CA certificate store is required to build the HTTP client")
 }
@@ -86,22 +98,21 @@ pub fn describe_error(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_builds() {
+        // Building sends nothing, so proxy variables cannot affect it.
+        let _ = client(&ClientOptions::default());
+    }
+
     #[tokio::test]
     async fn describe_error_reports_timeout_kind() {
         // The kernel completes the handshake, but nothing ever answers.
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/bot1:SECRET/getMe", silent.local_addr().unwrap());
 
-        // Built without `client()` so an HTTP_PROXY or ALL_PROXY in the test
-        // environment cannot reroute the request.
-        let opts = ClientOptions::default();
-        let err = reqwest::Client::builder()
-            .connect_timeout(opts.connect_timeout)
-            .timeout(opts.request_timeout)
-            .pool_idle_timeout(opts.pool_idle_timeout)
-            .no_proxy()
-            .build()
-            .unwrap()
+        // `no_proxy` so an HTTP_PROXY or ALL_PROXY in the test environment
+        // cannot reroute the request.
+        let err = client_with(&ClientOptions::default(), true)
             .get(&url)
             .timeout(Duration::from_millis(100))
             .send()
@@ -111,5 +122,33 @@ mod tests {
         let described = describe_error(&err);
         assert!(described.contains("timeout: true"), "{described}");
         assert!(!described.contains("SECRET"), "{described}");
+    }
+
+    #[tokio::test]
+    async fn describe_error_has_no_url() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{closed_port}/bot123456789:AAAAexampleSecretToken/x");
+
+        let err = client_with(&ClientOptions::default(), true)
+            .get(&url)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        assert!(
+            format!("{err:?}").contains("AAAA"),
+            "precondition: reqwest's own Debug output carries the URL"
+        );
+
+        let described = describe_error(&err);
+        assert!(!described.contains("AAAA"), "token leaked: {described}");
+        assert!(
+            !described.contains("bot123456789"),
+            "URL leaked: {described}"
+        );
+        assert!(described.contains("connect"), "kind missing: {described}");
     }
 }
