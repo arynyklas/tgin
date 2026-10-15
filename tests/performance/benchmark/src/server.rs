@@ -3,7 +3,11 @@
 //! `POST /bench/run` performs one measured run on demand.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -18,7 +22,7 @@ use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, OwnedMutexGuard},
     time::interval,
 };
 
@@ -94,9 +98,9 @@ pub struct Server {
     api: Arc<MockApi>,
     client: Client,
     /// The next `update_id`. Ids keep increasing across runs, as Telegram's
-    /// do, because long-poll offsets depend on it. Held for a whole run, so
-    /// runs never overlap.
-    next_update_id: Mutex<u64>,
+    /// do, because long-poll offsets depend on it. Held for a whole run,
+    /// including a cancelled run's send thread, so runs never overlap.
+    next_update_id: Arc<Mutex<u64>>,
 }
 
 impl Server {
@@ -104,7 +108,7 @@ impl Server {
         Self {
             api: Arc::new(MockApi::new()),
             client: Client::new(),
-            next_update_id: Mutex::new(1),
+            next_update_id: Arc::new(Mutex::new(1)),
         }
     }
 }
@@ -122,20 +126,21 @@ async fn run_handler(
     State(server): State<Arc<Server>>,
     Json(options): Json<RunOptions>,
 ) -> Response {
-    let Ok(mut next_update_id) = server.next_update_id.try_lock() else {
+    let Ok(lock) = server.next_update_id.clone().try_lock_owned() else {
         return (StatusCode::CONFLICT, "another run is in progress").into_response();
     };
-    match run(&server, &options, &mut next_update_id).await {
+    match run(&server, &options, lock).await {
         Ok(report) => Json(report).into_response(),
         Err(reason) => (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response(),
     }
 }
 
 /// Warm up, run the open-loop send phase, wait for completion and report.
+/// `lock` is the run lock, holding the next `update_id`.
 async fn run(
     server: &Server,
     options: &RunOptions,
-    next_update_id: &mut u64,
+    mut lock: OwnedMutexGuard<u64>,
 ) -> Result<Report, String> {
     if options.rps == 0 || options.duration == 0 {
         return Err("rps and duration must be at least 1".to_owned());
@@ -158,8 +163,8 @@ async fn run(
         let mut spacing = interval(WARMUP_SPACING);
         for _ in 0..options.warmup_updates {
             spacing.tick().await;
-            sender.send_warmup(*next_update_id);
-            *next_update_id += 1;
+            sender.send_warmup(*lock);
+            *lock += 1;
         }
         wait_until(Duration::from_secs(options.warmup_timeout), || {
             tracker.warmup_done()
@@ -174,10 +179,12 @@ async fn run(
         }
     }
 
-    let first_update_id = *next_update_id;
-    let (schedule, phase) =
-        send_phase(sender, first_update_id, options.rps, options.duration).await?;
-    *next_update_id = first_update_id + schedule.total();
+    // Reserve the whole id range before the thread starts, so the ids of a
+    // cancelled run are never handed out again.
+    let first_update_id = *lock;
+    *lock = first_update_id + Schedule::count(options.rps, options.duration);
+    let thread = SendThread::start(sender, first_update_id, options.rps, options.duration, lock)?;
+    let (schedule, phase, _lock) = thread.finish().await?;
     let waited = wait_until(Duration::from_secs(options.completion_timeout), || {
         tracker.settled()
     })
@@ -211,30 +218,81 @@ async fn run(
     })
 }
 
-/// Run the send loop on a dedicated OS thread, so neither the async
-/// runtime's timer granularity nor its other tasks delay a send. The thread
-/// hands each update to the runtime (webhook) or the update stream (long
-/// poll) and moves on.
-async fn send_phase(
-    sender: Arc<Sender>,
-    first_update_id: u64,
-    rps: u64,
-    duration_secs: u64,
-) -> Result<(Schedule, SendPhase), String> {
-    let (done_tx, done_rx) = oneshot::channel();
-    std::thread::Builder::new()
-        .name("bench-send-loop".to_owned())
-        .spawn(move || {
-            let schedule = Schedule::new(Instant::now(), rps, duration_secs);
-            let phase = run_open_loop(&schedule, &SystemClock, |i, due| {
-                sender.send(first_update_id + i, due)
-            });
-            let _ = done_tx.send((schedule, phase));
+/// The send loop, on a dedicated OS thread so neither the async runtime's
+/// timer granularity nor its other tasks delay a send. The thread hands each
+/// update to the runtime (webhook) or the update stream (long poll) and
+/// moves on.
+///
+/// The thread holds the run lock. Dropping a `SendThread` that has not
+/// finished, because the run was cancelled, stops the thread within
+/// [`crate::load::MAX_SLEEP_SLICE`] and releases the lock only once the thread has exited.
+struct SendThread {
+    stop: Arc<AtomicBool>,
+    done: Option<oneshot::Receiver<(Schedule, SendPhase)>>,
+    running: Option<(JoinHandle<()>, OwnedMutexGuard<u64>)>,
+}
+
+impl SendThread {
+    fn start(
+        sender: Arc<Sender>,
+        first_update_id: u64,
+        rps: u64,
+        duration_secs: u64,
+        lock: OwnedMutexGuard<u64>,
+    ) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = oneshot::channel();
+        let thread_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("bench-send-loop".to_owned())
+            .spawn(move || {
+                let schedule = Schedule::new(Instant::now(), rps, duration_secs);
+                let phase = run_open_loop(&schedule, &SystemClock, &thread_stop, |i, due| {
+                    sender.send(first_update_id + i, due)
+                });
+                let _ = done_tx.send((schedule, phase));
+            })
+            .map_err(|error| format!("cannot start the send loop thread: {error}"))?;
+        Ok(Self {
+            stop,
+            done: Some(done_rx),
+            running: Some((thread, lock)),
         })
-        .map_err(|error| format!("cannot start the send loop thread: {error}"))?;
-    done_rx
+    }
+
+    /// Wait for the send phase to end and the thread to exit; returns the
+    /// run lock.
+    async fn finish(mut self) -> Result<(Schedule, SendPhase, OwnedMutexGuard<u64>), String> {
+        let done = self.done.take().expect("finish runs once");
+        let result = done.await;
+        let (thread, lock) = self.running.take().expect("running until finished");
+        // The thread's last act was sending the result; the join is short.
+        let lock = tokio::task::spawn_blocking(move || {
+            let _ = thread.join();
+            lock
+        })
         .await
-        .map_err(|_| "the send loop thread panicked".to_owned())
+        .map_err(|error| format!("cannot join the send loop thread: {error}"))?;
+        let (schedule, phase) = result.map_err(|_| "the send loop thread panicked".to_owned())?;
+        Ok((schedule, phase, lock))
+    }
+}
+
+impl Drop for SendThread {
+    fn drop(&mut self) {
+        let Some((thread, lock)) = self.running.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::Relaxed);
+        let join = move || {
+            let _ = thread.join();
+            drop(lock);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(join)),
+            Err(_) => join(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -460,5 +518,97 @@ mod tests {
         assert_eq!((first.sent, first.received), (200, 200));
         assert_eq!((second.sent, second.received), (200, 200));
         assert_eq!(second.unmatched_replies, 0);
+    }
+
+    /// A 10 s long-poll run at 1000 RPS with nobody polling: the send thread
+    /// keeps pushing until the run ends or is cancelled.
+    fn long_cancellable_run() -> RunOptions {
+        RunOptions {
+            rps: 1000,
+            duration: 10,
+            warmup_updates: 0,
+            completion_timeout: 1,
+            ..options(Mode::Longpoll, "")
+        }
+    }
+
+    /// After a cancelled run: the send thread stops within 50 ms, the run lock
+    /// comes back holding the next id past the whole reserved range, and the
+    /// next run's updates come after that range.
+    async fn assert_cancelled_run_cleaned_up(server: &Arc<Server>) {
+        let tracker = server.api.tracker();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stopped_at = tracker.counts().sent;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            tracker.counts().sent,
+            stopped_at,
+            "the send thread kept sending"
+        );
+        assert!(stopped_at > 0 && stopped_at < 2_000, "sent {stopped_at}");
+
+        let lock = wait_for_run_lock(server).await;
+        assert_eq!(*lock, 10_001, "the cancelled run's ids must stay reserved");
+
+        let next = RunOptions {
+            rps: 10,
+            duration: 1,
+            completion_timeout: 0,
+            ..long_cancellable_run()
+        };
+        run(server, &next, lock).await.unwrap();
+        let ids = server.api.stream("123:test").update_ids();
+        let (cancelled, following) = ids.split_at(ids.len() - 10);
+        assert_eq!(following, (10_001..=10_010).collect::<Vec<i64>>());
+        assert!(cancelled.iter().all(|id| *id <= 10_000));
+    }
+
+    async fn wait_for_run_lock(server: &Arc<Server>) -> OwnedMutexGuard<u64> {
+        for _ in 0..100 {
+            if let Ok(lock) = server.next_update_id.clone().try_lock_owned() {
+                return lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the run lock was not released within 1 s of the cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_run_stops_its_send_thread_and_keeps_its_ids_reserved() {
+        let server = Arc::new(Server::new());
+        let run_server = server.clone();
+        let cancelled = tokio::spawn(async move {
+            let lock = run_server.next_update_id.clone().try_lock_owned().unwrap();
+            run(&run_server, &long_cancellable_run(), lock).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+
+        assert_cancelled_run_cleaned_up(&server).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_disconnect_cancels_the_run() {
+        let server = Arc::new(Server::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(server.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // The client gives up after 200 ms and closes the connection, as
+        // Ctrl-C on `tgin-bench run` does.
+        let result = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap()
+            .post(format!("{base}/bench/run"))
+            .json(&long_cancellable_run())
+            .send()
+            .await;
+        assert!(result.unwrap_err().is_timeout());
+
+        assert_cancelled_run_cleaned_up(&server).await;
     }
 }

@@ -6,13 +6,19 @@
 //! to a couple of milliseconds late, and that lateness would be charged to
 //! every latency sample.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
 /// How long before a due time the send loop stops sleeping and spins.
 pub const SPIN_WINDOW: Duration = Duration::from_millis(2);
+/// Longest single sleep of the send loop, so a stop is seen within it even
+/// at low rates.
+pub const MAX_SLEEP_SLICE: Duration = Duration::from_millis(10);
 /// Longest send lag the lag histogram tells apart, 1 h in nanoseconds.
 const LAG_MAX_NS: u64 = 3_600_000_000_000;
 /// How often [`wait_until`] re-checks its condition.
@@ -53,16 +59,17 @@ impl Schedule {
         Self {
             start,
             rps,
-            total: rps.saturating_mul(duration_secs),
+            total: Self::count(rps, duration_secs),
         }
+    }
+
+    /// How many sends a schedule of `rps` for `duration_secs` holds.
+    pub fn count(rps: u64, duration_secs: u64) -> u64 {
+        rps.saturating_mul(duration_secs)
     }
 
     pub fn start(&self) -> Instant {
         self.start
-    }
-
-    pub fn total(&self) -> u64 {
-        self.total
     }
 
     /// How long after `start` send `i` is due. Computed from `i` directly, so
@@ -97,17 +104,21 @@ pub struct SendPhase {
     pub lag: Lag,
 }
 
-/// Block until `due`: sleep while more than [`SPIN_WINDOW`] remains, then
-/// spin.
-fn wait_for(clock: &impl Clock, due: Instant) {
+/// Block until `due` or until `stop` is raised: sleep while more than
+/// [`SPIN_WINDOW`] remains, in slices of at most [`MAX_SLEEP_SLICE`], then
+/// spin. Returns `false` when stopped.
+fn wait_for(clock: &impl Clock, due: Instant, stop: &AtomicBool) -> bool {
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
         let now = clock.now();
         if now >= due {
-            return;
+            return true;
         }
         let remaining = due - now;
         if remaining > SPIN_WINDOW {
-            clock.sleep(remaining - SPIN_WINDOW);
+            clock.sleep((remaining - SPIN_WINDOW).min(MAX_SLEEP_SLICE));
         } else {
             std::hint::spin_loop();
         }
@@ -117,20 +128,24 @@ fn wait_for(clock: &impl Clock, due: Instant) {
 /// Run the send phase on the calling thread: call `send(i, due)` for every
 /// scheduled send in order, at its due time or, when the loop is behind, at
 /// once. A late send still gets its due time, so whoever records latency
-/// counts the delay.
+/// counts the delay. Raising `stop` ends the loop within
+/// [`MAX_SLEEP_SLICE`], before the next send.
 ///
 /// `send` must not wait for the system under test; it hands the update off
 /// and returns.
 pub fn run_open_loop(
     schedule: &Schedule,
     clock: &impl Clock,
+    stop: &AtomicBool,
     mut send: impl FnMut(u64, Instant),
 ) -> SendPhase {
     let mut lag_ns =
         Histogram::<u64>::new_with_bounds(1, LAG_MAX_NS, 3).expect("valid histogram bounds");
     for i in 0..schedule.total {
         let due = schedule.due(i);
-        wait_for(clock, due);
+        if !wait_for(clock, due, stop) {
+            break;
+        }
         send(i, due);
         let lag = clock.now().saturating_duration_since(due);
         lag_ns.saturating_record(u64::try_from(lag.as_nanos()).unwrap_or(u64::MAX));
@@ -196,6 +211,10 @@ mod tests {
         oversleep: Duration,
         /// Where each sleep would have ended without oversleeping.
         sleep_ends: RefCell<Vec<Instant>>,
+        /// The length of each sleep asked for.
+        sleeps: RefCell<Vec<Duration>>,
+        /// Raised after this many sleeps, as if another thread stopped the run.
+        stop_after_sleeps: Option<(usize, Arc<AtomicBool>)>,
     }
 
     impl FakeClock {
@@ -205,6 +224,8 @@ mod tests {
                 tick: Duration::from_nanos(100),
                 oversleep,
                 sleep_ends: RefCell::new(Vec::new()),
+                sleeps: RefCell::new(Vec::new()),
+                stop_after_sleeps: None,
             }
         }
 
@@ -223,15 +244,75 @@ mod tests {
         fn sleep(&self, duration: Duration) {
             let end = self.now.get() + duration;
             self.sleep_ends.borrow_mut().push(end);
+            self.sleeps.borrow_mut().push(duration);
             self.now.set(end + self.oversleep);
+            if let Some((after, stop)) = &self.stop_after_sleeps {
+                if self.sleeps.borrow().len() >= *after {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     /// Run `schedule` on `clock`; return `(i, due, sent_at)` per send.
     fn record(schedule: &Schedule, clock: &FakeClock) -> (Vec<(u64, Instant, Instant)>, SendPhase) {
         let mut sends = Vec::new();
-        let phase = run_open_loop(schedule, clock, |i, due| sends.push((i, due, clock.peek())));
+        let never = AtomicBool::new(false);
+        let phase = run_open_loop(schedule, clock, &never, |i, due| {
+            sends.push((i, due, clock.peek()))
+        });
         (sends, phase)
+    }
+
+    #[test]
+    fn a_stop_between_sends_ends_the_loop_before_the_next_send() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let schedule = Schedule::new(clock.peek(), 100, 10);
+        let stop = AtomicBool::new(false);
+        let mut sent = 0;
+
+        run_open_loop(&schedule, &clock, &stop, |i, _| {
+            sent += 1;
+            if i == 10 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert_eq!(sent, 11);
+    }
+
+    #[test]
+    fn a_stop_while_waiting_ends_the_loop_without_sending() {
+        // 1 RPS: the wait for send 1 is about a second of sleeps.
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock {
+            stop_after_sleeps: Some((3, stop.clone())),
+            ..FakeClock::new(Duration::ZERO)
+        };
+        let schedule = Schedule::new(clock.peek(), 1, 10);
+        let mut sent = 0;
+
+        run_open_loop(&schedule, &clock, &stop, |_, _| sent += 1);
+
+        assert_eq!(sent, 1, "only send 0, due at once, went out");
+        assert_eq!(
+            clock.sleeps.borrow().len(),
+            3,
+            "the loop kept sleeping after the stop"
+        );
+    }
+
+    #[test]
+    fn long_waits_sleep_in_short_slices_so_a_stop_is_seen_quickly() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let schedule = Schedule::new(clock.peek(), 1, 2);
+
+        let (sends, _) = record(&schedule, &clock);
+
+        assert_eq!(sends.len(), 2);
+        let sleeps = clock.sleeps.borrow();
+        assert!(sleeps.len() >= 99, "{} sleeps", sleeps.len());
+        assert!(sleeps.iter().all(|sleep| *sleep <= MAX_SLEEP_SLICE));
     }
 
     #[test]
@@ -239,7 +320,8 @@ mod tests {
         let start = Instant::now();
         let schedule = Schedule::new(start, 200, 5);
 
-        assert_eq!(schedule.total(), 1000);
+        assert_eq!(schedule.total, 1000);
+        assert_eq!(Schedule::count(200, 5), 1000);
         assert_eq!(schedule.offset(0), Duration::ZERO);
         assert_eq!(schedule.offset(1), Duration::from_millis(5));
         assert_eq!(schedule.offset(200), Duration::from_secs(1));
@@ -384,7 +466,7 @@ mod tests {
     fn the_real_clock_sends_on_time() {
         let schedule = Schedule::new(Instant::now(), 1000, 1);
 
-        let phase = run_open_loop(&schedule, &SystemClock, |_, _| {});
+        let phase = run_open_loop(&schedule, &SystemClock, &AtomicBool::new(false), |_, _| {});
 
         assert!(phase.lag.p50_ms < 1.0, "{:?}", phase.lag);
         assert!(phase.wall >= Duration::from_secs(1));
