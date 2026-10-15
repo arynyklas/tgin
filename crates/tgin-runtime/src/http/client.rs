@@ -4,7 +4,7 @@ use std::error::Error as _;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// Timeouts for [`client`].
+/// Timeouts and redirect handling for [`client`].
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
     /// Bound on establishing the TCP connection and TLS session.
@@ -14,6 +14,10 @@ pub struct ClientOptions {
     pub request_timeout: Duration,
     /// How long an idle pooled connection is kept for reuse.
     pub pool_idle_timeout: Duration,
+    /// Follow up to 10 redirects. Off by default: tgin never needs them, and
+    /// following one turns a POST into a GET and can carry credential
+    /// headers to another host.
+    pub follow_redirects: bool,
 }
 
 impl Default for ClientOptions {
@@ -22,6 +26,7 @@ impl Default for ClientOptions {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(90),
+            follow_redirects: false,
         }
     }
 }
@@ -44,7 +49,12 @@ fn client_with(opts: &ClientOptions, no_proxy: bool) -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .connect_timeout(opts.connect_timeout)
         .timeout(opts.request_timeout)
-        .pool_idle_timeout(opts.pool_idle_timeout);
+        .pool_idle_timeout(opts.pool_idle_timeout)
+        .redirect(if opts.follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        });
     let builder = if no_proxy {
         builder.no_proxy()
     } else {
@@ -102,6 +112,54 @@ mod tests {
     fn client_builds() {
         // Building sends nothing, so proxy variables cannot affect it.
         let _ = client(&ClientOptions::default());
+    }
+
+    /// A server whose `/from` redirects to its `/to`.
+    async fn redirecting() -> wiremock::MockServer {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/from"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/to", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/to"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn client_does_not_follow_redirects_by_default() {
+        let server = redirecting().await;
+        let response = client_with(&ClientOptions::default(), true)
+            .post(format!("{}/from", server.uri()))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status().as_u16(), 302);
+        let seen = server.received_requests().await.expect("recording on");
+        assert_eq!(seen.len(), 1, "the redirect was followed");
+    }
+
+    #[tokio::test]
+    async fn client_follows_redirects_when_asked() {
+        let server = redirecting().await;
+        let opts = ClientOptions {
+            follow_redirects: true,
+            ..ClientOptions::default()
+        };
+        let response = client_with(&opts, true)
+            .post(format!("{}/from", server.uri()))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.status().as_u16(), 200);
     }
 
     #[tokio::test]

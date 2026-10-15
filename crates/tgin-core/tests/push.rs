@@ -89,8 +89,10 @@ fn queue(ordering: Ordering) -> QueueConfig {
 }
 
 fn client() -> reqwest::Client {
-    // No proxy, so proxy variables in the environment cannot reroute tests.
+    // As `tgin_runtime::http::client` builds it: no redirects. No proxy
+    // either, so proxy variables in the environment cannot reroute tests.
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
         .expect("client")
@@ -851,4 +853,134 @@ async fn drain_keeps_dispatching() {
     h.admit(1, None);
     h.settled().await;
     assert_eq!(requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn cancel_stops_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "5"))
+        .mount(&server)
+        .await;
+    let mut h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/a")],
+        options(Balance::RoundRobin, 4, retry(1, 10_000, 5)),
+    );
+    h.admit(1, None);
+    wait_requests(&server, 1).await;
+    let start = Instant::now();
+    h.cancel.cancel();
+    h.join().await;
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "joined after {:?}",
+        start.elapsed()
+    );
+    let stats = h.consumer.queue().stats();
+    assert_eq!((stats.available, stats.leased), (1, 0), "back in the queue");
+    assert_eq!(h.consumer.in_flight(), 0);
+    assert_eq!(requests(&server).await.len(), 1, "no new attempt");
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="hooks",reason="dead_letter"} 0"#);
+}
+
+#[tokio::test]
+async fn redirect_dead_letters() {
+    let server = MockServer::start().await;
+    Mock::given(path("/moved"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/a", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    ok(&server).await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/moved")],
+        options(Balance::RoundRobin, 4, retry(1, 5, 5)),
+    );
+    h.admit(3020, None);
+    h.settled().await;
+
+    let got = requests(&server).await;
+    assert_eq!(got.len(), 1, "the redirect is not followed");
+    h.assert_metric(&format!("{} 1", h.attempts(0, "dead_letter")));
+    h.assert_metric(&format!("{} 0", h.attempts(0, "delivered")));
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="hooks",reason="dead_letter"} 1"#);
+    let logs = LOGS.text();
+    let line = logs
+        .lines()
+        .find(|l| l.contains("update_id=3020"))
+        .unwrap_or_else(|| panic!("no dead letter logged in {logs}"));
+    assert!(line.contains("redirect"), "{line}");
+    assert!(line.contains("302"), "{line}");
+}
+
+#[tokio::test]
+async fn open_breaker_admits_one_probe() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let open = breaker(1, Duration::from_millis(400));
+    open.on_failure(std::time::Instant::now());
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint_with(&server, "/a", open)],
+        options(Balance::RoundRobin, 4, retry(1, 5, 5)),
+    );
+    let start = Instant::now();
+    for id in 1..=3 {
+        h.admit(id, None);
+    }
+    wait_requests(&server, 1).await;
+    // The probe takes 300 ms; nothing else may go out before it answers.
+    assert_eq!(requests(&server).await.len(), 1);
+    assert_eq!(h.consumer.in_flight(), 3, "the others wait, leased");
+    h.settled().await;
+    // Reopen (400 ms), the probe alone (300 ms), then the other two at once
+    // (300 ms); without the single probe all three would end by ~700 ms.
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "settled after {:?}",
+        start.elapsed()
+    );
+    assert_eq!(requests(&server).await.len(), 3);
+}
+
+#[tokio::test]
+async fn force_during_backoff_keeps_chat_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(r#""update_id":1,"#))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "5"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    ok(&server).await;
+    let mut h = Harness::new(
+        queue(Ordering::PerKey),
+        vec![endpoint(&server, "/a")],
+        options(Balance::RoundRobin, 4, retry(1, 10_000, 5)),
+    );
+    h.admit(1, Some(7));
+    h.admit(2, Some(7));
+    wait_requests(&server, 1).await;
+    eventually("update 1 waits to retry", || {
+        h.metrics()
+            .lines()
+            .any(|l| l == format!("{} 1", h.attempts(0, "retry")))
+    })
+    .await;
+    h.force.cancel();
+    h.join().await;
+    let stats = h.consumer.queue().stats();
+    assert_eq!((stats.available, stats.leased), (2, 0));
+
+    h.spawn();
+    h.settled().await;
+    let order: Vec<i64> = requests(&server).await.iter().map(update_id).collect();
+    assert_eq!(order, [1, 1, 2]);
 }

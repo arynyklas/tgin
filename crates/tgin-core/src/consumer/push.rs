@@ -85,7 +85,9 @@ pub struct PushConsumer {
 
 impl PushConsumer {
     /// `cfg` should come from [`crate::config::Push::queue`]: the push queue
-    /// is never expired, so its lease timeout only has to be long.
+    /// is never expired, so its lease timeout only has to be long. `client`
+    /// must not follow redirects (as [`tgin_runtime::http::client`] by
+    /// default): any 3xx dead-letters the update.
     pub fn new(
         name: Arc<str>,
         cfg: QueueConfig,
@@ -118,11 +120,13 @@ impl PushConsumer {
     }
 
     /// Runs the dispatcher until `cancel` or `force`. After `cancel` it
-    /// leases nothing new and returns once the deliveries it holds settle,
-    /// each bounded by its request timeouts and backoffs. `force` aborts them
-    /// at once and returns their leases to the queue, as does dropping or
-    /// aborting the task, so a dispatcher spawned later retries them. Run at
-    /// most one dispatcher per consumer at a time.
+    /// leases nothing new and starts no new attempt: deliveries waiting to
+    /// retry or for a breaker return their leases to the queue at once, and
+    /// requests already sent finish (bounded by their request timeouts),
+    /// then the task returns. `force` aborts those requests too and returns
+    /// their leases, as does dropping or aborting the task, so a dispatcher
+    /// spawned later retries every update not delivered or dead-lettered.
+    /// Run at most one dispatcher per consumer at a time.
     pub fn spawn(
         self: &Arc<Self>,
         cancel: CancellationToken,
@@ -185,7 +189,7 @@ impl PushConsumer {
                     if !leases.is_empty() {
                         for lease in leases {
                             let held = Held::new(self, lease.seq);
-                            deliveries.push(self.deliver(held, lease.item));
+                            deliveries.push(self.deliver(held, lease.item, &cancel));
                         }
                         self.update_depth();
                     }
@@ -206,20 +210,26 @@ impl PushConsumer {
     }
 
     /// Delivers one update, retrying on the endpoints of the current set,
-    /// until it is delivered or dead-lettered.
-    async fn deliver(&self, held: Held<'_>, envelope: Envelope) {
+    /// until it is delivered or dead-lettered. Once `cancel` fires it starts
+    /// no new attempt and returns, leaving the update to the queue.
+    async fn deliver(&self, held: Held<'_>, envelope: Envelope, cancel: &CancellationToken) {
         let mut backoff: Option<Backoff> = None;
         let mut attempt: u32 = 0;
         let mut last: Option<(usize, Cause)> = None;
         loop {
-            let Some(mut sent) = self.choose(&envelope).await else {
-                // `max_age` passed before an endpoint could take it.
-                let (endpoint, cause) = match last {
-                    Some((endpoint, cause)) => (Some(endpoint), cause),
-                    None => (None, Cause::Expired),
-                };
-                self.dead_letter(held, &envelope, endpoint, &cause, "max_age");
-                return;
+            let mut sent = match self.choose(&envelope, cancel).await {
+                Choice::Send(sent) => sent,
+                // Dropping `held` returns the update to its position.
+                Choice::Cancelled => return,
+                Choice::Expired => {
+                    // `max_age` passed before an endpoint could take it.
+                    let (endpoint, cause) = match last {
+                        Some((endpoint, cause)) => (Some(endpoint), cause),
+                        None => (None, Cause::Expired),
+                    };
+                    self.dead_letter(held, &envelope, endpoint, &cause, "max_age");
+                    return;
+                }
             };
             attempt = attempt.saturating_add(1);
             let result = self.send(&sent, &envelope, attempt).await;
@@ -237,7 +247,8 @@ impl PushConsumer {
                     // The endpoint answered: it is up, only the update fails.
                     sent.report(true, now);
                     sent.slot().metrics.attempt(DeliveryOutcome::DeadLetter);
-                    self.dead_letter(held, &envelope, Some(sent.index), &cause, "rejected");
+                    let reason = cause.permanent_reason();
+                    self.dead_letter(held, &envelope, Some(sent.index), &cause, reason);
                     return;
                 }
                 Err(Failure::Transient { cause, retry_after }) => {
@@ -267,27 +278,35 @@ impl PushConsumer {
                     slot.metrics.attempt(DeliveryOutcome::Retry);
                     last = Some((sent.index, cause));
                     drop(sent);
-                    sleep(delay).await;
+                    tokio::select! {
+                        biased;
+                        // Dropping `held` returns the update to its position.
+                        () = cancel.cancelled() => return,
+                        () = sleep(delay) => {}
+                    }
                 }
             }
         }
     }
 
     /// Picks an endpoint of the current set whose breaker admits a request,
-    /// waiting while every breaker is open. `None` once the update is older
-    /// than `max_age`.
-    async fn choose(&self, envelope: &Envelope) -> Option<Sending<'_>> {
+    /// waiting while every breaker is open, until the update is older than
+    /// `max_age` or `cancel` fires.
+    async fn choose(&self, envelope: &Envelope, cancel: &CancellationToken) -> Choice<'_> {
         loop {
+            if cancel.is_cancelled() {
+                return Choice::Cancelled;
+            }
             let mut changed = pin!(self.changed.notified());
             changed.as_mut().enable();
             let targets = self.targets.load_full();
             let now = Instant::now();
             let deadline = envelope.received_at.checked_add(targets.opts.retry.max_age);
             if deadline.is_some_and(|deadline| now >= deadline) {
-                return None;
+                return Choice::Expired;
             }
             let wait = match self.pick(&targets, envelope.key, now) {
-                Ok(index) => return Some(Sending::new(targets, index, &self.changed)),
+                Ok(index) => return Choice::Send(Sending::new(targets, index, &self.changed)),
                 Err(wait) => wait,
             };
             // A half-open breaker waits for its probe's outcome, which
@@ -297,14 +316,16 @@ impl PushConsumer {
                 (Some(reopen), Some(deadline)) => Some(reopen.min(deadline)),
                 (reopen, deadline) => reopen.or(deadline),
             };
-            match until {
-                Some(until) => {
-                    tokio::select! {
-                        () = &mut changed => {}
-                        () = sleep_until(until) => {}
-                    }
+            let sleep = async {
+                match until {
+                    Some(until) => sleep_until(until).await,
+                    None => std::future::pending().await,
                 }
-                None => changed.await,
+            };
+            tokio::select! {
+                () = cancel.cancelled() => return Choice::Cancelled,
+                () = &mut changed => {}
+                () = sleep => {}
             }
         }
     }
@@ -408,6 +429,7 @@ impl PushConsumer {
                         retry_after: retry_after(response.headers()),
                     })
                 } else {
+                    // Other 4xx, and any 3xx the client did not follow.
                     Err(Failure::Permanent(Cause::Status(status.as_u16())))
                 }
             }
@@ -627,6 +649,14 @@ impl Drop for Held<'_> {
     }
 }
 
+/// What [`PushConsumer::choose`] found.
+enum Choice<'a> {
+    Send(Sending<'a>),
+    /// The update reached `max_age`.
+    Expired,
+    Cancelled,
+}
+
 enum Failure {
     /// Worth retrying: 408, 429, 5xx or a transport error.
     Transient {
@@ -644,6 +674,18 @@ enum Cause {
     InvalidSecret,
     /// No attempt was made before `max_age`.
     Expired,
+}
+
+impl Cause {
+    /// The dead-letter reason of a permanent failure. A redirect is never
+    /// followed: it would turn the POST into a GET and could carry the
+    /// secret header to another host.
+    fn permanent_reason(&self) -> &'static str {
+        match self {
+            Self::Status(status) if (300..400).contains(status) => "redirect",
+            _ => "rejected",
+        }
+    }
 }
 
 impl fmt::Display for Cause {

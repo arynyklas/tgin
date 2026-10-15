@@ -38,6 +38,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-rustls.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true
