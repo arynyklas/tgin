@@ -1,0 +1,560 @@
+//! Checks on the raw config that need no environment.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use indexmap::IndexMap;
+use serde_saphyr::Location;
+use tgin_runtime::config::{ConfigError, Located};
+
+use super::model::{
+    At, Consumer, HumanDuration, Ingress, Name, Push, RawConfig, Split, SplitStrategy, Target,
+};
+
+/// Paths that tgin itself serves; configured paths must not start with them.
+const RESERVED_PREFIXES: [&str; 8] = [
+    "/c/",
+    "/bot",
+    "/file/",
+    "/mtproto/",
+    "/v1/",
+    "/livez",
+    "/readyz",
+    "/metrics",
+];
+
+/// The shortest `reload.debounce`.
+const MIN_DEBOUNCE: Duration = Duration::from_millis(10);
+
+/// Errors and warnings found so far.
+#[derive(Debug, Default)]
+pub(super) struct Diagnostics {
+    pub(super) errors: Vec<ConfigError>,
+    pub(super) warnings: Vec<ConfigError>,
+}
+
+impl Diagnostics {
+    pub(super) fn error(
+        &mut self,
+        path: impl Into<String>,
+        location: Location,
+        message: impl Into<String>,
+    ) {
+        self.errors
+            .push(ConfigError::new(message).at(located(path, location)));
+    }
+
+    fn warning(&mut self, path: impl Into<String>, location: Location, message: impl Into<String>) {
+        self.warnings
+            .push(ConfigError::warning(message).at(located(path, location)));
+    }
+}
+
+pub(super) fn located(path: impl Into<String>, location: Location) -> Located {
+    let saturate = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+    Located {
+        path: path.into(),
+        line: saturate(location.line()),
+        column: saturate(location.column()),
+    }
+}
+
+/// `primary` if it was written in the document, else `fallback`.
+fn known(primary: Location, fallback: Location) -> Location {
+    if primary.line() == 0 {
+        fallback
+    } else {
+        primary
+    }
+}
+
+/// Validates `raw`. Returns, per bot and rule, whether the rule is free of
+/// errors, so that only those are compiled.
+pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) -> Vec<Vec<bool>> {
+    if raw.version.value != 1 {
+        diag.error(
+            "version",
+            raw.version.location,
+            format!(
+                "unsupported config version {}; this tgin reads version 1",
+                raw.version.value
+            ),
+        );
+    }
+
+    duration(diag, "runtime.lame_duck", &raw.runtime.lame_duck);
+    duration(diag, "runtime.shutdown_grace", &raw.runtime.shutdown_grace);
+    if let Some(server) = &raw.server {
+        at_least_one(
+            diag,
+            "server.max_connections".to_owned(),
+            &server.max_connections,
+        );
+        duration(
+            diag,
+            "server.header_read_timeout",
+            &server.header_read_timeout,
+        );
+    }
+    if raw.admin.token.is_none() {
+        for (i, listen) in raw.admin.listen.iter().enumerate() {
+            if !listen.value.ip().is_loopback() {
+                diag.error(
+                    format!("admin.listen[{i}]"),
+                    listen.location,
+                    format!(
+                        "the admin API listens on {}, which is not a loopback address, so `admin.token` is required",
+                        listen.value
+                    ),
+                );
+            }
+        }
+    }
+    duration(diag, "reload.debounce", &raw.reload.debounce);
+    if raw.reload.debounce.value.get() < MIN_DEBOUNCE {
+        diag.error(
+            "reload.debounce",
+            raw.reload.debounce.location,
+            format!(
+                "`{}` is shorter than the minimum of 10ms",
+                raw.reload.debounce.value.as_str()
+            ),
+        );
+    }
+    duration(diag, "reload.drain_timeout", &raw.reload.drain_timeout);
+
+    let mut paths = HttpPaths::default();
+    consumers(raw, diag, &mut paths);
+    bots(raw, diag, &mut paths)
+}
+
+fn consumers(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) {
+    for (name, consumer) in &raw.consumers {
+        let path = format!("consumers.{}", name.as_str());
+        check_name(diag, &path, name.as_str(), consumer.location);
+        match &consumer.value {
+            Consumer::Pull(pull) => {
+                let path = format!("{path}.pull");
+                if raw.server.is_none() {
+                    diag.error(
+                        &path,
+                        consumer.location,
+                        "a pull consumer needs a `server` block to serve getUpdates",
+                    );
+                }
+                at_least_one(diag, format!("{path}.capacity"), &pull.capacity);
+                at_least_one_byte(diag, format!("{path}.capacity_bytes"), &pull.capacity_bytes);
+                duration(diag, format!("{path}.lease_timeout"), &pull.lease_timeout);
+                for (k, alias) in pull.aliases.iter().enumerate() {
+                    paths.add(
+                        diag,
+                        format!("{path}.aliases[{k}]"),
+                        &alias.value,
+                        alias.location,
+                    );
+                }
+            }
+            Consumer::Push(push) => {
+                self::push(diag, &format!("{path}.push"), consumer.location, push)
+            }
+        }
+    }
+}
+
+fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
+    if push.endpoints.value.is_empty() {
+        diag.error(
+            format!("{path}.endpoints"),
+            known(push.endpoints.location, location),
+            "a push consumer needs at least one endpoint",
+        );
+    }
+    for (k, endpoint) in push.endpoints.value.iter().enumerate() {
+        duration(
+            diag,
+            format!("{path}.endpoints[{k}].timeout"),
+            &endpoint.timeout,
+        );
+    }
+    at_least_one(diag, format!("{path}.max_in_flight"), &push.max_in_flight);
+    at_least_one(diag, format!("{path}.capacity"), &push.capacity);
+    at_least_one_byte(diag, format!("{path}.capacity_bytes"), &push.capacity_bytes);
+    duration(diag, format!("{path}.retry.initial"), &push.retry.initial);
+    duration(diag, format!("{path}.retry.max"), &push.retry.max);
+    at_least_one(
+        diag,
+        format!("{path}.retry.max_attempts"),
+        &push.retry.max_attempts,
+    );
+    duration(diag, format!("{path}.retry.max_age"), &push.retry.max_age);
+    at_least_one(
+        diag,
+        format!("{path}.breaker.failure_threshold"),
+        &push.breaker.failure_threshold,
+    );
+    duration(
+        diag,
+        format!("{path}.breaker.open_for"),
+        &push.breaker.open_for,
+    );
+}
+
+fn bots(raw: &RawConfig, diag: &mut Diagnostics, paths: &mut HttpPaths) -> Vec<Vec<bool>> {
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    // The bot that first targets each pull consumer.
+    let mut pull_owner: HashMap<usize, &str> = HashMap::new();
+    let mut rules_ok = Vec::with_capacity(raw.bots.len());
+    for (i, bot) in raw.bots.iter().enumerate() {
+        let path = format!("bots[{i}]");
+        let name = bot.name.value.as_str();
+        check_name(diag, &format!("{path}.name"), name, bot.name.location);
+        if let Some(first) = names.get(name) {
+            diag.error(
+                format!("{path}.name"),
+                bot.name.location,
+                format!("bot name `{name}` is already used by bots[{first}]"),
+            );
+        } else {
+            names.insert(name, i);
+        }
+
+        if let Some(ingress) = &bot.ingress {
+            self::ingress(raw, diag, paths, &path, name, ingress);
+        }
+
+        let mut reached = Vec::new();
+        let mut bot_rules_ok = Vec::with_capacity(bot.routes.len());
+        for (j, route) in bot.routes.iter().enumerate() {
+            let before = diag.errors.len();
+            targets(
+                diag,
+                &raw.consumers,
+                &route.value.to,
+                &format!("{path}.routes[{j}].to"),
+                &mut reached,
+            );
+            bot_rules_ok.push(diag.errors.len() == before);
+        }
+        rules_ok.push(bot_rules_ok);
+        // One report per consumer and bot, at its first reference.
+        let mut seen = HashSet::new();
+        reached.retain(|(consumer, _, _)| seen.insert(*consumer));
+        if let Some(last) = bot.routes.last()
+            && last.value.r#match.as_ref().is_some_and(|m| !m.is_empty())
+        {
+            diag.warning(
+                format!("{path}.routes"),
+                last.location,
+                "last rule has a match; unmatched updates are dropped",
+            );
+        }
+
+        for (consumer, location, target_path) in reached {
+            let Some((
+                consumer_name,
+                At {
+                    value: Consumer::Pull(_),
+                    ..
+                },
+            )) = raw.consumers.get_index(consumer)
+            else {
+                continue;
+            };
+            match pull_owner.get(&consumer) {
+                None => {
+                    pull_owner.insert(consumer, name);
+                }
+                Some(owner) if *owner == name => {}
+                Some(owner) => diag.error(
+                    target_path,
+                    location,
+                    format!(
+                        "pull consumer `{}` is targeted by bots `{owner}` and `{name}`; a pull consumer serves one bot",
+                        consumer_name.as_str()
+                    ),
+                ),
+            }
+        }
+    }
+    rules_ok
+}
+
+fn ingress(
+    raw: &RawConfig,
+    diag: &mut Diagnostics,
+    paths: &mut HttpPaths,
+    path: &str,
+    name: &str,
+    ingress: &At<Ingress>,
+) {
+    match &ingress.value {
+        Ingress::LongPoll(poll) => {
+            let path = format!("{path}.ingress.long_poll");
+            duration(diag, format!("{path}.timeout"), &poll.timeout);
+            in_range(diag, format!("{path}.limit"), &poll.limit, ingress.location);
+        }
+        Ingress::Webhook(hook) => {
+            let path = format!("{path}.ingress.webhook");
+            if raw.server.is_none() {
+                diag.error(
+                    &path,
+                    ingress.location,
+                    "a webhook bot needs a `server` block to receive updates",
+                );
+            }
+            if hook.register.value && hook.public_url.is_none() {
+                diag.error(
+                    format!("{path}.register"),
+                    hook.register.location,
+                    "`register: true` needs `public_url`, the https URL Telegram posts to",
+                );
+            }
+            if let Some(certificate) = &hook.certificate_file
+                && !hook.register.value
+            {
+                diag.error(
+                    format!("{path}.certificate_file"),
+                    certificate.0.location,
+                    "`certificate_file` is uploaded by setWebhook, so it needs `register: true`",
+                );
+            }
+            if let Some(max) = &hook.max_connections {
+                in_range(
+                    diag,
+                    format!("{path}.max_connections"),
+                    max,
+                    ingress.location,
+                );
+            }
+            match &hook.path {
+                Some(http) => paths.add(diag, format!("{path}.path"), &http.value, http.location),
+                None => paths.add(
+                    diag,
+                    format!("{path}.path"),
+                    &format!("/webhook/{name}"),
+                    ingress.location,
+                ),
+            }
+        }
+    }
+}
+
+/// Checks every target, recording the consumers reached as (index,
+/// location, path).
+fn targets(
+    diag: &mut Diagnostics,
+    consumers: &IndexMap<Name, At<Consumer>>,
+    targets: &[At<Target>],
+    path: &str,
+    reached: &mut Vec<(usize, Location, String)>,
+) {
+    for (k, target) in targets.iter().enumerate() {
+        let path = format!("{path}[{k}]");
+        match &target.value {
+            Target::Consumer(name) => match consumers.get_index_of(name.as_str()) {
+                Some(index) => reached.push((index, target.location, path)),
+                None => {
+                    let defined: Vec<&str> = consumers.keys().map(Name::as_str).collect();
+                    let hint = if defined.is_empty() {
+                        "no consumers are defined".to_owned()
+                    } else {
+                        format!("defined consumers: {}", defined.join(", "))
+                    };
+                    diag.errors.push(
+                        ConfigError::new(format!("unknown consumer `{name}`"))
+                            .at(located(path, target.location))
+                            .hint(hint),
+                    );
+                }
+            },
+            Target::All(children) => {
+                self::targets(diag, consumers, children, &format!("{path}.all"), reached);
+            }
+            Target::Split(split) => {
+                let path = format!("{path}.split");
+                weights(diag, &path, split, target.location);
+                self::targets(
+                    diag,
+                    consumers,
+                    &split.among,
+                    &format!("{path}.among"),
+                    reached,
+                );
+            }
+        }
+    }
+}
+
+fn weights(diag: &mut Diagnostics, path: &str, split: &Split, fallback: Location) {
+    let weighted = split.strategy.value == SplitStrategy::Weighted;
+    let Some(weights) = &split.weights else {
+        if weighted {
+            diag.error(
+                format!("{path}.strategy"),
+                known(split.strategy.location, fallback),
+                "a weighted split needs `weights`, one per `among` entry",
+            );
+        }
+        return;
+    };
+    let location = known(weights.location, fallback);
+    if !weighted {
+        diag.error(
+            format!("{path}.weights"),
+            location,
+            "`weights` are only allowed with `strategy: weighted`",
+        );
+        return;
+    }
+    if weights.value.len() != split.among.len() {
+        diag.error(
+            format!("{path}.weights"),
+            location,
+            format!(
+                "{} weights for {} `among` entries; give one weight per entry",
+                weights.value.len(),
+                split.among.len()
+            ),
+        );
+    }
+    for (k, weight) in weights.value.iter().enumerate() {
+        if weight.value == 0 {
+            diag.error(
+                format!("{path}.weights[{k}]"),
+                known(weight.location, location),
+                "weights must be greater than 0",
+            );
+        }
+    }
+}
+
+fn check_name(diag: &mut Diagnostics, path: &str, name: &str, location: Location) {
+    let bytes = name.as_bytes();
+    let allowed = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = bytes.len() <= 63
+        && bytes.first().is_some_and(allowed)
+        && bytes.iter().all(|c| allowed(c) || *c == b'-');
+    if !valid {
+        diag.errors.push(
+            ConfigError::new(format!("invalid name `{name}`"))
+                .at(located(path, location))
+                .hint(
+                    "use 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit",
+                ),
+        );
+    }
+}
+
+/// Rejects humantime's month and year units.
+fn duration(diag: &mut Diagnostics, path: impl Into<String>, value: &At<HumanDuration>) {
+    if let Some(unit) = value.value.calendar_unit() {
+        diag.errors.push(
+            ConfigError::new(format!(
+                "`{}` uses `{unit}`, a month or year unit",
+                value.value.as_str()
+            ))
+            .at(located(path, value.location))
+            .hint("write days (`d`) or weeks (`w`) instead"),
+        );
+    }
+}
+
+fn at_least_one<T: PartialEq + Default>(diag: &mut Diagnostics, path: String, value: &At<T>) {
+    if value.value == T::default() {
+        diag.error(path, value.location, "must be at least 1");
+    }
+}
+
+fn at_least_one_byte(diag: &mut Diagnostics, path: String, value: &At<super::model::ByteSize>) {
+    if value.value.0 == 0 {
+        diag.error(path, value.location, "must be at least 1 byte");
+    }
+}
+
+/// Telegram's 1 to 100.
+fn in_range(diag: &mut Diagnostics, path: String, value: &At<u32>, fallback: Location) {
+    if !(1..=100).contains(&value.value) {
+        diag.error(
+            path,
+            known(value.location, fallback),
+            format!("{} is out of range; use 1 to 100", value.value),
+        );
+    }
+}
+
+/// Every configured HTTP path, keyed by path, with the YAML path of its
+/// first use.
+#[derive(Default)]
+struct HttpPaths {
+    seen: HashMap<String, String>,
+}
+
+impl HttpPaths {
+    fn add(&mut self, diag: &mut Diagnostics, yaml_path: String, http: &str, location: Location) {
+        if let Some(problem) = path_problem(http) {
+            diag.error(yaml_path, location, format!("path `{http}` {problem}"));
+            return;
+        }
+        if let Some(first) = self.seen.get(http) {
+            diag.error(
+                yaml_path,
+                location,
+                format!("path `{http}` is already used by {first}"),
+            );
+        } else {
+            self.seen.insert(http.to_owned(), yaml_path);
+        }
+    }
+}
+
+/// What is wrong with a configured HTTP path, if anything.
+fn path_problem(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return Some("must start with `/`".to_owned());
+    }
+    if path.contains(['{', '}']) {
+        return Some("contains `{` or `}`; paths are literal".to_owned());
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.starts_with([':', '*']))
+    {
+        return Some("has a segment starting with `:` or `*`; paths are literal".to_owned());
+    }
+    RESERVED_PREFIXES
+        .iter()
+        .find(|prefix| path.starts_with(*prefix) || path == prefix.trim_end_matches('/'))
+        .map(|prefix| format!("starts with `{prefix}`, which tgin reserves"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_rules() {
+        for ok in ["/", "/hook", "/webhook/shop", "/a:b", "/vone/x", "/v1x"] {
+            assert_eq!(path_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "hook",
+            "/a/{id}",
+            "/a}",
+            "/a/:id",
+            "/a/*rest",
+            "/c/x",
+            "/bot123",
+            "/botx",
+            "/file/x",
+            "/mtproto/x",
+            "/v1/x",
+            "/v1",
+            "/livez",
+            "/readyz/x",
+            "/metrics",
+            "/c",
+        ] {
+            assert!(path_problem(bad).is_some(), "{bad} accepted");
+        }
+    }
+}

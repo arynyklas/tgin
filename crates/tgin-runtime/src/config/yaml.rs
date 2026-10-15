@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 use serde_saphyr::{DuplicateKeyPolicy, Localizer, Location, SnippetMode, UserMessageFormatter};
 
-use super::{ConfigError, Located};
+use super::{ConfigError, Located, Severity};
 
 /// Deserializes `text`, rejecting duplicate keys. On failure the error
 /// carries the YAML path, line and column of the offending node, and its
@@ -30,6 +30,7 @@ pub fn parse_yaml<T: DeserializeOwned>(text: &str, origin: &Path) -> Result<T, C
         })
     })
     .map_err(|err| ConfigError {
+        severity: Severity::Error,
         at: err.location().map(|location| Located {
             path: failed_at.as_ref().map_or_else(|| ".".to_owned(), yaml_path),
             line: saturate(location.line()),
@@ -71,7 +72,10 @@ impl Localizer for NoLocationSuffix {
 }
 
 /// `path` as `bots[1].token`; `.` is the document root. Segments the tracker
-/// could not name (such as a duplicate key) are left out.
+/// could not name (such as a duplicate key) are left out, and so is every
+/// `value` key: [`serde_saphyr::Spanned`] reads its value through a
+/// synthesized `value` key, which is not in the document. A user-chosen map
+/// key named `value` is left out too; the line and column still point at it.
 fn yaml_path(path: &serde_path_to_error::Path) -> String {
     let mut out = String::new();
     for segment in path {
@@ -80,6 +84,9 @@ fn yaml_path(path: &serde_path_to_error::Path) -> String {
                 let _ = write!(out, "[{index}]");
             }
             Segment::Map { key: name } | Segment::Enum { variant: name } => {
+                if name == SPANNED_VALUE_KEY {
+                    continue;
+                }
                 if !out.is_empty() {
                     out.push('.');
                 }
@@ -97,6 +104,9 @@ fn yaml_path(path: &serde_path_to_error::Path) -> String {
 fn saturate(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
+
+/// The key [`serde_saphyr::Spanned`] reads its value through.
+const SPANNED_VALUE_KEY: &str = "value";
 
 #[cfg(test)]
 mod tests {
@@ -194,5 +204,33 @@ mod tests {
             parse_yaml("bots:\n  - name: a\n  - name: bb\n", Path::new("tgin.yaml")).unwrap();
         let at = named.bots[1].name.referenced;
         assert_eq!((at.line(), at.column()), (3, 11));
+    }
+
+    #[test]
+    fn parse_yaml_path_skips_spanned_value() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Outer {
+            inner: serde_saphyr::Spanned<Inner>,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Inner {
+            items: Vec<serde_saphyr::Spanned<u32>>,
+        }
+
+        let err =
+            parse_yaml::<Outer>("inner:\n  items: [1, x]\n", Path::new("tgin.yaml")).unwrap_err();
+        assert_eq!(
+            err.at,
+            Some(Located {
+                path: "inner.items[1]".to_owned(),
+                line: 2,
+                column: 14,
+            }),
+            "{err}"
+        );
     }
 }

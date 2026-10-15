@@ -18,7 +18,10 @@ arc-swap = "1.9.2"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 bytes = "1.12.1"
+humantime = "2.4.0"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+ipnet = "2.12.2"
 notify-debouncer-full = "0.7.0"
 parking_lot = "0.12.5"
 prometheus-client = "0.25.1"
@@ -36,12 +39,15 @@ serde_path_to_error = "0.1.20"
 smallvec = "1.16.3"
 subtle = "2.6.1"
 tempfile = "3.27.0"
+tgin-core = { path = "crates/tgin-core" }
+tgin-runtime = { path = "crates/tgin-runtime" }
 thiserror = "2.0.21"
 tokio = "1.53.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

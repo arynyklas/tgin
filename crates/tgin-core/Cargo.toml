@@ -11,10 +11,19 @@ publish.workspace = true
 [dependencies]
 aho-corasick.workspace = true
 bytes.workspace = true
+humantime.workspace = true
+indexmap.workspace = true
+ipnet.workspace = true
 prometheus-client.workspace = true
 regex-automata.workspace = true
+schemars = { workspace = true, features = ["indexmap2"] }
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
+tgin-runtime.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

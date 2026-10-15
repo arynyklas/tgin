@@ -1,0 +1,1039 @@
+{
+  "$defs": {
+    "Admin": {
+      "additionalProperties": false,
+      "description": "The admin HTTP server: health, metrics and the management API.",
+      "properties": {
+        "listen": {
+          "default": [
+            "127.0.0.1:9090"
+          ],
+          "description": "Addresses to listen on, as `ip:port`. A non-loopback address needs\n`token`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "public_metrics": {
+          "default": false,
+          "description": "Serve `/metrics` without the token.",
+          "type": "boolean"
+        },
+        "token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bearer token for the admin API."
+        }
+      },
+      "type": "object"
+    },
+    "Balance": {
+      "oneOf": [
+        {
+          "enum": [
+            "round_robin",
+            "least_in_flight"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "hash_chat",
+          "description": "Sticky by chat (or user).",
+          "type": "string"
+        }
+      ]
+    },
+    "Bot": {
+      "additionalProperties": false,
+      "description": "One Telegram bot.",
+      "properties": {
+        "api_url": {
+          "default": "https://api.telegram.org",
+          "description": "Bot API base URL. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "ingress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ingress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How updates arrive; at most one. Omitted, the bot receives none."
+        },
+        "name": {
+          "description": "Unique bot name, used in metrics and logs.",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "type": "string"
+        },
+        "routes": {
+          "default": [],
+          "description": "Rules in order; the first match wins.",
+          "items": {
+            "$ref": "#/$defs/Route"
+          },
+          "type": "array"
+        },
+        "token": {
+          "$ref": "#/$defs/Secret",
+          "description": "The bot token."
+        }
+      },
+      "required": [
+        "name",
+        "token"
+      ],
+      "type": "object"
+    },
+    "Breaker": {
+      "additionalProperties": false,
+      "description": "Per-endpoint circuit breaker.",
+      "properties": {
+        "failure_threshold": {
+          "default": 5,
+          "description": "Consecutive failures that open the breaker; at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "open_for": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "How long the breaker stays open."
+        }
+      },
+      "type": "object"
+    },
+    "ByteSize": {
+      "description": "A size: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
+      "examples": [
+        "64MiB",
+        "512KiB",
+        1048576
+      ],
+      "oneOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "pattern": "^\\s*[0-9]+\\s*(B|KiB|MiB|GiB)?\\s*$",
+          "type": "string"
+        }
+      ]
+    },
+    "ChatType": {
+      "enum": [
+        "private",
+        "group",
+        "supergroup",
+        "channel"
+      ],
+      "type": "string"
+    },
+    "Cidr": {
+      "description": "An IP network such as `10.0.0.0/8`, or a single address.",
+      "examples": [
+        "10.0.0.0/8",
+        "2001:db8::/32"
+      ],
+      "type": "string"
+    },
+    "Consumer": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Bots fetch updates from tgin with `getUpdates`.",
+          "properties": {
+            "pull": {
+              "$ref": "#/$defs/Pull"
+            }
+          },
+          "required": [
+            "pull"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "tgin posts updates to HTTP endpoints.",
+          "properties": {
+            "push": {
+              "$ref": "#/$defs/Push"
+            }
+          },
+          "required": [
+            "push"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Duration": {
+      "description": "A duration such as `500ms`, `30s`, `5m` or `1h 30m`. Month (`M`) and year (`y`) units are rejected.",
+      "examples": [
+        "30s",
+        "5m"
+      ],
+      "pattern": "^\\s*([0-9]+\\s*[a-zA-Zµ]+\\s*)+$",
+      "type": "string"
+    },
+    "Endpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "secret_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Sent as `X-Telegram-Bot-Api-Secret-Token`."
+        },
+        "timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "Per-request timeout."
+        },
+        "url": {
+          "description": "`http` or `https` URL. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "Ingress": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Poll Telegram with `getUpdates`.",
+          "properties": {
+            "long_poll": {
+              "$ref": "#/$defs/LongPoll"
+            }
+          },
+          "required": [
+            "long_poll"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Receive updates on the data-plane server.",
+          "properties": {
+            "webhook": {
+              "$ref": "#/$defs/Webhook"
+            }
+          },
+          "required": [
+            "webhook"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "IpAllowlist": {
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Any client may post."
+        },
+        {
+          "const": "telegram",
+          "description": "Telegram's published webhook networks."
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/Cidr"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "Log": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/LogFormat",
+          "default": "text"
+        },
+        "level": {
+          "$ref": "#/$defs/LogLevel",
+          "default": "info"
+        }
+      },
+      "type": "object"
+    },
+    "LogFormat": {
+      "enum": [
+        "text",
+        "json"
+      ],
+      "type": "string"
+    },
+    "LogLevel": {
+      "enum": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ],
+      "type": "string"
+    },
+    "LongPoll": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_updates": {
+          "description": "Update types to receive. Omitted, Telegram's default applies.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "delete_webhook_on_start": {
+          "default": true,
+          "description": "Call `deleteWebhook` before polling.",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Updates per `getUpdates` call, 1 to 100.",
+          "format": "uint32",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "`getUpdates` long-poll timeout."
+        }
+      },
+      "type": "object"
+    },
+    "Match": {
+      "additionalProperties": false,
+      "description": "Rule predicates: values within a list are alternatives, fields must all\nhold, and an empty list matches anything.",
+      "properties": {
+        "callback_data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextMatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "chat_ids": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "chat_types": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ChatType"
+          },
+          "type": "array"
+        },
+        "commands": {
+          "default": [],
+          "description": "Commands, with or without the leading `/`; no `@bot` suffix.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextMatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Message text or caption."
+        },
+        "update_types": {
+          "default": [],
+          "description": "Update types such as `message` or `callback_query`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "user_ids": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "OnFull": {
+      "description": "What a full queue does with a new update.",
+      "oneOf": [
+        {
+          "const": "backpressure",
+          "description": "Refuse it; the source retries later.",
+          "type": "string"
+        },
+        {
+          "const": "drop_oldest",
+          "description": "Evict the oldest queued updates.",
+          "type": "string"
+        }
+      ]
+    },
+    "Ordering": {
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "per_chat",
+          "description": "One update per chat in flight at a time.",
+          "type": "string"
+        }
+      ]
+    },
+    "Pull": {
+      "additionalProperties": false,
+      "properties": {
+        "aliases": {
+          "default": [],
+          "description": "Extra HTTP paths serving this consumer.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auth_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bearer token pollers must send."
+        },
+        "capacity": {
+          "default": 10000,
+          "description": "Most queued updates.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capacity_bytes": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64MiB",
+          "description": "Most queued bytes."
+        },
+        "lease_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "2m",
+          "description": "How long a fetched update waits for its acknowledgement before\nanother poll may receive it."
+        },
+        "on_full": {
+          "$ref": "#/$defs/OnFull",
+          "default": "backpressure"
+        },
+        "ordering": {
+          "$ref": "#/$defs/Ordering",
+          "default": "none"
+        }
+      },
+      "type": "object"
+    },
+    "Push": {
+      "additionalProperties": false,
+      "properties": {
+        "balance": {
+          "$ref": "#/$defs/Balance",
+          "default": "round_robin"
+        },
+        "breaker": {
+          "$ref": "#/$defs/Breaker",
+          "default": {
+            "failure_threshold": 5,
+            "open_for": "30s"
+          }
+        },
+        "capacity": {
+          "default": 10000,
+          "description": "Most queued updates.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capacity_bytes": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64MiB",
+          "description": "Most queued bytes."
+        },
+        "endpoints": {
+          "description": "Where updates are posted; at least one.",
+          "items": {
+            "$ref": "#/$defs/Endpoint"
+          },
+          "type": "array"
+        },
+        "max_in_flight": {
+          "default": 32,
+          "description": "Most requests in flight over all endpoints.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "on_full": {
+          "$ref": "#/$defs/OnFull",
+          "default": "backpressure"
+        },
+        "ordering": {
+          "$ref": "#/$defs/Ordering",
+          "default": "none"
+        },
+        "retry": {
+          "$ref": "#/$defs/Retry",
+          "default": {
+            "initial": "1s",
+            "max": "1m",
+            "max_age": "1h",
+            "max_attempts": 10
+          }
+        }
+      },
+      "required": [
+        "endpoints"
+      ],
+      "type": "object"
+    },
+    "Reload": {
+      "additionalProperties": false,
+      "properties": {
+        "debounce": {
+          "$ref": "#/$defs/Duration",
+          "default": "500ms",
+          "description": "Quiet time after a change before reloading; at least 10ms."
+        },
+        "drain_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "30s",
+          "description": "How long a removed consumer drains before it is dropped."
+        },
+        "watch": {
+          "default": true,
+          "description": "Reload when the config file changes.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Retry": {
+      "additionalProperties": false,
+      "description": "Retries of failed deliveries.",
+      "properties": {
+        "initial": {
+          "$ref": "#/$defs/Duration",
+          "default": "1s",
+          "description": "First backoff."
+        },
+        "max": {
+          "$ref": "#/$defs/Duration",
+          "default": "1m",
+          "description": "Longest backoff."
+        },
+        "max_age": {
+          "$ref": "#/$defs/Duration",
+          "default": "1h",
+          "description": "Age after which the update is dead-lettered."
+        },
+        "max_attempts": {
+          "default": 10,
+          "description": "Attempts before the update is dead-lettered; at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Route": {
+      "additionalProperties": false,
+      "description": "One routing rule.",
+      "properties": {
+        "match": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Match"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the rule applies. Omitted, it matches every update."
+        },
+        "to": {
+          "description": "Where matching updates go; every entry receives the update.",
+          "items": {
+            "$ref": "#/$defs/Target"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "to"
+      ],
+      "type": "object"
+    },
+    "Runtime": {
+      "additionalProperties": false,
+      "description": "Process settings; changing them needs a restart.",
+      "properties": {
+        "lame_duck": {
+          "$ref": "#/$defs/Duration",
+          "default": "5s",
+          "description": "How long readiness reports \"not ready\" before shutdown starts."
+        },
+        "shutdown_grace": {
+          "$ref": "#/$defs/Duration",
+          "default": "15s",
+          "description": "How long shutdown waits for queues to drain."
+        },
+        "worker_threads": {
+          "$ref": "#/$defs/WorkerThreads",
+          "default": "auto",
+          "description": "Tokio worker threads: `auto` (one per CPU) or a count."
+        }
+      },
+      "type": "object"
+    },
+    "Secret": {
+      "description": "A secret. Supports `${env:NAME}` and `${file:PATH}` (relative to the config file); `$${` is a literal `${`.",
+      "minLength": 1,
+      "type": "string",
+      "writeOnly": true
+    },
+    "Server": {
+      "additionalProperties": false,
+      "description": "The data-plane HTTP server.",
+      "properties": {
+        "header_read_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "How long a client may take to send the request headers."
+        },
+        "listen": {
+          "default": [
+            "0.0.0.0:8080"
+          ],
+          "description": "Addresses to listen on, as `ip:port`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_connections": {
+          "default": 10000,
+          "description": "Most open connections.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trusted_proxies": {
+          "default": [],
+          "description": "Proxies whose `X-Forwarded-For` is trusted, as networks.",
+          "items": {
+            "$ref": "#/$defs/Cidr"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Split": {
+      "additionalProperties": false,
+      "properties": {
+        "among": {
+          "items": {
+            "$ref": "#/$defs/Target"
+          },
+          "type": "array"
+        },
+        "strategy": {
+          "$ref": "#/$defs/SplitStrategy"
+        },
+        "weights": {
+          "description": "One weight per `among` entry, each above 0; only with `weighted`.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "strategy",
+        "among"
+      ],
+      "type": "object"
+    },
+    "SplitStrategy": {
+      "oneOf": [
+        {
+          "enum": [
+            "round_robin"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "hash_chat",
+          "description": "Sticky by chat (or user); round robin without either.",
+          "type": "string"
+        },
+        {
+          "const": "weighted",
+          "description": "Smooth weighted round robin over `weights`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Target": {
+      "description": "A consumer name, `{split: …}` (one child receives the update) or `{all: […]}` (every child does).",
+      "oneOf": [
+        {
+          "description": "A consumer name.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "split": {
+              "$ref": "#/$defs/Split"
+            }
+          },
+          "required": [
+            "split"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "all": {
+              "items": {
+                "$ref": "#/$defs/Target"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "all"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TextMatch": {
+      "description": "A text match; each list is non-empty.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Starts with any of these (case-sensitive).",
+          "properties": {
+            "prefix": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "prefix"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Any of these regexes matches somewhere in the text.",
+          "properties": {
+            "regex": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "regex"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Equals any of these exactly.",
+          "properties": {
+            "equals": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "equals"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Tls": {
+      "additionalProperties": false,
+      "properties": {
+        "cert_file": {
+          "description": "PEM certificate chain file. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "key_file": {
+          "description": "PEM private key file. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "cert_file",
+        "key_file"
+      ],
+      "type": "object"
+    },
+    "Webhook": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_updates": {
+          "description": "Update types to receive. Omitted, Telegram's default applies.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "certificate_file": {
+          "description": "Self-signed certificate to upload with `setWebhook`; needs\n`register: true`. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "drop_pending_updates": {
+          "default": false,
+          "type": "boolean"
+        },
+        "ip_address": {
+          "description": "Telegram's `ip_address` for `setWebhook`.",
+          "format": "ip",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ip_allowlist": {
+          "$ref": "#/$defs/IpAllowlist",
+          "default": "none",
+          "description": "Who may post updates: `none` (anyone), `telegram` (Telegram's\npublished networks) or a list of networks."
+        },
+        "max_connections": {
+          "description": "Telegram's `max_connections`, 1 to 100.",
+          "format": "uint32",
+          "maximum": 100,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public_url": {
+          "description": "The public HTTPS URL of `path`, for `setWebhook`. Supports `${env:…}`\nand `${file:…}`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "register": {
+          "default": false,
+          "description": "Call `setWebhook` at start; needs `public_url`.",
+          "type": "boolean"
+        },
+        "secret_token": {
+          "$ref": "#/$defs/WebhookSecret",
+          "default": "auto",
+          "description": "`auto` (generated), `none`, or the secret Telegram must send."
+        }
+      },
+      "type": "object"
+    },
+    "WebhookSecret": {
+      "anyOf": [
+        {
+          "const": "auto",
+          "description": "Generate a secret at start."
+        },
+        {
+          "const": "none",
+          "description": "Send and check no secret."
+        },
+        {
+          "$ref": "#/$defs/Secret"
+        }
+      ]
+    },
+    "WorkerThreads": {
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "One per CPU."
+        },
+        {
+          "minimum": 1,
+          "type": "integer"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The configuration file, version 1.\n\nOnly secrets (`token`, `secret_token`, `auth_token`, `admin.token`) and\nfields holding URLs or file paths expand `${env:NAME}` and `${file:PATH}`\nreferences; every other value is literal.",
+  "properties": {
+    "admin": {
+      "$ref": "#/$defs/Admin",
+      "default": {
+        "listen": [
+          "127.0.0.1:9090"
+        ],
+        "public_metrics": false
+      }
+    },
+    "bots": {
+      "default": [],
+      "description": "The Telegram bots updates come from.",
+      "items": {
+        "$ref": "#/$defs/Bot"
+      },
+      "type": "array"
+    },
+    "consumers": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "Where updates go, by name.",
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]{0,62}$": {
+          "$ref": "#/$defs/Consumer"
+        }
+      },
+      "type": "object"
+    },
+    "log": {
+      "$ref": "#/$defs/Log",
+      "default": {
+        "format": "text",
+        "level": "info"
+      }
+    },
+    "reload": {
+      "$ref": "#/$defs/Reload",
+      "default": {
+        "debounce": "500ms",
+        "drain_timeout": "30s",
+        "watch": true
+      }
+    },
+    "runtime": {
+      "$ref": "#/$defs/Runtime",
+      "default": {
+        "lame_duck": "5s",
+        "shutdown_grace": "15s",
+        "worker_threads": "auto"
+      }
+    },
+    "server": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Server"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The data plane: webhook ingress and pull consumers. Omitted, tgin\nserves neither."
+    },
+    "version": {
+      "const": 1,
+      "description": "The config format version; must be 1.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "title": "tgin configuration, version 1",
+  "type": "object"
+}

@@ -22,11 +22,23 @@ pub struct Located {
     pub column: u32,
 }
 
-/// A configuration error, displayed as
+/// Whether a [`ConfigError`] rejects the configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Severity {
+    /// The configuration is rejected.
+    #[default]
+    Error,
+    /// The configuration loads, but probably does not do what was meant.
+    Warning,
+}
+
+/// A configuration error or warning, displayed as
 /// `<path> (line L, column C): message` followed by `\n  hint: …` when there
-/// is a hint. Without a location only the message (and hint) is shown.
+/// is a hint. Without a location only the message (and hint) is shown, and
+/// a warning starts with `warning: `.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigError {
+    pub severity: Severity,
     pub at: Option<Located>,
     pub message: String,
     pub hint: Option<String>,
@@ -36,9 +48,18 @@ impl ConfigError {
     /// An error with no location and no hint.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            severity: Severity::Error,
             at: None,
             message: message.into(),
             hint: None,
+        }
+    }
+
+    /// A warning with no location and no hint.
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::new(message)
         }
     }
 
@@ -59,6 +80,9 @@ impl ConfigError {
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.severity == Severity::Warning {
+            f.write_str("warning: ")?;
+        }
         if let Some(at) = &self.at {
             write!(f, "{} (line {}, column {}): ", at.path, at.line, at.column)?;
         }
@@ -95,6 +119,10 @@ mod tests {
             "bots[1].tokn (line 7, column 5): unknown field `tokn`\n  hint: did you mean `token`?"
         );
         assert_eq!(ConfigError::new("no bots").to_string(), "no bots");
+        assert_eq!(
+            ConfigError::warning("no routes").to_string(),
+            "warning: no routes"
+        );
     }
 
     #[test]
