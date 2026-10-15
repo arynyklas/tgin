@@ -20,7 +20,9 @@ axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+gungraun = "0.20.0"
 humantime = "2.4.0"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
