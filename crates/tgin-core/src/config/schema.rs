@@ -105,13 +105,14 @@ impl JsonSchema for ByteSize {
     }
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        // At least 1 MiB in every unit: 1048576 bytes, 1024 KiB, 1 MiB or GiB.
         json_schema!({
-            "description": "A size of at least 1 byte: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
+            "description": "A size of at least 1 MiB: bytes, or a number with `B`, `KiB`, `MiB` or `GiB`.",
             "oneOf": [
-                { "type": "integer", "minimum": 1 },
-                { "type": "string", "pattern": "^\\s*0*[1-9][0-9]*\\s*(B|KiB|MiB|GiB)?\\s*$" }
+                { "type": "integer", "minimum": 1_048_576 },
+                { "type": "string", "pattern": "^\\s*0*(?:(?:[1-9][0-9]{7,}|[2-9][0-9]{6}|1[1-9][0-9]{5}|10[5-9][0-9]{4}|1049[0-9]{3}|1048[6-9][0-9]{2}|10485[89][0-9]|104857[6-9])\\s*B?|(?:[1-9][0-9]{4,}|[2-9][0-9]{3}|1[1-9][0-9]{2}|10[3-9][0-9]|102[4-9])\\s*KiB|[1-9][0-9]*\\s*(?:MiB|GiB))\\s*$" }
             ],
-            "examples": ["64MiB", "512KiB", 1048576]
+            "examples": ["64MiB", "1024KiB", 1048576]
         })
     }
 }

@@ -2,8 +2,9 @@
 //! tokio's paused clock; tests that reach a wiremock endpoint run in real
 //! time with bounded waits.
 
+use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -26,6 +27,53 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Bound on every wait for a condition.
 const WAIT: Duration = Duration::from_secs(10);
+
+/// Everything every test logs. A global subscriber, since a scoped one can
+/// miss events while tests on other threads register callsites. Tests that
+/// look at logs use names no other test uses.
+static LOGS: LazyLock<Logs> = LazyLock::new(|| {
+    let logs = Logs::default();
+    tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init()
+        .expect("the only global subscriber");
+    logs
+});
+
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl Logs {
+    /// Lines that contain every one of `needles`.
+    fn count(&self, needles: &[&str]) -> usize {
+        let bytes = self.0.lock().expect("logs").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| needles.iter().all(|n| l.contains(n)))
+            .count()
+    }
+}
+
+impl io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("logs").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// `message` goes to both pull consumers, `callback_query` to `p1` only and
 /// `edited_message` to `p2` only. `p1` refuses when full; `p2` evicts.
@@ -77,6 +125,7 @@ struct Harness {
 
 impl Harness {
     fn new(yaml: &str) -> Self {
+        LazyLock::force(&LOGS);
         let mut reg = Registry::with_prefix("tgin");
         let metrics = CoreMetrics::register(&mut reg);
         let supervisor = Arc::new(Supervisor::new());
@@ -267,13 +316,295 @@ async fn backpressure_seconds_counted_until_relieved() {
     assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
     assert_eq!(h.admit("callback_query", 2), Admit::Backpressure);
     sleep(Duration::from_secs(1)).await;
-    // Refusing again does not restart the clock.
+    // Every refusal adds the time since the previous one.
     assert_eq!(h.admit("callback_query", 2), Admit::Backpressure);
+    h.assert_metric(r#"tgin_consumer_backpressure_seconds_total{consumer="p1"} 1.0"#);
     sleep(Duration::from_secs(2)).await;
     assert_eq!(poll(&p1, "i", 0).await, [1]);
     assert!(poll(&p1, "i", 2).await.is_empty());
     assert_eq!(h.admit("callback_query", 2), Admit::Admitted);
     h.assert_metric(r#"tgin_consumer_backpressure_seconds_total{consumer="p1"} 3.0"#);
+    // A new episode starts from zero.
+    assert_eq!(h.admit("callback_query", 3), Admit::Backpressure);
+    sleep(Duration::from_secs(5)).await;
+    h.assert_metric(r#"tgin_consumer_backpressure_seconds_total{consumer="p1"} 3.0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn oversized_update_skips_target_never_backpressure() {
+    let yaml = BASE
+        .replace(
+            "p1: { pull: { capacity: 1 } }",
+            "p1: { pull: { capacity: 1, capacity_bytes: 1MiB } }",
+        )
+        .replace(
+            "p2: { pull: { capacity: 1, on_full: drop_oldest } }",
+            "p2: { pull: { capacity: 1, on_full: drop_oldest, capacity_bytes: 1MiB } }",
+        );
+    let h = Harness::new(&yaml);
+    let mut big = r#"{"update_id":1,"message":{"text":""#.to_owned();
+    big.push_str(&"x".repeat(1 << 20));
+    big.push_str(r#""}}"#);
+    let facts = Facts {
+        update_type: "message",
+        chat_id: Some(7),
+        ..Facts::default()
+    };
+    let admit = h.engine.admit(SourceId(0), 1, Bytes::from(big), &facts);
+    assert_eq!(admit, Admit::Admitted);
+    for name in ["p1", "p2"] {
+        let s = h.stats(name);
+        assert_eq!((s.available, s.reserved), (0, 0), "{name}");
+        h.assert_metric(&format!(
+            r#"tgin_consumer_dropped_total{{consumer="{name}",reason="oversized"}} 1"#
+        ));
+    }
+    h.assert_metric(r#"tgin_consumer_backpressure_seconds_total{consumer="p1"} 0.0"#);
+    // Smaller updates still queue.
+    assert_eq!(h.admit("message", 2), Admit::Admitted);
+    assert_eq!(h.stats("p1").available, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn overflow_and_unmatched_warn_once_per_episode() {
+    let h = Harness::new(
+        r#"version: 1
+server: {}
+bots:
+  - name: logbot
+    token: "1:aaa"
+    routes:
+      - match: { update_types: [message] }
+        to: [logq]
+consumers:
+  logq: { pull: { capacity: 1, on_full: drop_oldest } }
+"#,
+    );
+    let q = h.pull("logq");
+    let overflow = ["WARN", "logq", "dropping updates"];
+    let unmatched = ["WARN", "logbot", "match no rule"];
+
+    assert_eq!(h.admit("message", 1), Admit::Admitted);
+    assert_eq!(poll(&q, "i", 0).await, [1]);
+    // Full of leased updates: each new one is skipped.
+    for id in 2..=3 {
+        assert_eq!(h.admit("message", id), Admit::Admitted);
+    }
+    assert_eq!(LOGS.count(&overflow), 1);
+    // Room again: the episode ends, and the next drop warns again.
+    assert!(poll(&q, "i", 2).await.is_empty());
+    assert_eq!(h.admit("message", 4), Admit::Admitted);
+    assert_eq!(poll(&q, "i", 0).await, [4]);
+    assert_eq!(h.admit("message", 5), Admit::Admitted);
+    assert_eq!(LOGS.count(&overflow), 2);
+
+    for id in 6..=7 {
+        assert_eq!(h.admit("poll", id), Admit::Unroutable);
+    }
+    assert_eq!(LOGS.count(&unmatched), 1);
+    assert_eq!(LOGS.count(&["DEBUG", "logbot", "update_id=7"]), 1);
+    assert_eq!(h.admit("message", 8), Admit::Admitted);
+    assert_eq!(h.admit("poll", 9), Admit::Unroutable);
+    assert_eq!(LOGS.count(&unmatched), 2);
+}
+
+/// Two bots: `a` routes `callback_query` to `p1`, `b` everything to `p2`.
+const TWO_BOTS: &str = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{ match: { update_types: [callback_query] }, to: [p1] }]
+  - name: b
+    token: "2:bbb"
+    routes: [{ to: [p2] }]
+consumers:
+  p1: { pull: {} }
+  p2: { pull: {} }
+"#;
+
+#[tokio::test(start_paused = true)]
+async fn source_ids_are_stable_across_reloads() {
+    let h = Harness::new(TWO_BOTS);
+    assert_eq!(h.engine.source_id("a"), Some(SourceId(0)));
+    assert_eq!(h.engine.source_id("b"), Some(SourceId(1)));
+
+    // Removing the first bot keeps the second one's id.
+    let without_a = TWO_BOTS.replace(
+        "  - name: a\n    token: \"1:aaa\"\n    routes: [{ match: { update_types: [callback_query] }, to: [p1] }]\n",
+        "",
+    );
+    let report = h.engine.apply(&load(&without_a)).expect("apply");
+    assert_eq!(report.sources_removed, ["a"]);
+    assert!(report.sources_added.is_empty());
+    assert_eq!(h.engine.source_id("a"), None);
+    assert_eq!(h.engine.source_id("b"), Some(SourceId(1)));
+    assert_eq!(
+        admit_to(&h.engine, SourceId(1), "message", 1),
+        Admit::Admitted
+    );
+    assert_eq!(
+        admit_to(&h.engine, SourceId(0), "callback_query", 2),
+        Admit::Unroutable
+    );
+    assert_eq!(poll(&h.pull("p2"), "i", 0).await, [1]);
+
+    // A bot inserted in front gets a fresh id; `b` keeps its id and rules.
+    let c_first = without_a.replace(
+        "bots:\n",
+        "bots:\n  - name: c\n    token: \"3:ccc\"\n    routes: [{ to: [p1] }]\n",
+    );
+    let report = h.engine.apply(&load(&c_first)).expect("apply");
+    assert_eq!(report.sources_added, ["c"]);
+    assert_eq!(h.engine.source_id("c"), Some(SourceId(2)));
+    assert_eq!(h.engine.source_id("b"), Some(SourceId(1)));
+    assert_eq!(
+        admit_to(&h.engine, SourceId(1), "message", 3),
+        Admit::Admitted
+    );
+    assert_eq!(poll(&h.pull("p2"), "i", 2).await, [3]);
+    assert_eq!(
+        admit_to(&h.engine, SourceId(2), "message", 4),
+        Admit::Admitted
+    );
+    assert_eq!(poll(&h.pull("p1"), "i", 0).await, [4]);
+
+    // A removed bot that comes back is a new bot: its old id stays unused.
+    let a_back = c_first.replace(
+        "consumers:\n",
+        "  - name: a\n    token: \"1:aaa\"\n    routes: [{ to: [p3] }]\nconsumers:\n  p3: { pull: {} }\n",
+    );
+    let report = h.engine.apply(&load(&a_back)).expect("apply");
+    assert_eq!(report.sources_added, ["a"]);
+    assert_eq!(h.engine.source_id("a"), Some(SourceId(3)));
+    assert_eq!(
+        admit_to(&h.engine, SourceId(0), "message", 5),
+        Admit::Unroutable
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_pull_consumer_stays_pollable_while_draining() {
+    let yaml = r#"version: 1
+server: {}
+reload: { drain_timeout: 2s }
+bots:
+  - name: a
+    token: "1:aaa"
+    routes:
+      - match: { update_types: [callback_query] }
+        to: [pollme]
+      - to: [p2]
+consumers:
+  pollme: { pull: {} }
+  p2: { pull: {} }
+"#;
+    let h = Harness::new(yaml);
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    let old = h.pull("pollme");
+    let without = yaml
+        .replace(
+            "      - match: { update_types: [callback_query] }\n        to: [pollme]\n",
+            "",
+        )
+        .replace("  pollme: { pull: {} }\n", "");
+    h.engine.apply(&load(&without)).expect("apply");
+    assert!(h.engine.consumer("pollme").is_none());
+    let draining = h.engine.pull_consumer("pollme").expect("still draining");
+    assert!(Arc::ptr_eq(&old, &draining));
+    assert!(Arc::ptr_eq(
+        &h.engine.pull_consumer("p2").expect("current"),
+        &h.pull("p2")
+    ));
+    assert!(h.engine.pull_consumer("nope").is_none());
+
+    assert_eq!(poll(&draining, "i", 0).await, [1]);
+    assert!(poll(&draining, "i", 2).await.is_empty());
+    drop(draining);
+    // The drain ends well before `drain_timeout` (2s), with nothing left.
+    sleep(Duration::from_millis(300)).await;
+    assert!(h.engine.pull_consumer("pollme").is_none());
+    assert_eq!(Arc::strong_count(&old), 1);
+    assert_eq!(h.engine.pending(), 0);
+    assert_eq!(
+        LOGS.count(&["consumer=pollme", "still held"]),
+        0,
+        "nothing was dropped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_instance_leaves_shared_gauges_alone() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("edited_message", 1), Admit::Admitted);
+    h.assert_metric(r#"tgin_consumer_queue_depth{consumer="p2"} 1"#);
+    let pushed = BASE.replace(
+        "p2: { pull: { capacity: 1, on_full: drop_oldest } }",
+        r#"p2: { push: { endpoints: [{ url: "http://127.0.0.1:9/" }] } }"#,
+    );
+    h.engine.apply(&load(&pushed)).expect("apply");
+    h.assert_metric(r#"tgin_consumer_queue_depth{consumer="p2"} 0"#);
+    // The old instance's lease expiry runs every second; it still holds one.
+    sleep(Duration::from_millis(1500)).await;
+    h.assert_metric(r#"tgin_consumer_queue_depth{consumer="p2"} 0"#);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.engine.pending(), 0);
+    h.assert_metric(r#"tgin_consumer_queue_depth{consumer="p2"} 0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readded_consumer_revives_its_draining_instance() {
+    let with_h = BASE
+        .replace(
+            "consumers:\n",
+            "consumers:\n  h: { push: { endpoints: [{ url: \"http://127.0.0.1:9/\" }] } }\n",
+        )
+        .replace(
+            "        to: [p2]\n",
+            "        to: [p2]\n      - match: { update_types: [channel_post] }\n        to: [h]\n",
+        );
+    let h = Harness::new(&with_h);
+    let Some(Consumer::Push(hook)) = h.engine.consumer("h") else {
+        panic!("h is a push consumer");
+    };
+    let mut dispatcher = h.supervisor.subscribe("push:h").expect("supervised");
+    dispatcher
+        .wait_for(|s| *s == TaskState::Running)
+        .await
+        .expect("running");
+    // Paused, so nothing reaches the unreachable endpoint.
+    assert!(h.engine.pause("h"));
+    assert_eq!(h.admit("channel_post", 1), Admit::Admitted);
+
+    let report = h.engine.apply(&load(BASE)).expect("apply");
+    assert_eq!(report.removed, ["h"]);
+    sleep(Duration::from_millis(500)).await;
+    let report = h.engine.apply(&load(&with_h)).expect("apply");
+    assert_eq!(report.added, ["h"]);
+    let Some(Consumer::Push(back)) = h.engine.consumer("h") else {
+        panic!("h is a push consumer");
+    };
+    assert!(Arc::ptr_eq(&hook, &back), "the draining instance came back");
+    assert!(
+        !dispatcher.has_changed().expect("supervised"),
+        "the dispatcher kept running"
+    );
+
+    // Its drain was called off: the update outlives `drain_timeout`.
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(h.stats("h").available, 1);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="h",reason="reload"} 0"#);
+    assert_eq!(h.engine.pending(), 1);
+
+    // Removed for good, its supervised task is forgotten once it ends.
+    drop(back);
+    h.engine.apply(&load(BASE)).expect("apply");
+    sleep(Duration::from_secs(3)).await;
+    eventually("push:h is forgotten", || {
+        h.supervisor.subscribe("push:h").is_none()
+    })
+    .await;
+    assert_eq!(Arc::strong_count(&hook), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -499,6 +830,10 @@ consumers:
         .await
         .expect("stopped");
     eventually("h is released", || Arc::strong_count(&hook) == 1).await;
+    eventually("push:h is forgotten", || {
+        h.supervisor.subscribe("push:h").is_none()
+    })
+    .await;
 
     // `p1` holds an update until the drain timeout.
     sleep(Duration::from_millis(1900)).await;

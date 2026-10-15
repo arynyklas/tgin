@@ -5,6 +5,10 @@
 //! engine's [`Sink`](crate::sink::Sink) implementation) loads it once per
 //! update; a reload ([`Engine::apply`]) and a bot username
 //! ([`Engine::set_username`]) swap in a new one.
+//!
+//! Source ids are the engine's, not the config's: a bot keeps its id, by
+//! name, for as long as it stays configured, and an id is never given to
+//! another bot. Sources must admit with [`Engine::source_id`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +20,8 @@ use serde::Serialize;
 use tgin_runtime::backoff::Backoff;
 use tgin_runtime::breaker::BreakerState;
 use tgin_runtime::queue::{LeaseQueue, OnFull};
-use tgin_runtime::supervisor::{Exit, Supervisor};
+use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +52,11 @@ pub struct EngineRuntime {
 pub enum BuildError {
     #[error("the routing rules do not compile: {0}")]
     Rules(#[from] RuleError),
+    #[error(
+        "no source ids are left for new bots: every one of the 65536 ids was given out since \
+         tgin started; restart tgin to apply this config"
+    )]
+    SourceIdsExhausted,
 }
 
 /// One consumer instance. Cloning shares it.
@@ -123,6 +133,20 @@ impl Consumer {
         }
     }
 
+    pub(crate) fn end_drain(&self) {
+        match self {
+            Self::Pull(c) => c.end_drain(),
+            Self::Push(c) => c.end_drain(),
+        }
+    }
+
+    pub(crate) fn publish_gauges(&self, on: bool) {
+        match self {
+            Self::Pull(c) => c.publish_gauges(on),
+            Self::Push(c) => c.publish_gauges(on),
+        }
+    }
+
     pub(crate) fn update_depth(&self) {
         match self {
             Self::Pull(c) => c.update_depth(),
@@ -141,11 +165,41 @@ pub enum Mode {
 /// One bot of the current generation.
 #[derive(Clone, Debug)]
 pub struct SourceInfo {
+    /// The engine's id of the bot; see [`Engine::source_id`].
     pub id: SourceId,
     pub name: Arc<str>,
     /// The bot's username, once known: `/cmd@bot` rules match only then.
     pub username: Option<String>,
     pub metrics: SourceMetrics,
+    /// Set while the bot's updates match no rule, so that only the first of
+    /// a run is logged as a warning. Shared across generations.
+    pub(crate) unmatched: Arc<AtomicBool>,
+}
+
+impl SourceInfo {
+    /// Counts and logs an update no rule matched.
+    pub(crate) fn unmatched(&self, update_id: i64, update_type: &str) {
+        self.metrics.unmatched();
+        tracing::debug!(source = %self.name, update_id, update_type, "no rule matched the update");
+        if !self.unmatched.load(Ordering::Relaxed)
+            && self
+                .unmatched
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                source = %self.name,
+                "updates match no rule; they are dropped until one matches"
+            );
+        }
+    }
+
+    /// An update matched a rule: ends a run of unmatched ones.
+    pub(crate) fn matched(&self) {
+        if self.unmatched.load(Ordering::Relaxed) {
+            self.unmatched.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The routing state of one config generation.
@@ -154,10 +208,14 @@ pub struct EngineState {
     pub table: RouteTable,
     /// Indexed by [`ConsumerId`](crate::ids::ConsumerId).
     pub consumers: Vec<Consumer>,
-    /// Indexed by [`SourceId`].
-    pub sources: Vec<SourceInfo>,
+    /// Indexed by the engine's [`SourceId`]; `None` for ids of bots no
+    /// longer configured.
+    pub sources: Vec<Option<SourceInfo>>,
     /// Admission's view of `consumers`, by the same index.
     pub(crate) targets: Vec<Target>,
+    /// The name of every source id ever given out, by id; push consumers
+    /// name the source of queued updates with it.
+    pub(crate) source_names: Arc<[Arc<str>]>,
     /// The config this state was built from, for the next reload's diff.
     pub(crate) config: Arc<Config>,
 }
@@ -166,6 +224,14 @@ impl EngineState {
     pub(crate) fn target(&self, name: &str) -> Option<&Target> {
         self.targets.iter().find(|t| &*t.slot.name == name)
     }
+
+    pub(crate) fn source(&self, id: SourceId) -> Option<&SourceInfo> {
+        self.sources.get(usize::from(id.0))?.as_ref()
+    }
+
+    pub(crate) fn source_named(&self, name: &str) -> Option<&SourceInfo> {
+        self.sources.iter().flatten().find(|s| &*s.name == name)
+    }
 }
 
 /// A consumer as admission sees it in one generation.
@@ -173,6 +239,7 @@ impl EngineState {
 pub(crate) struct Target {
     pub(crate) slot: Arc<Slot>,
     pub(crate) on_full: OnFull,
+    pub(crate) capacity_bytes: usize,
 }
 
 /// One consumer instance with what the engine keeps for it. It lives as long
@@ -181,15 +248,24 @@ pub(crate) struct Slot {
     pub(crate) name: Arc<str>,
     pub(crate) consumer: Consumer,
     pub(crate) metrics: ConsumerMetrics,
-    /// When the queue began refusing with backpressure, as nanoseconds after
-    /// `epoch` plus one; 0 while it accepts.
+    /// The instant up to which backpressure time is counted, as nanoseconds
+    /// after `epoch` plus one; 0 while the queue accepts.
     pressured_since: AtomicU64,
     epoch: Instant,
+    /// Set while the queue drops updates for overflow, so that only the
+    /// first drop of a run is logged as a warning.
+    overflowing: AtomicBool,
+    /// Set when the instance is retired for good: admission must not queue
+    /// to it any more.
+    pub(crate) closed: AtomicBool,
     /// Stops the instance's tasks gracefully; a child of the engine's stop.
     pub(crate) stop: CancellationToken,
     /// Ends the supervision of its push dispatcher, aborting it; a child of
     /// the engine's force.
     pub(crate) kill: CancellationToken,
+    /// While the instance drains after a reload: cancelling it calls the
+    /// drain off.
+    pub(crate) drain: Mutex<Option<CancellationToken>>,
 }
 
 impl Slot {
@@ -205,33 +281,92 @@ impl Slot {
             metrics,
             pressured_since: AtomicU64::new(0),
             epoch: Instant::now(),
+            overflowing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             stop: rt.stop.child_token(),
             kill: rt.force.child_token(),
+            drain: Mutex::new(None),
         }
     }
 
-    /// The queue refused with backpressure; the first refusal starts the
-    /// clock.
-    pub(crate) fn pressured(&self, now: Instant) {
+    pub(crate) fn mode(&self) -> Mode {
+        self.consumer.mode()
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn mark(&self, now: Instant) -> u64 {
         let nanos = now.saturating_duration_since(self.epoch).as_nanos();
-        let mark = u64::try_from(nanos)
+        u64::try_from(nanos)
             .unwrap_or(u64::MAX - 1)
-            .saturating_add(1);
-        let _ =
-            self.pressured_since
-                .compare_exchange(0, mark, Ordering::Relaxed, Ordering::Relaxed);
+            .saturating_add(1)
     }
 
-    /// The queue reserved room; counts the time since the first refusal.
-    pub(crate) fn relieved(&self, now: Instant) {
-        if self.pressured_since.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        let mark = self.pressured_since.swap(0, Ordering::Relaxed);
+    /// Counts the backpressure time from `mark` (if any) up to `now`.
+    fn count_pressure(&self, mark: u64, now: Instant) {
         if let Some(nanos) = mark.checked_sub(1) {
             let since = self.epoch + Duration::from_nanos(nanos);
             let seconds = now.saturating_duration_since(since).as_secs_f64();
             self.metrics.backpressure(seconds);
+        }
+    }
+
+    /// The queue refused with backpressure: counts the time since the
+    /// episode began or the previous refusal.
+    pub(crate) fn pressured(&self, now: Instant) {
+        let previous = self.pressured_since.swap(self.mark(now), Ordering::Relaxed);
+        self.count_pressure(previous, now);
+    }
+
+    /// The queue reserved room: counts the rest of the episode, if any.
+    pub(crate) fn relieved(&self, now: Instant) {
+        if self.pressured_since.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let previous = self.pressured_since.swap(0, Ordering::Relaxed);
+        self.count_pressure(previous, now);
+    }
+
+    /// `n` updates dropped for overflow; the first of a run is logged.
+    pub(crate) fn overflowed(&self, n: u64) {
+        self.metrics.dropped(ConsumerDropReason::Overflow, n);
+        if !self.overflowing.load(Ordering::Relaxed)
+            && self
+                .overflowing
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                consumer = %self.name,
+                reason = ConsumerDropReason::Overflow.as_str(),
+                dropped = self.metrics.dropped_count(ConsumerDropReason::Overflow),
+                "the consumer queue is full; dropping updates"
+            );
+        }
+    }
+
+    /// A reservation that dropped nothing: ends a run of overflow drops.
+    pub(crate) fn reserved_cleanly(&self) {
+        if self.overflowing.load(Ordering::Relaxed) {
+            self.overflowing.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Drops what an admission committed after the instance was retired.
+    pub(crate) fn drain_late(&self) {
+        let dropped = self.consumer.queue().drain_all().len();
+        if dropped > 0 {
+            self.metrics.dropped(
+                ConsumerDropReason::Reload,
+                u64::try_from(dropped).unwrap_or(u64::MAX),
+            );
+            tracing::warn!(
+                consumer = %self.name,
+                dropped,
+                "dropped updates queued to a consumer after a reload retired it"
+            );
         }
     }
 
@@ -251,6 +386,11 @@ impl Slot {
     }
 }
 
+/// The supervisor's name of a push consumer's dispatcher.
+pub(crate) fn dispatcher_name(consumer: &str) -> String {
+    format!("push:{consumer}")
+}
+
 /// Supervises a push dispatcher as `push:<consumer>`: each attempt runs the
 /// task `spawn` starts until it returns (`Exit::Done`) or panics
 /// (`Exit::Retry`, restarted after a backoff). Cancelling `cancel` ends the
@@ -264,7 +404,7 @@ pub(crate) fn supervise_dispatcher<F>(
     F: FnMut() -> JoinHandle<()> + Send + 'static,
 {
     supervisor.spawn(
-        Arc::from(format!("push:{consumer}")),
+        Arc::from(dispatcher_name(consumer)),
         Backoff::new(
             Duration::from_secs(1),
             Duration::from_secs(60),
@@ -292,14 +432,15 @@ pub struct Engine {
     /// Reusable regex scratch; the lock is held only to take or return one.
     pub(crate) scratch: Mutex<Vec<MatchScratch>>,
     pub(crate) client: reqwest::Client,
-    pub(crate) rt: EngineRuntime,
 }
 
 /// What the engine shares with its drain tasks.
 pub(crate) struct Shared {
     pub(crate) state: ArcSwap<EngineState>,
     pub(crate) metrics: CoreMetrics,
-    /// Serializes state writers: reloads, usernames and the end of drains.
+    pub(crate) rt: EngineRuntime,
+    /// Serializes state writers: reloads, usernames, the shutdown drain and
+    /// the end of reload drains. Taken before `retired`.
     pub(crate) write: Mutex<()>,
     /// Removed or replaced instances whose drain has not ended.
     pub(crate) retired: Mutex<Vec<Arc<Slot>>>,
@@ -307,11 +448,30 @@ pub(crate) struct Shared {
     pub(crate) draining: AtomicBool,
 }
 
+/// A retired instance's dispatcher, to forget once it has stopped.
+pub(crate) struct Retired {
+    pub(crate) dispatcher: Option<(String, watch::Receiver<TaskState>)>,
+}
+
 impl Shared {
-    /// Ends the drain of a retired instance: drops what it still holds,
-    /// stops its tasks, and removes its metric series unless an instance
-    /// of the same name still uses them.
-    pub(crate) fn retire(&self, slot: &Arc<Slot>) {
+    /// Ends the drain `drain` of a retired instance, unless a reload called
+    /// it off: closes the instance to admission, drops what it still holds,
+    /// stops its tasks, and removes its metric series unless an instance of
+    /// the same name still uses them.
+    pub(crate) fn retire(&self, slot: &Arc<Slot>, drain: &CancellationToken) -> Option<Retired> {
+        let _write = self.write.lock();
+        if drain.is_cancelled() {
+            return None;
+        }
+        {
+            let mut retired = self.retired.lock();
+            let index = retired.iter().position(|s| Arc::ptr_eq(s, slot))?;
+            retired.remove(index);
+        }
+        slot.drain.lock().take();
+        // Before `drain_all`: an admission that commits after it sees the
+        // flag and drops what it committed.
+        slot.closed.store(true, Ordering::SeqCst);
         let dropped = slot.consumer.queue().drain_all().len();
         if dropped > 0 {
             slot.metrics.dropped(
@@ -324,23 +484,34 @@ impl Shared {
                 "dropped the updates a reloaded consumer still held"
             );
         }
+        // Taken before the supervision ends, while no other dispatcher of
+        // this name can exist (a new one of the same mode would have
+        // revived this instance).
+        let dispatcher = match slot.consumer {
+            Consumer::Push(_) => {
+                let name = dispatcher_name(&slot.name);
+                self.rt.supervisor.subscribe(&name).map(|rx| (name, rx))
+            }
+            Consumer::Pull(_) => None,
+        };
         slot.stop.cancel();
         slot.kill.cancel();
-        let _write = self.write.lock();
-        let mut retired = self.retired.lock();
-        retired.retain(|s| !Arc::ptr_eq(s, slot));
-        let in_use = self.state.load().target(&slot.name).is_some()
-            || retired.iter().any(|s| s.name == slot.name);
-        drop(retired);
+        let state = self.state.load();
+        let current = state.target(&slot.name);
+        let in_use = current.is_some() || self.retired.lock().iter().any(|s| s.name == slot.name);
         if !in_use {
             self.metrics.remove_consumer(&slot.name);
         }
+        if let Some(current) = current {
+            current.slot.consumer.update_depth();
+        }
+        Some(Retired { dispatcher })
     }
 }
 
 impl Engine {
     /// Builds the engine for `cfg` as generation 1 and starts every
-    /// consumer's tasks.
+    /// consumer's tasks. Bots get source ids in config order.
     ///
     /// # Errors
     ///
@@ -351,21 +522,24 @@ impl Engine {
         client: reqwest::Client,
         rt: EngineRuntime,
     ) -> Result<Self, BuildError> {
-        let plan = Plan::build(cfg, None, &metrics, &client, &rt)?;
-        let (state, rest) = plan.into_parts();
+        let plan = Plan::build(cfg, None, &[], &metrics, &client, &rt)?;
+        let (state, changes) = plan.into_parts();
         let engine = Self {
             shared: Arc::new(Shared {
                 state: ArcSwap::from_pointee(state),
                 metrics,
+                rt,
                 write: Mutex::new(()),
                 retired: Mutex::new(Vec::new()),
                 draining: AtomicBool::new(false),
             }),
             scratch: Mutex::new(Vec::new()),
             client,
-            rt,
         };
-        reload::commit(&engine, None, rest);
+        {
+            let _write = engine.shared.write.lock();
+            reload::commit(&engine, None, changes);
+        }
         Ok(engine)
     }
 
@@ -374,10 +548,34 @@ impl Engine {
         self.shared.state.load_full()
     }
 
+    /// The engine's id of the bot `name`, which its source must admit with.
+    /// It stays the same across reloads that keep the bot.
+    pub fn source_id(&self, name: &str) -> Option<SourceId> {
+        self.shared.state.load().source_named(name).map(|s| s.id)
+    }
+
     /// The current instance of the consumer `name`.
     pub fn consumer(&self, name: &str) -> Option<Consumer> {
         let state = self.shared.state.load();
         state.target(name).map(|t| t.slot.consumer.clone())
+    }
+
+    /// The pull consumer `name` to poll: the current instance, else an
+    /// instance a reload removed or replaced that still drains, so that its
+    /// clients can fetch and ack what it holds.
+    pub fn pull_consumer(&self, name: &str) -> Option<Arc<PullConsumer>> {
+        if let Some(Consumer::Pull(c)) = self.consumer(name) {
+            return Some(c);
+        }
+        self.shared
+            .retired
+            .lock()
+            .iter()
+            .filter(|s| &*s.name == name)
+            .find_map(|s| match &s.consumer {
+                Consumer::Pull(c) => Some(Arc::clone(c)),
+                Consumer::Push(_) => None,
+            })
     }
 
     /// Sets the username of a bot of the current generation, so that its
@@ -386,16 +584,13 @@ impl Engine {
     pub fn set_username(&self, source: SourceId, username: Option<String>) {
         let _write = self.shared.write.lock();
         let old = self.shared.state.load_full();
-        let index = usize::from(source.0);
-        if old
-            .sources
-            .get(index)
-            .is_none_or(|s| s.username == username)
-        {
+        if old.source(source).is_none_or(|s| s.username == username) {
             return;
         }
         let mut sources = old.sources.clone();
-        sources[index].username = username;
+        if let Some(Some(info)) = sources.get_mut(usize::from(source.0)) {
+            info.username = username;
+        }
         let table = match reload::compile(&old.config, &sources) {
             Ok(table) => table,
             Err(err) => {
@@ -409,6 +604,7 @@ impl Engine {
             consumers: old.consumers.clone(),
             sources,
             targets: old.targets.clone(),
+            source_names: Arc::clone(&old.source_names),
             config: Arc::clone(&old.config),
         }));
     }
@@ -422,8 +618,10 @@ impl Engine {
         }
     }
 
-    /// Starts the shutdown drain of every consumer, current and retired.
+    /// Starts the shutdown drain of every consumer, current and retired,
+    /// and of every instance a later reload starts.
     pub fn begin_drain(&self) {
+        let _write = self.shared.write.lock();
         self.shared.draining.store(true, Ordering::SeqCst);
         for c in &self.shared.state.load().consumers {
             c.begin_drain();
@@ -566,8 +764,6 @@ fn consumer_status(c: &Consumer) -> ConsumerStatus {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
-
-    use tgin_runtime::supervisor::TaskState;
 
     use super::*;
 

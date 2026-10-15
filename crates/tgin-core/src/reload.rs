@@ -3,6 +3,8 @@
 //!
 //! [`Engine::apply`] builds the complete new state first, so a config that
 //! fails to build changes nothing. Then:
+//! - a bot keeps its source id by name; a new bot gets an id never used
+//!   before;
 //! - a consumer with the same name and mode keeps its instance, and so its
 //!   queue, pause flag and breakers unless its endpoints change; new
 //!   parameters apply live;
@@ -10,31 +12,36 @@
 //!   `reload.drain_timeout`; what it still holds then is dropped
 //!   (`dropped{reason="reload"}`), its tasks stop and its metric series go;
 //! - a consumer whose mode changed is a new, empty instance; the old one
-//!   drains as if removed, but its series stay for the new one.
+//!   drains as if removed, but its series stay for the new one;
+//! - a consumer that comes back, with its mode, while its old instance
+//!   still drains gets that instance back, with the new parameters.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tgin_runtime::breaker::Breaker;
-use tgin_runtime::queue::OnFull;
+use tgin_runtime::queue::{OnFull, QueueConfig};
+use tgin_runtime::supervisor::TaskState;
 use tokio::time::{Instant, sleep_until};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, Config, ConsumerKind};
 use crate::consumer::push::{Endpoint, PushOptions};
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::engine::{
-    BuildError, Consumer, Engine, EngineRuntime, EngineState, Shared, Slot, SourceInfo, Target,
+    BuildError, Consumer, Engine, EngineRuntime, EngineState, Mode, Shared, Slot, SourceInfo,
+    Target,
 };
+use crate::ids::SourceId;
 use crate::metrics::{CoreMetrics, ReloadOutcome};
-use crate::rules::{RouteTable, RuleError};
+use crate::rules::{RouteTable, RuleError, RuleSpec};
 
-/// How often a drain looks whether its consumer is empty, and how long it
-/// waits at least: an admission that loaded the previous state may still
-/// commit to the instance, and must find it draining, not retired.
+/// How often a drain looks whether its consumer is empty, and the shortest
+/// drain of a consumer that still holds updates.
 const DRAIN_CHECK: Duration = Duration::from_millis(100);
 
-/// What a reload changed. Consumer and bot names are sorted.
+/// What a reload changed. Names are sorted.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ReloadReport {
     /// The generation now in effect.
@@ -45,6 +52,11 @@ pub struct ReloadReport {
     pub removed: Vec<String>,
     /// Consumers whose settings or mode changed.
     pub changed: Vec<String>,
+    /// Bots that are new: the caller starts them, with
+    /// [`Engine::source_id`].
+    pub sources_added: Vec<String>,
+    /// Bots that are gone: the caller stops them.
+    pub sources_removed: Vec<String>,
     /// Bots whose token, `api_url` or ingress changed: the caller restarts
     /// them.
     pub sources_restarted: Vec<String>,
@@ -60,21 +72,25 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// The config's rules do not compile; nothing changed. The caller
-    /// counts such a rejection, as it counts configs that fail validation.
+    /// The config's rules do not compile, or no source id is left for a new
+    /// bot; nothing changed. The caller counts such a rejection, as it
+    /// counts configs that fail validation.
     pub fn apply(&self, new: &Config) -> Result<ReloadReport, BuildError> {
-        let _write = self.shared.write.lock();
-        let old = self.shared.state.load_full();
+        let shared = &self.shared;
+        let _write = shared.write.lock();
+        let old = shared.state.load_full();
+        let retired = shared.retired.lock().clone();
         let plan = Plan::build(
             new,
             Some(&old),
-            &self.shared.metrics,
+            &retired,
+            &shared.metrics,
             &self.client,
-            &self.rt,
+            &shared.rt,
         )?;
         let (state, changes) = plan.into_parts();
         let report = commit(self, Some(state), changes);
-        self.shared.metrics.reload(ReloadOutcome::Applied);
+        shared.metrics.reload(ReloadOutcome::Applied);
         tracing::info!(
             generation = report.generation,
             added = report.added.len(),
@@ -93,76 +109,104 @@ pub(crate) struct Plan {
 }
 
 pub(crate) struct Changes {
-    /// Kept instances with new parameters.
+    /// Kept or revived instances with new parameters.
     live: Vec<Live>,
     /// New instances, to start.
     started: Vec<Arc<Slot>>,
+    /// Draining instances that come back.
+    revived: Vec<Arc<Slot>>,
     /// Removed or replaced instances, to drain.
-    retired: Vec<Arc<Slot>>,
+    retiring: Vec<Arc<Slot>>,
     removed_sources: Vec<String>,
     drain_timeout: Duration,
     report: ReloadReport,
 }
 
-/// New parameters for a kept instance.
+/// New parameters for a kept or revived instance.
 struct Live {
     slot: Arc<Slot>,
-    queue: Option<tgin_runtime::queue::QueueConfig>,
+    queue: Option<QueueConfig>,
     endpoints: Option<(Vec<Endpoint>, PushOptions)>,
 }
 
+/// A bot of the new generation before its metrics are resolved.
+struct Bot<'a> {
+    id: SourceId,
+    config: &'a config::Bot,
+    username: Option<String>,
+    unmatched: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
 impl Plan {
-    /// Builds the state for `cfg`, keeping what it can of `old`. Fails
-    /// before creating anything.
+    /// Builds the state for `cfg`, keeping what it can of `old` and
+    /// reviving instances of `retired`. Fails before creating anything.
     pub(crate) fn build(
         cfg: &Config,
         old: Option<&EngineState>,
+        retired: &[Arc<Slot>],
         metrics: &CoreMetrics,
         client: &reqwest::Client,
         rt: &EngineRuntime,
     ) -> Result<Self, BuildError> {
-        let usernames: Vec<Option<String>> = cfg
-            .bots
-            .iter()
-            .map(|bot| old.and_then(|old| known_username(old, bot)))
-            .collect();
-        let rules: Vec<_> = cfg.bots.iter().map(|b| (b.id, b.rules.clone())).collect();
-        let named: Vec<_> = cfg
-            .bots
-            .iter()
-            .zip(&usernames)
-            .map(|(b, u)| (b.id, u.clone()))
-            .collect();
-        let table = RouteTable::compile(&rules, &named)?;
-
-        let sources: Vec<SourceInfo> = cfg
-            .bots
-            .iter()
-            .zip(usernames)
-            .map(|(bot, username)| SourceInfo {
-                id: bot.id,
-                name: Arc::from(bot.name.as_str()),
-                username,
-                metrics: metrics.source(&bot.name),
-            })
-            .collect();
-        let source_names: Arc<[Arc<str>]> = sources.iter().map(|s| Arc::clone(&s.name)).collect();
-        let names_changed = old.is_some_and(|old| {
-            old.sources
-                .iter()
-                .map(|s| &s.name)
-                .ne(sources.iter().map(|s| &s.name))
-        });
-
         let mut report = ReloadReport {
             generation: old.map_or(1, |old| old.generation + 1),
             ..ReloadReport::default()
         };
+
+        // Source ids by name; ids are never reused.
+        let mut names: Vec<Arc<str>> = old.map_or_else(Vec::new, |old| old.source_names.to_vec());
+        let mut bots = Vec::with_capacity(cfg.bots.len());
+        for bot in &cfg.bots {
+            let kept = old.and_then(|old| old.source_named(&bot.name));
+            let entry = match kept {
+                Some(kept) => Bot {
+                    id: kept.id,
+                    config: bot,
+                    username: old.and_then(|old| known_username(old, kept, bot)),
+                    unmatched: Some(Arc::clone(&kept.unmatched)),
+                },
+                None => {
+                    let id =
+                        u16::try_from(names.len()).map_err(|_| BuildError::SourceIdsExhausted)?;
+                    names.push(Arc::from(bot.name.as_str()));
+                    report.sources_added.push(bot.name.clone());
+                    Bot {
+                        id: SourceId(id),
+                        config: bot,
+                        username: None,
+                        unmatched: None,
+                    }
+                }
+            };
+            bots.push(entry);
+        }
+        let rules: Vec<(SourceId, Vec<RuleSpec>)> = bots
+            .iter()
+            .map(|b| (b.id, b.config.rules.clone()))
+            .collect();
+        let usernames: Vec<_> = bots.iter().map(|b| (b.id, b.username.clone())).collect();
+        let table = RouteTable::compile(&rules, &usernames)?;
+
+        let source_names: Arc<[Arc<str>]> = names.into();
+        let names_grew = old.is_some_and(|old| old.source_names.len() != source_names.len());
+        let mut sources: Vec<Option<SourceInfo>> = vec![None; source_names.len()];
+        for bot in bots {
+            sources[usize::from(bot.id.0)] = Some(SourceInfo {
+                id: bot.id,
+                name: Arc::from(bot.config.name.as_str()),
+                username: bot.username,
+                metrics: metrics.source(&bot.config.name),
+                unmatched: bot.unmatched.unwrap_or_default(),
+            });
+        }
+
         let mut live = Vec::new();
         let mut started = Vec::new();
-        let mut retired = Vec::new();
+        let mut revived = Vec::new();
+        let mut retiring = Vec::new();
         let mut targets = Vec::with_capacity(cfg.consumers.len());
         for consumer in &cfg.consumers {
+            let mode = mode(&consumer.kind);
             let previous = old.and_then(|old| {
                 let target = old.target(&consumer.name)?;
                 let written = old
@@ -173,35 +217,56 @@ impl Plan {
                 Some((target, written))
             });
             let slot = match previous {
-                Some((target, written)) if same_mode(&written.kind, &consumer.kind) => {
+                Some((target, written)) if target.slot.mode() == mode => {
                     if written.kind != consumer.kind {
                         report.changed.push(consumer.name.clone());
                     }
-                    let change = live_change(
+                    live.extend(live_change(
                         &target.slot,
                         &written.kind,
                         &consumer.kind,
-                        names_changed,
+                        names_grew,
                         &source_names,
-                    );
-                    live.extend(change);
+                    ));
                     Arc::clone(&target.slot)
                 }
                 previous => {
                     if let Some((target, _)) = previous {
                         report.changed.push(consumer.name.clone());
-                        retired.push(Arc::clone(&target.slot));
+                        retiring.push(Arc::clone(&target.slot));
                     } else {
                         report.added.push(consumer.name.clone());
                     }
-                    let slot = new_slot(consumer, metrics, client, &source_names, rt);
-                    started.push(Arc::clone(&slot));
-                    slot
+                    let draining = retired
+                        .iter()
+                        .find(|s| *s.name == *consumer.name && s.mode() == mode);
+                    match draining {
+                        Some(slot) => {
+                            live.push(Live {
+                                slot: Arc::clone(slot),
+                                queue: Some(queue(&consumer.kind)),
+                                endpoints: match &consumer.kind {
+                                    ConsumerKind::Push(push) => {
+                                        Some((endpoints(push), options(push, &source_names)))
+                                    }
+                                    ConsumerKind::Pull(_) => None,
+                                },
+                            });
+                            revived.push(Arc::clone(slot));
+                            Arc::clone(slot)
+                        }
+                        None => {
+                            let slot = new_slot(consumer, metrics, client, &source_names, rt);
+                            started.push(Arc::clone(&slot));
+                            slot
+                        }
+                    }
                 }
             };
             targets.push(Target {
                 slot,
                 on_full: on_full(&consumer.kind),
+                capacity_bytes: queue(&consumer.kind).capacity_bytes,
             });
         }
 
@@ -210,12 +275,15 @@ impl Plan {
             for target in &old.targets {
                 if !cfg.consumers.iter().any(|c| *c.name == *target.slot.name) {
                     report.removed.push(target.slot.name.to_string());
-                    retired.push(Arc::clone(&target.slot));
+                    retiring.push(Arc::clone(&target.slot));
                 }
             }
             for bot in &old.config.bots {
                 match cfg.bots.iter().find(|b| b.name == bot.name) {
-                    None => removed_sources.push(bot.name.clone()),
+                    None => {
+                        report.sources_removed.push(bot.name.clone());
+                        removed_sources.push(bot.name.clone());
+                    }
                     Some(new) => {
                         if new.token.expose() != bot.token.expose()
                             || new.api_url != bot.api_url
@@ -228,10 +296,16 @@ impl Plan {
             }
             report.restart_required = restart_required(&old.config, cfg);
         }
-        report.added.sort();
-        report.removed.sort();
-        report.changed.sort();
-        report.sources_restarted.sort();
+        for list in [
+            &mut report.added,
+            &mut report.removed,
+            &mut report.changed,
+            &mut report.sources_added,
+            &mut report.sources_removed,
+            &mut report.sources_restarted,
+        ] {
+            list.sort();
+        }
 
         let state = EngineState {
             generation: report.generation,
@@ -239,6 +313,7 @@ impl Plan {
             consumers: targets.iter().map(|t| t.slot.consumer.clone()).collect(),
             sources,
             targets,
+            source_names,
             config: Arc::new(cfg.clone()),
         };
         Ok(Self {
@@ -246,7 +321,8 @@ impl Plan {
             changes: Changes {
                 live,
                 started,
-                retired,
+                revived,
+                retiring,
                 removed_sources,
                 drain_timeout: cfg.reload.drain_timeout,
                 report,
@@ -259,14 +335,16 @@ impl Plan {
     }
 }
 
-/// Applies a plan's changes; `state`, if given, is swapped in after the
-/// kept and new instances are ready and before the retired ones drain.
+/// Applies a plan's changes, with the engine's write lock held. `state`, if
+/// given, is swapped in once the kept, revived and new instances are ready
+/// and the retired ones drain.
 pub(crate) fn commit(
     engine: &Engine,
     state: Option<EngineState>,
     changes: Changes,
 ) -> ReloadReport {
     let shared = &engine.shared;
+    let draining = shared.draining.load(std::sync::atomic::Ordering::SeqCst);
     for change in changes.live {
         let consumer = &change.slot.consumer;
         if let Some(queue) = change.queue {
@@ -276,20 +354,63 @@ pub(crate) fn commit(
             push.set_endpoints(endpoints, opts);
         }
     }
-    let draining = shared.draining.load(std::sync::atomic::Ordering::SeqCst);
+    for slot in &changes.revived {
+        if let Some(drain) = slot.drain.lock().take() {
+            drain.cancel();
+        }
+        shared.retired.lock().retain(|s| !Arc::ptr_eq(s, slot));
+        if !draining {
+            slot.consumer.end_drain();
+        }
+    }
     for slot in &changes.started {
-        slot.start(&engine.rt);
+        slot.start(&shared.rt);
         if draining {
             slot.consumer.begin_drain();
+        }
+    }
+    // Registered before the swap, so that `pending` and `begin_drain` never
+    // miss them.
+    let mut drains = Vec::with_capacity(changes.retiring.len());
+    for slot in changes.retiring {
+        let drain = CancellationToken::new();
+        *slot.drain.lock() = Some(drain.clone());
+        slot.consumer.begin_drain();
+        shared.retired.lock().push(Arc::clone(&slot));
+        drains.push((slot, drain));
+    }
+    {
+        // A draining instance leaves the gauges of a name in use to the
+        // current instance.
+        let loaded;
+        let current: &EngineState = match &state {
+            Some(state) => state,
+            None => {
+                loaded = shared.state.load();
+                &loaded
+            }
+        };
+        for slot in current.targets.iter().map(|t| &t.slot) {
+            slot.consumer.publish_gauges(true);
+        }
+        for slot in shared.retired.lock().iter() {
+            slot.consumer
+                .publish_gauges(current.target(&slot.name).is_none());
         }
     }
     if let Some(state) = state {
         shared.state.store(Arc::new(state));
     }
-    for slot in changes.retired {
-        slot.consumer.begin_drain();
-        shared.retired.lock().push(Arc::clone(&slot));
-        tokio::spawn(drain(Arc::clone(shared), slot, changes.drain_timeout));
+    for slot in changes.started.iter().chain(&changes.revived) {
+        slot.consumer.update_depth();
+    }
+    for (slot, drain) in drains {
+        tokio::spawn(drain_retired(
+            Arc::clone(shared),
+            slot,
+            drain,
+            changes.drain_timeout,
+        ));
     }
     for name in &changes.removed_sources {
         shared.metrics.remove_source(name);
@@ -298,67 +419,93 @@ pub(crate) fn commit(
     changes.report
 }
 
-/// Recompiles the route table of `cfg` with the usernames of `sources`.
-pub(crate) fn compile(cfg: &Config, sources: &[SourceInfo]) -> Result<RouteTable, RuleError> {
-    let rules: Vec<_> = cfg.bots.iter().map(|b| (b.id, b.rules.clone())).collect();
-    let named: Vec<_> = sources.iter().map(|s| (s.id, s.username.clone())).collect();
-    RouteTable::compile(&rules, &named)
+/// Recompiles the route table of `cfg` with the ids and usernames of
+/// `sources`.
+pub(crate) fn compile(
+    cfg: &Config,
+    sources: &[Option<SourceInfo>],
+) -> Result<RouteTable, RuleError> {
+    let mut rules = Vec::with_capacity(cfg.bots.len());
+    let mut usernames = Vec::with_capacity(cfg.bots.len());
+    for info in sources.iter().flatten() {
+        if let Some(bot) = cfg.bots.iter().find(|b| *b.name == *info.name) {
+            rules.push((info.id, bot.rules.clone()));
+            usernames.push((info.id, info.username.clone()));
+        }
+    }
+    RouteTable::compile(&rules, &usernames)
 }
 
-/// Waits until the retired instance is empty (after at least one
-/// [`DRAIN_CHECK`]) or `timeout` passes, then retires it for good.
-async fn drain(shared: Arc<Shared>, slot: Arc<Slot>, timeout: Duration) {
-    let start = Instant::now();
-    let deadline = start.checked_add(timeout);
-    let grace = start + DRAIN_CHECK;
-    loop {
+/// Waits until the retired instance is empty or the drain timeout (at least
+/// [`DRAIN_CHECK`]) passes, then retires it for good, unless a reload
+/// revives it first. Its dispatcher, if any, is forgotten once it stops.
+async fn drain_retired(
+    shared: Arc<Shared>,
+    slot: Arc<Slot>,
+    drain: CancellationToken,
+    timeout: Duration,
+) {
+    let deadline = Instant::now().checked_add(timeout.max(DRAIN_CHECK));
+    while slot.consumer.pending() > 0 {
         let now = Instant::now();
-        let empty = now >= grace && slot.consumer.pending() == 0;
-        if empty || deadline.is_some_and(|deadline| now >= deadline) {
+        if deadline.is_some_and(|deadline| now >= deadline) {
             break;
         }
         let check = now + DRAIN_CHECK;
-        sleep_until(deadline.map_or(check, |deadline| deadline.min(check))).await;
+        tokio::select! {
+            () = drain.cancelled() => return,
+            () = sleep_until(deadline.map_or(check, |deadline| deadline.min(check))) => {}
+        }
     }
-    shared.retire(&slot);
+    let Some(retired) = shared.retire(&slot, &drain) else {
+        return;
+    };
+    drop(slot);
+    if let Some((name, mut rx)) = retired.dispatcher {
+        // An error means the task is gone too.
+        let _ = rx
+            .wait_for(|s| matches!(s, TaskState::Stopped | TaskState::Failed { .. }))
+            .await;
+        shared.rt.supervisor.remove(&name);
+    }
 }
 
-/// The username of `bot` in `old`, if its token did not change: another
+/// The username `kept` had in `old`, if its token did not change: another
 /// token may be another bot.
-fn known_username(old: &EngineState, bot: &config::Bot) -> Option<String> {
+fn known_username(old: &EngineState, kept: &SourceInfo, bot: &config::Bot) -> Option<String> {
     let previous = old.config.bots.iter().find(|b| b.name == bot.name)?;
     if previous.token.expose() != bot.token.expose() {
         return None;
     }
-    old.sources
-        .get(usize::from(previous.id.0))?
-        .username
-        .clone()
+    kept.username.clone()
 }
 
-fn same_mode(a: &ConsumerKind, b: &ConsumerKind) -> bool {
-    matches!(
-        (a, b),
-        (ConsumerKind::Pull(_), ConsumerKind::Pull(_))
-            | (ConsumerKind::Push(_), ConsumerKind::Push(_))
-    )
-}
-
-fn on_full(kind: &ConsumerKind) -> OnFull {
+fn mode(kind: &ConsumerKind) -> Mode {
     match kind {
-        ConsumerKind::Pull(pull) => pull.queue.on_full,
-        ConsumerKind::Push(push) => push.on_full,
+        ConsumerKind::Pull(_) => Mode::Pull,
+        ConsumerKind::Push(_) => Mode::Push,
     }
 }
 
+fn queue(kind: &ConsumerKind) -> QueueConfig {
+    match kind {
+        ConsumerKind::Pull(pull) => pull.queue,
+        ConsumerKind::Push(push) => push.queue(),
+    }
+}
+
+fn on_full(kind: &ConsumerKind) -> OnFull {
+    queue(kind).on_full
+}
+
 /// The live changes from `old` to `new` of the same mode, if any. A push
-/// consumer gets new endpoints (and breakers) when its delivery settings or
-/// the bot names it reports change.
+/// consumer gets new endpoints (and breakers) when its delivery settings
+/// change or new bots appear, whose names it reports.
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
     new: &ConsumerKind,
-    names_changed: bool,
+    names_grew: bool,
     source_names: &Arc<[Arc<str>]>,
 ) -> Option<Live> {
     let (queue, endpoints) = match (old, new) {
@@ -373,7 +520,7 @@ fn live_change(
                 || old.breaker != new.breaker;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
-                (delivery || names_changed).then(|| (endpoints(new), options(new, source_names))),
+                (delivery || names_grew).then(|| (endpoints(new), options(new, source_names))),
             )
         }
         _ => (None, None),
@@ -448,4 +595,53 @@ fn restart_required(old: &Config, new: &Config) -> Vec<String> {
         out.push("runtime.worker_threads".to_owned());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use prometheus_client::registry::Registry;
+    use tgin_runtime::config::MapEnv;
+    use tgin_runtime::supervisor::Supervisor;
+
+    use super::*;
+
+    fn load(yaml: &str) -> Config {
+        config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).expect("valid config")
+    }
+
+    #[test]
+    fn new_bot_fails_once_every_source_id_was_given_out() {
+        let metrics = CoreMetrics::register(&mut Registry::default());
+        let client = reqwest::Client::new();
+        let rt = EngineRuntime {
+            supervisor: Arc::new(Supervisor::new()),
+            stop: CancellationToken::new(),
+            force: CancellationToken::new(),
+        };
+        let one = "version: 1\nbots:\n  - { name: a, token: \"1:a\" }\n";
+        let build = |cfg: &Config, old: Option<&EngineState>| {
+            Plan::build(cfg, old, &[], &metrics, &client, &rt).map(Plan::into_parts)
+        };
+        let (mut old, _) = build(&load(one), None).expect("build");
+        // Every id below 65536 was given out since start; `a` holds id 0.
+        old.source_names = (0..=u16::MAX)
+            .map(|i| {
+                Arc::from(if i == 0 {
+                    "a".to_owned()
+                } else {
+                    format!("gone-{i}")
+                })
+            })
+            .collect();
+
+        let (state, _) = build(&load(one), Some(&old)).expect("a keeps its id");
+        assert_eq!(state.source_named("a").map(|s| s.id), Some(SourceId(0)));
+        let two = format!("{one}  - {{ name: b, token: \"2:b\" }}\n");
+        assert!(matches!(
+            build(&load(&two), Some(&old)),
+            Err(BuildError::SourceIdsExhausted)
+        ));
+    }
 }

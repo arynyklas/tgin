@@ -83,6 +83,8 @@ pub struct PushConsumer {
     draining: AtomicBool,
     /// While set, the dispatcher leases nothing new.
     paused: AtomicBool,
+    /// Whether [`PushConsumer::update_depth`] publishes the gauges.
+    gauges: AtomicBool,
     /// Wakes deliveries waiting for a breaker after an attempt's outcome, and
     /// the dispatcher after [`PushConsumer::set_endpoints`] and
     /// [`PushConsumer::resume`].
@@ -114,6 +116,7 @@ impl PushConsumer {
             in_flight: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            gauges: AtomicBool::new(true),
             changed: Notify::new(),
         }
     }
@@ -172,6 +175,17 @@ impl PushConsumer {
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Ends a drain that [`PushConsumer::begin_drain`] began.
+    pub fn end_drain(&self) {
+        self.draining.store(false, Ordering::SeqCst);
+    }
+
+    /// Turns the depth gauges on or off, for when another instance of the
+    /// same name owns the series.
+    pub fn publish_gauges(&self, on: bool) {
+        self.gauges.store(on, Ordering::SeqCst);
     }
 
     /// Stops leasing new updates; deliveries in flight, retries included,
@@ -511,8 +525,11 @@ impl PushConsumer {
         );
     }
 
-    /// Publishes the queue's depth and in-flight gauges.
+    /// Publishes the queue's depth and in-flight gauges, unless turned off.
     pub fn update_depth(&self) {
+        if !self.gauges.load(Ordering::SeqCst) {
+            return;
+        }
         let stats = self.queue.stats();
         let gauge = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         self.metrics.set_depth(

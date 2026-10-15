@@ -59,6 +59,8 @@ pub struct PullConsumer {
     metrics: ConsumerMetrics,
     draining: AtomicBool,
     paused: AtomicBool,
+    /// Whether [`PullConsumer::update_depth`] publishes the gauges.
+    gauges: AtomicBool,
     /// Wakes parked polls when the drain begins or the consumer resumes.
     wake: Notify,
 }
@@ -71,6 +73,7 @@ impl PullConsumer {
             metrics,
             draining: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            gauges: AtomicBool::new(true),
             wake: Notify::new(),
         }
     }
@@ -158,6 +161,18 @@ impl PullConsumer {
         self.wake.notify_waiters();
     }
 
+    /// Ends a drain that [`PullConsumer::begin_drain`] began: polls wait
+    /// their full timeout again.
+    pub fn end_drain(&self) {
+        self.draining.store(false, Ordering::SeqCst);
+    }
+
+    /// Turns the depth gauges on or off, for when another instance of the
+    /// same name owns the series.
+    pub fn publish_gauges(&self, on: bool) {
+        self.gauges.store(on, Ordering::SeqCst);
+    }
+
     /// Stops leasing new updates; admissions, acks and redelivery of held
     /// leases go on.
     pub fn pause(&self) {
@@ -209,8 +224,11 @@ impl PullConsumer {
         }
     }
 
-    /// Publishes the queue's depth gauges.
+    /// Publishes the queue's depth gauges, unless turned off.
     pub fn update_depth(&self) {
+        if !self.gauges.load(Ordering::SeqCst) {
+            return;
+        }
         let stats = self.queue.stats();
         let gauge = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         self.metrics

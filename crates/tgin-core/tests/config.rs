@@ -305,7 +305,7 @@ version: 1
 server: {}
 runtime: { worker_threads: 4, lame_duck: 1h 30m }
 consumers:
-  q: { pull: { capacity_bytes: 512KiB, lease_timeout: 2d } }
+  q: { pull: { capacity_bytes: 1536KiB, lease_timeout: 2d } }
   p:
     push:
       capacity_bytes: 1048576
@@ -316,7 +316,7 @@ consumers:
     assert_eq!(cfg.runtime.worker_threads.map(|n| n.get()), Some(4));
     assert_eq!(cfg.runtime.lame_duck, secs(90 * 60));
     let q = pull(&cfg, "q");
-    assert_eq!(q.queue.capacity_bytes, 512 << 10);
+    assert_eq!(q.queue.capacity_bytes, 1536 << 10);
     assert_eq!(q.queue.lease_timeout, secs(2 * 86_400));
     let p = push(&cfg, "p");
     assert_eq!(p.capacity_bytes, 1 << 20);
@@ -759,6 +759,92 @@ consumers:
         "{}",
         render(&errors)
     );
+}
+
+#[test]
+fn rule_capacity_bytes_at_least_one_mib() {
+    let yaml = r#"version: 1
+server: {}
+consumers:
+  q: { pull: { capacity_bytes: 1023KiB } }
+  p:
+    push:
+      capacity_bytes: 1048575
+      endpoints: [{ url: "http://p/" }]
+"#;
+    let errors = errors(yaml);
+    assert_eq!(errors.len(), 2, "{}", render(&errors));
+    for (err, (path, needle)) in errors.iter().zip([
+        ("consumers.q.pull.capacity_bytes", "1023KiB"),
+        ("consumers.p.push.capacity_bytes", "1048575"),
+    ]) {
+        assert_at(err, path, pos(yaml, needle));
+        assert_message(err, "must be at least 1MiB");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("updates can be up to 1 MiB")),
+            "{err}"
+        );
+    }
+    let cfg = loads(
+        &yaml
+            .replace("1023KiB", "1MiB")
+            .replace("1048575", "1048576"),
+    );
+    assert_eq!(pull(&cfg, "q").queue.capacity_bytes, 1 << 20);
+    assert_eq!(push(&cfg, "p").capacity_bytes, 1 << 20);
+}
+
+/// The schema's size branches accept what the loader accepts.
+#[test]
+fn byte_size_schema_matches_loader() {
+    let schema: serde_json::Value = serde_json::from_str(&config::schema()).unwrap();
+    let branches = schema["$defs"]["ByteSize"]["oneOf"].as_array().unwrap();
+    assert_eq!(
+        branches[0],
+        serde_json::json!({ "type": "integer", "minimum": 1_048_576 })
+    );
+    let re = regex_automata::meta::Regex::new(branches[1]["pattern"].as_str().unwrap()).unwrap();
+    let yaml = |size: &str| {
+        format!(
+            "version: 1\nserver: {{}}\nconsumers:\n  q: {{ pull: {{ capacity_bytes: \"{size}\" }} }}\n"
+        )
+    };
+    for ok in [
+        "1048576",
+        "001048576",
+        "1048579",
+        "1048580",
+        "1048599",
+        "1048600",
+        "1048999",
+        "1049000",
+        "1050000",
+        "1100000",
+        "2000000",
+        "10000000",
+        "1048576B",
+        "1024KiB",
+        "1025 KiB",
+        "1030KiB",
+        "1100KiB",
+        "2000KiB",
+        "10000KiB",
+        "1MiB",
+        " 64MiB ",
+        "1GiB",
+    ] {
+        assert!(re.is_match(ok), "schema rejects {ok:?}");
+        assert!(load(&yaml(ok)).is_ok(), "loader rejects {ok:?}");
+    }
+    for bad in [
+        "1048575", "1048575B", "1048570", "1048500", "1047999", "1040000", "999999", "1023KiB",
+        "1019KiB", "1000KiB", "999KiB", "0MiB", "0GiB", "", "64MB",
+    ] {
+        assert!(!re.is_match(bad), "schema accepts {bad:?}");
+        assert!(load(&yaml(bad)).is_err(), "loader accepts {bad:?}");
+    }
 }
 
 /// The fields that take a string or an object.

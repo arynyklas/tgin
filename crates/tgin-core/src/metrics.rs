@@ -73,6 +73,7 @@ label_enum!(
         DeadLetter => "dead_letter",
         Reload => "reload",
         Purge => "purge",
+        Oversized => "oversized",
     }
 );
 
@@ -464,6 +465,11 @@ impl ConsumerMetrics {
 
     pub fn dropped(&self, reason: ConsumerDropReason, n: u64) {
         self.dropped[reason as usize].inc_by(n);
+    }
+
+    /// The updates dropped for `reason` so far.
+    pub fn dropped_count(&self, reason: ConsumerDropReason) -> u64 {
+        self.dropped[reason as usize].get()
     }
 
     pub fn backpressure(&self, seconds: f64) {

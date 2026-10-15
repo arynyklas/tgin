@@ -142,7 +142,7 @@ fn consumers(raw: &RawConfig, diag: &mut Diagnostics) {
                     );
                 }
                 at_least_one(diag, format!("{path}.capacity"), &pull.capacity);
-                at_least_one_byte(diag, format!("{path}.capacity_bytes"), &pull.capacity_bytes);
+                capacity_bytes(diag, format!("{path}.capacity_bytes"), &pull.capacity_bytes);
                 duration(diag, format!("{path}.lease_timeout"), &pull.lease_timeout);
             }
             Consumer::Push(push) => {
@@ -169,7 +169,7 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
     }
     at_least_one(diag, format!("{path}.max_in_flight"), &push.max_in_flight);
     at_least_one(diag, format!("{path}.capacity"), &push.capacity);
-    at_least_one_byte(diag, format!("{path}.capacity_bytes"), &push.capacity_bytes);
+    capacity_bytes(diag, format!("{path}.capacity_bytes"), &push.capacity_bytes);
     duration(diag, format!("{path}.retry.initial"), &push.retry.initial);
     duration(diag, format!("{path}.retry.max"), &push.retry.max);
     at_least_one(
@@ -472,9 +472,14 @@ fn at_least_one<T: PartialEq + Default>(diag: &mut Diagnostics, path: String, va
     }
 }
 
-fn at_least_one_byte(diag: &mut Diagnostics, path: String, value: &At<super::model::ByteSize>) {
-    if value.value.0 == 0 {
-        diag.error(path, value.location, "must be at least 1 byte");
+/// A queue's `capacity_bytes`: at least 1 MiB, so every update fits.
+fn capacity_bytes(diag: &mut Diagnostics, path: String, value: &At<super::model::ByteSize>) {
+    if value.value.0 < 1 << 20 {
+        diag.errors.push(
+            ConfigError::new("must be at least 1MiB")
+                .at(located(path, value.location))
+                .hint("updates can be up to 1 MiB, and a larger update is dropped"),
+        );
     }
 }
 
