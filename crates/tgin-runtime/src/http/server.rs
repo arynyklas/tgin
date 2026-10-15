@@ -5,6 +5,9 @@
 //! server is HTTP/1 only because hyper-util's auto (h1 + h2) builder sniffs
 //! the protocol before the h1 timeout starts, so a client that never sends a
 //! byte would hold its connection forever.
+//!
+//! Handlers can read the TCP peer's address with
+//! [`ConnectInfo<SocketAddr>`](axum::extract::ConnectInfo).
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -76,7 +79,8 @@ struct Tls {
     files: TlsFiles,
 }
 
-/// Binds every address in `opts.listen`, then serves `router` on each.
+/// Binds every address in `opts.listen`, then serves `router` on each, with
+/// each request's TCP peer address as `ConnectInfo<SocketAddr>`.
 ///
 /// All addresses are bound before any is served, so on error nothing is left
 /// running.
@@ -128,7 +132,9 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
         .map(|(server, handle)| {
             let server = server.handle(handle.clone());
             let limit = ConnLimit::new(Arc::clone(&permits));
-            let make_service = router.clone().into_make_service();
+            let make_service = router
+                .clone()
+                .into_make_service_with_connect_info::<SocketAddr>();
             // With a pre-bound listener and an axum make-service, `serve`
             // cannot fail.
             match &tls {

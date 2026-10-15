@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::extract::ConnectInfo;
 use axum::routing::get;
 use tgin_runtime::http::{RunningServer, ServerOptions, TlsFiles, serve};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -207,6 +208,43 @@ async fn shutdown_before_any_request() {
     assert!(
         TcpStream::connect(addr).await.is_err(),
         "{addr} still accepts connections"
+    );
+}
+
+/// Handlers see the TCP peer's address as `ConnectInfo`, which webhook IP
+/// allowlists and pull instance ids depend on.
+#[tokio::test]
+async fn handlers_see_peer_address() {
+    let router = Router::new().route(
+        "/",
+        get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+    );
+    let server = serve(
+        router,
+        &ServerOptions {
+            listen: vec![loopback()],
+            ..ServerOptions::default()
+        },
+    )
+    .await
+    .expect("server starts");
+
+    let mut stream = TcpStream::connect(server.local_addrs[0]).await.unwrap();
+    let local = stream.local_addr().unwrap();
+    stream.write_all(CLOSE_REQUEST).await.unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("response within 5 s")
+        .expect("response is read");
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected response {response:?}"
+    );
+    assert!(
+        response.ends_with(&format!("\r\n\r\n{local}")),
+        "the handler did not see {local}: {response:?}"
     );
 }
 
