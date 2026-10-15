@@ -43,9 +43,9 @@ pub struct Config {
     pub consumers: Vec<Consumer>,
     /// Problems that do not reject the config.
     pub warnings: Vec<ConfigError>,
-    /// The config as written, for `/v1/config` (see
-    /// [`redacted_json`](super::redacted_json)).
-    pub raw: RawConfig,
+    /// The config as written; [`redacted_json`](super::redacted_json)
+    /// renders it, masked, for `/v1/config`.
+    pub(super) raw: RawConfig,
     /// Masks the config's secrets in [`redacted_json`](super::redacted_json).
     pub(super) masker: Masker,
 }

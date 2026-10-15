@@ -1,6 +1,7 @@
 //! Resolved URLs and paths, which may carry credentials.
 
 use std::fmt;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -93,54 +94,152 @@ impl fmt::Debug for Masker {
 
 impl<T: Eq> Eq for Sensitive<T> {}
 
-/// `url` without userinfo, query and fragment, then with bot tokens and
-/// configured secrets masked.
-fn mask_url(url: &Url, redactor: &Redactor) -> String {
-    let mut shown = format!("{}://", url.scheme());
-    if !url.username().is_empty() || url.password().is_some() {
-        shown.push_str(REDACTED);
-        shown.push('@');
-    }
-    if let Some(host) = url.host_str() {
-        shown.push_str(host);
-    }
-    if let Some(port) = url.port() {
-        shown.push(':');
-        shown.push_str(&port.to_string());
-    }
-    shown.push_str(url.path());
-    if url.query().is_some() {
-        shown.push('?');
-        shown.push_str(REDACTED);
-    }
-    if url.fragment().is_some() {
-        shown.push('#');
-        shown.push_str(REDACTED);
-    }
-    redactor.redact(&shown).into_owned()
+/// A run of written text: a `${…}` reference, or literal text.
+struct Run {
+    range: Range<usize>,
+    reference: bool,
 }
 
-/// Text as written in the config: URL-shaped text is masked like
-/// [`mask_url`], and bot tokens and configured secrets everywhere.
-pub(super) fn mask_written(text: &str, redactor: &Redactor) -> String {
-    match Url::parse(text) {
-        Ok(url) if text.contains("://") => mask_url(&url, redactor),
-        _ => redactor.redact(text).into_owned(),
+/// Splits `text` the way `interpolate` reads it: `${…}` up to the first `}`
+/// is a reference; `$${` and an unterminated `${` are literal.
+fn runs(text: &str) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let (mut i, mut literal) = (0, 0);
+    while let Some(found) = text[i..].find('$') {
+        let at = i + found;
+        let tail = &text[at..];
+        if tail.starts_with("$${") {
+            i = at + 3;
+        } else if let Some(body) = tail.strip_prefix("${")
+            && let Some(close) = body.find('}')
+        {
+            if literal < at {
+                runs.push(Run {
+                    range: literal..at,
+                    reference: false,
+                });
+            }
+            let end = at + 2 + close + 1;
+            runs.push(Run {
+                range: at..end,
+                reference: true,
+            });
+            i = end;
+            literal = end;
+        } else {
+            i = at + 1;
+        }
     }
+    if literal < text.len() {
+        runs.push(Run {
+            range: literal..text.len(),
+            reference: false,
+        });
+    }
+    runs
+}
+
+/// The first position at or after `from`, outside references, of a byte in
+/// `set`.
+fn find_literal(text: &str, runs: &[Run], from: usize, set: &[u8]) -> Option<usize> {
+    runs.iter()
+        .filter(|run| !run.reference && run.range.end > from)
+        .find_map(|run| {
+            let start = run.range.start.max(from);
+            text.as_bytes()[start..run.range.end]
+                .iter()
+                .position(|b| set.contains(b))
+                .map(|p| start + p)
+        })
+}
+
+/// The last position in `range`, outside references, of `byte`.
+fn rfind_literal(text: &str, runs: &[Run], range: Range<usize>, byte: u8) -> Option<usize> {
+    runs.iter()
+        .rev()
+        .filter(|run| !run.reference)
+        .find_map(|run| {
+            let start = run.range.start.max(range.start);
+            let end = run.range.end.min(range.end);
+            (start < end)
+                .then(|| text.as_bytes()[start..end].iter().rposition(|b| *b == byte))
+                .flatten()
+                .map(|p| start + p)
+        })
+}
+
+/// Text as written in the config, for `Debug` and `/v1/config`, without
+/// parsing it (a `${…}` in the host would defeat a URL parser).
+///
+/// In text with `://`, the userinfo (up to the authority's last `@`) and
+/// everything after the first `?` or `#` are masked as `[redacted]`. Then
+/// bot tokens and the redactor's secrets in the remaining literal text are
+/// masked as `#####`. `${…}` references are kept verbatim: they name where
+/// a value comes from, not the value.
+pub(super) fn mask_written(text: &str, redactor: &Redactor) -> String {
+    let runs = runs(text);
+    let mut hidden: Vec<Range<usize>> = Vec::new();
+    let scheme = runs.iter().filter(|run| !run.reference).find_map(|run| {
+        text[run.range.clone()]
+            .find("://")
+            .map(|p| run.range.start + p)
+    });
+    if let Some(scheme) = scheme {
+        let authority = scheme + 3;
+        let authority_end = find_literal(text, &runs, authority, b"/?#").unwrap_or(text.len());
+        if let Some(at) = rfind_literal(text, &runs, authority..authority_end, b'@') {
+            hidden.push(authority..at);
+        }
+        if let Some(query) = find_literal(text, &runs, authority_end, b"?#") {
+            hidden.push(query + 1..text.len());
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for run in &runs {
+        if run.reference {
+            out.push_str(&text[run.range.clone()]);
+            continue;
+        }
+        // Cut the literal run at the hidden ranges' edges.
+        let mut cuts = vec![run.range.start, run.range.end];
+        for range in &hidden {
+            for edge in [range.start, range.end] {
+                if run.range.contains(&edge) {
+                    cuts.push(edge);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for piece in cuts.windows(2) {
+            let piece = piece[0]..piece[1];
+            if hidden.iter().any(|h| h.contains(&piece.start)) {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(&redactor.redact(&text[piece]));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn mask(text: &str) -> String {
+        mask_written(text, &Redactor::new(["configured-secret".to_owned()]))
+    }
+
     #[test]
     fn urls_lose_credentials() {
-        let redactor = Redactor::new(["configured-secret".to_owned()]);
-        let mask = |s: &str| mask_written(s, &redactor);
         assert_eq!(
             mask("https://user:pass@host:8443/p?key=v#frag"),
-            "https://[redacted]@host:8443/p?[redacted]#[redacted]"
+            "https://[redacted]@host:8443/p?[redacted]"
         );
+        assert_eq!(mask("http://h/p#frag"), "http://h/p#[redacted]");
+        assert_eq!(mask("http://u@h"), "http://[redacted]@h");
         assert_eq!(
             mask("https://api.telegram.org/bot123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq/x"),
             "https://api.telegram.org/bot#####/x"
@@ -150,12 +249,44 @@ mod tests {
     }
 
     #[test]
-    fn other_text_keeps_shape() {
-        let redactor = Redactor::new(["configured-secret".to_owned()]);
-        let mask = |s: &str| mask_written(s, &redactor);
+    fn written_text_kept_as_written() {
+        // No parsing: case, default ports and references survive.
+        assert_eq!(
+            mask("HTTPS://Host.Example:443/A"),
+            "HTTPS://Host.Example:443/A"
+        );
+        assert_eq!(
+            mask("https://api.telegram.org/bot${env:TOKEN}/sendMessage"),
+            "https://api.telegram.org/bot${env:TOKEN}/sendMessage"
+        );
         assert_eq!(mask("/tls/key.pem"), "/tls/key.pem");
         assert_eq!(mask("${env:URL}"), "${env:URL}");
         assert_eq!(mask("/hook/configured-secret"), "/hook/#####");
+    }
+
+    #[test]
+    fn references_do_not_hide_credentials() {
+        assert_eq!(
+            mask("https://${env:HOOK_HOST}/hook?token=literal-query-secret"),
+            "https://${env:HOOK_HOST}/hook?[redacted]"
+        );
+        assert_eq!(
+            mask("http://admin:pa55w0rd-literal@${env:HOST}:8080/hook"),
+            "http://[redacted]@${env:HOST}:8080/hook"
+        );
+        // References inside hidden parts stay; the literal text around them
+        // does not.
+        assert_eq!(
+            mask("http://${env:USER}:pw@h/p?k=${env:Q}&x=lit"),
+            "http://${env:USER}[redacted]@h/p?[redacted]${env:Q}[redacted]"
+        );
+        // A `/` inside a reference does not end the authority.
+        assert_eq!(
+            mask("http://u:p@${file:/run/host}/x"),
+            "http://[redacted]@${file:/run/host}/x"
+        );
+        // `$${` is a literal `${`.
+        assert_eq!(mask("http://h/$${x}?q"), "http://h/$${x}?[redacted]");
     }
 
     #[test]

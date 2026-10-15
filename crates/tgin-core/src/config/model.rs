@@ -538,15 +538,15 @@ impl Serialize for SecretText {
 }
 
 /// A URL or path as written, before `${env:…}`/`${file:…}` expansion.
-/// `Debug` masks URL credentials and bot tokens.
+/// `Debug` is opaque: the text may hold credentials, and only a resolved
+/// [`Config`](super::Config) knows the secrets to mask in it.
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Template(pub At<String>);
 
 impl fmt::Debug for Template {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let redactor = tgin_runtime::secret::Redactor::new(Vec::new());
-        fmt::Debug::fmt(&super::sensitive::mask_written(&self.0.value, &redactor), f)
+        f.write_str("Template(..)")
     }
 }
 

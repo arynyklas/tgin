@@ -10,7 +10,7 @@ use tgin_core::config::{
 };
 use tgin_core::ids::ConsumerId;
 use tgin_core::rules::{SplitStrategy, TargetSpec, TextMatch};
-use tgin_runtime::config::{ConfigError, Located, MapEnv, Severity};
+use tgin_runtime::config::{ConfigError, Located, MapEnv, Severity, parse_yaml};
 use tgin_runtime::queue::{OnFull, Ordering};
 
 fn fixture(name: &str) -> String {
@@ -1264,6 +1264,19 @@ consumers:
     assert!(!render(&errors).contains("s3cret"), "{}", render(&errors));
 }
 
+/// The three renderings of a config: `Config`'s `Debug`, `redacted_json`
+/// and `RawConfig`'s `Debug`.
+fn renderings(yaml: &str, env: &MapEnv) -> [String; 3] {
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let raw: config::RawConfig = parse_yaml(yaml, Path::new("tgin.yaml")).unwrap();
+    [
+        format!("{cfg:?}"),
+        config::redacted_json(&cfg).to_string(),
+        format!("{raw:?}"),
+    ]
+}
+
 #[test]
 fn urls_and_paths_masked_in_debug_and_json() {
     let yaml = r#"version: 1
@@ -1275,7 +1288,7 @@ bots:
     api_url: "${env:API_URL}"
   - name: b
     token: "2:t"
-    ingress: { webhook: { public_url: "https://bot.example/hook?key=qu3ry-secret", register: true } }
+    ingress: { webhook: { public_url: "https://bot.example/hook?key=qu3ry-secret", register: true, path: /hook/configured-webhook-secret, secret_token: configured-webhook-secret } }
 consumers:
   p:
     push:
@@ -1294,24 +1307,17 @@ consumers:
     assert_eq!(p.endpoints[0].url.expose().query(), Some("token=env-qu3ry"));
     assert_eq!(cfg.bots[0].api_url.expose().password(), Some("pa55word"));
 
-    let debug = format!("{cfg:?}");
-    // `RawConfig`'s own Debug masks URL credentials and bot tokens; it does
-    // not know the config's secrets.
-    let raw_debug = format!("{:?}", cfg.raw);
-    let json = config::redacted_json(&cfg).to_string();
-    for leaked in [
-        "pa55word",
-        "env-qu3ry",
-        "qu3ry-secret",
-        "AAbbccddeeffgghhiijjkkllmmnnoopp_qq",
-        "configured-admin-token",
-    ] {
-        assert!(!debug.contains(leaked), "{leaked} in {debug}");
-        assert!(
-            leaked == "configured-admin-token" || !raw_debug.contains(leaked),
-            "{leaked} in {raw_debug}"
-        );
-        assert!(!json.contains(leaked), "{leaked} in {json}");
+    for rendering in renderings(yaml, &env) {
+        for leaked in [
+            "pa55word",
+            "env-qu3ry",
+            "qu3ry-secret",
+            "AAbbccddeeffgghhiijjkkllmmnnoopp_qq",
+            "configured-admin-token",
+            "configured-webhook-secret",
+        ] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
     }
     let json = config::redacted_json(&cfg);
     let endpoints = &json["consumers"]["p"]["push"]["endpoints"];
@@ -1321,10 +1327,53 @@ consumers:
         "https://api.telegram.org/bot#####/sendMessage"
     );
     assert_eq!(endpoints[2]["url"], "http://hooks.example/#####/x");
-    assert_eq!(
-        json["bots"][1]["ingress"]["webhook"]["public_url"],
-        "https://bot.example/hook?[redacted]"
-    );
+    let hook = &json["bots"][1]["ingress"]["webhook"];
+    assert_eq!(hook["public_url"], "https://bot.example/hook?[redacted]");
+    assert_eq!(hook["path"], "/hook/#####");
+}
+
+/// A `${…}` in the host must not stop the credentials around it from being
+/// masked; the reference itself is shown as written.
+#[test]
+fn templated_urls_masked_as_written() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "1:t"
+    api_url: "https://api.telegram.org/bot${env:TOKEN}/"
+    ingress: { webhook: { public_url: "https://${env:HOOK_HOST}/hook?token=literal-query-secret", register: true } }
+consumers:
+  p: { push: { endpoints: [{ url: "http://admin:pa55w0rd-literal@${env:HOST}:8080/hook" }] } }
+"#;
+    let env = env(&[
+        ("TOKEN", "123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq"),
+        ("HOOK_HOST", "bot.example"),
+        ("HOST", "push.internal"),
+    ]);
+    let [debug, json, raw] = renderings(yaml, &env);
+    for rendering in [&debug, &json, &raw] {
+        for leaked in [
+            "literal-query-secret",
+            "pa55w0rd-literal",
+            "AAbbccddeeffgghhiijjkkllmmnnoopp_qq",
+            "push.internal",
+        ] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
+    }
+    for written in [
+        "https://api.telegram.org/bot${env:TOKEN}/",
+        "https://${env:HOOK_HOST}/hook?[redacted]",
+        "http://[redacted]@${env:HOST}:8080/hook",
+    ] {
+        assert!(debug.contains(written), "{written} not in {debug}");
+        assert!(json.contains(written), "{written} not in {json}");
+    }
+    // `RawConfig` cannot know the config's secrets, so it shows no
+    // URL or path text at all.
+    assert!(raw.contains("Template(..)"), "{raw}");
+    assert!(!raw.contains("${env:"), "{raw}");
 }
 
 #[test]
@@ -1380,5 +1429,32 @@ fn regex_set_error_located() {
     assert!(
         err.hint.as_deref().is_some_and(|h| h.contains("together")),
         "{err}"
+    );
+}
+
+/// The schema's duration pattern accepts what the loader accepts.
+#[test]
+fn duration_schema_matches_loader() {
+    let schema: serde_json::Value = serde_json::from_str(&config::schema()).unwrap();
+    let pattern = schema["$defs"]["Duration"]["pattern"].as_str().unwrap();
+    let re = regex_automata::meta::Regex::new(pattern).unwrap();
+    for ok in ["0", "1.5s", "0.5h", "500ms", "1h 30m", "2d"] {
+        assert!(re.is_match(ok), "schema rejects {ok}");
+        let cfg = loads(&format!(
+            "version: 1\nreload: {{ drain_timeout: \"{ok}\" }}\n"
+        ));
+        assert_eq!(
+            cfg.reload.drain_timeout,
+            humantime::parse_duration(ok).unwrap()
+        );
+    }
+    for bad in ["5M", "1y", "2 months", "1.s", "s", ""] {
+        assert!(!re.is_match(bad), "schema accepts {bad}");
+    }
+    assert_eq!(
+        loads("version: 1\nreload: { drain_timeout: \"0\" }\n")
+            .reload
+            .drain_timeout,
+        Duration::ZERO
     );
 }

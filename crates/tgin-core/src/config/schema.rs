@@ -86,10 +86,10 @@ impl JsonSchema for HumanDuration {
 
     fn json_schema(_: &mut SchemaGenerator) -> Schema {
         json_schema!({
-            "description": "A duration such as `500ms`, `30s`, `5m` or `1h 30m`. Month (`M`) and year (`y`) units are rejected.",
+            "description": "A duration such as `500ms`, `1.5s`, `5m` or `1h 30m`, or `0`. Month (`M`) and year (`y`) units are rejected.",
             "type": "string",
-            "pattern": "^\\s*([0-9]+\\s*(nanos|nsec|ns|usec|us|µs|millis|msec|ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)\\s*)+$",
-            "examples": ["30s", "5m"]
+            "pattern": "^(0|\\s*([0-9]+(\\.[0-9]+)?\\s*(nanos|nsec|ns|usec|us|µs|millis|msec|ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)\\s*)+)$",
+            "examples": ["30s", "1.5s", "5m"]
         })
     }
 }
