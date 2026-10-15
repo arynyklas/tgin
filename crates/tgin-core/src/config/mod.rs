@@ -33,7 +33,7 @@ pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl
 /// A YAML or shape error alone, or else every validation error, ordered by
 /// position.
 pub fn load(text: &str, origin: &Path, env: &dyn Env) -> Result<Config, Vec<ConfigError>> {
-    let raw: RawConfig = parse_yaml(text, origin).map_err(|err| vec![err])?;
+    let raw: RawConfig = parse_yaml(text).map_err(|err| vec![err])?;
     let mut diag = validate::Diagnostics::default();
     validate::validate(&raw, &mut diag);
     let base_dir = origin.parent().unwrap_or(Path::new(""));
@@ -66,6 +66,27 @@ pub fn redacted_json(cfg: &Config) -> serde_json::Value {
     // model does not have.
     let mut json = serde_json::to_value(&cfg.raw).unwrap_or(Value::Null);
     mask_strings(&mut json, &cfg.masker);
+    // Every URL field starts redacted, so one without a resolved counterpart
+    // never shows as written.
+    fn redact(value: Option<&mut Value>) {
+        if let Some(value) = value.filter(|v| !v.is_null()) {
+            *value = Value::from("[redacted]");
+        }
+    }
+    let bots = json.get_mut("bots").and_then(Value::as_array_mut);
+    for out in bots.into_iter().flatten() {
+        redact(out.get_mut("api_url"));
+        redact(out.pointer_mut("/ingress/webhook/public_url"));
+    }
+    let consumers = json.get_mut("consumers").and_then(Value::as_object_mut);
+    for consumer in consumers.into_iter().flatten().map(|(_, c)| c) {
+        let endpoints = consumer
+            .pointer_mut("/push/endpoints")
+            .and_then(Value::as_array_mut);
+        for out in endpoints.into_iter().flatten() {
+            redact(out.get_mut("url"));
+        }
+    }
     // A loaded config resolved every bot and consumer, in document order.
     for (bot, out) in cfg
         .bots

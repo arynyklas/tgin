@@ -185,7 +185,8 @@
           "type": "string"
         },
         {
-          "const": 0
+          "const": 0,
+          "type": "integer"
         }
       ],
       "description": "A duration such as `500ms`, `1.5s`, `5m` or `1h 30m`, or `0`. Month (`M`) and year (`y`) units are rejected.",
@@ -333,7 +334,7 @@
         "timeout": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
-          "description": "`getUpdates` long-poll timeout."
+          "description": "`getUpdates` long-poll timeout; at least 1 s."
         }
       },
       "type": "object"

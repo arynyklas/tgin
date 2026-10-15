@@ -92,7 +92,7 @@ impl JsonSchema for HumanDuration {
                     "type": "string",
                     "pattern": "^(0|\\s*([0-9]+(\\.[0-9]+)?\\s*(nanos|nsec|ns|usec|us|µs|millis|msec|ms|seconds|second|secs|sec|s|minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d|weeks|week|wks|wk|w)\\s*)+)$"
                 },
-                { "const": 0 }
+                { "type": "integer", "const": 0 }
             ],
             "examples": ["30s", "1.5s", "5m"]
         })

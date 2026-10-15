@@ -183,7 +183,7 @@ pub enum Ingress {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct LongPoll {
-    /// `getUpdates` long-poll timeout.
+    /// `getUpdates` long-poll timeout; at least 1 s.
     pub timeout: At<HumanDuration>,
     /// Updates per `getUpdates` call, 1 to 100.
     #[schemars(range(min = 1, max = 100))]

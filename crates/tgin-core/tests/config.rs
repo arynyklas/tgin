@@ -633,7 +633,7 @@ fn rule_register_needs_https_public_url() {
         "bots[0].ingress.webhook.public_url",
         pos(yaml, "\"http:"),
     );
-    assert_message(&err, "expected https");
+    assert_message(&err, "must be https");
 }
 
 #[test]
@@ -1264,12 +1264,55 @@ consumers:
     assert!(!render(&errors).contains("s3cret"), "{}", render(&errors));
 }
 
+/// A malformed reference or unknown scheme in a URL field may sit inside its
+/// credentials, so the error quotes none of the written text.
+#[test]
+fn url_interpolation_errors_quote_no_text() {
+    for (url, message) in [
+        (
+            "https://user:pa55w0rd@host/${env:BROKEN",
+            "a `${…}` reference is malformed",
+        ),
+        (
+            "https://user:pa55w0rd@host/${vault:k3y}",
+            "a `${…}` reference is malformed",
+        ),
+        ("${env:MISSING_URL}", "MISSING_URL"),
+    ] {
+        let yaml =
+            format!("version: 1\nbots:\n  - name: a\n    token: t\n    api_url: \"{url}\"\n");
+        let errors = config::load(&yaml, Path::new("tgin.yaml"), &env(&[])).unwrap_err();
+        assert_eq!(errors.len(), 1, "{}", render(&errors));
+        assert_at(
+            &errors[0],
+            "bots[0].api_url",
+            pos(&yaml, &format!("\"{url}")),
+        );
+        assert_message(&errors[0], message);
+        let text = format!("{} {:?}", render(&errors), errors);
+        for leaked in ["pa55w0rd", "vault", "k3y", "BROKEN"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+}
+
+#[test]
+fn url_scheme_error_quotes_no_scheme() {
+    let yaml =
+        "version: 1\nbots:\n  - name: a\n    token: t\n    api_url: \"s3cretscheme://host/\"\n";
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env(&[])).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", render(&errors));
+    assert_message(&errors[0], "must be http or https");
+    let text = format!("{} {:?}", render(&errors), errors);
+    assert!(!text.contains("s3cretscheme"), "{text}");
+}
+
 /// The three renderings of a config: `Config`'s `Debug`, `redacted_json`
 /// and `RawConfig`'s `Debug`.
 fn renderings(yaml: &str, env: &MapEnv) -> [String; 3] {
     let cfg = config::load(yaml, Path::new("tgin.yaml"), env)
         .unwrap_or_else(|errors| panic!("{}", render(&errors)));
-    let raw: config::RawConfig = parse_yaml(yaml, Path::new("tgin.yaml")).unwrap();
+    let raw: config::RawConfig = parse_yaml(yaml).unwrap();
     [
         format!("{cfg:?}"),
         config::redacted_json(&cfg).to_string(),
@@ -1328,6 +1371,47 @@ consumers:
     let hook = &json["bots"][1]["ingress"]["webhook"];
     assert_eq!(hook["public_url"], "https://bot.example/…");
     assert_eq!(hook["path"], "/hook/#####");
+}
+
+/// URL fields with no resolved counterpart render as `[redacted]`, never as
+/// written.
+#[test]
+fn redacted_json_url_fallback_fails_closed() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: b
+    token: "2:t"
+    api_url: "https://user:pa55word@bot-api.internal/x"
+    ingress: { webhook: { public_url: "https://bot.example/hook?key=qu3ry-secret", register: true } }
+consumers:
+  p:
+    push:
+      endpoints:
+        - url: "https://push.example/tg?token=written-qu3ry"
+"#;
+    let mut cfg = config::load(yaml, Path::new("tgin.yaml"), &env(&[]))
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    cfg.bots.clear();
+    for consumer in &mut cfg.consumers {
+        if let config::ConsumerKind::Push(push) = &mut consumer.kind {
+            push.endpoints.clear();
+        }
+    }
+    let json = config::redacted_json(&cfg);
+    assert_eq!(json["bots"][0]["api_url"], "[redacted]");
+    assert_eq!(
+        json["bots"][0]["ingress"]["webhook"]["public_url"],
+        "[redacted]"
+    );
+    assert_eq!(
+        json["consumers"]["p"]["push"]["endpoints"][0]["url"],
+        "[redacted]"
+    );
+    let text = json.to_string();
+    for leaked in ["bot-api.internal", "bot.example", "push.example"] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
 }
 
 /// Every URL renders as its parsed origin, whatever the written text looks
@@ -1479,7 +1563,10 @@ fn duration_schema_matches_loader() {
     let schema: serde_json::Value = serde_json::from_str(&config::schema()).unwrap();
     let branches = schema["$defs"]["Duration"]["anyOf"].as_array().unwrap();
     let pattern = branches[0]["pattern"].as_str().unwrap();
-    assert_eq!(branches[1], serde_json::json!({ "const": 0 }));
+    assert_eq!(
+        branches[1],
+        serde_json::json!({ "type": "integer", "const": 0 })
+    );
     let re = regex_automata::meta::Regex::new(pattern).unwrap();
     for ok in ["0", "1.5s", "0.5h", "500ms", "1h 30m", "2d"] {
         assert!(re.is_match(ok), "schema rejects {ok}");

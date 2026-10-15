@@ -2,25 +2,26 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 use serde_saphyr::{DuplicateKeyPolicy, Localizer, Location, SnippetMode, UserMessageFormatter};
 
+use crate::secret::Redactor;
+
 use super::{ConfigError, Located, Severity};
 
 /// Deserializes `text`, rejecting duplicate keys. On failure the error
 /// carries the YAML path, line and column of the offending node, and its
-/// message is the problem followed by a source snippet headed by `origin`.
+/// message is the problem alone: no source text, and token-shaped values it
+/// quotes masked.
 ///
 /// # Errors
 ///
 /// Fails if `text` is not valid YAML or does not match `T`.
-pub fn parse_yaml<T: DeserializeOwned>(text: &str, origin: &Path) -> Result<T, ConfigError> {
+pub fn parse_yaml<T: DeserializeOwned>(text: &str) -> Result<T, ConfigError> {
     let options = serde_saphyr::options! {
         duplicate_keys: DuplicateKeyPolicy::Error,
-        with_snippet: true,
     };
     let mut failed_at = None;
     serde_saphyr::with_deserializer_from_str_with_options(text, options, |de| {
@@ -36,30 +37,22 @@ pub fn parse_yaml<T: DeserializeOwned>(text: &str, origin: &Path) -> Result<T, C
             line: saturate(location.line()),
             column: saturate(location.column()),
         }),
-        message: message(&err, origin),
+        message: message(&err),
         hint: None,
     })
 }
 
-/// The problem, without a location since [`Located`] carries it, then the
-/// source snippet if there is one.
-fn message(err: &serde_saphyr::Error, origin: &Path) -> String {
+/// The problem, without a location since [`Located`] carries it, and without
+/// a source snippet, which would quote the config verbatim.
+fn message(err: &serde_saphyr::Error) -> String {
     let formatter = UserMessageFormatter.with_localizer(&NoLocationSuffix);
-    let mut message = err.render_with_options(serde_saphyr::render_options! {
+    let message = err.render_with_options(serde_saphyr::render_options! {
         formatter: &formatter,
         snippets: SnippetMode::Off,
     });
-    let origin = origin.display().to_string();
-    let rendered = err.render_with_options(serde_saphyr::render_options! {
-        formatter: &formatter,
-        source_name: Some(&origin),
-    });
-    // A snippet's first line is a title repeating the location and problem.
-    if let Some((_title, snippet)) = rendered.split_once('\n') {
-        message.push('\n');
-        message.push_str(snippet.trim_end());
-    }
-    message
+    Redactor::new(std::iter::empty())
+        .redact(&message)
+        .into_owned()
 }
 
 /// Renders messages without serde-saphyr's `at line L, column C` suffix.
@@ -130,18 +123,14 @@ mod tests {
 
     #[test]
     fn parse_yaml_accepts_valid_document() {
-        let config: Config = parse_yaml(
-            "version: 1\nbots:\n  - name: a\n    token: x\n",
-            Path::new("tgin.yaml"),
-        )
-        .unwrap();
+        let config: Config = parse_yaml("version: 1\nbots:\n  - name: a\n    token: x\n").unwrap();
         assert_eq!(config.bots[0].name, "a");
     }
 
     #[test]
     fn parse_yaml_unknown_field_has_line_column() {
         let text = "version: 1\nbots:\n  - name: a\n    token: x\n  - name: b\n    tokn: y\n";
-        let err = parse_yaml::<Config>(text, Path::new("conf/tgin.yaml")).unwrap_err();
+        let err = parse_yaml::<Config>(text).unwrap_err();
         assert_eq!(
             err.at,
             Some(Located {
@@ -151,16 +140,11 @@ mod tests {
             }),
             "{err}"
         );
-        // The location is in `at`, not repeated in the message; the snippet
-        // follows the problem.
-        assert!(
-            err.message
-                .starts_with("unknown field `tokn`, expected one of name, token\n"),
+        // The location is in `at`, not repeated in the message, and no
+        // source text follows the problem.
+        assert_eq!(
+            err.message, "unknown field `tokn`, expected one of name, token",
             "{err}"
-        );
-        assert!(
-            err.message.contains("conf/tgin.yaml:6:5"),
-            "no snippet: {err}"
         );
         assert!(
             err.to_string()
@@ -172,7 +156,7 @@ mod tests {
     #[test]
     fn parse_yaml_duplicate_key_rejected() {
         let text = "version: 1\nversion: 2\nbots: []\n";
-        let err = parse_yaml::<Config>(text, Path::new("tgin.yaml")).unwrap_err();
+        let err = parse_yaml::<Config>(text).unwrap_err();
         assert_eq!(
             err.at,
             Some(Located {
@@ -200,8 +184,7 @@ mod tests {
             name: serde_saphyr::Spanned<String>,
         }
 
-        let named: Named =
-            parse_yaml("bots:\n  - name: a\n  - name: bb\n", Path::new("tgin.yaml")).unwrap();
+        let named: Named = parse_yaml("bots:\n  - name: a\n  - name: bb\n").unwrap();
         let at = named.bots[1].name.referenced;
         assert_eq!((at.line(), at.column()), (3, 11));
     }
@@ -221,8 +204,7 @@ mod tests {
             items: Vec<serde_saphyr::Spanned<u32>>,
         }
 
-        let err =
-            parse_yaml::<Outer>("inner:\n  items: [1, x]\n", Path::new("tgin.yaml")).unwrap_err();
+        let err = parse_yaml::<Outer>("inner:\n  items: [1, x]\n").unwrap_err();
         assert_eq!(
             err.at,
             Some(Located {
@@ -231,6 +213,43 @@ mod tests {
                 column: 14,
             }),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_yaml_error_quotes_no_source_text() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Doc {
+            url: String,
+            token: String,
+            version: u32,
+        }
+
+        let text = "url: https://user:pa55w0rd@host/x?k=v\n\
+                    token: 123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq\n\
+                    version: nope\n";
+        let err = parse_yaml::<Doc>(text).unwrap_err();
+        assert_eq!(
+            err.at.as_ref().map(|at| (at.path.as_str(), at.line)),
+            Some(("version", 3)),
+            "{err}"
+        );
+        let rendered = format!("{err} {err:?}");
+        for leaked in ["pa55w0rd", "k=v", "AAbbccddeeffgghhiijjkkllmmnnoopp_qq"] {
+            assert!(!rendered.contains(leaked), "{leaked} in {rendered}");
+        }
+    }
+
+    #[test]
+    fn parse_yaml_message_redacts_token_shapes() {
+        // A scalar the message quotes passes through token-shape redaction.
+        let text = "version: 123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq\nbots: []\n";
+        let err = parse_yaml::<Config>(text).unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains("AAbbccddeeffgghhiijjkkllmmnnoopp_qq"),
+            "{rendered}"
         );
     }
 }

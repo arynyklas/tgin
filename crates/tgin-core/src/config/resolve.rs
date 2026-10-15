@@ -338,11 +338,7 @@ impl Resolver<'_> {
                 return None;
             }
             Err(InterpError::BadSyntax(_) | InterpError::UnknownScheme(_)) => {
-                self.diag.errors.push(
-                    ConfigError::new("cannot expand the secret: a `${…}` reference is malformed")
-                        .at(located(path, text.0.location))
-                        .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
-                );
+                self.malformed(path, text.0.location, "secret");
                 return None;
             }
         };
@@ -353,6 +349,18 @@ impl Resolver<'_> {
         }
         self.secrets.push(value.clone());
         Some(Secret::new(value))
+    }
+
+    /// Reports a malformed reference or unknown scheme in `what` without
+    /// quoting the written text, which may hold credentials.
+    fn malformed(&mut self, path: String, location: Location, what: &str) {
+        self.diag.errors.push(
+            ConfigError::new(format!(
+                "cannot expand the {what}: a `${{…}}` reference is malformed"
+            ))
+            .at(located(path, location))
+            .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
+        );
     }
 
     fn template(&mut self, path: &str, text: &Template) -> Option<String> {
@@ -384,8 +392,18 @@ impl Resolver<'_> {
 
     /// An `http` or `https` URL; only `https` if `https_only`.
     fn url(&mut self, path: &str, text: &Template, https_only: bool) -> Option<SensitiveUrl> {
-        let value = self.template(path, text)?;
-        // The URL may carry credentials, so the error does not quote it.
+        // The URL may carry credentials, so no error quotes it.
+        let value = match interpolate(&text.0.value, self.env, self.base_dir) {
+            Ok(value) => value,
+            Err(err @ (InterpError::MissingVar(_) | InterpError::UnreadableFile { .. })) => {
+                self.diag.error(path, text.0.location, err.to_string());
+                return None;
+            }
+            Err(InterpError::BadSyntax(_) | InterpError::UnknownScheme(_)) => {
+                self.malformed(path.to_owned(), text.0.location, "URL");
+                return None;
+            }
+        };
         let url = match Url::parse(&value) {
             Ok(url) => url,
             Err(err) => {
@@ -404,7 +422,7 @@ impl Resolver<'_> {
             self.diag.error(
                 path,
                 text.0.location,
-                format!("the URL scheme is `{}`; expected {expected}", url.scheme()),
+                format!("the URL scheme must be {expected}"),
             );
             return None;
         }
