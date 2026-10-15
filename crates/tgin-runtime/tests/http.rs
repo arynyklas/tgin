@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::routing::get;
 use tgin_runtime::http::{
-    ClientOptions, RunningServer, ServerOptions, TlsFiles, client, describe_error, serve,
+    ClientOptions, RunningServer, ServerOptions, TlsFiles, describe_error, serve,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -258,7 +258,16 @@ async fn describe_error_has_no_url() {
         .port();
     let url = format!("http://127.0.0.1:{closed_port}/bot123456789:AAAAexampleSecretToken/x");
 
-    let err = client(&ClientOptions::default())
+    // Built without `client()` so an HTTP_PROXY or ALL_PROXY in the test
+    // environment cannot reroute the request.
+    let opts = ClientOptions::default();
+    let err = reqwest::Client::builder()
+        .connect_timeout(opts.connect_timeout)
+        .timeout(opts.request_timeout)
+        .pool_idle_timeout(opts.pool_idle_timeout)
+        .no_proxy()
+        .build()
+        .unwrap()
         .get(&url)
         .send()
         .await

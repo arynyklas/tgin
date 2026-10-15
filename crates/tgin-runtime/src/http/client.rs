@@ -28,13 +28,19 @@ impl Default for ClientOptions {
 
 /// Builds a `reqwest::Client` (rustls with aws-lc-rs, HTTP/1.1 and HTTP/2).
 /// The client is cheap to clone; clones share one connection pool.
+///
+/// # Panics
+///
+/// Panics if the host has no system CA certificate store: the client verifies
+/// servers against the platform's trust roots and cannot be built without
+/// them.
 pub fn client(opts: &ClientOptions) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(opts.connect_timeout)
         .timeout(opts.request_timeout)
         .pool_idle_timeout(opts.pool_idle_timeout)
         .build()
-        .expect("a reqwest client with only timeouts configured always builds")
+        .expect("a system CA certificate store is required to build the HTTP client")
 }
 
 /// Renders a `reqwest` error as its kind plus the `Debug` form of its source
@@ -86,7 +92,16 @@ mod tests {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/bot1:SECRET/getMe", silent.local_addr().unwrap());
 
-        let err = client(&ClientOptions::default())
+        // Built without `client()` so an HTTP_PROXY or ALL_PROXY in the test
+        // environment cannot reroute the request.
+        let opts = ClientOptions::default();
+        let err = reqwest::Client::builder()
+            .connect_timeout(opts.connect_timeout)
+            .timeout(opts.request_timeout)
+            .pool_idle_timeout(opts.pool_idle_timeout)
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(&url)
             .timeout(Duration::from_millis(100))
             .send()

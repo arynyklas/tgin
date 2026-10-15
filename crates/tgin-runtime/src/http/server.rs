@@ -16,7 +16,7 @@ use axum::Router;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use axum_server::{Handle, Server};
 use hyper_util::rt::TokioTimer;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::accept::ConnLimit;
@@ -63,11 +63,9 @@ pub struct RunningServer {
     tls: Option<Tls>,
     permits: Arc<Semaphore>,
     max_connections: usize,
-    /// Each listener's task owns its own `Handle` and forwards this signal
-    /// to it. `Handle::graceful_shutdown` wakes only servers that are already
-    /// waiting, so signalling it from here could be lost on a server that has
-    /// not been polled yet; a watch value is never missed.
-    shutdown: watch::Sender<Option<Duration>>,
+    /// One per listener. A graceful-shutdown signal latches in its `Handle`,
+    /// so it takes effect even on a server that has not been polled yet.
+    handles: Vec<Handle<SocketAddr>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -123,24 +121,29 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
         .collect::<io::Result<Vec<_>>>()?;
 
     let permits = Arc::new(Semaphore::new(opts.max_connections));
-    let (shutdown, _) = watch::channel(None);
+    let handles: Vec<Handle<SocketAddr>> = servers.iter().map(|_| Handle::new()).collect();
     let tasks = servers
         .into_iter()
-        .map(|server| {
-            let handle = Handle::new();
+        .zip(&handles)
+        .map(|(server, handle)| {
             let server = server.handle(handle.clone());
             let limit = ConnLimit::new(Arc::clone(&permits));
             let make_service = router.clone().into_make_service();
-            let stop = shutdown.subscribe();
+            // With a pre-bound listener and an axum make-service, `serve`
+            // cannot fail.
             match &tls {
                 Some(tls) => {
                     let acceptor = RustlsAcceptor::new(tls.config.clone()).acceptor(limit);
                     let server = harden(server.acceptor(acceptor), opts.header_read_timeout);
-                    tokio::spawn(run(server.serve(make_service), handle, stop))
+                    tokio::spawn(async move {
+                        let _ = server.serve(make_service).await;
+                    })
                 }
                 None => {
                     let server = harden(server.acceptor(limit), opts.header_read_timeout);
-                    tokio::spawn(run(server.serve(make_service), handle, stop))
+                    tokio::spawn(async move {
+                        let _ = server.serve(make_service).await;
+                    })
                 }
             }
         })
@@ -151,7 +154,7 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
         tls,
         permits,
         max_connections: opts.max_connections,
-        shutdown,
+        handles,
         tasks,
     })
 }
@@ -178,7 +181,9 @@ impl RunningServer {
     /// Stops accepting on every listener and lets open connections finish;
     /// connections still open after `grace` are closed.
     pub fn graceful_shutdown(&self, grace: Duration) {
-        self.shutdown.send_replace(Some(grace));
+        for handle in &self.handles {
+            handle.graceful_shutdown(Some(grace));
+        }
     }
 
     /// Waits until every listener has stopped.
@@ -213,26 +218,6 @@ fn harden<A>(
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout);
     server
-}
-
-/// Serves until the shutdown signal, then shuts the server down gracefully.
-async fn run(
-    serve: impl Future<Output = io::Result<()>>,
-    handle: Handle<SocketAddr>,
-    mut stop: watch::Receiver<Option<Duration>>,
-) {
-    tokio::pin!(serve);
-    // `serve` is polled first so its server is listening for the graceful
-    // signal before `handle` sends it. A dropped sender disables the second
-    // branch and the server keeps running.
-    let grace = tokio::select! {
-        biased;
-        _ = &mut serve => return,
-        Ok(grace) = async { stop.wait_for(Option::is_some).await.map(|grace| *grace) } => grace,
-    };
-    handle.graceful_shutdown(grace);
-    // With a pre-bound listener and an axum make-service, `serve` cannot fail.
-    let _ = serve.await;
 }
 
 /// Loads the PEM files into a config that advertises only `http/1.1` over
