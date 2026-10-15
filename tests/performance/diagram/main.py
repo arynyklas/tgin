@@ -1,12 +1,14 @@
 """Plot tgin benchmark results.
 
-Reads the typed CSV schema produced by `tgin-bench` / `benchmark.sh` and emits
-separate PNG sets for overhead and scale benchmark families into ./generated/.
-Rows are aggregated only when their scenario identity matches, and failed runs
-remain visible in loss plots without being plotted as 0 ms latency.
+Reads the CSV written by `benchmark.sh` (one row per run) and renders, per
+transport, achieved against target RPS and the latency percentiles, with one
+series per engine and scenario. Runs of the same series and rate are
+averaged. Direct baselines do not go through tgin, so their rows form one
+`direct` series whatever engine the run was for.
 
-By default, the newest ../results/*.csv run file is plotted. Pass one or more
-CSV paths explicitly to render specific campaigns.
+Without arguments the newest ../results/<run_id>.csv is plotted, newest by
+`run_id` (the file name), not by modification time. Pass CSV paths to plot
+specific runs, for example a v0 and a v1 run side by side.
 
 Run from this directory:
     uv run main.py [../results/<run_id>.csv ...]
@@ -23,47 +25,21 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 REQUIRED_COLUMNS: tuple[str, ...] = (
-    "run_id",
-    "git_sha",
-    "scenario_family",
-    "transport",
-    "route_path",
     "scenario",
-    "mode",
-    "bot_count",
-    "rps_target",
-    "rps_actual",
-    "duration_seconds",
-    "drain_timeout_seconds",
-    "sent",
-    "received",
-    "send_errors",
-    "http_errors",
-    "pending_end",
-    "loss_percent",
-    "min_ms",
-    "mean_ms",
+    "engine",
+    "target_rps",
+    "achieved_rps",
     "p50_ms",
     "p95_ms",
     "p99_ms",
     "max_ms",
+    "unreceived",
+    "dropped_by_generator",
 )
 
-SERIES_COLUMNS: tuple[str, ...] = (
-    "scenario_family",
-    "transport",
-    "route_path",
-    "scenario",
-    "mode",
-    "bot_count",
-)
+DIRECT_ENGINE = "direct"
 
-LATENCY_METRICS = frozenset(
-    {"min_ms", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"}
-)
-
-# Stable color palette (RGB 0-1) — kept identical to the previous Go script
-# so regenerated plots stay visually consistent with prior outputs.
+# Stable palette (RGB 0-1), one color per series.
 COLORS: list[tuple[float, float, float]] = [
     (255 / 255, 0 / 255, 0 / 255),
     (0 / 255, 0 / 255, 255 / 255),
@@ -79,47 +55,40 @@ COLORS: list[tuple[float, float, float]] = [
     (34 / 255, 139 / 255, 34 / 255),
 ]
 
+# Each engine gets its own line style, so engines stay apart in print.
+ENGINE_STYLES: dict[str, str] = {DIRECT_ENGINE: ":", "v0": "--", "v1": "-"}
 
-@dataclass(frozen=True)
-class ScenarioKey:
-    scenario_family: str
-    transport: str
-    route_path: str
+
+@dataclass(frozen=True, order=True)
+class SeriesKey:
+    engine: str
     scenario: str
-    mode: str
-    bot_count: str
 
     @classmethod
-    def from_row(cls, row: dict[str, str]) -> "ScenarioKey":
-        return cls(*(row[column] for column in SERIES_COLUMNS))
+    def from_row(cls, row: dict[str, str]) -> "SeriesKey":
+        scenario = row["scenario"]
+        engine = DIRECT_ENGINE if is_direct(scenario) else row["engine"]
+        return cls(engine, scenario)
 
     @property
     def label(self) -> str:
-        return f"{self.scenario} bots={self.bot_count}"
-
-    @property
-    def is_baseline(self) -> bool:
-        return self.scenario.endswith("-direct")
-
-
-@dataclass
-class _Accum:
-    total: float = 0.0
-    count: int = 0
-
-    def add(self, value: float) -> None:
-        self.total += value
-        self.count += 1
-
-    @property
-    def mean(self) -> float:
-        return self.total / self.count
+        if self.engine == DIRECT_ENGINE:
+            return self.scenario
+        return f"{self.engine} {self.scenario}"
 
 
 @dataclass(frozen=True)
 class Series:
-    key: ScenarioKey
+    key: SeriesKey
     points: tuple[tuple[float, float], ...]
+
+
+def is_direct(scenario: str) -> bool:
+    return "-direct-" in scenario
+
+
+def transport(scenario: str) -> str:
+    return scenario.split("-", 1)[0]
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -134,20 +103,16 @@ def read_csv_files(paths: list[Path]) -> list[dict[str, str]]:
     return records
 
 
-def default_csv_paths(performance_dir: Path) -> list[Path]:
-    run_files = sorted(
-        (performance_dir / "results").glob("*.csv"),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if run_files:
-        return [run_files[-1]]
-    return [performance_dir / "results.csv"]
+def default_csv_path(results_dir: Path) -> Path | None:
+    """The CSV whose name, the run id, sorts last."""
+    run_files = sorted(results_dir.glob("*.csv"), key=lambda path: path.stem)
+    return run_files[-1] if run_files else None
 
 
 def _read_csv_rows(lines: Iterable[str]) -> list[dict[str, str]]:
     reader = csv.DictReader(lines)
     if reader.fieldnames is None:
-        raise ValueError("results CSV is empty; expected typed tgin-bench header")
+        raise ValueError("results CSV is empty; expected the benchmark.sh header")
 
     missing = [column for column in REQUIRED_COLUMNS if column not in reader.fieldnames]
     if missing:
@@ -169,78 +134,65 @@ def _parse_float(row: dict[str, str], column: str) -> float | None:
         return None
 
 
-def _parse_int(row: dict[str, str], column: str) -> int | None:
-    value = row[column].strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+def aggregate(records: list[dict[str, str]], metric: str) -> list[Series]:
+    """Series sorted by engine and scenario, points sorted by target RPS.
 
-
-def _aggregate(records: list[dict[str, str]], metric: str) -> list[Series]:
-    """Return series sorted by label, with points sorted by target RPS."""
+    Rows without a value for `metric` (latency of a run without a single
+    reply) are left out rather than plotted as 0.
+    """
     if metric not in REQUIRED_COLUMNS:
         raise ValueError(f"unknown benchmark metric: {metric}")
 
-    by_series: dict[ScenarioKey, dict[float, _Accum]] = defaultdict(
-        lambda: defaultdict(_Accum)
+    values: dict[SeriesKey, dict[float, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
     )
-
     for row in records:
-        rps = _parse_float(row, "rps_target")
+        rps = _parse_float(row, "target_rps")
         value = _parse_float(row, metric)
-        received = _parse_int(row, "received")
         if rps is None or value is None:
             continue
-        if metric in LATENCY_METRICS and received == 0:
-            continue
-
-        by_series[ScenarioKey.from_row(row)][rps].add(value)
+        values[SeriesKey.from_row(row)][rps].append(value)
 
     return [
-        Series(key, tuple(sorted((rps, acc.mean) for rps, acc in rps_map.items())))
-        for key, rps_map in sorted(by_series.items(), key=lambda item: item[0].label)
+        Series(
+            key,
+            tuple(sorted((rps, sum(runs) / len(runs)) for rps, runs in by_rps.items())),
+        )
+        for key, by_rps in sorted(values.items())
     ]
 
 
 def create_plot(
     filename: Path,
     title: str,
-    subtitle: str,
-    x_label: str,
     y_label: str,
-    records: list[dict[str, str]],
-    metric: str,
-    scenario_family: str | None = None,
-    transport: str | None = None,
+    series_list: list[Series],
+    reference_line: bool = False,
 ) -> None:
-    filtered_records = [
-        row
-        for row in records
-        if (scenario_family is None or row["scenario_family"] == scenario_family)
-        and (transport is None or row["transport"] == transport)
-    ]
-    series_list = _aggregate(filtered_records, metric)
-
     fig, ax = plt.subplots(figsize=(12, 8))
-    fig.suptitle(title, fontsize=20)
-    ax.set_title(subtitle, fontsize=13, color="#444", pad=8)
-    ax.set_xlabel(x_label, fontsize=14)
+    ax.set_title(title, fontsize=18)
+    ax.set_xlabel("Target RPS", fontsize=14)
     ax.set_ylabel(y_label, fontsize=14)
     ax.grid(True)
 
-    for i, series in enumerate(series_list):
-        xs = [point[0] for point in series.points]
-        ys = [point[1] for point in series.points]
-        color = COLORS[i % len(COLORS)]
-        linewidth = 6 if series.key.is_baseline else 2
+    if reference_line and series_list:
+        top = max(rps for series in series_list for rps, _ in series.points)
         ax.plot(
-            xs,
-            ys,
-            color=color,
-            linewidth=linewidth,
+            [0, top],
+            [0, top],
+            color="#999",
+            linestyle="--",
+            linewidth=1,
+            label="target",
+        )
+
+    for i, series in enumerate(series_list):
+        ax.plot(
+            [rps for rps, _ in series.points],
+            [value for _, value in series.points],
+            color=COLORS[i % len(COLORS)],
+            linestyle=ENGINE_STYLES.get(series.key.engine, "-."),
+            linewidth=2,
             marker="o",
             markersize=6,
             label=series.key.label,
@@ -249,20 +201,68 @@ def create_plot(
     if series_list:
         ax.legend(loc="upper left", fontsize=12, framealpha=0.9)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout()
     fig.savefig(filename, dpi=100)
     plt.close(fig)
 
 
+PLOTS: tuple[tuple[str, str, str], ...] = (
+    ("p50", "Median latency (p50)", "p50_ms"),
+    ("p95", "Latency p95", "p95_ms"),
+    ("p99", "Latency p99", "p99_ms"),
+    ("max", "Max latency", "max_ms"),
+)
+
+
+def render(records: list[dict[str, str]], out_dir: Path) -> list[Path]:
+    """Write every chart for every transport present; return their paths."""
+    written: list[Path] = []
+    for name in sorted({transport(row["scenario"]) for row in records}):
+        rows = [row for row in records if transport(row["scenario"]) == name]
+
+        path = out_dir / f"{name}-achieved-rps.png"
+        create_plot(
+            path,
+            f"{name}: achieved vs target RPS",
+            "Achieved RPS",
+            aggregate(rows, "achieved_rps"),
+            reference_line=True,
+        )
+        written.append(path)
+
+        for slug, title, metric in PLOTS:
+            path = out_dir / f"{name}-latency-{slug}.png"
+            create_plot(
+                path,
+                f"{name}: {title}, from scheduled send to reply",
+                f"{title} (ms)",
+                aggregate(rows, metric),
+            )
+            written.append(path)
+
+        path = out_dir / f"{name}-unreceived.png"
+        create_plot(
+            path,
+            f"{name}: updates without a reply after the completion wait",
+            "Unreceived updates",
+            aggregate(rows, "unreceived"),
+        )
+        written.append(path)
+    return written
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Plot typed tgin benchmark CSV results."
-    )
+    parser = argparse.ArgumentParser(description="Plot tgin benchmark CSV results.")
     parser.add_argument(
         "csv_paths",
         nargs="*",
         type=Path,
-        help="CSV files to render; defaults to newest ../results/*.csv, then ../results.csv",
+        help="CSV files to render; defaults to the ../results/<run_id>.csv with the newest run id",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        help="where to write the charts, default ./generated; PNGs already there are removed",
     )
     return parser.parse_args()
 
@@ -270,18 +270,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     here = Path(__file__).resolve().parent
-    performance_dir = here.parent
-    csv_paths = args.csv_paths or default_csv_paths(performance_dir)
+    csv_paths: list[Path] = args.csv_paths
+    if not csv_paths:
+        newest = default_csv_path(here.parent / "results")
+        if newest is None:
+            print(
+                "no ../results/*.csv to plot; run benchmark.sh first", file=sys.stderr
+            )
+            return 1
+        csv_paths = [newest]
     missing_paths = [path for path in csv_paths if not path.exists()]
     if missing_paths:
         joined = ", ".join(str(path) for path in missing_paths)
         print(f"cannot open benchmark CSV path(s): {joined}", file=sys.stderr)
         return 1
-
-    out_dir = here / "generated"
-    out_dir.mkdir(exist_ok=True)
-    for stale_chart in out_dir.glob("*.png"):
-        stale_chart.unlink()
 
     try:
         records = read_csv_files(csv_paths)
@@ -289,32 +291,13 @@ def main() -> int:
         print(f"invalid benchmark results CSV: {exc}", file=sys.stderr)
         return 1
 
-    plots = [
-        ("loss", "Packet loss", "Loss (%)", "loss_percent"),
-        ("mean", "Mean latency", "Mean latency (ms)", "mean_ms"),
-        ("max", "Max latency", "Max latency (ms)", "max_ms"),
-        ("median", "Median latency (p50)", "Median latency p50 (ms)", "p50_ms"),
-    ]
-    chart_sets = [
-        ("webhook", "overhead", "Webhook routing overhead, equal backend count"),
-        ("webhook", "scale", "Webhook tgin scale-out by backend count"),
-        ("longpoll", "overhead", "Long-poll routing overhead, equal backend count"),
-        ("longpoll", "scale", "Long-poll tgin scale-out by backend count"),
-    ]
-    for transport, scenario_family, title in chart_sets:
-        for metric_slug, metric_title, y_label, metric in plots:
-            create_plot(
-                out_dir / f"{transport}-{scenario_family}-{metric_slug}.png",
-                title,
-                metric_title,
-                "Target RPS",
-                y_label,
-                records,
-                metric,
-                scenario_family=scenario_family,
-                transport=transport,
-            )
+    out_dir: Path = args.out_dir or here / "generated"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale_chart in out_dir.glob("*.png"):
+        stale_chart.unlink()
 
+    for path in render(records, out_dir):
+        print(f"wrote {path}")
     return 0
 
 

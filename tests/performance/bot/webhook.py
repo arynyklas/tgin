@@ -1,5 +1,6 @@
+import asyncio
 import os
-import asyncio, time
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -10,6 +11,9 @@ TOKEN = os.getenv("BOT_TOKEN", "123:test")
 API_URL = os.getenv("TELEGRAM_API_URL", "http://host.docker.internal:8090")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 PORT = int(os.getenv("PORT", 8080))
+# Simulated per-update work before the reply, in milliseconds.
+BOT_SLEEP = float(os.getenv("BOT_SLEEP_MS", "0")) / 1000
+
 
 async def healthz(_request):
     return web.Response(text="ok")
@@ -23,7 +27,8 @@ async def main():
     @dp.message()
     async def echo_handler(message: types.Message):
         try:
-            await asyncio.sleep(0.01)
+            if BOT_SLEEP:
+                await asyncio.sleep(BOT_SLEEP)
             await message.answer(message.text)
         except Exception as e:
             print(f"Error sending reply: {e}")
@@ -37,7 +42,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    
+
     await asyncio.Event().wait()
 
 
