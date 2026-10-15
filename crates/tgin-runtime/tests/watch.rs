@@ -2,6 +2,7 @@
 //! temporary directory.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
@@ -82,6 +83,37 @@ async fn watch_closes_channel_on_drop() {
         .await
         .expect("the channel closes");
     assert_eq!(closed, None);
+}
+
+#[tokio::test]
+async fn watch_falls_back_to_polling() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tgin.yaml");
+    fs::write(&file, "version: 1\n").unwrap();
+    // An hour of debounce: only the poll thread can report within the test.
+    let (_watcher, mut rx) =
+        watch_config(&file, Duration::from_secs(3600), Duration::from_millis(100)).unwrap();
+
+    fs::write(&file, "version: 2\n").unwrap();
+    assert_change(&mut rx, "an in-place write, by polling").await;
+}
+
+#[test]
+fn watch_rejects_zero_intervals() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tgin.yaml");
+    fs::write(&file, "version: 1\n").unwrap();
+
+    for (debounce, poll_every, name) in [
+        (Duration::ZERO, POLL_EVERY, "debounce"),
+        (DEBOUNCE, Duration::ZERO, "poll_every"),
+    ] {
+        let Err(err) = watch_config(&file, debounce, poll_every) else {
+            panic!("a zero {name} was accepted");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains(name), "{err}");
+    }
 }
 
 /// Publishes `content` the way the kubelet updates a mounted ConfigMap:
