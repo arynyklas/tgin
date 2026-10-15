@@ -3,7 +3,8 @@
 # One bot, three downstream instances: two poll tgin (pull), one receives
 # webhooks (push). Updates are shared round robin. Started from
 # `tgin config migrate tgin.ron` of the 0.2 example; check it with
-# `tgin config validate tgin.yaml`.
+# `TOKEN=… TGIN_ADMIN_TOKEN=… TELEGRAM_API_URL=https://api.telegram.org
+# tgin config validate tgin.yaml` (every `${env:…}` must be set).
 version: 1
 
 # The data plane: the pull endpoints the polling bots call.
@@ -20,7 +21,9 @@ admin:
 bots:
   - name: main
     token: ${env:TOKEN}
-    # https://api.telegram.org unless TELEGRAM_API_URL says otherwise.
+    # TELEGRAM_API_URL must be set: the config has no default for it.
+    # docker-compose.yml sets it (default https://api.telegram.org); set it
+    # yourself when you use this file elsewhere, e.g. with `config validate`.
     api_url: ${env:TELEGRAM_API_URL}
     ingress:
       long_poll: {}
