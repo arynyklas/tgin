@@ -45,6 +45,9 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # `bench = false` keeps the Callgrind bench out of `--all-targets`.
+      - name: Lint the instruction-count bench
+        run: cargo clippy -p tgin-botapi --bench hot_path_ir --locked -- -D warnings
       - name: Check the config JSON Schema is up to date
         run: cargo xtask schema --check
 
@@ -161,3 +164,22 @@ jobs:
           workspaces: tests/performance/benchmark
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # Instruction counts of the hot path under Callgrind: each benchmark in
+  # crates/tgin-botapi/benches/hot_path_ir.rs fails past its hard limit.
+  bench-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # The limits were measured with this toolchain; instruction counts
+        # move with the compiler, so raise both together.
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --no-self-update
+          rustup default 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Valgrind, and gungraun-runner at the gungraun version in Cargo.lock.
+      - uses: gungraun/setup-gungraun@62591572561bb2f4ed2ae300b8a8bea99ea8ddaf # v1.1.3
+      - run: cargo bench -p tgin-botapi --bench hot_path_ir --locked

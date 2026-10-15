@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The benches are criterion and gungraun harnesses; libtest has none to run,
+# and it would reject criterion's options (`cargo bench -- --quick`).
+[lib]
+bench = false
+
 [dependencies]
 aws-lc-rs.workspace = true
 axum.workspace = true
@@ -26,11 +31,28 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 parking_lot.workspace = true
 prometheus-client.workspace = true
 proptest.workspace = true
+smallvec.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "test-util", "time"] }
 wiremock.workspace = true
+
+# Callgrind runs on Linux only; elsewhere `hot_path_ir` builds as an empty main.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gungraun.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+# Needs Valgrind and gungraun-runner, so `cargo bench` skips it unless named:
+# `cargo bench -p tgin-botapi --bench hot_path_ir`.
+[[bench]]
+name = "hot_path_ir"
+harness = false
+bench = false
 
 [lints]
 workspace = true
