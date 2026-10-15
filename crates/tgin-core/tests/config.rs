@@ -950,6 +950,61 @@ consumers:
 }
 
 #[test]
+fn rule_push_secret_token_is_header_safe() {
+    let long = "a".repeat(257);
+    let yaml = format!(
+        r#"version: 1
+consumers:
+  p:
+    push:
+      endpoints:
+        - {{ url: "http://p/", secret_token: "s3cr3t value" }}
+        - {{ url: "http://p/", secret_token: "{long}" }}
+        - {{ url: "http://p/", secret_token: "${{env:BAD_SECRET}}" }}
+        - {{ url: "http://p/", secret_token: "ok-Secret_9" }}
+"#
+    );
+    let errors = config::load(
+        &yaml,
+        Path::new("tgin.yaml"),
+        &env(&[("BAD_SECRET", "x\ny")]),
+    )
+    .unwrap_err();
+    assert_eq!(errors.len(), 3, "{}", render(&errors));
+    for (err, (k, needle)) in
+        errors
+            .iter()
+            .zip([(0, "\"s3cr3t"), (1, "\"aaaa"), (2, "\"${env:BAD")])
+    {
+        assert_at(
+            err,
+            &format!("consumers.p.push.endpoints[{k}].secret_token"),
+            pos(&yaml, needle),
+        );
+        assert_message(err, "secret_token");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("1 to 256 ASCII letters, digits, `_` or `-`")),
+            "{err}"
+        );
+        for part in ["s3cr3t", "aaaa", "x\ny"] {
+            assert!(!err.to_string().contains(part), "{err}");
+        }
+    }
+    let max = "Z".repeat(256);
+    let cfg = loads(&format!(
+        "version: 1\nconsumers:\n  p: {{ push: {{ endpoints: [{{ url: \"http://p/\", secret_token: \"{max}\" }}, {{ url: \"http://p/\", secret_token: ok-Secret_9 }}] }} }}\n"
+    ));
+    let endpoints = push(&cfg, "p").endpoints;
+    assert_eq!(endpoints[0].secret_token.as_ref().unwrap().expose(), &max);
+    assert_eq!(
+        endpoints[1].secret_token.as_ref().unwrap().expose(),
+        "ok-Secret_9"
+    );
+}
+
+#[test]
 fn all_errors_collected() {
     let yaml = r#"version: 3
 bots:

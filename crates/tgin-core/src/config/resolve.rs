@@ -510,10 +510,22 @@ impl Resolver<'_> {
         for (k, endpoint) in push.endpoints.value.iter().enumerate() {
             let path = format!("{path}.push.endpoints[{k}]");
             let url = self.url(&format!("{path}.url"), &endpoint.url, false);
-            let secret_token = endpoint
-                .secret_token
-                .as_ref()
-                .and_then(|t| self.secret(format!("{path}.secret_token"), t));
+            let secret_token = endpoint.secret_token.as_ref().and_then(|t| {
+                let path = format!("{path}.secret_token");
+                let secret = self.secret(path.clone(), t)?;
+                if !header_safe_secret(secret.expose()) {
+                    // Never quotes the value: it is the secret.
+                    self.diag.errors.push(
+                        ConfigError::new("the secret_token is not a valid secret header value")
+                            .at(located(path, t.0.location))
+                            .hint(
+                                "it is sent as `X-Telegram-Bot-Api-Secret-Token`: use 1 to 256 ASCII letters, digits, `_` or `-`",
+                            ),
+                    );
+                    return None;
+                }
+                Some(secret)
+            });
             if let Some(url) = url {
                 endpoints.push(Endpoint {
                     url,
@@ -819,6 +831,16 @@ fn on_full(o: raw::OnFull) -> queue::OnFull {
         raw::OnFull::Backpressure => queue::OnFull::Backpressure,
         raw::OnFull::DropOldest => queue::OnFull::DropOldest,
     }
+}
+
+/// Whether a push endpoint's `secret_token` is sendable as
+/// `X-Telegram-Bot-Api-Secret-Token`: `^[A-Za-z0-9_-]{1,256}$`, as Telegram
+/// requires of webhook secrets.
+fn header_safe_secret(secret: &str) -> bool {
+    (1..=256).contains(&secret.len())
+        && secret
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 /// Sizes beyond the address space mean "unlimited".

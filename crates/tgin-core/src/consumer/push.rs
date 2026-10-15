@@ -211,7 +211,10 @@ impl PushConsumer {
 
     /// Delivers one update, retrying on the endpoints of the current set,
     /// until it is delivered or dead-lettered. Once `cancel` fires it starts
-    /// no new attempt and returns, leaving the update to the queue.
+    /// no new attempt and returns, leaving the update to the queue. A request
+    /// already sent when `cancel` fires still settles the update: if it fails
+    /// transiently and the update has spent `max_attempts` or `max_age`, the
+    /// update is dead-lettered, not released.
     async fn deliver(&self, held: Held<'_>, envelope: Envelope, cancel: &CancellationToken) {
         let mut backoff: Option<Backoff> = None;
         let mut attempt: u32 = 0;
