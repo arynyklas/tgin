@@ -1505,3 +1505,28 @@ fn duration_schema_matches_loader() {
     let err = single_error(yaml);
     assert_message(&err, "add a unit, such as `30s`");
 }
+
+#[test]
+fn rule_long_poll_timeout_at_least_one_second() {
+    for timeout in ["0", "500ms", "999ms"] {
+        let yaml = format!(
+            "version: 1\nbots:\n  - name: a\n    token: t\n    ingress: {{ long_poll: {{ timeout: \"{timeout}\" }} }}\n"
+        );
+        let err = single_error(&yaml);
+        assert_at(
+            &err,
+            "bots[0].ingress.long_poll.timeout",
+            pos(&yaml, &format!("\"{timeout}\"")),
+        );
+        assert_message(&err, "shorter than the minimum of 1s");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("whole seconds")),
+            "{err}"
+        );
+    }
+    loads(
+        "version: 1\nbots:\n  - name: a\n    token: t\n    ingress: { long_poll: { timeout: 1s } }\n",
+    );
+}

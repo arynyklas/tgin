@@ -273,6 +273,19 @@ fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ing
         Ingress::LongPoll(poll) => {
             let path = format!("{path}.ingress.long_poll");
             duration(diag, format!("{path}.timeout"), &poll.timeout);
+            if poll.timeout.value.get() < Duration::from_secs(1) {
+                diag.errors.push(
+                    ConfigError::new(format!(
+                        "`{}` is shorter than the minimum of 1s",
+                        poll.timeout.value.as_str()
+                    ))
+                    .at(located(
+                        format!("{path}.timeout"),
+                        known(poll.timeout.location, ingress.location),
+                    ))
+                    .hint("Telegram takes whole seconds, and 0 would poll in a tight loop; use 1s or more (30s is usual)"),
+                );
+            }
             in_range(diag, format!("{path}.limit"), &poll.limit, ingress.location);
         }
         Ingress::Webhook(hook) => {
