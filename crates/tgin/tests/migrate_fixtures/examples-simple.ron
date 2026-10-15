@@ -1,0 +1,25 @@
+(
+    dark_threads: 6,
+    server_port: Some(3000),
+
+    api: Some(ApiConfig(base_path: "/api")),
+    // Required whenever `api` is set; clients send `Authorization: Bearer <token>`.
+    auth_token: Some("${TGIN_AUTH_TOKEN}"),
+
+    updates: [
+        LongPollUpdate(
+            token: "${TOKEN}",
+        ),
+        // WebhookUpdate(
+        //     path: "/bot/pull",
+        // ),
+    ],
+
+    route: RoundRobinLB(
+        routes: [
+            LongPollRoute(path: "/bot1/getUpdates"),
+            WebhookRoute(url: "${WH_ENDPOINT}"),
+            LongPollRoute(path: "/bot2/getUpdates"),
+        ],
+    ),
+)

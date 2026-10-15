@@ -1,0 +1,49 @@
+# Converted from a tgin 0.2 config by `tgin config migrate`.
+# Warnings:
+# - `api` was dropped: tgin 1.0 has no route-management API; edit the routes in this file instead, which tgin reloads on change
+
+version: 1
+runtime:
+  worker_threads: 6
+log:
+  level: info
+  format: text
+server:
+  listen:
+    - "0.0.0.0:3000"
+admin:
+  # tgin 0.2's auth_token. The status and metrics endpoints moved from the data port to admin.listen (default 127.0.0.1:9090).
+  token: "${env:TGIN_AUTH_TOKEN}"
+bots:
+  - name: bot-1
+    token: "${env:TOKEN}"
+    ingress:
+      long_poll: {}
+    routes:
+      - to:
+          - split:
+              strategy: round_robin
+              among:
+                - pull-bot1-getupdates
+                - push-1
+                - pull-bot2-getupdates
+consumers:
+  pull-bot1-getupdates:
+    pull:
+      capacity: 10000
+      on_full: drop_oldest
+      aliases:
+        - "/bot1/getUpdates"
+  push-1:
+    push:
+      endpoints:
+        - url: "${env:WH_ENDPOINT}"
+      # tgin 0.2 made one delivery attempt per update; raise max_attempts to retry.
+      retry:
+        max_attempts: 1
+  pull-bot2-getupdates:
+    pull:
+      capacity: 10000
+      on_full: drop_oldest
+      aliases:
+        - "/bot2/getUpdates"
