@@ -243,9 +243,13 @@ mod tests {
 
     #[test]
     fn parse_yaml_message_redacts_token_shapes() {
-        // A scalar the message quotes passes through token-shape redaction.
-        let text = "version: 123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq\nbots: []\n";
-        let err = parse_yaml::<Config>(text).unwrap_err();
+        // A duplicate key is quoted in the message, so the token-shaped key
+        // must pass through redaction.
+        let token = "123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq";
+        let text = format!("{token}: a\n{token}: b\n");
+        let err = parse_yaml::<std::collections::BTreeMap<String, String>>(&text).unwrap_err();
+        assert!(err.message.starts_with("duplicate mapping key: "), "{err}");
+        assert!(err.message.contains("#####"), "{err}");
         let rendered = format!("{err} {err:?}");
         assert!(
             !rendered.contains("AAbbccddeeffgghhiijjkkllmmnnoopp_qq"),

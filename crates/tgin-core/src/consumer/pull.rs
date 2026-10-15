@@ -77,9 +77,10 @@ impl PullConsumer {
         &self.name
     }
 
-    /// Acks by `offset`, then returns what the instance still holds from
-    /// `offset` on, else leases up to `limit` new updates, waiting for them
-    /// until the timeout, `cancel`, or the drain hold ends the wait.
+    /// Acks by `offset`, then returns the oldest `limit` updates the instance
+    /// still holds from `offset` on, else leases up to `limit` new updates,
+    /// waiting for them until the timeout, `cancel`, or the drain hold ends
+    /// the wait.
     pub async fn poll(&self, req: PollRequest, cancel: &CancellationToken) -> PollResponse {
         debug_assert!(
             (1..=MAX_LIMIT).contains(&req.limit),
@@ -93,7 +94,9 @@ impl PullConsumer {
         );
         let start = Instant::now();
         self.ack(&req.instance, req.offset, start);
-        let held = self.queue.held(&req.instance, req.offset, start);
+        let mut held = self.queue.held(&req.instance, req.offset, start);
+        // The rest stay leased and come back on a later poll.
+        held.truncate(req.limit);
         if !held.is_empty() {
             self.update_depth();
             return PollResponse::from_leases(held);
@@ -321,6 +324,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn poll_redelivery_capped_at_limit() {
+        let (_reg, c) = consumer();
+        for id in 1..=3 {
+            admit(&c, id, None);
+        }
+        assert_eq!(poll(&c, req("a", 0, 100, NOW)).await, [1, 2, 3]);
+        // Held updates come back oldest first, at most `limit` of them; the
+        // rest stay leased to the instance.
+        assert_eq!(poll(&c, req("a", 0, 2, NOW)).await, [1, 2]);
+        let stats = c.queue().stats();
+        assert_eq!((stats.available, stats.leased), (0, 3));
+        assert_eq!(poll(&c, req("a", 2, 1, NOW)).await, [2]);
+        assert_eq!(poll(&c, req("a", 3, 1, NOW)).await, [3]);
+        assert!(poll(&c, req("b", 0, 100, NOW)).await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn poll_negative_offset_acks_all() {
         let (reg, c) = consumer();
         admit(&c, 1, None);
@@ -371,6 +391,19 @@ mod tests {
         assert!(poll(&c, req("a", 2, 100, NOW)).await.is_empty());
         assert_eq!(poll(&c, req("b", 0, 100, NOW)).await, [1]);
         cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_task_stops_on_cancel() {
+        let (_reg, c) = consumer();
+        let cancel = CancellationToken::new();
+        c.spawn_expiry(cancel.clone());
+        assert_eq!(Arc::strong_count(&c), 2);
+        cancel.cancel();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(Arc::strong_count(&c), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -431,12 +464,14 @@ mod tests {
         let (_reg, c) = consumer_with(config(Duration::from_secs(60), Ordering::PerKey));
         admit(&c, 1, Some(7));
         admit(&c, 2, Some(7));
-        assert_eq!(poll(&c, req("a", 0, 100, NOW)).await, [1]);
+        admit(&c, 3, Some(8));
+        assert_eq!(poll(&c, req("a", 0, 100, NOW)).await, [1, 3]);
         let start = Instant::now();
         let (got, ()) = tokio::join!(poll(&c, req("b", 0, 100, Duration::from_secs(30))), async {
             sleep(Duration::from_secs(1)).await;
-            // Acked straight on the queue: a poll by `a` would lease 2 itself.
-            assert_eq!(c.queue().ack_all(&HolderId(Arc::from("a"))), 1);
+            // `a` still holds 3, so its poll acks 1 and returns 3 without
+            // leasing 2 itself; the ack wakes `b`.
+            assert_eq!(poll(&c, req("a", 2, 100, NOW)).await, [3]);
         });
         assert_eq!(got, [2]);
         assert_eq!(start.elapsed(), Duration::from_secs(1));
