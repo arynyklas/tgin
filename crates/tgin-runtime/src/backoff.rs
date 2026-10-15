@@ -41,6 +41,11 @@ impl Backoff {
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
+
+    /// The cap on any single delay.
+    pub fn max(&self) -> Duration {
+        self.max
+    }
 }
 
 /// The longer of `computed` and the server's `retry_after`, the latter capped

@@ -19,7 +19,8 @@ regex.workspace = true
 serde.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
