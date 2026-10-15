@@ -10,3 +10,13 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+aho-corasick.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

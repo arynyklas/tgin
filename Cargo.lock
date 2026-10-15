@@ -1670,6 +1670,14 @@ version = "1.0.0-dev"
 [[package]]
 name = "tgin-runtime"
 version = "1.0.0-dev"
+dependencies = [
+ "aho-corasick",
+ "rand",
+ "regex",
+ "serde",
+ "serde_json",
+ "subtle",
+]
 
 [[package]]
 name = "thiserror"
