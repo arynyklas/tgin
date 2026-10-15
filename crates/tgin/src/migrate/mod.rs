@@ -41,8 +41,7 @@ const DEFAULT_LONG_POLL_LIMIT: u64 = 100;
 const HEADER: &str = "# Converted from a tgin 0.2 config by `tgin config migrate`.";
 const API_DROPPED: &str = "`api` was dropped: tgin 1.0 has no route-management API; edit the routes in this file instead, which tgin reloads on change";
 const ADMIN_NOTE: &str = "tgin 0.2's auth_token. The status and metrics endpoints moved from the data port to admin.listen (default 127.0.0.1:9090).";
-const PUSH_NOTE: &str =
-    "tgin 0.2 made one delivery attempt per update; raise max_attempts to retry.";
+const PUSH_NOTE: &str = "tgin 0.2 made one delivery attempt and dropped what its downstream did not take, never pausing the source; delete on_full and retry for tgin 1.0's backpressure and retries.";
 
 /// A converted config.
 #[derive(Debug)]
@@ -352,7 +351,12 @@ impl<'r> Migrator<'r> {
                 }
                 let secret = match secret_token.as_deref() {
                     // 0.2 checked no secret; v1's default `auto` would.
-                    None => Node::plain("none"),
+                    None => {
+                        self.warnings.push(format!(
+                            "updates[{i}]: bot-{n}: the webhook has no secret token, so anyone who can reach its path can post updates; set secret_token and register it with Telegram"
+                        ));
+                        Node::plain("none")
+                    }
                     Some("auto" | "none") => {
                         self.errors.push(format!(
                             "updates[{i}].secret_token: `auto` and `none` are keywords in tgin 1.0, not secrets; choose another secret_token"
@@ -471,6 +475,9 @@ impl<'r> Migrator<'r> {
                 let push = Node::map()
                     .field("endpoints", Node::Seq(vec![endpoint]))
                     .comment(PUSH_NOTE)
+                    // With `backpressure`, one dead endpoint would stall
+                    // every other consumer of the bot.
+                    .field("on_full", Node::plain("drop_oldest"))
                     .field("retry", Node::map().field("max_attempts", Node::plain(1)));
                 self.consumers
                     .push((name.clone(), Node::map().field("push", push)));

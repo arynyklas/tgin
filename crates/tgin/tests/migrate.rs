@@ -137,6 +137,30 @@ fn migrated_output_validates() {
     }
 }
 
+/// 0.2 dropped what a failing downstream did not take and never paused the
+/// source; with v1's `backpressure`, one dead push endpoint would stall
+/// every other consumer of its bot.
+#[test]
+fn migrated_push_consumers_never_backpressure() {
+    let mut pushes = 0;
+    for name in SHIPPED {
+        let cfg = load(&read(&format!("{name}.yaml")));
+        for consumer in &cfg.consumers {
+            if let ConsumerKind::Push(push) = &consumer.kind {
+                pushes += 1;
+                assert_eq!(
+                    push.on_full,
+                    OnFull::DropOldest,
+                    "{name}: {}",
+                    consumer.name
+                );
+                assert_eq!(push.retry.max_attempts, 1, "{name}: {}", consumer.name);
+            }
+        }
+    }
+    assert_eq!(pushes, 4, "push consumers in the shipped configs");
+}
+
 #[test]
 fn multi_bot_with_pull_is_error() {
     let ron = r#"(
@@ -225,12 +249,20 @@ fn webhook_without_token_gets_placeholder_and_warning() {
         "{}",
         out.yaml
     );
-    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
     assert!(
         out.warnings[0].contains("updates[1]") && out.warnings[0].contains("TGIN_BOT_2_TOKEN"),
         "{}",
         out.warnings[0]
     );
+    // 0.2 accepted any post to a webhook without a secret; v1 keeps that,
+    // with a warning that names neither the path nor a token.
+    assert!(
+        out.warnings[1].contains("bot-2") && out.warnings[1].contains("no secret token"),
+        "{}",
+        out.warnings[1]
+    );
+    assert!(!out.warnings[1].contains("/hook"), "{}", out.warnings[1]);
     // The warning heads the file too.
     assert!(
         out.yaml
@@ -294,7 +326,7 @@ fn webhook_registration_supplies_token_url_and_secret() {
     assert_eq!(secret.expose(), "hook-secret-value");
 
     // Without `set_webhook_url`, the registration's token is the bot's.
-    let ron = r#"(server_port: Some(8443), updates: [WebhookUpdate(path: "/hook", registration: Some((public_ip: "https://bot.example.com", token: "${TOKEN}")))], route: WebhookRoute(url: "http://a/"))"#;
+    let ron = r#"(server_port: Some(8443), updates: [WebhookUpdate(path: "/hook", secret_token: Some("literal-secret"), registration: Some((public_ip: "https://bot.example.com", token: "${TOKEN}")))], route: WebhookRoute(url: "http://a/"))"#;
     let out = migrated(ron);
     assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     let cfg = load(&out.yaml);
@@ -407,10 +439,13 @@ fn trees_map_to_split_and_all() {
         std::time::Duration::from_millis(2500)
     );
     assert_eq!(a.retry.max_attempts, 1);
+    // 0.2 never paused the source for a failing downstream.
+    assert_eq!(a.on_full, OnFull::DropOldest);
     let ConsumerKind::Push(b) = &cfg.consumers[1].kind else {
         panic!("{:?}", cfg.consumers[1].kind);
     };
     assert_eq!(b.endpoints[0].timeout, std::time::Duration::from_secs(10));
+    assert_eq!((b.on_full, b.retry.max_attempts), (OnFull::DropOldest, 1));
     let ConsumerKind::Pull(log) = &cfg.consumers[2].kind else {
         panic!("{:?}", cfg.consumers[2].kind);
     };

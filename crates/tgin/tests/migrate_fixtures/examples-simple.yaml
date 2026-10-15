@@ -38,7 +38,8 @@ consumers:
     push:
       endpoints:
         - url: "${env:WH_ENDPOINT}"
-      # tgin 0.2 made one delivery attempt per update; raise max_attempts to retry.
+      # tgin 0.2 made one delivery attempt and dropped what its downstream did not take, never pausing the source; delete on_full and retry for tgin 1.0's backpressure and retries.
+      on_full: drop_oldest
       retry:
         max_attempts: 1
   pull-bot2-getupdates:
