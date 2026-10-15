@@ -304,10 +304,11 @@ mod tests {
             r#"tgin_delivery_latency_seconds_count{consumer="q"} 2"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.002",consumer="q"} 0"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.004",consumer="q"} 2"#,
-            r#"tgin_delivery_attempts_total{consumer="q",outcome="delivered"} 0"#,
         ] {
             assert!(out.lines().any(|l| l == want), "missing {want:?} in\n{out}");
         }
+        // Pollers are not endpoints: a pull consumer counts no attempts.
+        assert!(!out.contains("tgin_delivery_attempts_total{"), "{out}");
     }
 
     #[tokio::test(start_paused = true)]

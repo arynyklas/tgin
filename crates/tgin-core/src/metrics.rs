@@ -1,15 +1,18 @@
 //! Core metric families and pre-resolved handles.
 //!
 //! [`CoreMetrics::register`] adds every family to a registry that carries the
-//! `tgin` prefix. [`SourceMetrics`] and [`ConsumerMetrics`] hold handles for
-//! every label combination of one source or consumer, resolved once, so the
-//! hot path never hashes labels. A handle obtained before
-//! [`CoreMetrics::remove_source`] / [`CoreMetrics::remove_consumer`] keeps
-//! counting but is no longer exported; re-resolve after removal.
+//! `tgin` prefix. [`SourceMetrics`], [`ConsumerMetrics`] and
+//! [`EndpointMetrics`] hold handles for every label combination of one
+//! source, consumer or push endpoint, resolved once, so the hot path never
+//! hashes labels. A handle obtained before [`CoreMetrics::remove_source`] /
+//! [`CoreMetrics::remove_consumer`] keeps counting but is no longer exported;
+//! re-resolve after removal.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use parking_lot::Mutex;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -111,10 +114,16 @@ struct ConsumerReasonLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct ConsumerOutcomeLabels {
+struct AttemptLabels {
     consumer: Arc<str>,
+    /// The endpoint's index in its consumer's list, in decimal.
+    endpoint: Arc<str>,
     outcome: &'static str,
 }
+
+/// How many endpoint indices each consumer resolved handles for, so that
+/// [`CoreMetrics::remove_consumer`] finds every label set it created.
+type EndpointCounts = Arc<Mutex<HashMap<Arc<str>, usize>>>;
 
 type SecondsCounter = Counter<f64, AtomicU64>;
 type HistogramCtor = fn() -> Histogram;
@@ -136,8 +145,9 @@ pub struct CoreMetrics {
     consumer_in_flight: Family<ConsumerLabels, Gauge>,
     consumer_dropped: Family<ConsumerReasonLabels, Counter>,
     consumer_backpressure: Family<ConsumerLabels, SecondsCounter>,
-    delivery_attempts: Family<ConsumerOutcomeLabels, Counter>,
+    delivery_attempts: Family<AttemptLabels, Counter>,
     delivery_latency: Family<ConsumerLabels, Histogram, HistogramCtor>,
+    endpoints: EndpointCounts,
 }
 
 impl CoreMetrics {
@@ -156,6 +166,7 @@ impl CoreMetrics {
             consumer_backpressure: Family::default(),
             delivery_attempts: Family::default(),
             delivery_latency: Family::new_with_constructor(latency_histogram),
+            endpoints: EndpointCounts::default(),
         };
         reg.register(
             "source_updates",
@@ -209,7 +220,7 @@ impl CoreMetrics {
         );
         reg.register(
             "delivery_attempts",
-            "Delivery attempts by outcome",
+            "Delivery attempts by endpoint and outcome",
             m.delivery_attempts.clone(),
         );
         reg.register(
@@ -251,7 +262,8 @@ impl CoreMetrics {
         }
     }
 
-    /// Resolves the handles of every label combination of one consumer.
+    /// Resolves the handles of every label combination of one consumer;
+    /// [`ConsumerMetrics::endpoint`] resolves those of its push endpoints.
     pub fn consumer(&self, name: &str) -> ConsumerMetrics {
         let consumer: Arc<str> = Arc::from(name);
         let labels = ConsumerLabels {
@@ -269,14 +281,10 @@ impl CoreMetrics {
                     })
             }),
             backpressure: self.consumer_backpressure.get_or_create_owned(&labels),
-            attempts: DeliveryOutcome::ALL.map(|o| {
-                self.delivery_attempts
-                    .get_or_create_owned(&ConsumerOutcomeLabels {
-                        consumer: consumer.clone(),
-                        outcome: o.as_str(),
-                    })
-            }),
             latency: self.delivery_latency.get_or_create_owned(&labels),
+            attempts: self.delivery_attempts.clone(),
+            endpoints: Arc::clone(&self.endpoints),
+            consumer,
         }
     }
 
@@ -308,7 +316,8 @@ impl CoreMetrics {
         }
     }
 
-    /// Removes every series of one consumer from the exposition.
+    /// Removes every series of one consumer from the exposition, including
+    /// those of every endpoint index ever resolved for it.
     pub fn remove_consumer(&self, name: &str) {
         let consumer: Arc<str> = Arc::from(name);
         let labels = ConsumerLabels {
@@ -325,11 +334,17 @@ impl CoreMetrics {
                 reason: r.as_str(),
             });
         }
-        for o in DeliveryOutcome::ALL {
-            self.delivery_attempts.remove(&ConsumerOutcomeLabels {
-                consumer: consumer.clone(),
-                outcome: o.as_str(),
-            });
+        let mut endpoints = self.endpoints.lock();
+        let count = endpoints.remove(&consumer).unwrap_or(0);
+        for index in 0..count {
+            let endpoint: Arc<str> = Arc::from(index.to_string());
+            for o in DeliveryOutcome::ALL {
+                self.delivery_attempts.remove(&AttemptLabels {
+                    consumer: consumer.clone(),
+                    endpoint: endpoint.clone(),
+                    outcome: o.as_str(),
+                });
+            }
         }
     }
 }
@@ -379,8 +394,10 @@ pub struct ConsumerMetrics {
     in_flight: Gauge,
     dropped: [Counter; ConsumerDropReason::ALL.len()],
     backpressure: SecondsCounter,
-    attempts: [Counter; DeliveryOutcome::ALL.len()],
     latency: Histogram,
+    consumer: Arc<str>,
+    attempts: Family<AttemptLabels, Counter>,
+    endpoints: EndpointCounts,
 }
 
 impl ConsumerMetrics {
@@ -398,12 +415,41 @@ impl ConsumerMetrics {
         self.backpressure.inc_by(seconds);
     }
 
-    pub fn attempt(&self, outcome: DeliveryOutcome) {
-        self.attempts[outcome as usize].inc();
+    /// Resolves the `tgin_delivery_attempts_total` handles of the endpoint at
+    /// `index`, labelled with the index in decimal. Call it when endpoints
+    /// are set or replaced, not per attempt.
+    pub fn endpoint(&self, index: usize) -> EndpointMetrics {
+        let endpoint: Arc<str> = Arc::from(index.to_string());
+        // Recorded under the lock that `remove_consumer` takes, so a removal
+        // sees either none of these series or all of them.
+        let mut endpoints = self.endpoints.lock();
+        let count = endpoints.entry(self.consumer.clone()).or_default();
+        *count = (*count).max(index.saturating_add(1));
+        EndpointMetrics {
+            attempts: DeliveryOutcome::ALL.map(|o| {
+                self.attempts.get_or_create_owned(&AttemptLabels {
+                    consumer: self.consumer.clone(),
+                    endpoint: endpoint.clone(),
+                    outcome: o.as_str(),
+                })
+            }),
+        }
     }
 
     pub fn latency(&self, seconds: f64) {
         self.latency.observe(seconds);
+    }
+}
+
+/// Pre-resolved `tgin_delivery_attempts_total` handles of one push endpoint.
+#[derive(Clone, Debug)]
+pub struct EndpointMetrics {
+    attempts: [Counter; DeliveryOutcome::ALL.len()],
+}
+
+impl EndpointMetrics {
+    pub fn attempt(&self, outcome: DeliveryOutcome) {
+        self.attempts[outcome as usize].inc();
     }
 }
 
@@ -443,7 +489,8 @@ mod tests {
         c.set_depth(3, 2, 1);
         c.dropped(ConsumerDropReason::DeadLetter, 1);
         c.backpressure(1.5);
-        c.attempt(DeliveryOutcome::Delivered);
+        c.endpoint(0).attempt(DeliveryOutcome::Delivered);
+        c.endpoint(1).attempt(DeliveryOutcome::Retry);
         c.latency(0.002);
         let out = text(&reg);
         let got = lines(&out);
@@ -461,8 +508,10 @@ mod tests {
             r#"tgin_consumer_dropped_total{consumer="c1",reason="dead_letter"} 1"#,
             r#"tgin_consumer_dropped_total{consumer="c1",reason="overflow"} 0"#,
             r#"tgin_consumer_backpressure_seconds_total{consumer="c1"} 1.5"#,
-            r#"tgin_delivery_attempts_total{consumer="c1",outcome="delivered"} 1"#,
-            r#"tgin_delivery_attempts_total{consumer="c1",outcome="dead_letter"} 0"#,
+            r#"tgin_delivery_attempts_total{consumer="c1",endpoint="0",outcome="delivered"} 1"#,
+            r#"tgin_delivery_attempts_total{consumer="c1",endpoint="0",outcome="dead_letter"} 0"#,
+            r#"tgin_delivery_attempts_total{consumer="c1",endpoint="1",outcome="retry"} 1"#,
+            r#"tgin_delivery_attempts_total{consumer="c1",endpoint="1",outcome="delivered"} 0"#,
             r#"tgin_delivery_latency_seconds_count{consumer="c1"} 1"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.002",consumer="c1"} 1"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.001",consumer="c1"} 0"#,
@@ -500,8 +549,15 @@ mod tests {
     #[test]
     fn remove_consumer_drops_series() {
         let (reg, m) = setup();
-        m.consumer("c1").attempt(DeliveryOutcome::Retry);
-        m.consumer("c2").attempt(DeliveryOutcome::Retry);
+        let c1 = m.consumer("c1");
+        // Endpoint sets resolved over time, through different handles.
+        for i in 0..3 {
+            c1.endpoint(i).attempt(DeliveryOutcome::Retry);
+        }
+        m.consumer("c1")
+            .endpoint(0)
+            .attempt(DeliveryOutcome::Delivered);
+        m.consumer("c2").endpoint(0).attempt(DeliveryOutcome::Retry);
         m.source("s1").update();
         m.remove_consumer("c1");
         let out = text(&reg);
@@ -509,6 +565,18 @@ mod tests {
         assert!(out.contains(r#"consumer="c2""#));
         m.remove_source("s1");
         assert!(!text(&reg).contains(r#"source="s1""#));
+    }
+
+    #[test]
+    fn removed_consumer_resolves_again() {
+        let (reg, m) = setup();
+        m.consumer("c1").endpoint(2).attempt(DeliveryOutcome::Retry);
+        m.remove_consumer("c1");
+        m.consumer("c1")
+            .endpoint(0)
+            .attempt(DeliveryOutcome::Delivered);
+        m.remove_consumer("c1");
+        assert!(!text(&reg).contains(r#"consumer="c1""#));
     }
 
     #[test]

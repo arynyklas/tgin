@@ -2190,12 +2190,17 @@ name = "tgin-core"
 version = "1.0.0-dev"
 dependencies = [
  "aho-corasick",
+ "arc-swap",
  "bytes",
+ "futures-util",
  "humantime",
  "indexmap",
  "ipnet",
+ "parking_lot",
  "prometheus-client",
+ "rand",
  "regex-automata",
+ "reqwest",
  "schemars",
  "serde",
  "serde-saphyr",
@@ -2205,7 +2210,10 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]

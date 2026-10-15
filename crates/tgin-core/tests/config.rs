@@ -8,10 +8,11 @@ use tgin_core::config::{
     self, Balance, Config, ConsumerKind, Ingress, IpAllowlist, LogFormat, LogLevel, Pull, Push,
     WebhookSecret,
 };
+use tgin_core::consumer::push::LEASE_TIMEOUT;
 use tgin_core::ids::ConsumerId;
 use tgin_core::rules::{SplitStrategy, TargetSpec, TextMatch};
 use tgin_runtime::config::{ConfigError, Located, MapEnv, Severity, parse_yaml};
-use tgin_runtime::queue::{OnFull, Ordering};
+use tgin_runtime::queue::{OnFull, Ordering, QueueConfig};
 
 fn fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -279,6 +280,16 @@ fn defaults_applied() {
     assert_eq!(pusher.retry.max_age, secs(3600));
     assert_eq!(pusher.breaker.failure_threshold, 5);
     assert_eq!(pusher.breaker.open_for, secs(30));
+    assert_eq!(
+        pusher.queue(),
+        QueueConfig {
+            capacity: 10_000,
+            capacity_bytes: 64 << 20,
+            lease_timeout: LEASE_TIMEOUT,
+            ordering: Ordering::None,
+            on_full: OnFull::Backpressure,
+        }
+    );
 
     // Without a `server` block there is no data plane.
     let cfg = loads("version: 1\n");

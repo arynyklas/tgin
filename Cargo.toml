@@ -18,6 +18,7 @@ arc-swap = "1.9.2"
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 bytes = "1.12.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 humantime = "2.4.0"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
@@ -48,6 +49,7 @@ tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
+wiremock = "0.6.5"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

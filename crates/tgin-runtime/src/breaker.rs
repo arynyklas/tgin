@@ -75,8 +75,7 @@ impl Breaker {
             CLOSED => true,
             OPEN => {
                 let opened_at = word >> STATE_BITS;
-                let open_for = u64::try_from(self.cfg.open_for.as_nanos()).unwrap_or(u64::MAX);
-                if self.offset(now) < opened_at.saturating_add(open_for) {
+                if self.offset(now) < self.reopens_at(opened_at) {
                     return false;
                 }
                 self.word
@@ -122,6 +121,23 @@ impl Breaker {
         }
     }
 
+    /// How long until [`Breaker::allow`] may admit a call, without changing
+    /// the state: zero while closed or once an open breaker's `open_for` has
+    /// elapsed, the rest of `open_for` while open, and `None` while half-open,
+    /// when only the probe's outcome changes it.
+    pub fn ready_in(&self, now: Instant) -> Option<Duration> {
+        let word = self.word.load(Ordering::Acquire);
+        match word & STATE_MASK {
+            CLOSED => Some(Duration::ZERO),
+            OPEN => {
+                let reopens_at = self.reopens_at(word >> STATE_BITS);
+                let left = reopens_at.saturating_sub(self.offset(now));
+                Some(Duration::from_nanos(left))
+            }
+            _ => None,
+        }
+    }
+
     /// Opens the breaker at `now` unless another caller already moved it
     /// away from `from`; a lost race changes nothing.
     fn open(&self, from: u64, now: Instant) {
@@ -131,6 +147,12 @@ impl Breaker {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    /// The offset at which a breaker opened at `opened_at` admits a probe.
+    fn reopens_at(&self, opened_at: u64) -> u64 {
+        let open_for = u64::try_from(self.cfg.open_for.as_nanos()).unwrap_or(u64::MAX);
+        opened_at.saturating_add(open_for)
     }
 
     /// Nanoseconds from `base - OFFSET_SHIFT` to `t`, capped at
@@ -245,5 +267,26 @@ mod tests {
         });
         assert_eq!(admitted, 1);
         assert_eq!(b.state(), BreakerState::HalfOpen);
+    }
+
+    #[test]
+    fn breaker_ready_in_tracks_state() {
+        let t0 = Instant::now();
+        let b = Breaker::new(cfg());
+        assert_eq!(b.ready_in(t0), Some(Duration::ZERO));
+        for _ in 0..3 {
+            b.on_failure(t0);
+        }
+        assert_eq!(
+            b.ready_in(t0 + Duration::from_secs(10)),
+            Some(Duration::from_secs(20))
+        );
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(b.ready_in(t1), Some(Duration::ZERO));
+        assert_eq!(b.state(), BreakerState::Open, "ready_in admits nothing");
+        assert!(b.allow(t1));
+        assert_eq!(b.ready_in(t1), None, "the probe's outcome decides");
+        b.on_success();
+        assert_eq!(b.ready_in(t1), Some(Duration::ZERO));
     }
 }

@@ -201,6 +201,20 @@ pub struct Push {
     pub breaker: BreakerConfig,
 }
 
+impl Push {
+    /// The push queue's limits. The dispatcher acks or releases every lease
+    /// it takes, so its leases are made never to expire.
+    pub fn queue(&self) -> QueueConfig {
+        QueueConfig {
+            capacity: self.capacity,
+            capacity_bytes: self.capacity_bytes,
+            lease_timeout: crate::consumer::push::LEASE_TIMEOUT,
+            ordering: self.ordering,
+            on_full: self.on_full,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     /// `http` or `https`.
