@@ -368,9 +368,9 @@ impl<S: Sink> LongPollSource<S> {
     }
 }
 
-/// Errors no retry can fix: the token is rejected (401, 403, 404) or the
-/// client is misconfigured.
-fn is_fatal(err: &ApiError) -> bool {
+/// Errors no retry can fix: Telegram rejected the token (401, 403, 404) or
+/// the client is misconfigured.
+pub fn is_fatal(err: &ApiError) -> bool {
     matches!(
         err,
         ApiError::Http {

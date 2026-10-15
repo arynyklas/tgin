@@ -16,6 +16,7 @@ dist = true
 arc-swap.workspace = true
 axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
@@ -37,7 +38,6 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
-futures-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true

@@ -226,8 +226,11 @@ impl App {
 
         // Usernames first, so `/cmd@bot` rules match from the first update;
         // a bot whose first `getMe` fails keeps trying in the background.
-        for hook in &webhooks {
-            match hook.client.get_me().await {
+        // The calls run at once: each may wait out the client's timeout.
+        let identities =
+            futures_util::future::join_all(webhooks.iter().map(|hook| hook.client.get_me())).await;
+        for (hook, identity) in webhooks.iter().zip(identities) {
+            match identity {
                 Ok(user) => engine.set_username(hook.id, user.username),
                 Err(err) => {
                     tracing::warn!(
@@ -606,17 +609,6 @@ fn engine_source(engine: &Engine, name: &str) -> Option<(SourceId, SourceMetrics
     Some((id, info.metrics.clone()))
 }
 
-/// Whether Telegram rejected the bot token, which no retry fixes.
-fn token_rejected(err: &ApiError) -> bool {
-    matches!(
-        err,
-        ApiError::Http {
-            status: 401 | 403 | 404,
-            ..
-        }
-    )
-}
-
 /// The server's `retry_after`, if it sent one.
 fn retry_after(err: &ApiError) -> Option<Duration> {
     match err {
@@ -637,7 +629,7 @@ fn learn_username(
     hook: &WebhookBot<'_>,
     first: &ApiError,
 ) {
-    if token_rejected(first) {
+    if tgin_botapi::is_fatal(first) {
         return;
     }
     let (id, name) = (hook.id, Arc::<str>::from(hook.bot.name.as_str()));
@@ -679,7 +671,7 @@ fn learn_username(
                             engine.set_username(id, user.username);
                             return Exit::Done;
                         }
-                        Some(Err(err)) if token_rejected(&err) => {
+                        Some(Err(err)) if tgin_botapi::is_fatal(&err) => {
                             tracing::warn!(source = %name, error = %err, "Telegram rejected the bot token; no longer calling getMe");
                             return Exit::Done;
                         }

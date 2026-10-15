@@ -914,6 +914,57 @@ async fn webhook_get_me_retried_until_username_known() {
     assert_eq!(app.outcome().await, Outcome::Clean);
 }
 
+/// Two webhook bots whose `getMe` each answers after `GET_ME_DELAY`: the
+/// start asks for both identities at once, so it takes one delay, not two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_get_me_calls_run_concurrently() {
+    const GET_ME_DELAY: Duration = Duration::from_millis(1500);
+    let telegram = MockServer::start().await;
+    mount_bot(
+        &telegram,
+        TOKEN,
+        me("first_bot").set_delay(GET_ME_DELAY),
+        Vec::new(),
+    )
+    .await;
+    mount_bot(
+        &telegram,
+        OTHER_TOKEN,
+        me("second_bot").set_delay(GET_ME_DELAY),
+        Vec::new(),
+    )
+    .await;
+    let started = Instant::now();
+    let app = start(&format!(
+        r#"version: 1
+{QUICK}
+server: {{ listen: ["127.0.0.1:0"] }}
+bots:
+  - name: first
+    token: "{TOKEN}"
+    api_url: {api}
+    ingress: {{ webhook: {{ path: /first, secret_token: none }} }}
+    routes: [{{ to: [first] }}]
+  - name: second
+    token: "{OTHER_TOKEN}"
+    api_url: {api}
+    ingress: {{ webhook: {{ path: /second, secret_token: none }} }}
+    routes: [{{ to: [second] }}]
+consumers:
+  first: {{ pull: {{}} }}
+  second: {{ pull: {{}} }}
+"#,
+        api = telegram.uri()
+    ))
+    .await;
+    let took = started.elapsed();
+    assert!(took >= GET_ME_DELAY, "started after {took:?}");
+    assert!(took < GET_ME_DELAY * 2, "started after {took:?}");
+
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::Clean);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_allowlist_uses_connect_info() {
     let telegram = MockServer::start().await;
@@ -1333,7 +1384,7 @@ async fn os_sigterm_exits_0() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn os_sigterm_then_sigint_exits_130() {
     let telegram = telegram_with_hooked_bot().await;
-    let (child, base) = spawn_tgin(
+    let (mut child, base) = spawn_tgin(
         "os_sigterm_then_sigint_exits_130",
         &telegram,
         "runtime: { lame_duck: 30s, shutdown_grace: 30s }",
@@ -1350,7 +1401,11 @@ async fn os_sigterm_then_sigint_exits_130() {
         .ok()
         != Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
     {
-        assert!(started.elapsed() < PATIENCE, "/readyz never turned 503");
+        if started.elapsed() > PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("/readyz never turned 503");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     kill(&child, "-INT");

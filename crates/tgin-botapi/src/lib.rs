@@ -11,7 +11,7 @@ pub use client::{ApiError, BotClient, BotUser, SetWebhook, split_updates};
 pub use facts::{FactsError, extract};
 /// The network type of [`IpAllowlist`] and [`WebhookOptions::trusted_proxies`].
 pub use ipnet::IpNet;
-pub use longpoll::{LongPollOptions, LongPollSource, OnIdentity};
+pub use longpoll::{LongPollOptions, LongPollSource, OnIdentity, is_fatal};
 pub use secret::webhook_secret;
 pub use webhook::{
     DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, WebhookOptions, client_ip, register, webhook_router,
