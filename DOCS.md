@@ -65,7 +65,7 @@ Prebuilt release archives and the container image are listed in the [README](REA
 
 ## Configuration reference
 
-Top-level structure loaded from `tgin.ron` (`src/config/schema.rs`).
+Top-level structure loaded from `tgin.ron` (`crates/tgin/src/config/schema.rs`).
 
 The schema is strict: an unknown field anywhere in the file (top level, inside a variant such as `LongPollUpdate(...)`, or in a nested struct) is a parse error that names the field, so a typo like `server_prot` fails startup instead of silently falling back to a default. After parsing, tgin validates the whole config and reports every problem it finds in one message (exit code `1`).
 
@@ -178,11 +178,11 @@ Push-based forwarder: every update is POSTed once to `url` (e.g. `http://interna
 
 Load balancers compose multiple routes and can be nested arbitrarily deep. An empty load balancer in the config is a validation error; one emptied at runtime through the API drops updates and counts them in `dropped_empty_total`.
 
-#### `RoundRobinLB { routes }` (`src/lb/roundrobin.rs`)
+#### `RoundRobinLB { routes }` (`crates/tgin/src/lb/roundrobin.rs`)
 
 Forwards each update to the next child in turn. Children can be heterogeneous: mix `WebhookRoute` and `LongPollRoute` freely. There is no health checking: a child whose downstream is down keeps receiving its share.
 
-#### `AllLB { routes }` (`src/lb/all.rs`)
+#### `AllLB { routes }` (`crates/tgin/src/lb/all.rs`)
 
 Sends every update to every child concurrently and returns once all of them have finished, so the slowest child sets the pace of the worker. Useful when several specialized services must each see the full update stream (analytics, moderation, etc.).
 
@@ -250,7 +250,7 @@ curl -X POST http://localhost:3000/bot-c/getUpdates \
   --data-urlencode 'timeout=30'
 ```
 
-The API talks to the routing core via an in-memory channel (see `src/api/router.rs` and `src/api/methods.rs`).
+The API talks to the routing core via an in-memory channel (see `crates/tgin/src/api/router.rs` and `crates/tgin/src/api/methods.rs`).
 
 ## Observability
 

@@ -19,6 +19,8 @@
 # * `# vX.Y.Z` comments after the pinned action commits;
 # * `steps.cargo-cyclonedx.outputs.paths` in build-global-artifacts (the
 #   template reads `.output.paths`, which is always empty);
+# * build-global-artifacts uploads only `crates/tgin/tgin.cdx.xml`; the
+#   template uploads every `*.cdx.xml`, one per workspace member;
 # * `Install cargo-auditable` runs `cargo install cargo-auditable --locked
 #   --version 0.7.7` instead of piping the unpinned `releases/latest` installer;
 # * the plan job's `val` output carries only the manifest's `ci` section. The
@@ -241,15 +243,16 @@ jobs:
       - id: cargo-cyclonedx
         shell: bash
         run: |
-            # Generate SBOM (.cdx.xml) files.
+            # Generate SBOM (.cdx.xml) files, one per workspace member.
             cargo cyclonedx -v
 
-            # Move all SBOM (.cdx.xml) files under target/distrib/ since
-            # we expect all artifacts to be in that folder.
-            find . -name '*.cdx.xml' -exec mv '{}' target/distrib/ ';'
+            # Local edit: ship only the SBOM of the released tgin binary, not
+            # those of the library crates and xtask. Move it under
+            # target/distrib/ since we expect all artifacts to be in that folder.
+            mv crates/tgin/tgin.cdx.xml target/distrib/
 
             echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-            find . -name '*.cdx.xml' | tee -a "$GITHUB_OUTPUT"
+            echo target/distrib/tgin.cdx.xml | tee -a "$GITHUB_OUTPUT"
             echo "EOF" >> "$GITHUB_OUTPUT"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

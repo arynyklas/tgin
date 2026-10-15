@@ -8,8 +8,6 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ## [Unreleased]
 
-## [Unreleased]
-
 ### Upgrade notes
 
 1. The container image's `ENTRYPOINT` is the tgin binary itself: run
@@ -140,5 +138,4 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 - Added `SECURITY.md` (supported versions, private reporting, verifying
   release attestations) and this changelog.
 
-[Unreleased]: https://github.com/arynyklas/tgin/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/arynyklas/tgin/releases/tag/v0.2.0
+[Unreleased]: https://github.com/arynyklas/tgin/compare/v0.2.0-rc.2...HEAD
