@@ -59,8 +59,21 @@ pub enum TaskState {
 /// [`TaskState`].
 #[derive(Debug, Default)]
 pub struct Supervisor {
-    states: Mutex<BTreeMap<Arc<str>, watch::Sender<TaskState>>>,
-    tasks: Mutex<JoinSet<()>>,
+    tasks: Mutex<Tasks>,
+}
+
+#[derive(Debug, Default)]
+struct Tasks {
+    entries: BTreeMap<Arc<str>, Entry>,
+    running: JoinSet<()>,
+}
+
+/// One supervised task: its published state, and the token that stops
+/// this instance only (a child of the caller's token).
+#[derive(Debug)]
+struct Entry {
+    state: watch::Sender<TaskState>,
+    cancel: CancellationToken,
 }
 
 impl Supervisor {
@@ -73,9 +86,10 @@ impl Supervisor {
     /// stops the task; an attempt that must finish in-flight work on
     /// shutdown watches a token of its own instead.
     ///
-    /// A `name` that is already supervised gets the new task's state; the
-    /// old task keeps running but is no longer listed. Must be called from
-    /// within a Tokio runtime.
+    /// Spawning a `name` that is already supervised stops the previous
+    /// instance as if its token were cancelled, and the name then lists
+    /// the new instance only. The caller's `cancel` is never cancelled by
+    /// the supervisor. Must be called from within a Tokio runtime.
     pub fn spawn<F, Fut>(
         &self,
         name: Arc<str>,
@@ -87,25 +101,39 @@ impl Supervisor {
         Fut: Future<Output = Exit> + Send + 'static,
     {
         let state = watch::Sender::new(TaskState::Starting);
-        self.states.lock().insert(name, state.clone());
+        let cancel = cancel.child_token();
         let mut tasks = self.tasks.lock();
+        let entry = Entry {
+            state: state.clone(),
+            cancel: cancel.clone(),
+        };
+        if let Some(previous) = tasks.entries.insert(name, entry) {
+            previous.cancel.cancel();
+        }
         // Reap finished tasks so a long-lived supervisor does not
         // accumulate them.
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(supervise(StopOnDrop(state), backoff, cancel, make));
+        while tasks.running.try_join_next().is_some() {}
+        tasks
+            .running
+            .spawn(supervise(StopOnDrop(state), backoff, cancel, make));
     }
 
     /// Every task's name and current state, ordered by name.
     pub fn states(&self) -> Vec<(Arc<str>, TaskState)> {
-        self.states
+        self.tasks
             .lock()
+            .entries
             .iter()
-            .map(|(name, state)| (name.clone(), state.borrow().clone()))
+            .map(|(name, entry)| (name.clone(), entry.state.borrow().clone()))
             .collect()
     }
 
     pub fn subscribe(&self, name: &str) -> Option<watch::Receiver<TaskState>> {
-        self.states.lock().get(name).map(watch::Sender::subscribe)
+        self.tasks
+            .lock()
+            .entries
+            .get(name)
+            .map(|entry| entry.state.subscribe())
     }
 
     /// Waits for every task spawned so far to end, until `deadline`; then
@@ -113,7 +141,7 @@ impl Supervisor {
     /// in [`TaskState::Stopped`]. Tasks spawned while this runs are not
     /// waited for.
     pub async fn shutdown(&self, deadline: Instant) -> usize {
-        let mut tasks = std::mem::take(&mut *self.tasks.lock());
+        let mut tasks = std::mem::take(&mut self.tasks.lock().running);
         loop {
             match tokio::time::timeout_at(deadline, tasks.join_next()).await {
                 Ok(Some(_)) => {}
@@ -226,7 +254,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tokio::sync::watch;
@@ -250,6 +278,28 @@ mod tests {
 
     fn is_backoff(state: &TaskState) -> bool {
         matches!(state, TaskState::Backoff { .. })
+    }
+
+    /// Sets its flag when dropped, to observe an attempt being dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Attempts that never return and raise `dropped` when dropped.
+    fn pending_with_flag(
+        dropped: Arc<AtomicBool>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Exit> + Send>> + Send + 'static {
+        move || {
+            let flag = DropFlag(dropped.clone());
+            Box::pin(async move {
+                let _flag = flag;
+                std::future::pending().await
+            })
+        }
     }
 
     /// Calls `first` on the first attempt; every later attempt never
@@ -358,16 +408,18 @@ mod tests {
 
         // Cancelled while running: the attempt is dropped.
         let running = CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
         supervisor.spawn(
             "running".into(),
             fixed_backoff(Duration::from_secs(1)),
             running.clone(),
-            std::future::pending::<Exit>,
+            pending_with_flag(dropped.clone()),
         );
         let mut rx = supervisor.subscribe("running").unwrap();
         wait_until(&mut rx, is_running).await;
         running.cancel();
         wait_until(&mut rx, |s| *s == TaskState::Stopped).await;
+        assert!(dropped.load(Ordering::SeqCst));
 
         // Cancelled while backing off: no restart.
         let backing_off = CancellationToken::new();
@@ -394,6 +446,77 @@ mod tests {
         let mut rx = supervisor.subscribe("done").unwrap();
         wait_until(&mut rx, |s| *s == TaskState::Stopped).await;
         assert!(supervisor.subscribe("missing").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_restarts_after_factory_panic() {
+        let supervisor = Supervisor::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        supervisor.spawn(
+            "source".into(),
+            fixed_backoff(Duration::from_secs(3)),
+            CancellationToken::new(),
+            move || {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("factory boom");
+                }
+                std::future::pending::<Exit>()
+            },
+        );
+        let mut rx = supervisor.subscribe("source").unwrap();
+
+        let TaskState::Backoff {
+            retry_at,
+            last_error,
+        } = wait_until(&mut rx, is_backoff).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(retry_at - Instant::now(), Duration::from_secs(3));
+        assert!(last_error.contains("factory boom"), "{last_error}");
+
+        wait_until(&mut rx, is_running).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_respawn_same_name_stops_previous() {
+        let supervisor = Supervisor::new();
+        let cancel = CancellationToken::new();
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        supervisor.spawn(
+            "a".into(),
+            fixed_backoff(Duration::from_secs(1)),
+            cancel.clone(),
+            pending_with_flag(first_dropped.clone()),
+        );
+        let mut first = supervisor.subscribe("a").unwrap();
+        wait_until(&mut first, is_running).await;
+
+        let second_dropped = Arc::new(AtomicBool::new(false));
+        supervisor.spawn(
+            "a".into(),
+            fixed_backoff(Duration::from_secs(1)),
+            cancel.clone(),
+            pending_with_flag(second_dropped.clone()),
+        );
+        wait_until(&mut first, |s| *s == TaskState::Stopped).await;
+        assert!(first_dropped.load(Ordering::SeqCst));
+
+        let mut second = supervisor.subscribe("a").unwrap();
+        wait_until(&mut second, is_running).await;
+        assert!(!second_dropped.load(Ordering::SeqCst));
+        assert!(!cancel.is_cancelled());
+        assert_eq!(
+            supervisor.states(),
+            vec![(Arc::<str>::from("a"), TaskState::Running)]
+        );
+
+        // The caller's token still stops the replacement.
+        cancel.cancel();
+        wait_until(&mut second, |s| *s == TaskState::Stopped).await;
+        assert!(second_dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
