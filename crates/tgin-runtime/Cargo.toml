@@ -8,5 +8,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+hyper-util.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
+tokio-rustls.workspace = true
+
 [lints]
 workspace = true
