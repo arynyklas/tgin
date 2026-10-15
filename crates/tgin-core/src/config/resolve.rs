@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use ipnet::IpNet;
 use serde_saphyr::Location;
 use tgin_runtime::breaker::BreakerConfig;
-use tgin_runtime::config::{ConfigError, Env, interpolate};
+use tgin_runtime::config::{ConfigError, Env, InterpError, interpolate};
 use tgin_runtime::queue::{self, QueueConfig};
 use tgin_runtime::secret::Secret;
 use url::Url;
@@ -325,19 +325,26 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
-    /// Expands references in a secret. Errors never quote any of its text:
-    /// an unknown scheme or a variable name may be part of the secret.
+    /// Expands references in a secret. Errors never quote text from the
+    /// value: a malformed reference or unknown scheme may be part of the
+    /// secret. A missing variable or unreadable file names the reference,
+    /// which the operator wrote, and never a file's contents.
     fn secret(&mut self, path: impl Into<String>, text: &SecretText) -> Option<Secret<String>> {
         let path = path.into();
-        let Ok(value) = interpolate(&text.0.value, self.env, self.base_dir) else {
-            self.diag.errors.push(
-                ConfigError::new(
-                    "cannot expand the secret: a `${…}` reference is malformed, names an unset variable or an unreadable file",
-                )
-                .at(located(path, text.0.location))
-                .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
-            );
-            return None;
+        let value = match interpolate(&text.0.value, self.env, self.base_dir) {
+            Ok(value) => value,
+            Err(err @ (InterpError::MissingVar(_) | InterpError::UnreadableFile { .. })) => {
+                self.diag.error(path, text.0.location, err.to_string());
+                return None;
+            }
+            Err(InterpError::BadSyntax(_) | InterpError::UnknownScheme(_)) => {
+                self.diag.errors.push(
+                    ConfigError::new("cannot expand the secret: a `${…}` reference is malformed")
+                        .at(located(path, text.0.location))
+                        .hint("references are `${env:NAME}` or `${file:PATH}`; write `$${` for a literal `${`"),
+                );
+                return None;
+            }
         };
         if value.is_empty() {
             self.diag

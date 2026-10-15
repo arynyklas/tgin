@@ -1054,9 +1054,8 @@ bots:
     let errors = errors(yaml);
     assert_eq!(errors.len(), 2, "{}", render(&errors));
     assert_at(&errors[0], "bots[0].token", pos(yaml, "\"${env:NOPE}"));
-    // A secret's error never quotes its text, not even a variable name.
-    assert_message(&errors[0], "cannot expand the secret");
-    assert!(!errors[0].to_string().contains("NOPE"), "{}", errors[0]);
+    // The variable name is the operator's reference, not secret content.
+    assert_message(&errors[0], "environment variable NOPE is not set");
     assert_at(&errors[1], "bots[0].api_url", pos(yaml, "\"${file:"));
     assert_message(&errors[1], "missing.txt");
 }
@@ -1330,13 +1329,23 @@ consumers:
 
 #[test]
 fn secret_errors_never_quote_the_secret() {
-    let yaml = "version: 1\nbots:\n  - name: a\n    token: \"p4ss${w0rd:x}\"\n";
-    let err = single_error(yaml);
-    assert_at(&err, "bots[0].token", pos(yaml, "\"p4ss"));
-    assert_message(&err, "cannot expand the secret");
-    for part in ["p4ss", "w0rd"] {
-        assert!(!err.to_string().contains(part), "{err}");
+    // Malformed references and unknown schemes may be secret content.
+    for token in ["p4ss${w0rd:x}", "p4ss${w0rd"] {
+        let yaml = format!("version: 1\nbots:\n  - name: a\n    token: \"{token}\"\n");
+        let err = single_error(&yaml);
+        assert_at(&err, "bots[0].token", pos(&yaml, "\"p4ss"));
+        assert_message(&err, "cannot expand the secret");
+        for part in ["p4ss", "w0rd"] {
+            assert!(!err.to_string().contains(part), "{err}");
+        }
     }
+
+    // An unreadable secret file is named, with the error but no contents.
+    let yaml = "version: 1\nbots:\n  - name: a\n    token: \"${file:secrets/token}\"\n";
+    let err = single_error(yaml);
+    assert_at(&err, "bots[0].token", pos(yaml, "\"${file:"));
+    assert_message(&err, "cannot read");
+    assert_message(&err, "token");
 }
 
 #[test]
