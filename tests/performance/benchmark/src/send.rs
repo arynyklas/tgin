@@ -1,19 +1,20 @@
 //! Hands updates to the system under test: a webhook POST or a long-poll
-//! stream on the fake Bot API.
+//! stream on the fake Bot API. The send loop calls in from its own thread;
+//! webhook requests run on the async runtime.
 
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::body::Bytes;
 use reqwest::{header::CONTENT_TYPE, Client, RequestBuilder};
 use serde_json::json;
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{runtime::Handle, sync::Semaphore};
 
 use crate::{
     mock::UpdateStream,
-    track::{Failure, Tracker, WARMUP_TEXT},
+    track::{warmup_text, Failure, Tracker},
 };
 
 /// A Telegram `Update` carrying a text message; bots echo `text` back.
@@ -43,6 +44,8 @@ pub enum Sender {
         target: Arc<str>,
         budget: Arc<Semaphore>,
         tracker: Arc<Tracker>,
+        /// Where the requests run.
+        runtime: Handle,
     },
     /// Append each update to the stream a long-poll consumer reads.
     LongPoll {
@@ -52,6 +55,7 @@ pub enum Sender {
 }
 
 impl Sender {
+    /// A webhook sender whose requests run on the current runtime.
     pub fn webhook(
         client: Client,
         target: &str,
@@ -63,29 +67,33 @@ impl Sender {
             target: target.into(),
             budget: Arc::new(Semaphore::new(max_in_flight.max(1))),
             tracker,
+            runtime: Handle::current(),
         }
     }
 
     /// Send measured update `update_id`, due at `due`. Its reply text is the
-    /// id, which is how the reply finds its scheduled time.
+    /// id, which is how the reply finds its scheduled time. Returns without
+    /// waiting for the request.
     pub fn send(&self, update_id: u64, due: Instant) {
-        let payload = || update_payload(update_id, &update_id.to_string());
+        let due = tokio::time::Instant::from_std(due);
         match self {
             Self::Webhook {
                 client,
                 target,
                 budget,
                 tracker,
+                runtime,
             } => {
                 let Ok(permit) = budget.clone().try_acquire_owned() else {
                     tracker.dropped();
                     return;
                 };
                 tracker.issued(update_id, due);
-                let request = post_json(client, target, payload());
-                let tracker = tracker.clone();
-                tokio::spawn(async move {
-                    let delivered = deliver(request).await;
+                let (client, target, tracker) = (client.clone(), target.clone(), tracker.clone());
+                // The payload is built on the runtime, off the send loop.
+                runtime.spawn(async move {
+                    let payload = update_payload(update_id, &update_id.to_string());
+                    let delivered = deliver(post_json(&client, &target, payload)).await;
                     drop(permit);
                     if let Err((failure, _)) = delivered {
                         tracker.failed(update_id, failure);
@@ -94,31 +102,35 @@ impl Sender {
             }
             Self::LongPoll { stream, tracker } => {
                 tracker.issued(update_id, due);
-                stream.push(update_id as i64, payload());
+                stream.push(
+                    update_id as i64,
+                    update_payload(update_id, &update_id.to_string()),
+                );
             }
         }
     }
 
     /// Send a warm-up update; its reply only proves the path is live.
     pub fn send_warmup(&self, update_id: u64) {
-        let payload = update_payload(update_id, WARMUP_TEXT);
+        let payload = update_payload(update_id, &warmup_text(update_id));
         match self {
             Self::Webhook {
                 client,
                 target,
                 tracker,
+                runtime,
                 ..
             } => {
-                tracker.warmup_issued();
+                tracker.warmup_issued(update_id);
                 let request = post_json(client, target, payload);
-                tokio::spawn(async move {
+                runtime.spawn(async move {
                     if let Err((_, reason)) = deliver(request).await {
                         eprintln!("warm-up update {update_id} failed: {reason}");
                     }
                 });
             }
             Self::LongPoll { stream, tracker } => {
-                tracker.warmup_issued();
+                tracker.warmup_issued(update_id);
                 stream.push(update_id as i64, payload);
             }
         }
@@ -195,8 +207,8 @@ mod tests {
         assert_eq!(counts.dropped_by_generator, 3);
     }
 
-    #[tokio::test]
-    async fn webhook_counts_error_statuses_as_failed() {
+    /// A webhook bot that answers every update with 503.
+    async fn start_failing_bot() -> String {
         let app = axum::Router::new().route(
             "/webhook",
             axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
@@ -204,10 +216,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}/webhook")
+    }
+
+    #[tokio::test]
+    async fn webhook_counts_error_statuses_as_failed() {
         let tracker = Arc::new(Tracker::new());
         let sender = Sender::webhook(
             Client::new(),
-            &format!("http://{addr}/webhook"),
+            &start_failing_bot().await,
             10,
             tracker.clone(),
         );
@@ -223,6 +240,26 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_sends_from_a_thread_outside_the_runtime() {
+        let tracker = Arc::new(Tracker::new());
+        let sender = Arc::new(Sender::webhook(
+            Client::new(),
+            &start_failing_bot().await,
+            10,
+            tracker.clone(),
+        ));
+
+        let thread_sender = sender.clone();
+        std::thread::spawn(move || thread_sender.send(1, Instant::now()))
+            .join()
+            .unwrap();
+        let settled = crate::load::wait_until(Duration::from_secs(5), || tracker.settled()).await;
+
+        assert!(settled < Duration::from_secs(5));
+        assert_eq!(tracker.counts().http_errors, 1);
+    }
+
     #[tokio::test]
     async fn long_poll_appends_to_the_stream() {
         let tracker = Arc::new(Tracker::new());
@@ -236,6 +273,8 @@ mod tests {
         sender.send_warmup(6);
 
         assert_eq!(stream.update_ids(), vec![5, 6]);
+        let warmup: Value = serde_json::from_slice(&stream.take(5, 100)[1]).unwrap();
+        assert_eq!(warmup["message"]["text"], "warmup-6");
         assert_eq!(tracker.counts().sent, 1);
         assert_eq!(tracker.counts().warmup_sent, 1);
     }

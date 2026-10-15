@@ -2,7 +2,10 @@
 //! start, so tgin and the bots are polling it before a run begins, and
 //! `POST /bench/run` performs one measured run on demand.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::State,
@@ -15,12 +18,12 @@ use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::Mutex,
-    time::{interval, Instant},
+    sync::{oneshot, Mutex},
+    time::interval,
 };
 
 use crate::{
-    load::{achieved_rps, run_open_loop, wait_until, Schedule},
+    load::{rate, run_open_loop, wait_until, Schedule, SendPhase, SystemClock},
     mock::{self, MockApi},
     report::Report,
     send::Sender,
@@ -138,7 +141,7 @@ async fn run(
         return Err("rps and duration must be at least 1".to_owned());
     }
     let tracker = server.api.start_run();
-    let sender = match options.mode {
+    let sender = Arc::new(match options.mode {
         Mode::Webhook => Sender::webhook(
             server.client.clone(),
             &options.target,
@@ -149,7 +152,7 @@ async fn run(
             stream: server.api.stream(&options.longpoll_token),
             tracker: tracker.clone(),
         },
-    };
+    });
 
     if options.warmup_updates > 0 {
         let mut spacing = interval(WARMUP_SPACING);
@@ -172,28 +175,33 @@ async fn run(
     }
 
     let first_update_id = *next_update_id;
-    let schedule = Schedule::new(Instant::now(), options.rps, options.duration);
-    *next_update_id += schedule.total();
-    let phase = run_open_loop(&schedule, |i, due| sender.send(first_update_id + i, due)).await;
+    let (schedule, phase) =
+        send_phase(sender, first_update_id, options.rps, options.duration).await?;
+    *next_update_id = first_update_id + schedule.total();
     let waited = wait_until(Duration::from_secs(options.completion_timeout), || {
         tracker.settled()
     })
     .await;
 
     let counts = tracker.counts();
+    let delivery_window = tracker.last_reply().map_or(Duration::ZERO, |last| {
+        last.into_std().saturating_duration_since(schedule.start())
+    });
     Ok(Report {
         scenario: options.scenario.clone(),
         engine: options.engine.clone(),
         mode: options.mode.as_str().to_owned(),
         target_rps: options.rps,
-        achieved_rps: achieved_rps(counts.sent, phase.wall),
+        achieved_rps: rate(counts.sent, phase.wall),
+        delivered_rps: rate(counts.received, delivery_window),
         duration_secs: options.duration,
         send_phase_secs: phase.wall.as_secs_f64(),
-        max_send_lag_ms: phase.max_lag.as_secs_f64() * 1000.0,
+        lag: phase.lag,
         completion_wait_secs: waited.as_secs_f64(),
         sent: counts.sent,
         received: counts.received,
         unreceived: counts.unreceived(),
+        duplicate_replies: counts.duplicate_replies,
         dropped_by_generator: counts.dropped_by_generator,
         send_errors: counts.send_errors,
         http_errors: counts.http_errors,
@@ -203,10 +211,35 @@ async fn run(
     })
 }
 
+/// Run the send loop on a dedicated OS thread, so neither the async
+/// runtime's timer granularity nor its other tasks delay a send. The thread
+/// hands each update to the runtime (webhook) or the update stream (long
+/// poll) and moves on.
+async fn send_phase(
+    sender: Arc<Sender>,
+    first_update_id: u64,
+    rps: u64,
+    duration_secs: u64,
+) -> Result<(Schedule, SendPhase), String> {
+    let (done_tx, done_rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("bench-send-loop".to_owned())
+        .spawn(move || {
+            let schedule = Schedule::new(Instant::now(), rps, duration_secs);
+            let phase = run_open_loop(&schedule, &SystemClock, |i, due| {
+                sender.send(first_update_id + i, due)
+            });
+            let _ = done_tx.send((schedule, phase));
+        })
+        .map_err(|error| format!("cannot start the send loop thread: {error}"))?;
+    done_rx
+        .await
+        .map_err(|_| "the send loop thread panicked".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::WARMUP_TEXT;
     use serde_json::Value;
 
     /// A bench server on a free port; returns its base URL.
@@ -286,6 +319,12 @@ mod tests {
             "achieved {} RPS",
             report.achieved_rps
         );
+        // 200 replies, the last about 1 s after the first scheduled send.
+        assert!(
+            (180.0..=205.0).contains(&report.delivered_rps),
+            "delivered {} RPS",
+            report.delivered_rps
+        );
     }
 
     #[tokio::test]
@@ -302,15 +341,15 @@ mod tests {
             (200, 200, 0)
         );
         assert_eq!(report.dropped_by_generator, 0);
-        assert_eq!(report.unmatched_replies, 0);
+        assert_eq!((report.unmatched_replies, report.duplicate_replies), (0, 0));
         assert!(report.latency.p99_ms.is_some());
         assert_on_target(&report);
         assert!(report.completion_wait_secs < 1.0, "{report:?}");
     }
 
     /// An aiogram-style long-poll bot: the offset goes in a form body, and
-    /// every update gets a reply.
-    fn start_long_poll_bot(bench: String) {
+    /// every update gets `replies` replies.
+    fn start_long_poll_bot(bench: String, replies: usize) {
         tokio::spawn(async move {
             let client = Client::new();
             let mut offset = 0;
@@ -328,7 +367,9 @@ mod tests {
                 for update in response["result"].as_array().unwrap() {
                     offset = update["update_id"].as_i64().unwrap() + 1;
                     let text = update["message"]["text"].as_str().unwrap().to_owned();
-                    reply(&client, &bench, &text).await;
+                    for _ in 0..replies {
+                        reply(&client, &bench, &text).await;
+                    }
                 }
             }
         });
@@ -337,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn long_poll_run_with_an_offset_honouring_poller_has_no_duplicates() {
         let bench = start_bench().await;
-        start_long_poll_bot(bench.clone());
+        start_long_poll_bot(bench.clone(), 1);
 
         let report = run_remote(&bench, &options(Mode::Longpoll, ""))
             .await
@@ -347,16 +388,35 @@ mod tests {
             (report.sent, report.received, report.unreceived),
             (200, 200, 0)
         );
-        assert_eq!(report.unmatched_replies, 0, "updates were delivered twice");
+        assert_eq!((report.unmatched_replies, report.duplicate_replies), (0, 0));
         assert!(report.polls.calls > 0);
         assert_on_target(&report);
+    }
+
+    #[tokio::test]
+    async fn repeated_replies_count_as_duplicates_not_as_received() {
+        let bench = start_bench().await;
+        start_long_poll_bot(bench.clone(), 2);
+
+        let report = run_remote(&bench, &options(Mode::Longpoll, ""))
+            .await
+            .unwrap();
+
+        assert_eq!((report.sent, report.received), (200, 200));
+        // Settling does not wait for the second reply to the last updates.
+        assert!(
+            (195..=200).contains(&report.duplicate_replies),
+            "{report:?}"
+        );
+        // The 5 repeated warm-up replies are unmatched, not duplicates.
+        assert_eq!(report.unmatched_replies, 5);
     }
 
     #[tokio::test]
     async fn missing_replies_are_unreceived_after_the_completion_wait() {
         let bench = start_bench().await;
         let bot = start_webhook_bot(bench.clone(), |text| {
-            text == WARMUP_TEXT || text.parse::<u64>().unwrap() % 2 == 0
+            text.starts_with("warmup-") || text.parse::<u64>().unwrap() % 2 == 0
         })
         .await;
         let options = RunOptions {
@@ -390,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn runs_count_from_zero_and_keep_update_ids_increasing() {
         let bench = start_bench().await;
-        start_long_poll_bot(bench.clone());
+        start_long_poll_bot(bench.clone(), 1);
         let options = options(Mode::Longpoll, "");
 
         let first = run_remote(&bench, &options).await.unwrap();

@@ -68,7 +68,7 @@ impl UpdateStream {
 
     /// Confirm updates by `offset`, then return up to `limit` of the rest.
     /// Returned updates stay queued until a later offset confirms them.
-    fn take(&self, offset: i64, limit: usize) -> Vec<Bytes> {
+    pub(crate) fn take(&self, offset: i64, limit: usize) -> Vec<Bytes> {
         let mut queue = self.queue.lock().expect(POISONED);
         if offset > 0 {
             while queue

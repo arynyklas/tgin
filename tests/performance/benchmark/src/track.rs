@@ -11,8 +11,15 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-/// Reply text of warm-up updates. Measured updates carry their `update_id`.
-pub const WARMUP_TEXT: &str = "warmup";
+/// Prefix of warm-up reply texts, `warmup-<update_id>`. Measured updates
+/// carry their bare `update_id`.
+const WARMUP_PREFIX: &str = "warmup-";
+const REPLIES_POISONED: &str = "reply records lock poisoned";
+
+/// The text of warm-up update `update_id`, which its reply echoes.
+pub fn warmup_text(update_id: u64) -> String {
+    format!("{WARMUP_PREFIX}{update_id}")
+}
 
 /// Longest latency the histogram tells apart, 1 h in microseconds; longer
 /// ones are recorded as this.
@@ -27,17 +34,30 @@ pub enum Failure {
     Status,
 }
 
+/// Where a measured update stands.
+enum Slot {
+    /// Sent, no reply yet; holds the scheduled send time.
+    Pending(Instant),
+    Received,
+    /// The send never reached the system under test.
+    Failed,
+}
+
 pub struct Tracker {
-    /// Measured updates in flight: `update_id` → scheduled send time.
-    pending: DashMap<u64, Instant>,
-    latency_us: Mutex<Histogram<u64>>,
+    /// Every measured update of the run, by `update_id`.
+    updates: DashMap<u64, Slot>,
+    /// Warm-up updates by `update_id`: whether their reply came back.
+    warmup: DashMap<u64, bool>,
+    replies: Mutex<Replies>,
     sent: AtomicU64,
     received: AtomicU64,
     dropped_by_generator: AtomicU64,
     send_errors: AtomicU64,
     http_errors: AtomicU64,
-    /// Replies matching no pending update: duplicates, or late replies to
-    /// updates that already failed.
+    /// Further replies to a measured update already received.
+    duplicate_replies: AtomicU64,
+    /// Replies matching no update: unknown ids, replies to warm-up updates
+    /// already received, or late replies to updates whose send failed.
     unmatched_replies: AtomicU64,
     warmup_sent: AtomicU64,
     warmup_received: AtomicU64,
@@ -45,6 +65,12 @@ pub struct Tracker {
     poll_empty_calls: AtomicU64,
     poll_max_batch: AtomicU64,
     poll_total_batch: AtomicU64,
+}
+
+/// What the first reply to each measured update recorded.
+struct Replies {
+    latency_us: Histogram<u64>,
+    last: Option<Instant>,
 }
 
 /// A snapshot of the counters.
@@ -55,6 +81,7 @@ pub struct Counts {
     pub dropped_by_generator: u64,
     pub send_errors: u64,
     pub http_errors: u64,
+    pub duplicate_replies: u64,
     pub unmatched_replies: u64,
     pub warmup_sent: u64,
     pub warmup_received: u64,
@@ -103,15 +130,19 @@ impl PollStats {
 impl Tracker {
     pub fn new() -> Self {
         Self {
-            pending: DashMap::new(),
-            latency_us: Mutex::new(
-                Histogram::new_with_bounds(1, LATENCY_MAX_US, 3).expect("valid histogram bounds"),
-            ),
+            updates: DashMap::new(),
+            warmup: DashMap::new(),
+            replies: Mutex::new(Replies {
+                latency_us: Histogram::new_with_bounds(1, LATENCY_MAX_US, 3)
+                    .expect("valid histogram bounds"),
+                last: None,
+            }),
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             dropped_by_generator: AtomicU64::new(0),
             send_errors: AtomicU64::new(0),
             http_errors: AtomicU64::new(0),
+            duplicate_replies: AtomicU64::new(0),
             unmatched_replies: AtomicU64::new(0),
             warmup_sent: AtomicU64::new(0),
             warmup_received: AtomicU64::new(0),
@@ -124,7 +155,7 @@ impl Tracker {
 
     /// A measured update due at `due` is about to go out.
     pub fn issued(&self, update_id: u64, due: Instant) {
-        self.pending.insert(update_id, due);
+        self.updates.insert(update_id, Slot::Pending(due));
         self.sent.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -133,16 +164,23 @@ impl Tracker {
         self.dropped_by_generator.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn warmup_issued(&self) {
+    /// Warm-up update `update_id` is about to go out.
+    pub fn warmup_issued(&self, update_id: u64) {
+        self.warmup.insert(update_id, false);
         self.warmup_sent.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A measured update never reached the system under test.
     pub fn failed(&self, update_id: u64, failure: Failure) {
+        let Some(mut slot) = self.updates.get_mut(&update_id) else {
+            return;
+        };
         // A reply that already arrived wins: the update was delivered.
-        if self.pending.remove(&update_id).is_none() {
+        if !matches!(*slot, Slot::Pending(_)) {
             return;
         }
+        *slot = Slot::Failed;
+        drop(slot);
         let counter = match failure {
             Failure::Transport => &self.send_errors,
             Failure::Status => &self.http_errors,
@@ -152,24 +190,52 @@ impl Tracker {
 
     /// A bot replied with `text` through `sendMessage`.
     pub fn reply(&self, text: &str) {
-        if text == WARMUP_TEXT {
-            self.warmup_received.fetch_add(1, Ordering::Relaxed);
+        if let Some(id) = text.strip_prefix(WARMUP_PREFIX) {
+            self.warmup_reply(id);
             return;
         }
-        let due = text
+        let now = Instant::now();
+        let slot = text
             .parse::<u64>()
             .ok()
-            .and_then(|update_id| self.pending.remove(&update_id));
-        let Some((_, due)) = due else {
+            .and_then(|update_id| self.updates.get_mut(&update_id));
+        let Some(mut slot) = slot else {
             self.unmatched_replies.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let micros = u64::try_from(due.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.latency_us
-            .lock()
-            .expect("latency histogram lock poisoned")
-            .saturating_record(micros);
+        let due = match *slot {
+            Slot::Pending(due) => due,
+            Slot::Received => {
+                self.duplicate_replies.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Slot::Failed => {
+                self.unmatched_replies.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        *slot = Slot::Received;
+        drop(slot);
+        let micros = u64::try_from((now - due).as_micros()).unwrap_or(u64::MAX);
+        let mut replies = self.replies.lock().expect(REPLIES_POISONED);
+        replies.latency_us.saturating_record(micros);
+        replies.last = replies.last.max(Some(now));
+        drop(replies);
         self.received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn warmup_reply(&self, id: &str) {
+        let first = id
+            .parse::<u64>()
+            .ok()
+            .and_then(|update_id| self.warmup.get_mut(&update_id))
+            .is_some_and(|mut received| !std::mem::replace(&mut *received, true));
+        let counter = if first {
+            &self.warmup_received
+        } else {
+            &self.unmatched_replies
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Every sent update was received or failed, so no reply is outstanding.
@@ -178,6 +244,7 @@ impl Tracker {
         counts.received + counts.send_errors + counts.http_errors >= counts.sent
     }
 
+    /// Every warm-up update's reply came back.
     pub fn warmup_done(&self) -> bool {
         let counts = self.counts();
         counts.warmup_received >= counts.warmup_sent
@@ -191,17 +258,21 @@ impl Tracker {
             dropped_by_generator: load(&self.dropped_by_generator),
             send_errors: load(&self.send_errors),
             http_errors: load(&self.http_errors),
+            duplicate_replies: load(&self.duplicate_replies),
             unmatched_replies: load(&self.unmatched_replies),
             warmup_sent: load(&self.warmup_sent),
             warmup_received: load(&self.warmup_received),
         }
     }
 
+    /// When the latest first reply to a measured update arrived.
+    pub fn last_reply(&self) -> Option<Instant> {
+        self.replies.lock().expect(REPLIES_POISONED).last
+    }
+
     pub fn latency(&self) -> Latency {
-        let histogram = self
-            .latency_us
-            .lock()
-            .expect("latency histogram lock poisoned");
+        let replies = self.replies.lock().expect(REPLIES_POISONED);
+        let histogram = &replies.latency_us;
         if histogram.is_empty() {
             return Latency::default();
         }
@@ -323,31 +394,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_and_unknown_replies_are_counted_apart() {
+    async fn duplicate_replies_are_counted_apart_from_unmatched_ones() {
         let tracker = Tracker::new();
         tracker.issued(1, Instant::now());
+        tracker.issued(2, Instant::now());
+        tracker.reply("1");
         tracker.reply("1");
         tracker.reply("1");
         tracker.reply("not-an-id");
+        tracker.reply("99");
+        // A late reply to an update whose send failed is not a duplicate.
+        tracker.failed(2, Failure::Transport);
+        tracker.reply("2");
 
         let counts = tracker.counts();
         assert_eq!(counts.received, 1);
-        assert_eq!(counts.unmatched_replies, 2);
+        assert_eq!(counts.duplicate_replies, 2);
+        assert_eq!(counts.unmatched_replies, 3);
     }
 
     #[tokio::test]
-    async fn warmup_replies_do_not_touch_measured_counts() {
+    async fn warmup_completes_only_when_every_warmup_id_came_back() {
         let tracker = Tracker::new();
-        tracker.warmup_issued();
-        tracker.warmup_issued();
-        tracker.reply(WARMUP_TEXT);
-        assert!(!tracker.warmup_done());
-        tracker.reply(WARMUP_TEXT);
+        tracker.warmup_issued(1);
+        tracker.warmup_issued(2);
+        tracker.reply(&warmup_text(1));
+        tracker.reply(&warmup_text(1));
+        assert!(
+            !tracker.warmup_done(),
+            "a repeated reply must not stand in for id 2"
+        );
+        tracker.reply(&warmup_text(7));
+        assert!(
+            !tracker.warmup_done(),
+            "an unknown id must not stand in for id 2"
+        );
+        tracker.reply(&warmup_text(2));
         assert!(tracker.warmup_done());
 
         let counts = tracker.counts();
+        assert_eq!((counts.warmup_sent, counts.warmup_received), (2, 2));
         assert_eq!((counts.sent, counts.received), (0, 0));
+        assert_eq!(counts.unmatched_replies, 2);
         assert_eq!(tracker.latency(), Latency::default());
+    }
+
+    #[test]
+    fn warmup_text_carries_the_id() {
+        assert_eq!(warmup_text(42), "warmup-42");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_last_matched_reply_is_remembered() {
+        let tracker = Tracker::new();
+        let due = Instant::now();
+        tracker.issued(1, due);
+        tracker.issued(2, due);
+        assert_eq!(tracker.last_reply(), None);
+
+        tokio::time::advance(Duration::from_millis(3)).await;
+        tracker.reply("2");
+        tokio::time::advance(Duration::from_millis(4)).await;
+        tracker.reply("1");
+        tokio::time::advance(Duration::from_millis(5)).await;
+        tracker.reply("1");
+        tracker.reply("nope");
+
+        assert_eq!(tracker.last_reply(), Some(due + Duration::from_millis(7)));
     }
 
     #[test]

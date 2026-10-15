@@ -1,10 +1,12 @@
 """Plot tgin benchmark results.
 
 Reads the CSV written by `benchmark.sh` (one row per run) and renders, per
-transport, achieved against target RPS and the latency percentiles, with one
-series per engine and scenario. Runs of the same series and rate are
-averaged. Direct baselines do not go through tgin, so their rows form one
-`direct` series whatever engine the run was for.
+transport, achieved and delivered against target RPS and the latency
+percentiles, with one series per engine and scenario. Achieved RPS is the
+generator's send rate; delivered RPS is the reply rate, which shows whether
+the engine kept up. Runs of the same series and rate are averaged. Direct
+baselines do not go through tgin, so their rows form one `direct` series
+whatever engine the run was for.
 
 Without arguments the newest ../results/<run_id>.csv is plotted, newest by
 `run_id` (the file name), not by modification time. Pass CSV paths to plot
@@ -29,12 +31,15 @@ REQUIRED_COLUMNS: tuple[str, ...] = (
     "engine",
     "target_rps",
     "achieved_rps",
+    "delivered_rps",
     "p50_ms",
     "p95_ms",
     "p99_ms",
     "max_ms",
     "unreceived",
+    "duplicate_replies",
     "dropped_by_generator",
+    "lag_p99_ms",
 )
 
 DIRECT_ENGINE = "direct"
@@ -220,15 +225,19 @@ def render(records: list[dict[str, str]], out_dir: Path) -> list[Path]:
     for name in sorted({transport(row["scenario"]) for row in records}):
         rows = [row for row in records if transport(row["scenario"]) == name]
 
-        path = out_dir / f"{name}-achieved-rps.png"
-        create_plot(
-            path,
-            f"{name}: achieved vs target RPS",
-            "Achieved RPS",
-            aggregate(rows, "achieved_rps"),
-            reference_line=True,
-        )
-        written.append(path)
+        for metric, title in (
+            ("achieved_rps", "Achieved RPS (sent)"),
+            ("delivered_rps", "Delivered RPS (replied)"),
+        ):
+            path = out_dir / f"{name}-{metric.replace('_', '-')}.png"
+            create_plot(
+                path,
+                f"{name}: {title} vs target RPS",
+                title,
+                aggregate(rows, metric),
+                reference_line=True,
+            )
+            written.append(path)
 
         for slug, title, metric in PLOTS:
             path = out_dir / f"{name}-latency-{slug}.png"

@@ -1,9 +1,42 @@
 //! Open-loop load: sends go out on a fixed schedule derived from the target
 //! rate, whatever the system under test does with them.
+//!
+//! The send loop runs on its own OS thread. It sleeps until shortly before a
+//! send is due and spins the rest of the way, because a timer alone wakes up
+//! to a couple of milliseconds late, and that lateness would be charged to
+//! every latency sample.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::time::{sleep_until, Instant};
+use hdrhistogram::Histogram;
+use serde::{Deserialize, Serialize};
+
+/// How long before a due time the send loop stops sleeping and spins.
+pub const SPIN_WINDOW: Duration = Duration::from_millis(2);
+/// Longest send lag the lag histogram tells apart, 1 h in nanoseconds.
+const LAG_MAX_NS: u64 = 3_600_000_000_000;
+/// How often [`wait_until`] re-checks its condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The time source of the send loop; tests substitute a fake one.
+pub trait Clock {
+    fn now(&self) -> Instant;
+    /// Block the thread for about `duration`; it may oversleep.
+    fn sleep(&self, duration: Duration);
+}
+
+/// The real clock.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
 
 /// When each send is due: send `i` at `start + i / rps`.
 #[derive(Clone, Copy, Debug)]
@@ -12,9 +45,6 @@ pub struct Schedule {
     rps: u64,
     total: u64,
 }
-
-/// How often [`wait_until`] re-checks its condition.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 impl Schedule {
     /// `rps * duration_secs` sends from `start`. `rps` must be at least 1.
@@ -25,6 +55,10 @@ impl Schedule {
             rps,
             total: rps.saturating_mul(duration_secs),
         }
+    }
+
+    pub fn start(&self) -> Instant {
+        self.start
     }
 
     pub fn total(&self) -> u64 {
@@ -43,46 +77,86 @@ impl Schedule {
     }
 }
 
+/// How late sends left, from their due time to the end of their hand-off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Lag {
+    #[serde(rename = "lag_p50_ms")]
+    pub p50_ms: f64,
+    #[serde(rename = "lag_p99_ms")]
+    pub p99_ms: f64,
+    #[serde(rename = "lag_max_ms")]
+    pub max_ms: f64,
+}
+
 /// What the send phase took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SendPhase {
     /// From the start to the end of the phase: the later of the last actual
     /// send and the nominal end `total / rps`.
     pub wall: Duration,
-    /// The largest delay between a send's due time and when it went out.
-    pub max_lag: Duration,
+    pub lag: Lag,
 }
 
-/// Run the send phase: call `send(i, due)` for every scheduled send in order,
-/// at its due time or, when the loop is behind, at once. A late send still
-/// gets its due time, so whoever records latency counts the delay.
+/// Block until `due`: sleep while more than [`SPIN_WINDOW`] remains, then
+/// spin.
+fn wait_for(clock: &impl Clock, due: Instant) {
+    loop {
+        let now = clock.now();
+        if now >= due {
+            return;
+        }
+        let remaining = due - now;
+        if remaining > SPIN_WINDOW {
+            clock.sleep(remaining - SPIN_WINDOW);
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Run the send phase on the calling thread: call `send(i, due)` for every
+/// scheduled send in order, at its due time or, when the loop is behind, at
+/// once. A late send still gets its due time, so whoever records latency
+/// counts the delay.
 ///
 /// `send` must not wait for the system under test; it hands the update off
 /// and returns.
-pub async fn run_open_loop(schedule: &Schedule, mut send: impl FnMut(u64, Instant)) -> SendPhase {
-    let mut max_lag = Duration::ZERO;
+pub fn run_open_loop(
+    schedule: &Schedule,
+    clock: &impl Clock,
+    mut send: impl FnMut(u64, Instant),
+) -> SendPhase {
+    let mut lag_ns =
+        Histogram::<u64>::new_with_bounds(1, LAG_MAX_NS, 3).expect("valid histogram bounds");
     for i in 0..schedule.total {
         let due = schedule.due(i);
-        if due > Instant::now() {
-            sleep_until(due).await;
-        }
-        max_lag = max_lag.max(Instant::now().saturating_duration_since(due));
+        wait_for(clock, due);
         send(i, due);
+        let lag = clock.now().saturating_duration_since(due);
+        lag_ns.saturating_record(u64::try_from(lag.as_nanos()).unwrap_or(u64::MAX));
     }
-    SendPhase {
-        wall: schedule
-            .start
-            .elapsed()
-            .max(schedule.offset(schedule.total)),
-        max_lag,
-    }
+    let wall = clock
+        .now()
+        .saturating_duration_since(schedule.start)
+        .max(schedule.offset(schedule.total));
+    let ms = |nanos: u64| nanos as f64 / 1_000_000.0;
+    let lag = if lag_ns.is_empty() {
+        Lag::default()
+    } else {
+        Lag {
+            p50_ms: ms(lag_ns.value_at_quantile(0.50)),
+            p99_ms: ms(lag_ns.value_at_quantile(0.99)),
+            max_ms: ms(lag_ns.max()),
+        }
+    };
+    SendPhase { wall, lag }
 }
 
-/// Updates sent per second of send-phase wall time.
-pub fn achieved_rps(sent: u64, wall: Duration) -> f64 {
-    let secs = wall.as_secs_f64();
+/// Updates per second over `window`; 0 for an empty window.
+pub fn rate(count: u64, window: Duration) -> f64 {
+    let secs = window.as_secs_f64();
     if secs > 0.0 {
-        sent as f64 / secs
+        count as f64 / secs
     } else {
         0.0
     }
@@ -91,14 +165,14 @@ pub fn achieved_rps(sent: u64, wall: Duration) -> f64 {
 /// Wait until `done()` holds or `timeout` passes, whichever is first.
 /// Returns how long it waited.
 pub async fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Duration {
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     let deadline = started + timeout;
     while !done() {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
-        sleep_until(deadline.min(now + POLL_INTERVAL)).await;
+        tokio::time::sleep_until(deadline.min(now + POLL_INTERVAL)).await;
     }
     started.elapsed()
 }
@@ -106,13 +180,62 @@ pub async fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Du
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+    use std::{
+        cell::{Cell, RefCell},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
 
-    #[tokio::test(start_paused = true)]
-    async fn sends_are_scheduled_at_i_over_rps() {
+    /// A clock that moves only when read or slept on: each read advances it
+    /// by `tick`, each sleep by the duration plus `oversleep`.
+    struct FakeClock {
+        now: Cell<Instant>,
+        tick: Duration,
+        oversleep: Duration,
+        /// Where each sleep would have ended without oversleeping.
+        sleep_ends: RefCell<Vec<Instant>>,
+    }
+
+    impl FakeClock {
+        fn new(oversleep: Duration) -> Self {
+            Self {
+                now: Cell::new(Instant::now()),
+                tick: Duration::from_nanos(100),
+                oversleep,
+                sleep_ends: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn peek(&self) -> Instant {
+            self.now.get()
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            let now = self.now.get();
+            self.now.set(now + self.tick);
+            now
+        }
+
+        fn sleep(&self, duration: Duration) {
+            let end = self.now.get() + duration;
+            self.sleep_ends.borrow_mut().push(end);
+            self.now.set(end + self.oversleep);
+        }
+    }
+
+    /// Run `schedule` on `clock`; return `(i, due, sent_at)` per send.
+    fn record(schedule: &Schedule, clock: &FakeClock) -> (Vec<(u64, Instant, Instant)>, SendPhase) {
+        let mut sends = Vec::new();
+        let phase = run_open_loop(schedule, clock, |i, due| sends.push((i, due, clock.peek())));
+        (sends, phase)
+    }
+
+    #[test]
+    fn sends_are_scheduled_at_i_over_rps() {
         let start = Instant::now();
         let schedule = Schedule::new(start, 200, 5);
 
@@ -124,8 +247,8 @@ mod tests {
         assert_eq!(schedule.due(7), start + Duration::from_millis(35));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn schedule_does_not_accumulate_rounding_drift() {
+    #[test]
+    fn schedule_does_not_accumulate_rounding_drift() {
         let schedule = Schedule::new(Instant::now(), 3, 1000);
 
         assert_eq!(schedule.offset(1), Duration::from_nanos(333_333_333));
@@ -134,82 +257,146 @@ mod tests {
         assert_eq!(schedule.offset(2999), Duration::from_nanos(999_666_666_666));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn open_loop_sends_each_update_at_its_due_time() {
-        let start = Instant::now();
-        let schedule = Schedule::new(start, 100, 1);
-        let mut sends = Vec::new();
+    #[test]
+    fn sends_leave_at_their_due_time_never_before() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let schedule = Schedule::new(clock.peek(), 100, 1);
 
-        let phase = run_open_loop(&schedule, |i, due| sends.push((i, due, Instant::now()))).await;
+        let (sends, phase) = record(&schedule, &clock);
 
         assert_eq!(sends.len(), 100);
         for (i, due, at) in &sends {
-            assert_eq!(*due, start + Duration::from_millis(10 * i));
-            assert_eq!(at, due, "send {i} left early or late");
+            assert_eq!(*due, schedule.due(*i));
+            assert!(at >= due, "send {i} left early");
+            assert!(*at - *due <= Duration::from_micros(1), "send {i} left late");
         }
-        assert_eq!(phase.max_lag, Duration::ZERO);
+        assert!(phase.lag.max_ms < 0.001, "{:?}", phase.lag);
         // The last send is due at 990 ms; the phase still lasts the nominal 1 s.
         assert_eq!(phase.wall, Duration::from_secs(1));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn late_sends_go_out_at_once_and_keep_their_scheduled_time() {
-        // The loop starts 55 ms behind: sends 0..=5 are already due.
-        let start = Instant::now() - Duration::from_millis(55);
-        let schedule = Schedule::new(start, 100, 1);
-        let resumed = Instant::now();
-        let mut sends = Vec::new();
+    #[test]
+    fn the_loop_sleeps_only_until_the_spin_window_and_spins_the_rest() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let schedule = Schedule::new(clock.peek(), 100, 1);
+        let dues: Vec<Instant> = (0..100).map(|i| schedule.due(i)).collect();
 
-        let phase = run_open_loop(&schedule, |i, due| sends.push((i, due, Instant::now()))).await;
+        record(&schedule, &clock);
 
-        assert_eq!(sends.len(), 100, "late sends must not be skipped");
-        for (i, due, at) in &sends {
-            assert_eq!(*due, start + Duration::from_millis(10 * i));
-            if *i <= 5 {
-                assert_eq!(*at, resumed, "late send {i} must go out at once");
-            } else {
-                assert_eq!(at, due);
-            }
+        let sleep_ends = clock.sleep_ends.borrow();
+        assert_eq!(
+            sleep_ends.len(),
+            99,
+            "one sleep before every send but the first"
+        );
+        // Each sleep ends where the spin window of a due time begins, give or
+        // take the fake clock's read ticks.
+        for end in sleep_ends.iter() {
+            let spin_starts_near = |due: &Instant| {
+                let window_start = *due - SPIN_WINDOW;
+                *end >= window_start && *end - window_start <= Duration::from_micros(1)
+            };
+            assert!(
+                dues.iter().any(spin_starts_near),
+                "a sleep ended at {:?} after start, not {SPIN_WINDOW:?} before a due time",
+                *end - schedule.start()
+            );
         }
-        assert_eq!(phase.max_lag, Duration::from_millis(55));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn open_loop_does_not_wait_for_slow_sends_to_complete() {
-        // A send that hands off work (here: a task that takes 10 s) must not
-        // delay the next one.
-        let start = Instant::now();
-        let schedule = Schedule::new(start, 10, 1);
-        let mut issued = Vec::new();
-
-        run_open_loop(&schedule, |i, _| {
-            tokio::spawn(tokio::time::sleep(Duration::from_secs(10)));
-            issued.push((i, Instant::now()));
-        })
-        .await;
-
-        assert_eq!(issued.len(), 10);
-        assert_eq!(issued[9].1, start + Duration::from_millis(900));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn send_phase_wall_time_extends_past_nominal_when_behind() {
-        let start = Instant::now() - Duration::from_secs(3);
-        let schedule = Schedule::new(start, 10, 1);
-
-        let phase = run_open_loop(&schedule, |_, _| {}).await;
-
-        // All ten sends were overdue; the phase ended when the last went out.
-        assert_eq!(phase.wall, Duration::from_secs(3));
     }
 
     #[test]
-    fn achieved_rps_is_sent_over_wall_time() {
-        assert_eq!(achieved_rps(1000, Duration::from_secs(5)), 200.0);
-        assert_eq!(achieved_rps(1000, Duration::from_secs(10)), 100.0);
-        assert_eq!(achieved_rps(750, Duration::from_millis(2500)), 300.0);
-        assert_eq!(achieved_rps(0, Duration::from_secs(5)), 0.0);
-        assert_eq!(achieved_rps(10, Duration::ZERO), 0.0);
+    fn oversleeping_within_the_spin_window_costs_no_lag() {
+        let clock = FakeClock::new(Duration::from_micros(1500));
+        let schedule = Schedule::new(clock.peek(), 100, 1);
+
+        let (sends, phase) = record(&schedule, &clock);
+
+        for (i, due, at) in &sends {
+            assert!(
+                at >= due && *at - *due <= Duration::from_micros(1),
+                "send {i}"
+            );
+        }
+        assert!(phase.lag.max_ms < 0.001, "{:?}", phase.lag);
+    }
+
+    #[test]
+    fn late_sends_keep_their_scheduled_time_and_count_as_lag() {
+        // Every sleep overshoots the spin window by 1 ms.
+        let clock = FakeClock::new(SPIN_WINDOW + Duration::from_millis(1));
+        let schedule = Schedule::new(clock.peek(), 100, 1);
+
+        let (sends, phase) = record(&schedule, &clock);
+
+        assert_eq!(sends.len(), 100, "late sends must not be skipped");
+        for (i, due, at) in sends.iter().skip(1) {
+            assert_eq!(*due, schedule.due(*i));
+            let late = *at - *due;
+            assert!(
+                late >= Duration::from_millis(1) && late <= Duration::from_micros(1001),
+                "send {i} left {late:?} late"
+            );
+        }
+        assert!((phase.lag.p99_ms - 1.0).abs() < 0.01, "{:?}", phase.lag);
+        assert!((phase.lag.max_ms - 1.0).abs() < 0.01, "{:?}", phase.lag);
+    }
+
+    #[test]
+    fn overdue_sends_go_out_at_once() {
+        let clock = FakeClock::new(Duration::ZERO);
+        // The loop starts 55 ms behind: sends 0..=5 are already due.
+        let schedule = Schedule::new(clock.peek() - Duration::from_millis(55), 100, 1);
+        let resumed = clock.peek();
+
+        let (sends, phase) = record(&schedule, &clock);
+
+        assert_eq!(sends.len(), 100);
+        for (i, due, at) in &sends {
+            if *i <= 5 {
+                assert!(
+                    *at - resumed < Duration::from_micros(10),
+                    "late send {i} waited"
+                );
+            } else {
+                assert!(
+                    at >= due && *at - *due <= Duration::from_micros(1),
+                    "send {i}"
+                );
+            }
+        }
+        assert!((phase.lag.max_ms - 55.0).abs() < 0.1, "{:?}", phase.lag);
+        assert!(phase.lag.p50_ms < 0.001, "{:?}", phase.lag);
+    }
+
+    #[test]
+    fn send_phase_wall_time_extends_past_nominal_when_behind() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let schedule = Schedule::new(clock.peek() - Duration::from_secs(3), 10, 1);
+
+        let (_, phase) = record(&schedule, &clock);
+
+        // All ten sends were overdue; the phase ended when the last went out.
+        let wall = phase.wall.as_secs_f64();
+        assert!((3.0..3.001).contains(&wall), "{wall}");
+    }
+
+    #[test]
+    fn the_real_clock_sends_on_time() {
+        let schedule = Schedule::new(Instant::now(), 1000, 1);
+
+        let phase = run_open_loop(&schedule, &SystemClock, |_, _| {});
+
+        assert!(phase.lag.p50_ms < 1.0, "{:?}", phase.lag);
+        assert!(phase.wall >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rate_is_count_over_window() {
+        assert_eq!(rate(1000, Duration::from_secs(5)), 200.0);
+        assert_eq!(rate(1000, Duration::from_secs(10)), 100.0);
+        assert_eq!(rate(750, Duration::from_millis(2500)), 300.0);
+        assert_eq!(rate(0, Duration::from_secs(5)), 0.0);
+        assert_eq!(rate(10, Duration::ZERO), 0.0);
     }
 
     #[tokio::test(start_paused = true)]
