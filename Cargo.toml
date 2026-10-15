@@ -15,8 +15,10 @@ publish = false
 [workspace.dependencies]
 aho-corasick = "1.1.5"
 arc-swap = "1.9.2"
+aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 axum = "0.8.9"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.23.1"
 bytes = "1.12.1"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 notify-debouncer-full = "0.7.0"
@@ -36,12 +38,15 @@ serde_path_to_error = "0.1.20"
 smallvec = "1.16.3"
 subtle = "2.6.1"
 tempfile = "3.27.0"
+tgin-core = { path = "crates/tgin-core" }
+tgin-runtime = { path = "crates/tgin-runtime" }
 thiserror = "2.0.21"
 tokio = "1.53.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+wiremock = "0.6.5"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -3,10 +3,26 @@ name = "tgin-botapi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Telegram Bot API types for tgin."
+description = "Telegram Bot API client and update facts extraction for tgin."
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+aws-lc-rs.workspace = true
+base64.workspace = true
+bytes.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+tgin-core.workspace = true
+tgin-runtime.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true
