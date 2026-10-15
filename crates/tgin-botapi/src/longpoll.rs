@@ -17,6 +17,9 @@ use tokio_util::sync::CancellationToken;
 use crate::client::{ApiError, BotClient, BotUser, split_updates};
 use crate::facts::extract;
 
+/// Telegram wants a positive `getUpdates` `timeout`; 0 would turn the long
+/// poll into a tight short-poll loop.
+const MIN_POLL_TIMEOUT: Duration = Duration::from_secs(1);
 /// Telegram caps the `getUpdates` `timeout` at 50 s.
 const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(50);
 /// Telegram caps the `getUpdates` `limit` at 100.
@@ -34,12 +37,14 @@ pub type OnIdentity = Arc<dyn Fn(SourceId, &BotUser) + Send + Sync>;
 /// How a [`LongPollSource`] polls.
 #[derive(Clone, Debug)]
 pub struct LongPollOptions {
-    /// The `getUpdates` long-poll `timeout`, in whole seconds; at most 50 s.
+    /// The `getUpdates` long-poll `timeout`, in whole seconds; 1 s to 50 s.
     pub timeout: Duration,
     /// Updates per `getUpdates`, 1 to 100.
     pub limit: u32,
     pub allowed_updates: Option<Vec<String>>,
-    /// Delete any webhook before the first poll, keeping pending updates.
+    /// Delete any webhook before the first poll, and again when a poll finds
+    /// one active, keeping pending updates. When off, an active webhook
+    /// stops the source polling until someone else deletes it.
     pub delete_webhook_on_start: bool,
     /// The error backoff: `(initial, max, floor)`.
     pub backoff: (Duration, Duration, Duration),
@@ -112,9 +117,9 @@ impl Poll {
 }
 
 impl<S: Sink> LongPollSource<S> {
-    /// `opts.timeout` and `opts.limit` are clamped to what Telegram accepts.
-    /// `on_identity` is called with the bot's account after every successful
-    /// `getMe`.
+    /// `opts.timeout` is clamped to 1 s..=50 s and `opts.limit` to 1..=100,
+    /// what Telegram accepts. `on_identity` is called with the bot's account
+    /// after every successful `getMe`.
     pub fn new(
         id: SourceId,
         name: Arc<str>,
@@ -124,7 +129,7 @@ impl<S: Sink> LongPollSource<S> {
         metrics: SourceMetrics,
         on_identity: OnIdentity,
     ) -> Self {
-        opts.timeout = opts.timeout.min(MAX_POLL_TIMEOUT);
+        opts.timeout = opts.timeout.clamp(MIN_POLL_TIMEOUT, MAX_POLL_TIMEOUT);
         opts.limit = opts.limit.clamp(1, MAX_LIMIT);
         Self {
             id,
@@ -141,9 +146,10 @@ impl<S: Sink> LongPollSource<S> {
     ///
     /// Returns [`Exit::Done`] on cancellation, [`Exit::Fatal`] when Telegram
     /// rejects the token (401, 403 or 404), and [`Exit::Retry`] when `getMe`
-    /// fails otherwise. Every other poll failure is waited out here. Updates
-    /// not yet admitted at cancellation are not confirmed, so Telegram
-    /// delivers them again to the next poller.
+    /// fails otherwise (after the server's `retry_after`, if it sent one).
+    /// Every other poll failure is waited out here. Updates not yet admitted
+    /// at cancellation are not confirmed, so Telegram delivers them again to
+    /// the next poller.
     pub async fn run(&self, ingest: CancellationToken) -> Exit {
         self.metrics.set_state(SourceStateLabel::Starting);
         let exit = self.poll(&ingest).await;
@@ -167,6 +173,22 @@ impl<S: Sink> LongPollSource<S> {
                     Exit::Fatal(message)
                 } else {
                     tracing::warn!(source = %self.name, error = %err, "getMe failed");
+                    if let ApiError::Http {
+                        retry_after: Some(retry_after),
+                        ..
+                    } = err
+                    {
+                        self.metrics.set_state(SourceStateLabel::Backoff);
+                        let wait =
+                            honor_retry_after(Duration::ZERO, Some(retry_after), RETRY_AFTER_CAP);
+                        if ingest
+                            .run_until_cancelled(tokio::time::sleep(wait))
+                            .await
+                            .is_none()
+                        {
+                            return Exit::Done;
+                        }
+                    }
                     Exit::Retry(message)
                 };
             }
@@ -267,11 +289,7 @@ impl<S: Sink> LongPollSource<S> {
                     .sink
                     .admit(self.id, *update_id, payload.clone(), &facts)
                 {
-                    Admit::Admitted => break,
-                    Admit::Unroutable => {
-                        self.metrics.unmatched();
-                        break;
-                    }
+                    Admit::Admitted | Admit::Unroutable => break,
                     Admit::Backpressure => {
                         if !held {
                             held = true;
@@ -299,6 +317,10 @@ impl<S: Sink> LongPollSource<S> {
                 description,
                 ..
             } if description.contains("webhook is active") => {
+                if !self.opts.delete_webhook_on_start {
+                    tracing::error!(source = %self.name, "a webhook is set on this bot token and delete_webhook_on_start is off; delete the webhook or enable the option");
+                    return Step::Wait(self.opts.conflict_backoff);
+                }
                 if state
                     .webhook_deleted
                     .is_some_and(|at| at.elapsed() < WEBHOOK_REDELETE_GUARD)
