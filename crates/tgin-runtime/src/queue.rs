@@ -506,12 +506,24 @@ impl<T: Clone> LeaseQueue<T> {
 
     /// Removes the leases `holder` has with `ack_id` below the given one.
     pub fn ack_below(&self, holder: &HolderId, ack_id: i64) -> usize {
-        self.ack_where(holder, |entry| entry.ack_id < ack_id)
+        self.ack_below_each(holder, ack_id, |_| {})
+    }
+
+    /// As [`LeaseQueue::ack_below`], calling `f` on each removed item in seq
+    /// order after the queue lock is released.
+    pub fn ack_below_each(&self, holder: &HolderId, ack_id: i64, f: impl FnMut(&T)) -> usize {
+        self.ack_where(holder, |entry| entry.ack_id < ack_id, f)
     }
 
     /// Removes every lease `holder` has.
     pub fn ack_all(&self, holder: &HolderId) -> usize {
-        self.ack_where(holder, |_| true)
+        self.ack_all_each(holder, |_| {})
+    }
+
+    /// As [`LeaseQueue::ack_all`], calling `f` on each removed item in seq
+    /// order after the queue lock is released.
+    pub fn ack_all_each(&self, holder: &HolderId, f: impl FnMut(&T)) -> usize {
+        self.ack_where(holder, |_| true, f)
     }
 
     /// Removes the item `seq` if `holder` leases it.
@@ -627,8 +639,14 @@ impl<T: Clone> LeaseQueue<T> {
         self.notify.notify_waiters();
     }
 
-    /// Removes the leases of `holder` that match `pred`.
-    fn ack_where(&self, holder: &HolderId, pred: impl Fn(&Entry<T>) -> bool) -> usize {
+    /// Removes the leases of `holder` that match `pred`, then calls `f` on
+    /// each removed item outside the lock.
+    fn ack_where(
+        &self,
+        holder: &HolderId,
+        pred: impl Fn(&Entry<T>) -> bool,
+        mut f: impl FnMut(&T),
+    ) -> usize {
         let mut inner = self.inner.lock();
         let Some(seqs) = inner.leases.get(holder) else {
             return 0;
@@ -636,14 +654,21 @@ impl<T: Clone> LeaseQueue<T> {
         let acked: Vec<u64> = (seqs.iter().copied())
             .filter(|seq| inner.entries.get(seq).is_some_and(&pred))
             .collect();
+        let mut removed = Vec::with_capacity(acked.len());
         let mut freed_key = false;
         for &seq in &acked {
-            freed_key |= inner.remove(seq).is_some_and(|e| e.key.is_some());
+            if let Some(entry) = inner.remove(seq) {
+                freed_key |= entry.key.is_some();
+                removed.push(entry.item);
+            }
         }
         let wake = freed_key && inner.cfg.ordering == Ordering::PerKey;
         drop(inner);
         if wake {
             self.notify.notify_waiters();
+        }
+        for item in &removed {
+            f(item);
         }
         acked.len()
     }
@@ -944,6 +969,41 @@ mod tests {
             },
             "the item counts its reserved size"
         );
+    }
+
+    #[test]
+    fn ack_below_each_visits_removed_items_in_seq_order() {
+        let q = queue(config(10, 100));
+        let now = Instant::now();
+        let (h1, h2) = (holder("h1"), holder("h2"));
+        for (item, ack_id) in [("a", 10), ("b", 11), ("c", 12), ("d", 13)] {
+            push(&q, item, None, ack_id, 1);
+        }
+        q.lease(&h1, 3, now);
+        q.lease(&h2, 1, now);
+        let mut seen = Vec::new();
+        assert_eq!(q.ack_below_each(&h1, 12, |item| seen.push(*item)), 2);
+        assert_eq!(seen, ["a", "b"]);
+        seen.clear();
+        assert_eq!(q.ack_below_each(&h2, 100, |item| seen.push(*item)), 1);
+        assert_eq!(seen, ["d"]);
+        assert_eq!(items(&q.peek_held(&h1)), ["c"]);
+    }
+
+    #[test]
+    fn ack_all_each_visits_every_removed_item() {
+        let q = queue(config(10, 100));
+        let now = Instant::now();
+        let h = holder("h");
+        for (item, ack_id) in [("a", 1), ("b", 2), ("c", 3)] {
+            push(&q, item, None, ack_id, 1);
+        }
+        q.lease(&h, 2, now);
+        let mut seen = Vec::new();
+        assert_eq!(q.ack_all_each(&h, |item| seen.push(*item)), 2);
+        assert_eq!(seen, ["a", "b"]);
+        assert_eq!(q.ack_all_each(&holder("other"), |_| unreachable!()), 0);
+        assert_eq!(q.stats().available, 1);
     }
 
     #[test]

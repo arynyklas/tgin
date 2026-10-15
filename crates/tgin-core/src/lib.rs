@@ -1,6 +1,7 @@
 //! Core routing engine for tgin.
 
 pub mod config;
+pub mod consumer;
 pub mod envelope;
 pub mod facts;
 pub mod ids;

@@ -1,8 +1,7 @@
 //! One update as it travels from a source to the consumer queues.
 
-use std::time::Instant;
-
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::ids::SourceId;
 

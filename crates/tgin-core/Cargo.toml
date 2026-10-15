@@ -23,7 +23,12 @@ serde_json.workspace = true
 smallvec.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true
