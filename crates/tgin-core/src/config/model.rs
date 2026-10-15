@@ -117,9 +117,11 @@ pub struct Server {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Tls {
-    /// PEM certificate chain file. Supports `${env:…}` and `${file:…}`.
+    /// PEM certificate chain file; a relative path is relative to the config
+    /// file's directory. Supports `${env:…}` and `${file:…}`.
     pub cert_file: Template,
-    /// PEM private key file. Supports `${env:…}` and `${file:…}`.
+    /// PEM private key file; a relative path is relative to the config
+    /// file's directory. Supports `${env:…}` and `${file:…}`.
     pub key_file: Template,
 }
 
@@ -222,7 +224,8 @@ pub struct Webhook {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_address: Option<IpAddr>,
     /// Self-signed certificate to upload with `setWebhook`; needs
-    /// `register: true`. Supports `${env:…}` and `${file:…}`.
+    /// `register: true`. A relative path is relative to the config file's
+    /// directory. Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_file: Option<Template>,
     /// Who may post updates: `none` (anyone), `telegram` (Telegram's

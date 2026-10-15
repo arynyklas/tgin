@@ -1702,6 +1702,42 @@ fn empty_file_path_rejected() {
     assert_message(&errors[0], "the file path is empty");
 }
 
+/// Relative file paths, written or expanded from a reference, resolve
+/// against the config file's directory, never the process CWD (a Windows
+/// service runs in `System32`); absolute paths stay as written.
+#[test]
+fn relative_file_paths_resolve_against_the_config_directory() {
+    let dir = std::env::temp_dir().join("tgin-relative-file-paths");
+    let absolute = std::env::temp_dir().join("elsewhere").join("tls.key");
+    let yaml = format!(
+        "version: 1\nserver:\n  tls: {{ cert_file: tls/tls.crt, key_file: \"{}\" }}\nbots:\n  - name: a\n    token: t\n    ingress: {{ webhook: {{ public_url: \"https://bot.example\", register: true, certificate_file: \"${{env:CERT}}\" }} }}\n",
+        absolute.display().to_string().replace('\\', "\\\\")
+    );
+    let cfg = config::load(
+        &yaml,
+        &dir.join("tgin.yaml"),
+        &env(&[("CERT", "certs/public.pem")]),
+    )
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let tls = cfg.server.as_ref().unwrap().tls.as_ref().unwrap();
+    assert_eq!(tls.cert_file.expose(), &dir.join("tls/tls.crt"));
+    assert_eq!(tls.key_file.expose(), &absolute);
+    let Some(Ingress::Webhook(hook)) = &cfg.bots[0].ingress else {
+        panic!("{:?}", cfg.bots[0].ingress);
+    };
+    assert_eq!(
+        hook.certificate_file.as_ref().map(|file| file.expose()),
+        Some(&dir.join("certs/public.pem"))
+    );
+
+    // A rooted path stays as written, on every platform.
+    let yaml = "version: 1\nserver:\n  tls: { cert_file: /tls/tls.crt, key_file: /tls/tls.key }\n";
+    let cfg = config::load(yaml, &dir.join("tgin.yaml"), &MapEnv::default())
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let tls = cfg.server.as_ref().unwrap().tls.as_ref().unwrap();
+    assert_eq!(tls.cert_file.expose(), Path::new("/tls/tls.crt"));
+}
+
 /// A combined-regex failure has no single rule; it is reported at the
 /// first rule with a regex.
 #[test]
