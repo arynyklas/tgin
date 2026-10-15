@@ -273,6 +273,9 @@ impl Builder {
                 among,
                 weights,
             } => {
+                if among.is_empty() {
+                    return Err(InvalidRule::EmptyGroup);
+                }
                 let schedule = match strategy {
                     SplitStrategy::Weighted => {
                         if weights.len() != among.len() {

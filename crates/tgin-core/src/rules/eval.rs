@@ -155,15 +155,22 @@ impl RouteTable {
                     return;
                 }
                 let next = || cursor.fetch_add(1, Ordering::Relaxed);
-                let pick = match (strategy, key) {
-                    (SplitStrategy::HashChat, Some(key)) => (key % len as u64) as usize,
-                    (SplitStrategy::Weighted, _) if !schedule.is_empty() => {
-                        schedule[next() % schedule.len()] as usize
+                // Hash splits consume the key in mixed radix: pick `key % len`
+                // and hand `key / len` to the child, so nested hash splits are
+                // decorrelated while every key stays sticky (and stable across
+                // reloads of the same tree shape).
+                let (pick, child_key) = match (strategy, key) {
+                    (SplitStrategy::HashChat, Some(key)) => {
+                        let len = len as u64;
+                        ((key % len) as usize, Some(key / len))
                     }
-                    _ => next() % len,
+                    (SplitStrategy::Weighted, _) if !schedule.is_empty() => {
+                        (schedule[next() % schedule.len()] as usize, key)
+                    }
+                    _ => (next() % len, key),
                 };
                 if let Some(&child) = children.get(pick) {
-                    self.walk(child, key, out);
+                    self.walk(child, child_key, out);
                 }
             }
         }

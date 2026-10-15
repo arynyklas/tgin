@@ -394,6 +394,61 @@ mod tests {
     }
 
     #[test]
+    fn nested_hash_chat_reaches_every_consumer() {
+        let t = table(vec![rule(
+            Predicates::default(),
+            vec![split(
+                SplitStrategy::HashChat,
+                vec![
+                    split(SplitStrategy::HashChat, vec![c(1), c(2)], vec![]),
+                    split(SplitStrategy::HashChat, vec![c(3), c(4)], vec![]),
+                ],
+                vec![],
+            )],
+        )]);
+        let mut seen = std::collections::HashSet::new();
+        for chat in 0..1000_i64 {
+            let mut f = msg("x");
+            f.chat_id = Some(chat);
+            let first = route(&t, &f).1;
+            assert_eq!(first.len(), 1);
+            assert_eq!(route(&t, &f).1, first, "key {chat} is not sticky");
+            seen.insert(first[0]);
+        }
+        assert_eq!(seen.len(), 4, "reached only {seen:?}");
+    }
+
+    #[test]
+    fn empty_split_is_empty_group() {
+        for strategy in [
+            SplitStrategy::Weighted,
+            SplitStrategy::RoundRobin,
+            SplitStrategy::HashChat,
+        ] {
+            let bad = RouteTable::compile(
+                &[(
+                    S,
+                    vec![rule(
+                        Predicates::default(),
+                        vec![split(strategy, vec![], vec![])],
+                    )],
+                )],
+                &[],
+            );
+            assert!(
+                matches!(
+                    bad,
+                    Err(RuleError::Invalid {
+                        reason: InvalidRule::EmptyGroup,
+                        ..
+                    })
+                ),
+                "{strategy:?}: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unmatched_returns_none() {
         let t = table(vec![rule(
             Predicates {
