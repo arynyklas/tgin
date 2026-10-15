@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=../../schema/tgin.v1.schema.json
+#
+# One bot, three downstream instances: two poll tgin (pull), one receives
+# webhooks (push). Updates are shared round robin. Started from
+# `tgin config migrate tgin.ron` of the 0.2 example; check it with
+# `tgin config validate tgin.yaml`.
+version: 1
+
+# The data plane: the pull endpoints the polling bots call.
+server:
+  listen: ["0.0.0.0:8080"]
+
+# The admin plane (health, status, metrics) stays on its default loopback
+# listener, 127.0.0.1:9090, inside the container; compose does not publish
+# it. The image's HEALTHCHECK (`tgin admin health`) needs no token; the
+# other admin endpoints need TGIN_ADMIN_TOKEN as a bearer token.
+admin:
+  token: ${env:TGIN_ADMIN_TOKEN}
+
+bots:
+  - name: main
+    token: ${env:TOKEN}
+    # https://api.telegram.org unless TELEGRAM_API_URL says otherwise.
+    api_url: ${env:TELEGRAM_API_URL}
+    ingress:
+      long_poll: {}
+    routes:
+      - to:
+          - split:
+              strategy: round_robin
+              among: [bot1, bot3, bot2]
+
+consumers:
+  # bot1 and bot2 call http://tgin:8080/c/<name>/getUpdates instead of
+  # Telegram's getUpdates.
+  bot1:
+    pull:
+      # Kept from migrate on purpose: when a bot is stopped its queue drops
+      # its oldest updates instead of pausing the source for every bot.
+      on_full: drop_oldest
+  bot2:
+    pull:
+      # Same as bot1.
+      on_full: drop_oldest
+  # bot3 receives webhooks.
+  bot3:
+    push:
+      endpoints:
+        - url: http://bot3:3001/bot
+      # Kept from migrate on purpose (as tgin 0.2 behaved): a full queue drops
+      # its oldest updates, so a stopped bot3 never stalls bot1 and bot2.
+      # Migrate's `retry: {max_attempts: 1}` is not kept: bot3 starts after
+      # tgin, and the default retries (backoff from 1 s) deliver the updates
+      # that arrive before it listens.
+      on_full: drop_oldest

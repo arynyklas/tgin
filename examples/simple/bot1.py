@@ -1,41 +1,44 @@
+"""A polling bot that takes its updates from tgin instead of Telegram."""
+
 import asyncio
 import logging
-import sys, os
+import os
+import sys
+
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import Message
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
-TOKEN = os.getenv("TOKEN")
-TGIN_ENDPOINT = os.getenv("TGIN_ENDPOINT")
-from aiogram.client.telegram import TelegramAPIServer
-class TginUpateLongPullServer(TelegramAPIServer):
-    tgin_updates: str
-    def __init__(self, tgin_updates: str, **kwargs):
-        self.tgin_updates = tgin_updates
-        if "base" not in kwargs:
-            kwargs["base"] = "https://api.telegram.org/bot{token}/{method}"
-        if "file" not in kwargs:
-            kwargs["file"] = "https://api.telegram.org/file/bot{token}/{path}"
-        super().__init__(**kwargs)
+from aiogram.types import Message
+
+TOKEN = os.environ["TOKEN"]
+# tgin's pull endpoint, e.g. http://tgin:8080/c/bot1/getUpdates.
+TGIN_ENDPOINT = os.environ["TGIN_ENDPOINT"]
+TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org")
+REPLY = os.getenv("REPLY", "hello from bot 1")
+
+
+class TginServer(TelegramAPIServer):
+    """getUpdates goes to tgin; every other method goes to the Bot API."""
+
     def api_url(self, token: str, method: str) -> str:
         if method == "getUpdates":
-            return self.tgin_updates
-        return self.base.format(token=token, method=method)
-session = AiohttpSession(api=TginUpateLongPullServer(
-    tgin_updates= TGIN_ENDPOINT,
-))
+            return TGIN_ENDPOINT
+        return super().api_url(token, method)
+
+
 dp = Dispatcher()
+
 
 @dp.message()
 async def echo_handler(message: Message) -> None:
-    await message.answer("hello from first bot")
-async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML), session=session)
+    await message.answer(REPLY)
 
+
+async def main() -> None:
+    server = TginServer.from_base(TELEGRAM_API_URL)
+    bot = Bot(token=TOKEN, session=AiohttpSession(api=server))
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)

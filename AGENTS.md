@@ -103,13 +103,13 @@ docker run --rm -v "$PWD/tgin.ron:/etc/tgin/config.ron:ro" \
   -e TOKEN=... -e TGIN_AUTH_TOKEN="$TGIN_AUTH_TOKEN" -p 3000:3000 tgin
 
 # Example stack (long-poll + webhook bots)
-cd examples/simple && TOKEN=... TGIN_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
+cd examples/simple && TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
 
-# Performance harness
+# Performance harness (ENGINE=v1 default, or v0 = tgin 0.2 built from 1af6aaa)
 cd tests/performance
-make build
-make webhook-tgin-scale-2 RPS=1000 DURATION=10   # one scenario
-./benchmark.sh                           # full RPS matrix → results/<run_id>.csv (~3 h)
+make build && make image ENGINE=v1
+make webhook-tgin-3 ENGINE=v1 RPS=1000 DURATION=10   # one scenario
+ENGINE=v1 ./benchmark.sh                 # 6 scenarios × 3 rates × 3 runs → results/<run_id>.csv (~45 min)
 ```
 
 There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses stock `rustfmt` and `clippy` on stable, with clippy warnings as errors.
@@ -157,7 +157,7 @@ Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is
 - **Test doubles** live in `crates/tgin/src/mock/routes.rs` (`MockCallsRoute` records every received update as `Bytes` in `Arc<tokio::sync::Mutex<Vec<Bytes>>>`; `get_calls` parses them). The `mod mock` declaration in `crates/tgin/src/main.rs` is `#[cfg(test)]`-gated, so production builds don't see it.
 - **HTTP mocking**: `wiremock` for outbound assertions (see `crates/tgin/src/route/webhook.rs::tests::test_process_sends_correct_post_request`). `tower::ServiceExt` and `http_body_util` are available via dev-deps for in-process axum requests.
 - **Dependencies must not be mocked at the boundary** the system actually crosses — prefer real `wiremock` HTTP servers and real `tokio::sync::mpsc` channels over hand-rolled fakes.
-- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. A full sweep is 12 scenarios × 6 RPS values × 3 runs (216 runs of 30 s load plus container start-up), about 3 h. Results land in `tests/performance/results/<run_id>.csv` and are plotted by `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`). Without arguments it plots the CSV under `results/` with the latest modification time (not the latest `run_id`); if `results/` has no CSV it falls back to `tests/performance/results.csv`, which holds only a header, so every chart comes out empty. Pass CSV paths explicitly to plot a specific run. The plotter deletes every PNG in `diagram/generated/` before rendering. PERF.md lists the harness's known measurement defects.
+- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE=v1|v0` selects tgin 1.x (`cfgs/v1/*.yaml`) or 0.2 (`cfgs/*.ron`, image built from `1af6aaa`). One engine's sweep is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 45 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) and are plotted by `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`). Without arguments it plots the `results/*.csv` whose run id sorts last; pass several CSVs to compare engines. The plotter deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the v0/v1 gate and the harness's known limits.
 - Always exercise the actual change before claiming it passes: run the specific `cargo test -p tgin <name>` for the touched module, and for HTTP-affecting changes spin up `examples/simple` or a perf scenario.
 
 ## Runtime / Tooling

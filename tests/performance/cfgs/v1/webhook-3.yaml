@@ -20,6 +20,8 @@ bots:
 consumers:
   bots:
     push:
+      # 8 requests in flight per bot (see webhook-1.yaml and PERF.md).
+      max_in_flight: 24
       endpoints:
         - url: http://10.5.0.11:8080/webhook
         - url: http://10.5.0.12:8080/webhook

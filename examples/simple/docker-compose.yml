@@ -1,44 +1,43 @@
 services:
   tgin:
     build: ../../
-    container_name: tgin_server
-    # Shutdown drains for up to about 21 s; Docker's default 10 s cuts it short.
+    # Shutdown drains for up to about 20 s; Docker's default 10 s cuts it short.
     stop_grace_period: 30s
-    ports:
-      # Loopback only: the management API must not be reachable from the network.
-      - "127.0.0.1:3000:3000"
+    # No published ports: the bots reach the data plane (8080) on the compose
+    # network, and the admin plane stays on the container's loopback.
     volumes:
-      - ./tgin.ron:/etc/tgin/config.ron
+      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
     environment:
-      - TOKEN=${TOKEN}
-      - WH_ENDPOINT=http://bot_3:3001/bot
-      - TGIN_AUTH_TOKEN=${TGIN_AUTH_TOKEN:?set TGIN_AUTH_TOKEN}
+      - TOKEN=${TOKEN:?set TOKEN}
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
+      - TGIN_ADMIN_TOKEN=${TGIN_ADMIN_TOKEN:?set TGIN_ADMIN_TOKEN}
 
-  bot_1:
+  bot1:
     build: .
     depends_on:
       - tgin
     environment:
       - TOKEN=${TOKEN}
-      - TGIN_ENDPOINT=http://tgin:3000/bot1/getUpdates
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
+      - TGIN_ENDPOINT=http://tgin:8080/c/bot1/getUpdates
 
-  bot_2:
+  bot2:
     build: .
+    command: ["uv", "run", "bot1.py"]
     depends_on:
       - tgin
     environment:
       - TOKEN=${TOKEN}
-      - TGIN_ENDPOINT=http://tgin:3000/bot2/getUpdates
-    volumes:
-      - ./bot2.py:/app/main.py
+      - REPLY=hello from bot 2
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
+      - TGIN_ENDPOINT=http://tgin:8080/c/bot2/getUpdates
 
-  bot_3:
+  bot3:
     build: .
+    command: ["uv", "run", "bot3.py"]
     depends_on:
       - tgin
     environment:
       - TOKEN=${TOKEN}
+      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
       - PORT=3001
-
-    volumes:
-      - ./bot3.py:/app/main.py

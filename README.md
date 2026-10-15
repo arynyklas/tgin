@@ -104,7 +104,7 @@ Or run the bundled docker-compose example:
 
 ```bash
 cd examples/simple
-TOKEN=... TGIN_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
+TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
 ```
 
 ### Install a release
@@ -124,22 +124,16 @@ The image runs as uid/gid `65532` and contains no shell: a mounted config file (
 
 ## Performance
 
-Headline scale-out runs — full charts (overhead and per-metric breakdowns for both transports) live in [PERF.md](PERF.md). These numbers come from a harness with known measurement defects and will be re-measured; read the warning at the top of PERF.md before relying on them.
+tgin 1.0 against 0.2 at 1 000, 5 000 and 10 000 updates per second, with one and three aiogram bots behind it; methodology, the full table, the raw CSVs and the harness's limits are in [PERF.md](PERF.md). Below the bots' capacity tgin adds well under a millisecond (median 0.6–1.0 ms end to end at 1 000 RPS). Beyond it, one aiogram process tops out near 2 000 updates per second and the numbers measure queueing in front of the bots; there tgin 1.0 keeps updates that 0.2 loses, at the cost of a longer tail.
 
 <table>
   <tr>
-    <td colspan="2" align="center"><strong>Webhook — tgin scale-out</strong></td>
+    <td><img src="tests/performance/diagram/generated/webhook-delivered-rps.png" alt="Webhook delivered RPS" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-latency-p99.png" alt="Webhook p99 latency" width="500"></td>
   </tr>
   <tr>
-    <td><img src="tests/performance/diagram/generated/webhook-scale-loss.png" alt="Webhook Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/webhook-scale-median.png" alt="Webhook Median Latency" width="500"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><strong>Long-poll — tgin scale-out</strong></td>
-  </tr>
-  <tr>
-    <td><img src="tests/performance/diagram/generated/longpoll-scale-loss.png" alt="Long-poll Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/longpoll-scale-median.png" alt="Long-poll Median Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-delivered-rps.png" alt="Long-poll delivered RPS" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-latency-p99.png" alt="Long-poll p99 latency" width="500"></td>
   </tr>
 </table>
 
