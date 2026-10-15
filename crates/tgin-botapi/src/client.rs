@@ -115,7 +115,8 @@ impl BotClient {
     }
 
     /// The raw `getUpdates` response body, for [`split_updates`]. The request
-    /// may take up to `timeout` plus 10 s.
+    /// may take up to `timeout` plus 10 s. An `"ok": false` body is returned
+    /// as an [`ApiError::Http`] with the token masked.
     pub async fn get_updates(
         &self,
         offset: i64,
@@ -140,7 +141,18 @@ impl BotClient {
         let req = self
             .post_json("getUpdates", &params)?
             .timeout(timeout.saturating_add(LONG_POLL_GRACE));
-        self.send(req).await
+        let body = self.send(req).await?;
+        // The Bot API writes `{"ok":true` first, so a success costs no extra
+        // parse. Anything else is checked for an `"ok": false` error here,
+        // where the token can be masked; other malformed bodies are left to
+        // `split_updates`.
+        if !body.starts_with(br#"{"ok":true"#)
+            && let Ok(envelope) = serde_json::from_slice::<Envelope<IgnoredAny>>(&body)
+            && !envelope.ok
+        {
+            return Err(self.scrub(envelope.into_error(StatusCode::OK.as_u16(), None)));
+        }
+        Ok(body)
     }
 
     /// Sends JSON, or `multipart/form-data` when a certificate is set.
@@ -738,9 +750,9 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(path(at("getUpdates")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(format!(r#"{{"ok":"{TOKEN}"}}"#)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"ok":false,"error_code":409,"description":"Conflict: bot{TOKEN} polls"}}"#
+            )))
             .mount(&server)
             .await;
         let bot = client_for(&server.uri());
@@ -752,11 +764,15 @@ mod tests {
             .port();
         let unreachable = client_for(&format!("http://127.0.0.1:{closed_port}"));
 
-        let body = bot.get_updates(0, 1, Duration::ZERO, None).await.unwrap();
+        // A 2xx body that is not `"ok":false` is returned for `split_updates`.
+        let odd_body = Bytes::from(format!(r#"{{"ok":"{TOKEN}"}}"#));
         let errors = [
             bot.get_me().await.unwrap_err(),
             bot.delete_webhook(false).await.unwrap_err(),
-            split_updates(&body).unwrap_err(),
+            bot.get_updates(0, 1, Duration::ZERO, None)
+                .await
+                .unwrap_err(),
+            split_updates(&odd_body).unwrap_err(),
             unreachable.get_me().await.unwrap_err(),
             BotClient::new(
                 http(),
@@ -765,7 +781,14 @@ mod tests {
             )
             .unwrap_err(),
         ];
-        assert!(matches!(errors[3], ApiError::Network(_)), "{:?}", errors[3]);
+        assert!(
+            matches!(&errors[2], ApiError::Http { status: 409, description, .. }
+                if description == "Conflict: bot[redacted] polls"),
+            "{:?}",
+            errors[2]
+        );
+        assert!(matches!(errors[3], ApiError::Decode(_)), "{:?}", errors[3]);
+        assert!(matches!(errors[4], ApiError::Network(_)), "{:?}", errors[4]);
         for err in &errors {
             for rendered in [err.to_string(), format!("{err:?}")] {
                 assert!(!rendered.contains("AAAA"), "token leaked: {rendered}");

@@ -57,19 +57,21 @@ pub enum FactsError {
 /// - `chat` is `.chat`, or `.message.chat` for `callback_query`.
 /// - `user_id` is `.from.id`, or `.user.id`.
 /// - `text` is `.text`, `.caption`, or `.query` for `inline_query`, cut to
-///   4 KiB on a char boundary. Escaped strings are decoded into owned text.
+///   4 KiB on a char boundary. Escaped strings are decoded into owned text
+///   (one allocation each); lone surrogates decode to U+FFFD.
 /// - `callback_data` is `.data` for `callback_query`.
 /// - `command` is the leading `/token` of `text`, split at the first `@`. It
 ///   borrows from the payload, so a token that contains a JSON escape (other
-///   than the leading `\/` the Bot API writes) yields no command; command
-///   names are ASCII, so real commands are never escaped.
+///   than a leading `\/` or `\u002f`) yields no command; command names are
+///   ASCII, so real commands are never escaped.
 ///
-/// Fields of an unexpected JSON type count as absent; only a payload that is
-/// not a JSON object, or has no integer `update_id`, is an error.
+/// Fields of an unexpected JSON type count as absent. Only a payload that is
+/// not a JSON object, has no integer `update_id`, or is not valid JSON
+/// (including invalid escapes) is an error.
 pub fn extract(payload: &[u8]) -> Result<(i64, Facts<'_>), FactsError> {
     let update: Update<'_> = serde_json::from_slice(payload)?;
     let update_id = update.update_id.ok_or(FactsError::MissingUpdateId)?;
-    Ok((update_id, update.into_facts()?))
+    Ok((update_id, update.into_facts()))
 }
 
 #[derive(Default)]
@@ -104,36 +106,35 @@ struct Chat {
 }
 
 impl<'a> Update<'a> {
-    fn into_facts(self) -> Result<Facts<'a>, serde_json::Error> {
+    fn into_facts(self) -> Facts<'a> {
         let Some((update_type, p)) = self.kind else {
-            return Ok(Facts::default());
+            return Facts::default();
         };
         let chat = p.chat.or(p.message_chat);
         let text = [p.text, p.caption, p.query]
             .into_iter()
             .flatten()
-            .find_map(|raw| string_contents(raw).map(|inner| (raw, inner)));
+            .find_map(string_contents);
         let (text, command) = match text {
-            Some((raw, inner)) => {
-                let text = cap(decode(raw, inner)?);
+            Some(inner) => {
+                let text = unescape(inner, TEXT_CAP);
                 let command = command(&text, inner);
                 (Some(text), command)
             }
             None => (None, None),
         };
-        let callback_data = match p.data.and_then(|raw| Some((raw, string_contents(raw)?))) {
-            Some((raw, inner)) => Some(decode(raw, inner)?),
-            None => None,
-        };
-        Ok(Facts {
+        Facts {
             update_type,
             chat_id: chat.and_then(|c| c.id),
             chat_type: chat.and_then(|c| c.kind),
             user_id: p.from.or(p.user).flatten(),
             text,
-            callback_data,
+            callback_data: p
+                .data
+                .and_then(string_contents)
+                .map(|inner| unescape(inner, usize::MAX)),
             command,
-        })
+        }
     }
 }
 
@@ -142,32 +143,102 @@ fn string_contents(raw: &RawValue) -> Option<&str> {
     raw.get().strip_prefix('"')?.strip_suffix('"')
 }
 
-/// `raw` (a JSON string with contents `inner`) decoded: borrowed when it has
-/// no escapes.
-fn decode<'a>(raw: &'a RawValue, inner: &'a str) -> Result<Cow<'a, str>, serde_json::Error> {
-    if inner.contains('\\') {
-        serde_json::from_str(raw.get()).map(Cow::Owned)
-    } else {
-        Ok(Cow::Borrowed(inner))
+/// The contents of a JSON string (between its quotes) decoded and cut to at
+/// most `limit` bytes on a char boundary.
+///
+/// Without escapes the result borrows from `inner`. Otherwise it is built in
+/// one allocation of `min(inner.len(), limit)` bytes, which never grows:
+/// every escape is longer than the UTF-8 it decodes to. Lone surrogates
+/// become U+FFFD. `inner` comes from a `RawValue`, whose escapes serde_json
+/// has already validated; anything malformed would also become U+FFFD.
+fn unescape(inner: &str, limit: usize) -> Cow<'_, str> {
+    if !inner.contains('\\') {
+        return Cow::Borrowed(floor(inner, limit));
     }
+    let mut out = String::with_capacity(inner.len().min(limit));
+    let mut rest = inner;
+    while !rest.is_empty() {
+        let (plain, escaped) = rest.split_at(rest.find('\\').unwrap_or(rest.len()));
+        let room = limit - out.len();
+        if plain.len() > room {
+            out.push_str(floor(plain, room));
+            break;
+        }
+        out.push_str(plain);
+        let Some(escaped) = escaped.strip_prefix('\\') else {
+            break;
+        };
+        let (c, after) = unescape_one(escaped);
+        if c.len_utf8() > limit - out.len() {
+            break;
+        }
+        out.push(c);
+        rest = after;
+    }
+    Cow::Owned(out)
 }
 
-/// `text` cut to at most [`TEXT_CAP`] bytes on a char boundary.
-fn cap(text: Cow<'_, str>) -> Cow<'_, str> {
-    if text.len() <= TEXT_CAP {
-        return text;
+/// The char of one escape, given the text after its `\`, and the text after
+/// the escape.
+fn unescape_one(s: &str) -> (char, &str) {
+    let mut chars = s.chars();
+    let Some(c) = chars.next() else {
+        return (char::REPLACEMENT_CHARACTER, s);
+    };
+    let rest = chars.as_str();
+    let c = match c {
+        '"' | '\\' | '/' => c,
+        'b' => '\u{8}',
+        'f' => '\u{c}',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'u' => return unescape_unicode(rest),
+        _ => char::REPLACEMENT_CHARACTER,
+    };
+    (c, rest)
+}
+
+/// A `\u` escape (`s` follows the `u`), joining a surrogate pair written as
+/// two escapes.
+fn unescape_unicode(s: &str) -> (char, &str) {
+    let Some(unit) = hex4(s) else {
+        return (char::REPLACEMENT_CHARACTER, s);
+    };
+    let rest = &s[4..];
+    if (0xd800..0xdc00).contains(&unit)
+        && let Some(low) = rest.strip_prefix("\\u").and_then(hex4)
+        && (0xdc00..0xe000).contains(&low)
+    {
+        let pair = char::decode_utf16([unit, low])
+            .next()
+            .and_then(Result::ok)
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        return (pair, &rest[6..]);
     }
-    let mut end = TEXT_CAP;
-    while !text.is_char_boundary(end) {
+    let c = char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER);
+    (c, rest)
+}
+
+/// The four hex digits at the start of `s`.
+fn hex4(s: &str) -> Option<u16> {
+    let digits = s.get(..4)?;
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(digits, 16).ok()
+}
+
+/// `s` cut to at most `limit` bytes on a char boundary.
+fn floor(s: &str, limit: usize) -> &str {
+    if s.len() <= limit {
+        return s;
+    }
+    let mut end = limit;
+    while !s.is_char_boundary(end) {
         end -= 1;
     }
-    match text {
-        Cow::Borrowed(s) => Cow::Borrowed(&s[..end]),
-        Cow::Owned(mut s) => {
-            s.truncate(end);
-            Cow::Owned(s)
-        }
-    }
+    &s[..end]
 }
 
 /// The leading `/name[@bot]` of `text`, borrowed from the payload. `raw` is
@@ -703,6 +774,10 @@ mod tests {
             r#"{"message":{}}"#,
             r#"{"update_id":"1","message":{}}"#,
             r#"{"update_id":1.5}"#,
+            // serde_json validates escapes while it reads the raw string.
+            r#"{"update_id":1,"message":{"text":"\x"}}"#,
+            r#"{"update_id":1,"message":{"text":"\u12"}}"#,
+            r#"{"update_id":1,"message":{"text":"\u12g4"}}"#,
         ] {
             assert!(extract(bad.as_bytes()).is_err(), "{bad}");
         }
@@ -729,6 +804,102 @@ mod tests {
 
         let raw = r#"{"update_id":22,"callback_query":{"from":{"id":1},"data":"a\nb"}}"#;
         assert!(matches!(facts(raw).1.callback_data, Some(Cow::Owned(d)) if d == "a\nb"));
+
+        // A lone surrogate decodes to U+FFFD instead of failing the update.
+        let raw = r#"{"update_id":23,"message":{"text":"\ud83d \/x"}}"#;
+        let f = facts(raw).1;
+        assert_eq!(f.text.as_deref(), Some("\u{fffd} /x"));
+        assert_eq!(f.command, None);
+
+        // `\u002f` as the leading slash still yields a borrowed command.
+        let raw = r#"{"update_id":24,"message":{"text":"\u002Fhelp@b\u00e9 x"}}"#;
+        assert_eq!(facts(raw).1.command, None, "the bot name is escaped");
+        let raw = r#"{"update_id":25,"message":{"text":"\u002fhelp@bot \u00e9"}}"#;
+        let (name, bot) = facts(raw).1.command.expect("a command");
+        assert_eq!((name, bot), ("help", Some("bot")));
+        assert!(inside(raw, name));
+    }
+
+    /// `unescape` of a JSON string's contents, with no cap.
+    fn unescaped(inner: &str) -> Cow<'_, str> {
+        unescape(inner, usize::MAX)
+    }
+
+    #[test]
+    fn unescape_short_escapes() {
+        assert_eq!(
+            unescaped(r#"a\"b\\c\/d\be\ff\ng\rh\ti"#),
+            "a\"b\\c/d\u{8}e\u{c}f\ng\rh\ti"
+        );
+        assert_eq!(unescaped(r"\n"), "\n");
+        assert_eq!(unescaped(r"x\\"), "x\\");
+    }
+
+    #[test]
+    fn unescape_borrows_without_escapes() {
+        let inner = "plain é text";
+        let out = unescaped(inner);
+        assert!(matches!(out, Cow::Borrowed(s) if std::ptr::eq(s, inner)));
+        assert!(matches!(unescape(inner, 8), Cow::Borrowed("plain \u{e9}")));
+        assert!(matches!(unescape(inner, 7), Cow::Borrowed("plain ")));
+    }
+
+    #[test]
+    fn unescape_unicode_escapes() {
+        assert_eq!(unescaped(r"\u0041\u00e9\u00E9\u20ac\u041f"), "Aéé€П");
+        assert_eq!(unescaped(r"\u0000"), "\0");
+        assert_eq!(unescaped(r"\uffff"), "\u{ffff}");
+    }
+
+    #[test]
+    fn unescape_surrogate_pairs() {
+        assert_eq!(unescaped(r"\ud83d\ude00"), "😀");
+        assert_eq!(unescaped(r"\uD83D\uDE00!"), "😀!");
+        assert_eq!(unescaped(r"\udbff\udfff"), "\u{10ffff}");
+        assert_eq!(unescaped(r"\ud800\udc00"), "\u{10000}");
+    }
+
+    #[test]
+    fn unescape_lone_surrogates() {
+        let r = '\u{fffd}';
+        assert_eq!(unescaped(r"\ud83d"), r.to_string());
+        assert_eq!(unescaped(r"\ud83dx"), format!("{r}x"));
+        assert_eq!(unescaped(r"\ude00"), r.to_string());
+        assert_eq!(unescaped(r"\ude00\ud83d"), format!("{r}{r}"));
+        assert_eq!(unescaped(r"\ud83d\u0041"), format!("{r}A"));
+        assert_eq!(unescaped(r"\ud83d\n"), format!("{r}\n"));
+        assert_eq!(unescaped(r"\ud83d\ud83d\ude00"), format!("{r}😀"));
+    }
+
+    #[test]
+    fn unescape_stops_at_cap_on_char_boundary() {
+        assert_eq!(unescape(r"ab\ncd", 3), "ab\n");
+        assert_eq!(unescape(r"ab\ncd", 2), "ab");
+        assert_eq!(unescape(r"\u20ac\u20ac", 6), "€€");
+        assert_eq!(unescape(r"\u20ac\u20ac", 5), "€");
+        assert_eq!(unescape(r"\u20ac\u20ac", 3), "€");
+        assert_eq!(unescape(r"\u20ac\u20ac", 2), "");
+        assert_eq!(unescape(r"\ud83d\ude00a", 4), "😀");
+        assert_eq!(unescape(r"\ud83d\ude00a", 3), "");
+        assert_eq!(unescape(r"x\né", 3), "x\n");
+        assert_eq!(unescape(r"x\néé", 4), "x\né");
+        assert_eq!(unescape(r"\n", 0), "");
+    }
+
+    #[test]
+    fn unescape_allocates_once() {
+        // Every escape is longer than its output, so the buffer sized from the
+        // input never grows.
+        for (inner, limit) in [
+            (r"\u20ac\ud83d\ude00\/\n plain \u00e9", usize::MAX),
+            (r"\u20ac\u20ac\u20ac", 7),
+            (r"\ud83d", usize::MAX),
+        ] {
+            match unescape(inner, limit) {
+                Cow::Owned(s) => assert_eq!(s.capacity(), inner.len().min(limit), "{inner}"),
+                Cow::Borrowed(_) => panic!("{inner} has escapes"),
+            }
+        }
     }
 
     #[test]
@@ -907,16 +1078,30 @@ mod tests {
         "message_reaction",
     ];
 
-    /// Fields the extractor reads, in generator mask order.
-    const FIELDS: [&str; 8] = [
-        "chat", "from", "user", "text", "caption", "query", "data", "message",
+    /// Fields the generator places in update payloads, in mask order. Most
+    /// are read by the extractor; `reply_to_message` nests a whole message
+    /// whose `chat`, `from` and `text` must be ignored.
+    const FIELDS: [&str; 9] = [
+        "chat",
+        "from",
+        "user",
+        "text",
+        "caption",
+        "query",
+        "data",
+        "message",
+        "reply_to_message",
     ];
 
     /// The fields each shape usually carries.
     fn typical(kind: &str) -> &'static [&'static str] {
         match kind {
-            "message" | "edited_message" => &["chat", "from", "text", "caption"],
-            "channel_post" | "edited_channel_post" => &["chat", "text", "caption"],
+            "message" | "edited_message" => {
+                &["chat", "from", "text", "caption", "reply_to_message"]
+            }
+            "channel_post" | "edited_channel_post" => {
+                &["chat", "text", "caption", "reply_to_message"]
+            }
             "callback_query" => &["from", "message", "data"],
             "inline_query" | "chosen_inline_result" => &["from", "query"],
             "my_chat_member" | "chat_member" | "chat_join_request" => &["chat", "from"],
@@ -1045,10 +1230,35 @@ mod tests {
         prop_oneof![9 => user, 1 => Just(json!(42))].boxed()
     }
 
+    /// A message with its own `chat`, `from` and `text`.
+    fn plain_message() -> BoxedStrategy<Value> {
+        (
+            chat_value(),
+            prop::option::weighted(0.9, user_value()),
+            text_value(),
+        )
+            .prop_map(|(chat, from, text)| {
+                let mut m = json!({"message_id": 1, "date": 2, "chat": chat, "text": text});
+                if let Some(from) = from {
+                    m["from"] = from;
+                }
+                m
+            })
+            .boxed()
+    }
+
+    /// A message, sometimes replying to another one.
     fn message_value() -> BoxedStrategy<Value> {
-        let message = (chat_value(), text_value()).prop_map(
-            |(chat, text)| json!({"message_id": 1, "date": 2, "chat": chat, "text": text}),
-        );
+        let message = (
+            plain_message(),
+            prop::option::weighted(0.3, plain_message()),
+        )
+            .prop_map(|(mut message, reply)| {
+                if let Some(reply) = reply {
+                    message["reply_to_message"] = reply;
+                }
+                message
+            });
         prop_oneof![9 => message, 1 => Just(json!([1, 2]))].boxed()
     }
 
@@ -1083,8 +1293,9 @@ mod tests {
             text_value(),
             text_value(),
             message_value(),
+            message_value(),
         )
-            .prop_map(|(a, b, c, d, e, f, g, h)| vec![a, b, c, d, e, f, g, h]);
+            .prop_map(|(a, b, c, d, e, f, g, h, i)| vec![a, b, c, d, e, f, g, h, i]);
         (
             values,
             prop::collection::vec(prop::bool::weighted(0.85), FIELDS.len()),
@@ -1131,13 +1342,13 @@ mod tests {
         out
     }
 
-    /// Escapes like the Bot API does: `/` as `\/` and non-ASCII as `\uXXXX`.
-    /// Outside strings, JSON has neither.
-    fn telegram_escape(json: &str) -> String {
+    /// Escapes like the Bot API does: `/` as `slash` (Telegram writes `\/`)
+    /// and non-ASCII as `\uXXXX`. Outside strings, JSON has neither.
+    fn telegram_escape(json: &str, slash: &str) -> String {
         let mut out = String::with_capacity(json.len() * 2);
         for c in json.chars() {
             match c {
-                '/' => out.push_str("\\/"),
+                '/' => out.push_str(slash),
                 c if c.is_ascii() => out.push(c),
                 c => {
                     let mut units = [0u16; 2];
@@ -1169,7 +1380,7 @@ mod tests {
             top_extras,
             order(),
             any::<bool>(),
-            any::<bool>(),
+            prop::option::weighted(0.5, select(vec!["\\/", "\\/", "\\u002f", "\\u002F"])),
         )
             .prop_map(|(kind, parts, id, extra, order, id_first, escape)| {
                 let payload = object(&payload(&kind, parts));
@@ -1182,7 +1393,10 @@ mod tests {
                     top.insert(0, entry);
                 }
                 let json = object(&top);
-                if escape { telegram_escape(&json) } else { json }
+                match escape {
+                    Some(slash) => telegram_escape(&json, slash),
+                    None => json,
+                }
             })
             .boxed()
     }
