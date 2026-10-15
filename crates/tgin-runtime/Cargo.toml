@@ -12,9 +12,14 @@ publish.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 hyper-util.workspace = true
+notify-debouncer-full.workspace = true
 parking_lot.workspace = true
 prometheus-client.workspace = true
 reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_path_to_error.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tracing.workspace = true
@@ -23,6 +28,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 arc-swap.workspace = true
 rcgen.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "time"] }
 tokio-rustls.workspace = true
 
