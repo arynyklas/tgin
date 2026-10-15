@@ -8,7 +8,7 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-15
+## [Unreleased]
 
 ### Upgrade notes
 
@@ -92,9 +92,9 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
   silently never receive or serve updates.
 - **Breaking:** enabling the management API (`api`) requires a non-blank
   `auth_token`. The shipped example configs read it from `TGIN_AUTH_TOKEN`.
-- **Breaking:** the minimum supported Rust version is now 1.88
-  (`rust-version = "1.88"`). The `icu_*` 2.3 crates pulled in by `url`/`idna`
-  require it.
+- **Breaking:** the minimum supported Rust version is now 1.89
+  (`rust-version = "1.89"` in the workspace manifest). The `icu_*` 2.3 crates
+  pulled in by `url`/`idna` already require 1.88.
 - **Breaking:** the container image is a static musl binary on distroless and
   runs as the numeric user and group `65532:65532`. Mounted configuration
   files (and TLS keys) must be readable by uid 65532.

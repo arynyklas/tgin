@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "tgin"
-version = "0.2.0-rc.2"
+version = "1.0.0-dev"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1658,6 +1658,18 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
 ]
+
+[[package]]
+name = "tgin-botapi"
+version = "1.0.0-dev"
+
+[[package]]
+name = "tgin-core"
+version = "1.0.0-dev"
+
+[[package]]
+name = "tgin-runtime"
+version = "1.0.0-dev"
 
 [[package]]
 name = "thiserror"
@@ -2166,6 +2178,10 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "xtask"
+version = "1.0.0-dev"
 
 [[package]]
 name = "yoke"

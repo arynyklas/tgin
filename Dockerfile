@@ -11,12 +11,13 @@ RUN apk add --no-cache musl-dev build-base cmake perl
 WORKDIR /usr/src/tgin
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
+COPY xtask ./xtask
 
 # `target` lives in a cache mount, so the binary is copied out in the same step.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/tgin/target \
-    cargo build --release --locked && \
+    cargo build --release --locked -p tgin && \
     install -D -m 0755 target/release/tgin /out/tgin
 
 # gcr.io/distroless/static-debian13:latest (multi-arch index digest)

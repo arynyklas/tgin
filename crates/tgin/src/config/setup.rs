@@ -1068,7 +1068,8 @@ mod tests {
         env::set_var("WH_ENDPOINT", "http://127.0.0.1:3001/bot");
         env::set_var("TGIN_AUTH_TOKEN", "test-auth-token");
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // The shipped configs live at the repository root, two levels above this crate.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut configs = vec![root.join("tgin.ron"), root.join("examples/simple/tgin.ron")];
         let perf_dir = root.join("tests/performance/cfgs");
         let mut perf: Vec<PathBuf> = fs::read_dir(&perf_dir)

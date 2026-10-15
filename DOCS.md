@@ -57,7 +57,7 @@ cargo build --release
 TOKEN=123456:ABC TGIN_AUTH_TOKEN=$(openssl rand -hex 32) ./target/release/tgin -f tgin.ron
 ```
 
-The shipped `tgin.ron` reads the bot token from `TOKEN` and, because it enables the management API, the API secret from `TGIN_AUTH_TOKEN`. Building requires Rust 1.88 or newer and a C compiler for `aws-lc-sys` (the TLS crypto backend).
+The shipped `tgin.ron` reads the bot token from `TOKEN` and, because it enables the management API, the API secret from `TGIN_AUTH_TOKEN`. Building requires Rust 1.89 or newer and a C compiler for `aws-lc-sys` (the TLS crypto backend).
 
 The `-f`/`--file` flag selects the configuration file (defaults to `tgin.ron`); `--version` prints the tgin version. `${VAR}` placeholders inside the config are substituted from the environment **before** the RON parser runs, everywhere in the file, including comments. Every unset variable is listed on stderr and tgin exits with code `1`.
 

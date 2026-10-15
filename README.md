@@ -60,7 +60,7 @@ Updates arrive over a long-poll or webhook ingress, traverse a tree of routes an
 
 ## Quick start
 
-Building from source requires Rust 1.88 or newer (`rust-version` in `Cargo.toml`) and a C compiler for `aws-lc-sys`, the TLS crypto backend. Prebuilt binaries and a container image are described under [Install a release](#install-a-release).
+Building from source requires Rust 1.89 or newer (`rust-version` in `Cargo.toml`) and a C compiler for `aws-lc-sys`, the TLS crypto backend. Prebuilt binaries and a container image are described under [Install a release](#install-a-release).
 
 ### 1. Clone and build
 

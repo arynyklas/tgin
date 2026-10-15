@@ -1,45 +1,22 @@
-[package]
-name = "tgin"
-version = "0.2.0-rc.2"
-edition = "2021"
-rust-version = "1.88"
-description = "Routing layer between the Telegram Bot API and downstream bot instances"
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+# The benchmark harness is a separate crate with its own Cargo.lock.
+exclude = ["tests/performance/benchmark"]
+
+[workspace.package]
+version = "1.0.0-dev"
+edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/arynyklas/tgin"
 publish = false
 
-# `publish = false` makes dist skip the package unless it is opted in.
-[package.metadata.dist]
-dist = true
+[workspace.lints.rust]
+unsafe_code = "deny"
 
-[dependencies]
-tokio = { version = "1.53.3", features = ["full"] }
-axum = "0.8.9"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "query"] }
-async-trait = "0.1.92"
-ron = "0.12.2"
-clap = "4.6.7"
-regex = "1.13.1"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-rand = "0.10.3"
-serde_urlencoded = "0.7.1"
-subtle = "2.6.1"
-arc-swap = "1.9.2"
-bytes = "1.12.1"
-tokio-util = "0.7.20"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false }
-
-[dev-dependencies]
-tokio = { version = "1.53.3", features = ["test-util"] }
-wiremock = "0.6.5"
-tower = { version = "0.5.3", features = ["util"] }
-http-body-util = "0.1.5"
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
 
 [profile.release]
 lto = true
