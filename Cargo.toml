@@ -12,6 +12,34 @@ license = "MIT"
 repository = "https://github.com/arynyklas/tgin"
 publish = false
 
+[workspace.dependencies]
+aho-corasick = "1.1.5"
+arc-swap = "1.9.2"
+axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+notify-debouncer-full = "0.7.0"
+parking_lot = "0.12.5"
+prometheus-client = "0.25.1"
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+rand = "0.10.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.154"
+serde_path_to_error = "0.1.20"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = "1.53.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
@@ -26,16 +54,3 @@ codegen-units = 1
 # profile's fat LTO and single codegen unit.
 [profile.dist]
 inherits = "release"
-
-[workspace.dependencies]
-aho-corasick = "1.1.5"
-parking_lot = "0.12.5"
-proptest = { version = "1.12.0", default-features = false, features = ["std"] }
-rand = "0.10.3"
-regex = "1.13.1"
-serde = "1.0.229"
-serde_json = "1.0.154"
-subtle = "2.6.1"
-thiserror = "2.0.21"
-tokio = "1.53.3"
-tokio-util = "0.7.20"
