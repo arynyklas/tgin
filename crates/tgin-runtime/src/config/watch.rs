@@ -36,23 +36,27 @@ pub struct ConfigWatcher {
 ///
 /// # Errors
 ///
-/// Fails with [`io::ErrorKind::InvalidInput`] if `debounce` or `poll_every`
-/// is zero, and otherwise if the parent directory cannot be watched or the
-/// poll thread cannot be started.
+/// Fails with [`io::ErrorKind::InvalidInput`] if `debounce` is below 4ns or
+/// `poll_every` is zero, and otherwise if the parent directory cannot be
+/// watched or the poll thread cannot be started.
 pub fn watch_config(
     file: &Path,
     debounce: Duration,
     poll_every: Duration,
 ) -> io::Result<(ConfigWatcher, mpsc::Receiver<()>)> {
-    // Zero would make the debouncer tick, or the poll thread loop, without
-    // ever sleeping.
-    for (name, interval) in [("debounce", debounce), ("poll_every", poll_every)] {
-        if interval.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("the config watcher's {name} interval must be greater than zero"),
-            ));
-        }
+    // The debouncer ticks every `debounce / 4`, and the poll thread sleeps
+    // `poll_every`; a zero would make either loop without ever sleeping.
+    if (debounce / 4).is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the config watcher's debounce interval must be at least 4ns",
+        ));
+    }
+    if poll_every.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the config watcher's poll_every interval must be greater than zero",
+        ));
     }
     let (tx, rx) = mpsc::channel(1);
     let change = Arc::new(Change {

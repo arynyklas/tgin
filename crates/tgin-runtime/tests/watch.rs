@@ -106,10 +106,12 @@ fn watch_rejects_zero_intervals() {
 
     for (debounce, poll_every, name) in [
         (Duration::ZERO, POLL_EVERY, "debounce"),
+        // The debouncer ticks every debounce / 4, which is zero below 4ns.
+        (Duration::from_nanos(3), POLL_EVERY, "debounce"),
         (DEBOUNCE, Duration::ZERO, "poll_every"),
     ] {
         let Err(err) = watch_config(&file, debounce, poll_every) else {
-            panic!("a zero {name} was accepted");
+            panic!("{name} {debounce:?}/{poll_every:?} was accepted");
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         assert!(err.to_string().contains(name), "{err}");
