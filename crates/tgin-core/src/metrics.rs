@@ -440,6 +440,16 @@ impl SourceMetrics {
     pub fn unmatched(&self) {
         self.unmatched.inc();
     }
+
+    /// Updates received so far.
+    pub fn updates_total(&self) -> u64 {
+        self.updates.get()
+    }
+
+    /// Ingest errors so far, over every reason.
+    pub fn errors_total(&self) -> u64 {
+        self.errors.iter().map(Counter::get).sum()
+    }
 }
 
 /// Pre-resolved metric handles for one consumer.

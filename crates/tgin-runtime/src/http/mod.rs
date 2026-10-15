@@ -11,4 +11,4 @@ mod client;
 mod server;
 
 pub use client::{ClientOptions, client, describe_error};
-pub use server::{RunningServer, ServerOptions, TlsFiles, serve};
+pub use server::{RunningServer, ServerOptions, ServerTls, TlsFiles, serve};

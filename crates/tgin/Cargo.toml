@@ -20,6 +20,7 @@ futures-util.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 # Only for reading 0.2 configs (`migrate`).
 ron.workspace = true
 serde.workspace = true

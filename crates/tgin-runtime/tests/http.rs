@@ -281,17 +281,21 @@ async fn handshake(addr: SocketAddr, roots: &RootCertStore) -> CertificateDer<'s
     presented
 }
 
+/// The reload reads the files it is given, which may be other files than
+/// the server started with.
 #[tokio::test]
 async fn tls_reload_serves_new_certificate() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tls_reload_serves_new_certificate");
-    std::fs::create_dir_all(&dir).unwrap();
+    let (first_dir, second_dir) = (dir.join("first"), dir.join("second"));
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
     let first = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let second = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(first.cert.der().clone()).unwrap();
     roots.add(second.cert.der().clone()).unwrap();
 
-    let files = write_pair(&dir, &first);
+    let files = write_pair(&first_dir, &first);
     let server = start(ServerOptions {
         listen: vec![loopback()],
         tls: Some(files),
@@ -301,7 +305,17 @@ async fn tls_reload_serves_new_certificate() {
     let addr = server.local_addrs[0];
     assert_eq!(&handshake(addr, &roots).await, first.cert.der());
 
-    write_pair(&dir, &second);
-    server.reload_tls().await.expect("reload succeeds");
+    let tls = server.tls().expect("a TLS server");
+    tls.reload(&write_pair(&second_dir, &second))
+        .await
+        .expect("reload succeeds");
+    assert_eq!(&handshake(addr, &roots).await, second.cert.der());
+
+    // A failed reload keeps the certificate in use.
+    let missing = TlsFiles {
+        cert: dir.join("missing.pem"),
+        key: dir.join("missing.key"),
+    };
+    assert!(tls.reload(&missing).await.is_err());
     assert_eq!(&handshake(addr, &roots).await, second.cert.der());
 }

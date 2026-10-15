@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use tgin::app::{App, Connections};
+use tgin::app::{App, Boot, Connections};
 use tgin::exit::Outcome;
 use tgin_core::config;
 use tgin_runtime::config::MapEnv;
@@ -129,6 +129,7 @@ async fn next<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
 /// The app, running.
 struct Running {
     addr: SocketAddr,
+    admin: SocketAddr,
     signals: mpsc::Sender<SignalKind>,
     run: JoinHandle<Outcome>,
     metrics: Arc<MetricsRegistry>,
@@ -140,26 +141,51 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// `yaml` with the admin plane on a port the OS picks, unless it places
+/// the admin plane itself.
+fn with_admin(yaml: &str) -> String {
+    if yaml.contains("\nadmin:") {
+        yaml.to_owned()
+    } else {
+        format!("{yaml}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\n")
+    }
+}
+
 fn load(yaml: &str) -> config::Config {
-    config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).unwrap_or_else(|errors| {
+    config::load(
+        &with_admin(yaml),
+        Path::new("tgin.yaml"),
+        &MapEnv::default(),
+    )
+    .unwrap_or_else(|errors| {
         let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
         panic!("invalid test config:\n{}", errors.join("\n"))
     })
 }
 
+/// `yaml`, written to a config file of its own and loaded from there.
+fn boot(yaml: &str) -> Boot {
+    let file = scratch(&format!("boot-{:016x}", rand::random::<u64>())).join("tgin.yaml");
+    std::fs::write(&file, with_admin(yaml)).expect("the config file");
+    Boot::load(&file, Arc::new(MapEnv::default()))
+        .unwrap_or_else(|err| panic!("invalid test config: {err:?}"))
+}
+
 async fn start(yaml: &str) -> Running {
-    running(App::start(load(yaml)).await.expect("tgin starts"))
+    running(App::start(boot(yaml)).await.expect("tgin starts"))
 }
 
 /// Runs `app` on signals the test sends.
 fn running(app: App) -> Running {
     let addr = app.data_addrs()[0];
+    let admin = app.admin_addrs()[0];
     let metrics = app.metrics();
     let connections = app.connections();
     let (signals, rx) = mpsc::channel(4);
     let run = tokio::spawn(app.run(Signals::from_channel(rx)));
     Running {
         addr,
+        admin,
         signals,
         run,
         metrics,
@@ -232,10 +258,21 @@ impl Running {
         ids(&body)
     }
 
+    /// The status `/readyz` on the admin plane answers.
+    async fn readiness(&self) -> u16 {
+        self.http
+            .get(format!("http://{}/readyz", self.admin))
+            .send()
+            .await
+            .expect("readiness probe")
+            .status()
+            .as_u16()
+    }
+
     async fn wait_until_not_ready(&self) {
         let started = Instant::now();
         loop {
-            let status = self.get("/readyz", None).await.0;
+            let status = self.readiness().await;
             if status == 503 {
                 return;
             }
@@ -520,7 +557,7 @@ async fn shutdown_serves_buffered_then_exits_0() {
         "  workers: { pull: {} }",
     ))
     .await;
-    assert_eq!(app.get("/readyz", None).await.0, 200);
+    assert_eq!(app.readiness().await, 200);
     app.deliver(&[(1, "one"), (2, "two"), (3, "three")]).await;
 
     app.signal(SignalKind::Terminate).await;
@@ -729,7 +766,7 @@ async fn two_signals_while_sources_failed_exit_130() {
 
 /// A webhook bot whose `getMe` answers only after a minute, with a push
 /// consumer, so the start is still waiting when the test signals.
-async fn slow_start() -> (MockServer, config::Config) {
+async fn slow_start() -> (MockServer, Boot) {
     let telegram = MockServer::start().await;
     mount_bot(
         &telegram,
@@ -739,7 +776,7 @@ async fn slow_start() -> (MockServer, config::Config) {
     )
     .await;
     let (down, _seen) = downstream(ResponseTemplate::new(200)).await;
-    let cfg = load(&hooked(
+    let cfg = boot(&hooked(
         &telegram,
         QUICK,
         "[{ to: [downstream] }]",
@@ -754,7 +791,7 @@ async fn slow_start() -> (MockServer, config::Config) {
 /// Launches `cfg` and waits until it asked Telegram for the bot's identity.
 async fn launch_until_get_me(
     telegram: &MockServer,
-    cfg: config::Config,
+    cfg: Boot,
 ) -> (
     mpsc::Sender<SignalKind>,
     JoinHandle<Result<Outcome, tgin::app::StartError>>,
@@ -808,7 +845,7 @@ async fn set_routes_serves_the_next_request() {
             &format!("  workers: {{ pull: {{ aliases: [{alias}] }} }}"),
         )
     };
-    let app = App::start(load(&config("/old")))
+    let app = App::start(boot(&config("/old")))
         .await
         .expect("tgin starts");
     let addr = app.data_addrs()[0];
@@ -874,7 +911,7 @@ async fn webhook_get_me_retried_until_username_known() {
     ))
     .await;
     // Ready after the first, failed getMe.
-    assert_eq!(app.get("/readyz", None).await.0, 200);
+    assert_eq!(app.readiness().await, 200);
 
     // Until the username is known, `/admin@tgin_bot` is someone else's.
     let started = Instant::now();
@@ -1292,18 +1329,25 @@ fn shipped_config_is_valid() {
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
 
-/// The `tgin` binary serving a webhook bot backed by `telegram`, on a port
-/// picked by binding port 0, with `runtime` timings; waits until ready.
+/// A free loopback port, found by binding port 0.
+#[cfg(unix)]
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port()
+}
+
+/// The `tgin` binary serving a webhook bot backed by `telegram`, on free
+/// ports, with `runtime` timings; waits until ready. Returns the child and
+/// the admin plane's base URL.
 #[cfg(unix)]
 async fn spawn_tgin(
     test: &str,
     telegram: &MockServer,
     runtime: &str,
 ) -> (std::process::Child, String) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free port")
-        .port();
+    let (port, admin_port) = (free_port(), free_port());
     let file = scratch(test).join("tgin.yaml");
     std::fs::write(
         &file,
@@ -1311,6 +1355,7 @@ async fn spawn_tgin(
             r#"version: 1
 {runtime}
 server: {{ listen: ["127.0.0.1:{port}"] }}
+admin: {{ listen: ["127.0.0.1:{admin_port}"] }}
 bots:
   - name: hooked
     token: "{TOKEN}"
@@ -1329,7 +1374,7 @@ consumers:
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("tgin starts");
-    let base = format!("http://127.0.0.1:{port}");
+    let base = format!("http://127.0.0.1:{admin_port}");
     let http = client();
     let started = Instant::now();
     while started.elapsed() < PATIENCE {

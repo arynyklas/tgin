@@ -1,30 +1,35 @@
-//! The running process: the engine, the sources that feed it, the data
-//! plane, and the shutdown sequence.
+//! The running process: the engine, the sources that feed it, the data and
+//! admin planes, hot reload, and the shutdown sequence.
 
+use std::collections::BTreeSet;
+use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use axum::Router;
 use parking_lot::Mutex;
-use tgin_botapi::{ApiError, BotClient, BotUser, LongPollOptions, LongPollSource, SetWebhook};
-use tgin_core::config::{Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
+use tgin_botapi::ApiError;
+use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
-use tgin_core::ids::SourceId;
-use tgin_core::metrics::{CoreMetrics, SourceMetrics, SourceStateLabel};
-use tgin_runtime::backoff::{Backoff, honor_retry_after};
+use tgin_core::metrics::CoreMetrics;
+use tgin_runtime::config::Env;
 use tgin_runtime::http::{self, ClientOptions, RunningServer, ServerOptions, TlsFiles};
 use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, MetricsRegistry, Readiness};
-use tgin_runtime::secret::Secret;
-use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
+use tgin_runtime::secret::{Redactor, Secret};
+use tgin_runtime::supervisor::Supervisor;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::{VERSION, commit};
-use crate::data_server::{self, Probes};
+use crate::admin;
+use crate::cli::{LoadError, VERSION, commit};
+use crate::data_server::DataRoutes;
 use crate::exit::Outcome;
+use crate::reload::{self, ReloadQueue, Reloader, Request};
+use crate::sources::{Kind, Sources, source_task};
 
 /// How long the listeners and the supervised tasks get to finish once the
 /// drain has ended.
@@ -37,16 +42,12 @@ const SOURCES_CHECK: Duration = Duration::from_secs(1);
 const ENGINE: &str = "engine";
 /// The readiness component of the data plane.
 const DATA_PLANE: &str = "data_plane";
-/// The supervisor's task-name prefix of long-poll sources.
-const SOURCE_PREFIX: &str = "source:";
-/// The supervisor's task-name prefix of a webhook bot's background `getMe`.
-const IDENTITY_PREFIX: &str = "identity:";
-/// The backoff of a webhook bot's background `getMe`: `(initial, max, floor)`.
-const IDENTITY_BACKOFF: (Duration, Duration, Duration) = (
-    Duration::from_secs(1),
-    Duration::from_secs(300),
-    Duration::from_millis(100),
-);
+/// The readiness component of the admin plane.
+const ADMIN_PLANE: &str = "admin_plane";
+/// Open connections the admin plane allows.
+const ADMIN_MAX_CONNECTIONS: usize = 256;
+/// How long an admin client may take to send a request head.
+const ADMIN_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why tgin could not start.
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +59,47 @@ pub enum StartError {
     #[error("the engine has no source for bot `{0}`")]
     NoSource(String),
     #[error("the data plane could not start: {0}")]
-    Serve(std::io::Error),
+    Serve(io::Error),
+    #[error("the admin plane could not start: {0}")]
+    Admin(io::Error),
+}
+
+/// What tgin starts from: a loaded config and how to load it again.
+pub struct Boot {
+    pub cfg: Config,
+    /// The config file, which every reload reads again.
+    pub path: PathBuf,
+    /// The bytes `cfg` was loaded from. Once the config watcher runs, the
+    /// file is compared with them, so a change made before it began is
+    /// reloaded too.
+    pub loaded: Vec<u8>,
+    /// Resolves `${env:…}` and `${file:…}` references of reloaded configs.
+    pub env: Arc<dyn Env>,
+    /// Masks secrets in logs; reloads add the secrets of each new config.
+    pub redactor: Arc<ArcSwap<Redactor>>,
+}
+
+impl Boot {
+    /// Reads and loads the config file at `path`, resolving references with
+    /// `env`; the redactor masks the config's secrets.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, or its errors.
+    pub fn load(path: &Path, env: Arc<dyn Env>) -> Result<Self, LoadError> {
+        let loaded = std::fs::read(path).map_err(LoadError::Read)?;
+        let text = std::str::from_utf8(&loaded)
+            .map_err(|err| LoadError::Read(io::Error::new(io::ErrorKind::InvalidData, err)))?;
+        let cfg = config::load(text, path, &*env).map_err(LoadError::Invalid)?;
+        let redactor = Arc::new(ArcSwap::from_pointee(Redactor::new(secrets(&cfg))));
+        Ok(Self {
+            cfg,
+            path: path.to_owned(),
+            loaded,
+            env,
+            redactor,
+        })
+    }
 }
 
 /// Starts tgin and runs it until it shuts down, handling signals from the
@@ -68,12 +109,12 @@ pub enum StartError {
 /// # Errors
 ///
 /// The start failed, as for [`App::start`].
-pub async fn launch(cfg: Config, mut signals: Signals) -> Result<Outcome, StartError> {
+pub async fn launch(boot: Boot, mut signals: Signals) -> Result<Outcome, StartError> {
     let handles = Handles::new();
     let first = {
         // Dropping the start, when a signal wins, cancels the Bot API calls
         // it is waiting on.
-        let start = App::assemble(cfg, handles.clone());
+        let start = App::assemble(boot, handles.clone());
         tokio::select! {
             started = start => {
                 return match started {
@@ -84,13 +125,13 @@ pub async fn launch(cfg: Config, mut signals: Signals) -> Result<Outcome, StartE
                     }
                 };
             }
-            kind = next_terminating(&mut signals) => kind,
+            kind = next_terminating(&mut signals, &handles.reloads) => kind,
         }
     };
     tracing::info!(cause = ?first, "shutdown requested while starting; stopping what started");
     tokio::select! {
         biased;
-        kind = next_terminating(&mut signals) => {
+        kind = next_terminating(&mut signals, &handles.reloads) => {
             handles.force(kind).await;
             Ok(Outcome::Forced)
         }
@@ -98,23 +139,30 @@ pub async fn launch(cfg: Config, mut signals: Signals) -> Result<Outcome, StartE
     }
 }
 
-/// tgin, started: sources poll, the data plane serves, consumers deliver.
+/// tgin, started: sources poll, the data plane serves, consumers deliver,
+/// the admin plane answers and reloads apply.
 pub struct App {
     handles: Handles,
-    timing: ShutdownTiming,
-    health: Arc<Health>,
-    metrics: Arc<MetricsRegistry>,
-    engine: Arc<Engine>,
+    shared: Arc<Shared>,
     data_addrs: Vec<SocketAddr>,
-    /// The data plane's routes, which the listeners serve from the next
-    /// request on when replaced; `None` without a data plane.
-    routes: Option<Arc<ArcSwap<Router>>>,
-    probes: Probes,
-    /// The webhook sources' metrics, whose state follows the data plane.
-    webhook_metrics: Vec<SourceMetrics>,
-    /// Whether every source failing ends the process: only with long-poll
-    /// sources and no webhook, which could still deliver.
-    exit_when_sources_fail: bool,
+    admin_addrs: Vec<SocketAddr>,
+    /// The data plane's routes; `None` without a data plane.
+    routes: Option<Arc<DataRoutes>>,
+}
+
+/// What the admin plane and the reloads share with the app.
+pub(crate) struct Shared {
+    pub(crate) lifecycle: Arc<Lifecycle>,
+    pub(crate) health: Arc<Health>,
+    pub(crate) metrics: Arc<MetricsRegistry>,
+    pub(crate) core: CoreMetrics,
+    pub(crate) engine: Arc<Engine>,
+    pub(crate) supervisor: Arc<Supervisor>,
+    pub(crate) redactor: Arc<ArcSwap<Redactor>>,
+    /// The config in effect; a reload swaps it once the engine applied it.
+    pub(crate) config: ArcSwap<Config>,
+    pub(crate) sources: Sources,
+    pub(crate) reloads: ReloadQueue,
 }
 
 /// What a starting app shares with whoever stops it, so that a start cut
@@ -128,8 +176,16 @@ struct Handles {
     /// The data plane once it listens; taken by the shutdown, which waits
     /// for the listeners to stop.
     server: Arc<Mutex<Option<RunningServer>>>,
+    /// The admin plane once it listens; closed last.
+    admin: Arc<Mutex<Option<RunningServer>>>,
     /// The engine and its metrics once built.
     engine: Arc<OnceLock<(Arc<Engine>, CoreMetrics)>>,
+    reloads: ReloadQueue,
+    /// The queue's receiving end until the reload task takes it; requests
+    /// made while tgin starts wait there.
+    requests: Arc<Mutex<Option<mpsc::Receiver<Request>>>>,
+    /// Stops the reload task: no reload once the shutdown has begun.
+    stop_reloads: CancellationToken,
 }
 
 /// Why the shutdown started.
@@ -139,36 +195,37 @@ enum Cause {
     AllSourcesFailed,
 }
 
-/// A webhook bot, for its start-up calls.
-struct WebhookBot<'a> {
-    id: SourceId,
-    bot: &'a Bot,
-    hook: &'a Webhook,
-    client: BotClient,
-    metrics: SourceMetrics,
-}
-
 impl App {
-    /// Builds the engine, starts the data plane and the sources, registers
-    /// webhooks, and reports ready.
+    /// Builds the engine, starts the admin plane, the data plane and the
+    /// sources, registers webhooks, and reports ready.
     ///
     /// # Errors
     ///
     /// The engine cannot be built, a bot's API client cannot be set up, or
-    /// the data plane cannot listen. Nothing keeps running then.
-    pub async fn start(cfg: Config) -> Result<Self, StartError> {
+    /// the admin or data plane cannot listen. Nothing keeps running then.
+    pub async fn start(boot: Boot) -> Result<Self, StartError> {
         let handles = Handles::new();
-        let started = Self::assemble(cfg, handles.clone()).await;
+        let started = Self::assemble(boot, handles.clone()).await;
         if started.is_err() {
             handles.stop_now().await;
         }
         started
     }
 
-    async fn assemble(cfg: Config, handles: Handles) -> Result<Self, StartError> {
+    async fn assemble(boot: Boot, handles: Handles) -> Result<Self, StartError> {
+        let Boot {
+            cfg,
+            path,
+            loaded,
+            env,
+            redactor,
+        } = boot;
         let health = Arc::new(Health::default());
         let starting = || Readiness::NotReady("starting".to_owned());
         health.set(ENGINE, starting());
+        if !cfg.admin.listen.is_empty() {
+            health.set(ADMIN_PLANE, starting());
+        }
         if cfg.server.is_some() {
             health.set(DATA_PLANE, starting());
         }
@@ -194,155 +251,121 @@ impl App {
             },
         )?);
         // Set once, here: the slot is new with `handles`.
-        let _ = handles.engine.set((Arc::clone(&engine), core));
+        let _ = handles.engine.set((Arc::clone(&engine), core.clone()));
         health.set(ENGINE, Readiness::Ready);
 
-        // Source ids are the engine's, never config positions.
-        let mut long_polls = Vec::new();
-        let mut webhooks = Vec::new();
-        for bot in &cfg.bots {
-            let Some(ingress) = &bot.ingress else {
-                continue;
-            };
-            let (id, metrics) = engine_source(&engine, &bot.name)
-                .ok_or_else(|| StartError::NoSource(bot.name.clone()))?;
-            let api = BotClient::new(client.clone(), bot.api_url.expose(), &bot.token).map_err(
-                |source| StartError::Bot {
-                    bot: bot.name.clone(),
-                    source,
-                },
-            )?;
-            match ingress {
-                Ingress::LongPoll(poll) => long_polls.push((id, bot, poll, api, metrics)),
-                Ingress::Webhook(hook) => webhooks.push(WebhookBot {
-                    id,
-                    bot,
-                    hook,
-                    client: api,
-                    metrics,
-                }),
-            }
-        }
-
-        // Usernames first, so `/cmd@bot` rules match from the first update;
-        // a bot whose first `getMe` fails keeps trying in the background.
-        // The calls run at once: each may wait out the client's timeout.
-        let identities =
-            futures_util::future::join_all(webhooks.iter().map(|hook| hook.client.get_me())).await;
-        for (hook, identity) in webhooks.iter().zip(identities) {
-            match identity {
-                Ok(user) => engine.set_username(hook.id, user.username),
-                Err(err) => {
-                    tracing::warn!(
-                        source = %hook.bot.name,
-                        error = %err,
-                        "getMe failed; commands addressed to this bot by @username do not match until it succeeds"
-                    );
-                    learn_username(&supervisor, &engine, &ingest, &force, hook, &err);
-                }
-            }
-        }
-
-        let probes = Probes {
+        let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
+        let cfg = Arc::new(cfg);
+        let shared = Arc::new(Shared {
             lifecycle: Arc::clone(&handles.lifecycle),
             health: Arc::clone(&health),
+            metrics,
+            core,
+            engine: Arc::clone(&engine),
+            supervisor: Arc::clone(&supervisor),
+            redactor,
+            config: ArcSwap::new(Arc::clone(&cfg)),
+            sources: Sources::new(
+                Arc::clone(&engine),
+                Arc::clone(&supervisor),
+                Arc::clone(&health),
+                client,
+                ingest.clone(),
+                force,
+            ),
+            reloads: handles.reloads.clone(),
+        });
+
+        // Before any source starts, so the probes answer during a slow
+        // start.
+        let admin_addrs = if cfg.admin.listen.is_empty() {
+            Vec::new()
+        } else {
+            let opts = ServerOptions {
+                listen: cfg.admin.listen.clone(),
+                tls: None,
+                max_connections: ADMIN_MAX_CONNECTIONS,
+                header_read_timeout: ADMIN_HEADER_TIMEOUT,
+            };
+            let running = http::serve(admin::router(Arc::clone(&shared)), &opts)
+                .await
+                .map_err(StartError::Admin)?;
+            let addrs = running.local_addrs.clone();
+            *handles.admin.lock() = Some(running);
+            tracing::info!(listen = ?addrs, "admin plane listening");
+            health.set(ADMIN_PLANE, Readiness::Ready);
+            addrs
         };
-        let (routes, data_addrs) = match &cfg.server {
+
+        let sources = &shared.sources;
+        let mut prepared = Vec::new();
+        for bot in cfg.bots.iter().filter(|bot| bot.ingress.is_some()) {
+            prepared.push(sources.prepare(bot)?);
+        }
+        // Usernames first, so `/cmd@bot` rules match from the first update.
+        sources.identify(&prepared).await;
+
+        let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
-                let router = data_server::router(&cfg, server, &engine, &ingest, probes.clone());
-                let routes = Arc::new(ArcSwap::from_pointee(router));
+                let routes = Arc::new(DataRoutes::new(&cfg, server, &engine, &ingest));
+                let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
+                    cert: tls.cert_file.expose().clone(),
+                    key: tls.key_file.expose().clone(),
+                });
+                // Read before the server loads them: a change in between is
+                // only reloaded again.
+                let tls_bytes = match &tls_files {
+                    Some(files) => Some(reload::read_tls(files).await.map_err(StartError::Serve)?),
+                    None => None,
+                };
                 let opts = ServerOptions {
                     listen: server.listen.clone(),
-                    tls: server.tls.as_ref().map(|tls| TlsFiles {
-                        cert: tls.cert_file.expose().clone(),
-                        key: tls.key_file.expose().clone(),
-                    }),
+                    tls: tls_files,
                     max_connections: server.max_connections,
                     header_read_timeout: server.header_read_timeout,
                 };
-                let running = http::serve(data_server::delegating(Arc::clone(&routes)), &opts)
+                let running = http::serve(routes.service(), &opts)
                     .await
                     .map_err(StartError::Serve)?;
                 let data_addrs = running.local_addrs.clone();
+                let tls = running.tls().zip(tls_bytes);
                 *handles.server.lock() = Some(running);
                 tracing::info!(listen = ?data_addrs, "data plane listening");
                 health.set(DATA_PLANE, Readiness::Ready);
-                (Some(routes), data_addrs)
+                (Some(routes), data_addrs, tls)
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), None),
         };
 
-        for hook in &webhooks {
-            hook.metrics.set_state(SourceStateLabel::Running);
-            if hook.hook.register {
-                register(hook).await;
-            } else {
-                tracing::info!(source = %hook.bot.name, "webhook served; not registered with Telegram (register: false)");
-            }
-            health.set(&source_task(&hook.bot.name), Readiness::Ready);
+        let (long_polls, webhooks): (Vec<_>, Vec<_>) = prepared
+            .into_iter()
+            .partition(|bot| bot.kind() == Some(Kind::LongPoll));
+        sources.start_webhooks(webhooks).await;
+        for bot in long_polls {
+            sources.start_long_poll(bot);
         }
 
-        for (id, bot, poll, api, metrics) in long_polls {
-            let name: Arc<str> = Arc::from(bot.name.as_str());
-            let identity_engine = Arc::clone(&engine);
-            let source = Arc::new(LongPollSource::new(
-                id,
-                Arc::clone(&name),
-                api,
-                LongPollOptions {
-                    timeout: poll.timeout,
-                    limit: poll.limit,
-                    allowed_updates: poll.allowed_updates.clone(),
-                    delete_webhook_on_start: poll.delete_webhook_on_start,
-                    ..LongPollOptions::default()
-                },
-                Arc::clone(&engine),
-                metrics,
-                Arc::new(move |id: SourceId, user: &BotUser| {
-                    identity_engine.set_username(id, user.username.clone());
-                }),
-            ));
-            let ingest = ingest.clone();
-            // The supervisor's token aborts; the source stops on `ingest`
-            // by itself.
-            supervisor.spawn(
-                Arc::from(source_task(&name)),
-                Backoff::new(
-                    Duration::from_secs(1),
-                    Duration::from_secs(60),
-                    Duration::ZERO,
-                ),
-                force.clone(),
-                move || {
-                    let source = Arc::clone(&source);
-                    let ingest = ingest.clone();
-                    async move { source.run(ingest).await }
-                },
-            );
-            health.set(&source_task(&name), Readiness::Ready);
-        }
-
-        let long_poll_sources = cfg
-            .bots
-            .iter()
-            .filter(|bot| matches!(bot.ingress, Some(Ingress::LongPoll(_))))
-            .count();
         handles.lifecycle.set_running();
         tracing::info!(version = VERSION, "tgin started");
+
+        if let Some(requests) = handles.requests.lock().take() {
+            let reloader = Reloader {
+                shared: Arc::clone(&shared),
+                routes: routes.clone(),
+                tls,
+                path,
+                env,
+                loaded,
+                secrets: known_secrets,
+            };
+            tokio::spawn(reloader.run(requests, handles.stop_reloads.clone()));
+        }
         Ok(Self {
-            timing: ShutdownTiming {
-                lame_duck: cfg.runtime.lame_duck,
-                grace: cfg.runtime.shutdown_grace,
-            },
-            exit_when_sources_fail: long_poll_sources > 0 && webhooks.is_empty(),
-            webhook_metrics: webhooks.into_iter().map(|hook| hook.metrics).collect(),
             handles,
-            health,
-            metrics,
-            engine,
+            shared,
             data_addrs,
+            admin_addrs,
             routes,
-            probes,
         })
     }
 
@@ -352,14 +375,25 @@ impl App {
         &self.data_addrs
     }
 
+    /// The admin plane's bound addresses, in `admin.listen` order; empty
+    /// without an admin plane.
+    pub fn admin_addrs(&self) -> &[SocketAddr] {
+        &self.admin_addrs
+    }
+
     /// The process's metrics.
     pub fn metrics(&self) -> Arc<MetricsRegistry> {
-        Arc::clone(&self.metrics)
+        Arc::clone(&self.shared.metrics)
     }
 
     /// The readiness of every component.
     pub fn health(&self) -> Arc<Health> {
-        Arc::clone(&self.health)
+        Arc::clone(&self.shared.health)
+    }
+
+    /// What masks secrets in logs, current with the last reload.
+    pub fn redactor(&self) -> Arc<ArcSwap<Redactor>> {
+        Arc::clone(&self.shared.redactor)
     }
 
     /// The data plane's open connections.
@@ -377,18 +411,19 @@ impl App {
             return false;
         };
         let ingest = self.handles.lifecycle.ingest_token();
-        let router = data_server::router(cfg, server, &self.engine, &ingest, self.probes.clone());
-        routes.store(Arc::new(router));
+        routes.rebuild(cfg, server, &self.shared.engine, &ingest);
         true
     }
 
     /// Runs until a terminating signal (or every source failing), then
-    /// drains and shuts down. A further terminating signal forces the exit;
-    /// when the shutdown began because every source failed, it takes two.
+    /// drains and shuts down. SIGHUP reloads the config. A further
+    /// terminating signal forces the exit; when the shutdown began because
+    /// every source failed, it takes two.
     pub async fn run(self, mut signals: Signals) -> Outcome {
+        let reloads = self.handles.reloads.clone();
         let cause = tokio::select! {
-            kind = next_terminating(&mut signals) => Cause::Signal(kind),
-            () = all_sources_failed(&self.handles.supervisor, self.exit_when_sources_fail) => Cause::AllSourcesFailed,
+            kind = next_terminating(&mut signals, &reloads) => Cause::Signal(kind),
+            () = all_sources_failed(&self.shared.sources) => Cause::AllSourcesFailed,
         };
         let mut escalate = matches!(cause, Cause::Signal(_));
         let shutdown = self.shutdown(cause);
@@ -396,7 +431,7 @@ impl App {
         let forced = loop {
             tokio::select! {
                 outcome = &mut shutdown => return outcome,
-                kind = next_terminating(&mut signals) => {
+                kind = next_terminating(&mut signals, &reloads) => {
                     if escalate {
                         break kind;
                     }
@@ -409,16 +444,24 @@ impl App {
         Outcome::Forced
     }
 
-    /// The drain: readiness off, lame duck, ingest off, queues drained (or
-    /// the grace spent), listeners and tasks closed.
+    /// The drain: readiness off and reloads refused, lame duck, ingest off,
+    /// queues drained (or the grace spent), data plane and tasks closed,
+    /// then the admin plane.
     async fn shutdown(&self, cause: Cause) -> Outcome {
+        let runtime = &self.shared.config.load().runtime;
+        let timing = ShutdownTiming {
+            lame_duck: runtime.lame_duck,
+            grace: runtime.shutdown_grace,
+        };
         let (timing, outcome) = match cause {
-            Cause::Signal(kind) => (self.timing.for_signal(kind), Outcome::Clean),
-            Cause::AllSourcesFailed => (self.timing, Outcome::AllSourcesFailed),
+            Cause::Signal(kind) => (timing.for_signal(kind), Outcome::Clean),
+            Cause::AllSourcesFailed => (timing, Outcome::AllSourcesFailed),
         };
         let lifecycle = &self.handles.lifecycle;
+        let engine = &self.shared.engine;
         let serving = !self.data_addrs.is_empty();
         lifecycle.begin_drain();
+        self.handles.stop_reloads.cancel();
         match cause {
             Cause::Signal(kind) => tracing::info!(
                 cause = ?kind,
@@ -437,32 +480,24 @@ impl App {
             tokio::time::sleep(timing.lame_duck).await;
         }
         lifecycle.ingest_token().cancel();
-        for metrics in &self.webhook_metrics {
-            metrics.set_state(SourceStateLabel::Stopped);
-        }
-        self.engine.begin_drain();
+        self.shared.sources.webhooks_stopped();
+        engine.begin_drain();
         let drained = tokio::time::timeout(timing.grace, async {
-            while self.engine.pending() > 0 {
+            while engine.pending() > 0 {
                 tokio::time::sleep(DRAIN_POLL).await;
             }
         })
         .await
         .is_ok();
         if !drained {
-            tracing::warn!(pending = self.engine.pending(), grace = ?timing.grace, "the queues did not drain within the shutdown grace");
+            tracing::warn!(pending = engine.pending(), grace = ?timing.grace, "the queues did not drain within the shutdown grace");
         }
 
         self.handles.stop.cancel();
         let deadline = Instant::now() + CLOSE_GRACE;
         let server = self.handles.server.lock().take();
         if let Some(server) = server {
-            server.graceful_shutdown(CLOSE_GRACE);
-            if tokio::time::timeout_at(deadline, server.wait())
-                .await
-                .is_err()
-            {
-                tracing::warn!("the data plane did not close within its grace");
-            }
+            close(server, CLOSE_GRACE, deadline, "data").await;
         }
         let aborted = self.handles.supervisor.shutdown(deadline).await;
         lifecycle.force_token().cancel();
@@ -473,18 +508,41 @@ impl App {
             );
         }
         self.handles.finish();
+        // Last, so that the probes and the status answer during the drain.
+        let admin = self.handles.admin.lock().take();
+        if let Some(admin) = admin {
+            close(admin, CLOSE_GRACE, Instant::now() + CLOSE_GRACE, "admin").await;
+        }
         outcome
+    }
+}
+
+/// Stops `server` accepting, gives its connections `grace`, and waits for
+/// it until `deadline`.
+async fn close(server: RunningServer, grace: Duration, deadline: Instant, plane: &str) {
+    server.graceful_shutdown(grace);
+    if tokio::time::timeout_at(deadline, server.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(plane, "a listener did not close within its grace");
     }
 }
 
 impl Handles {
     fn new() -> Self {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let (reloads, requests) = ReloadQueue::new(Arc::clone(&lifecycle));
         Self {
-            lifecycle: Arc::new(Lifecycle::new()),
+            lifecycle,
             stop: CancellationToken::new(),
             supervisor: Arc::new(Supervisor::new()),
             server: Arc::new(Mutex::new(None)),
+            admin: Arc::new(Mutex::new(None)),
             engine: Arc::new(OnceLock::new()),
+            reloads,
+            requests: Arc::new(Mutex::new(Some(requests))),
+            stop_reloads: CancellationToken::new(),
         }
     }
 
@@ -493,19 +551,18 @@ impl Handles {
     /// For a start that failed or was cut short.
     async fn stop_now(&self) {
         self.lifecycle.begin_drain();
+        self.stop_reloads.cancel();
         self.lifecycle.ingest_token().cancel();
         self.stop.cancel();
         self.lifecycle.force_token().cancel();
         let deadline = Instant::now() + CLOSE_GRACE;
         let server = self.server.lock().take();
         if let Some(server) = server {
-            server.graceful_shutdown(Duration::ZERO);
-            if tokio::time::timeout_at(deadline, server.wait())
-                .await
-                .is_err()
-            {
-                tracing::warn!("the data plane did not close within its grace");
-            }
+            close(server, Duration::ZERO, deadline, "data").await;
+        }
+        let admin = self.admin.lock().take();
+        if let Some(admin) = admin {
+            close(admin, Duration::ZERO, deadline, "admin").await;
         }
         self.supervisor.shutdown(deadline).await;
         self.finish();
@@ -514,11 +571,14 @@ impl Handles {
     /// A second signal: stop everything now.
     async fn force(&self, kind: SignalKind) {
         tracing::warn!(cause = ?kind, "second shutdown signal; exiting without completing the drain");
+        self.stop_reloads.cancel();
         self.lifecycle.force_token().cancel();
         self.lifecycle.ingest_token().cancel();
         self.stop.cancel();
-        if let Some(server) = self.server.lock().take() {
-            server.graceful_shutdown(Duration::ZERO);
+        for server in [&self.server, &self.admin] {
+            if let Some(server) = server.lock().take() {
+                server.graceful_shutdown(Duration::ZERO);
+            }
         }
         self.supervisor.shutdown(Instant::now()).await;
         self.finish();
@@ -596,172 +656,24 @@ pub(crate) fn webhook_secret(bot: &Bot, hook: &Webhook) -> Option<Secret<String>
     }
 }
 
-/// The supervisor's name of a bot's source, also its readiness component.
-fn source_task(bot: &str) -> String {
-    format!("{SOURCE_PREFIX}{bot}")
-}
-
-/// The engine's id and metrics of the bot `name`.
-fn engine_source(engine: &Engine, name: &str) -> Option<(SourceId, SourceMetrics)> {
-    let id = engine.source_id(name)?;
-    let state = engine.state();
-    let info = state.sources.get(usize::from(id.0))?.as_ref()?;
-    Some((id, info.metrics.clone()))
-}
-
-/// The server's `retry_after`, if it sent one.
-fn retry_after(err: &ApiError) -> Option<Duration> {
-    match err {
-        ApiError::Http { retry_after, .. } => *retry_after,
-        _ => None,
-    }
-}
-
-/// After the first `getMe` of a webhook bot failed with `first`, keeps
-/// calling it in the background, backing off from 1 s to 5 min, until it
-/// succeeds (the username then goes to the engine), Telegram rejects the
-/// token, or ingest stops.
-fn learn_username(
-    supervisor: &Supervisor,
-    engine: &Arc<Engine>,
-    ingest: &CancellationToken,
-    force: &CancellationToken,
-    hook: &WebhookBot<'_>,
-    first: &ApiError,
-) {
-    if tgin_botapi::is_fatal(first) {
-        return;
-    }
-    let (id, name) = (hook.id, Arc::<str>::from(hook.bot.name.as_str()));
-    let (engine, client, ingest) = (Arc::clone(engine), hook.client.clone(), ingest.clone());
-    let first_retry_after = retry_after(first);
-    supervisor.spawn(
-        Arc::from(format!("{IDENTITY_PREFIX}{name}")),
-        Backoff::new(
-            Duration::from_secs(1),
-            Duration::from_secs(60),
-            Duration::ZERO,
-        ),
-        force.clone(),
-        move || {
-            let (engine, client, ingest, name) = (
-                Arc::clone(&engine),
-                client.clone(),
-                ingest.clone(),
-                Arc::clone(&name),
-            );
-            async move {
-                let (initial, max, floor) = IDENTITY_BACKOFF;
-                let mut backoff = Backoff::new(initial, max, floor);
-                let mut server_wait = first_retry_after;
-                loop {
-                    let delay = honor_retry_after(
-                        backoff.next_delay(&mut rand::rng()),
-                        server_wait,
-                        max,
-                    );
-                    let sleep = tokio::time::sleep(delay);
-                    if ingest.run_until_cancelled(sleep).await.is_none() {
-                        return Exit::Done;
-                    }
-                    match ingest.run_until_cancelled(client.get_me()).await {
-                        None => return Exit::Done,
-                        Some(Ok(user)) => {
-                            tracing::info!(source = %name, "getMe succeeded; commands addressed to this bot by @username match");
-                            engine.set_username(id, user.username);
-                            return Exit::Done;
-                        }
-                        Some(Err(err)) if tgin_botapi::is_fatal(&err) => {
-                            tracing::warn!(source = %name, error = %err, "Telegram rejected the bot token; no longer calling getMe");
-                            return Exit::Done;
-                        }
-                        Some(Err(err)) => {
-                            tracing::debug!(source = %name, error = %err, "getMe failed again");
-                            server_wait = retry_after(&err);
-                        }
-                    }
-                }
-            }
-        },
-    );
-}
-
-/// Calls `setWebhook` for `hook`. A failure is logged, not fatal: Telegram
-/// may still have the webhook from an earlier run.
-async fn register(hook: &WebhookBot<'_>) {
-    let name = &hook.bot.name;
-    let Some(public_url) = &hook.hook.public_url else {
-        return;
-    };
-    let joined = format!(
-        "{}{}",
-        public_url.expose().as_str().trim_end_matches('/'),
-        hook.hook.path.expose()
-    );
-    let Ok(url) = url::Url::parse(&joined) else {
-        tracing::error!(source = %name, "the webhook URL (public_url + path) is not a valid URL; not registering");
-        return;
-    };
-    let certificate = match &hook.hook.certificate_file {
-        Some(file) => match tokio::fs::read(file.expose()).await {
-            Ok(pem) => Some(pem.into()),
-            Err(err) => {
-                tracing::error!(source = %name, file = ?file, error = %err, "reading the webhook certificate failed; not registering");
-                return;
-            }
-        },
-        None => None,
-    };
-    let request = SetWebhook {
-        url,
-        secret_token: webhook_secret(hook.bot, hook.hook),
-        allowed_updates: hook.hook.allowed_updates.clone(),
-        max_connections: hook.hook.max_connections,
-        drop_pending_updates: hook.hook.drop_pending_updates,
-        ip_address: hook.hook.ip_address,
-        certificate,
-    };
-    match tgin_botapi::register(&hook.client, &request).await {
-        Ok(()) => {
-            tracing::info!(source = %name, url = ?public_url, "webhook registered with Telegram")
-        }
-        Err(err) => {
-            tracing::error!(source = %name, error = %err, "setWebhook failed; Telegram may not deliver updates")
-        }
-    }
-}
-
-/// The next signal that asks to shut down. Never returns once the signal
-/// stream has ended.
-async fn next_terminating(signals: &mut Signals) -> SignalKind {
+/// The next signal that asks to shut down; SIGHUP on the way queues a
+/// reload. Never returns once the signal stream has ended.
+async fn next_terminating(signals: &mut Signals, reloads: &ReloadQueue) -> SignalKind {
     loop {
         match signals.recv().await {
             Some(kind) if kind.is_terminating() => return kind,
-            Some(kind) => {
-                tracing::debug!(signal = ?kind, "ignoring the signal; config reload is not available yet");
-            }
+            Some(_) => reloads.signal(),
             None => std::future::pending().await,
         }
     }
 }
 
-/// Returns once every supervised source has failed for good, checking each
-/// second; never when `enabled` is false.
-async fn all_sources_failed(supervisor: &Supervisor, enabled: bool) {
-    if !enabled {
-        return std::future::pending().await;
-    }
+/// Returns once every source has failed for good, checking each second.
+async fn all_sources_failed(sources: &Sources) {
     let mut ticks = tokio::time::interval(SOURCES_CHECK);
     loop {
         ticks.tick().await;
-        let states = supervisor.states();
-        let mut sources = states
-            .iter()
-            .filter(|(name, _)| name.starts_with(SOURCE_PREFIX))
-            .peekable();
-        if sources.peek().is_some()
-            && sources.all(|(_, state)| matches!(state, TaskState::Failed { .. }))
-        {
+        if sources.all_failed() {
             return;
         }
     }

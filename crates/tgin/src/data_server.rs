@@ -1,10 +1,9 @@
-//! The data plane's routes: webhook ingress, the Bot-API-shaped pull
-//! endpoints (`/c/{consumer}/getUpdates` and each alias) and, until the admin
-//! plane takes them, `/livez` and `/readyz`.
+//! The data plane's routes: webhook ingress and the Bot-API-shaped pull
+//! endpoints (`/c/{consumer}/getUpdates` and each alias).
 //!
-//! The listeners serve [`delegating`], which hands every request to the
-//! router current in an `ArcSwap`, so routes can change without restarting
-//! the listeners.
+//! The listeners serve [`DataRoutes::service`], which hands every request to
+//! the router current in an `ArcSwap`, so a reload can change the routes
+//! without restarting the listeners.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -23,13 +22,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use http_body::{Frame, SizeHint};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
 use tgin_core::consumer::pull::PollRequest;
 use tgin_core::engine::Engine;
-use tgin_runtime::lifecycle::{Lifecycle, Phase};
-use tgin_runtime::obs::{Health, Readiness};
 use tgin_runtime::queue::HolderId;
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio_util::sync::CancellationToken;
@@ -52,26 +50,92 @@ const INSTANCE_HEADER: &str = "x-tgin-instance";
 /// The longest instance name.
 const MAX_INSTANCE_LEN: usize = 64;
 
-/// What the probes report on.
-#[derive(Clone)]
-pub(crate) struct Probes {
-    pub(crate) lifecycle: Arc<Lifecycle>,
-    pub(crate) health: Arc<Health>,
+/// The pull consumers a router serves, by name, each with its bearer token
+/// if it has one.
+pub(crate) type PullAuth = HashMap<Arc<str>, Option<Secret<String>>>;
+
+/// The data plane's current routes, and the pull consumers they serve.
+pub(crate) struct DataRoutes {
+    routes: Arc<ArcSwap<Router>>,
+    auth: Mutex<PullAuth>,
 }
 
-/// The data plane's routes for `cfg`, served by `engine`. Webhook routes
-/// answer 503 once `ingest` is cancelled.
-pub(crate) fn router(
+impl DataRoutes {
+    /// The routes of `cfg`, served by `engine`. Webhook routes answer 503
+    /// once `ingest` is cancelled.
+    pub(crate) fn new(
+        cfg: &Config,
+        server: &Server,
+        engine: &Arc<Engine>,
+        ingest: &CancellationToken,
+    ) -> Self {
+        let auth = pull_auth(cfg, &PullAuth::new(), engine);
+        let router = router(cfg, server, engine, ingest, auth.clone());
+        Self {
+            routes: Arc::new(ArcSwap::from_pointee(router)),
+            auth: Mutex::new(auth),
+        }
+    }
+
+    /// What the listeners serve: the current routes, swapped in by
+    /// [`DataRoutes::rebuild`].
+    pub(crate) fn service(&self) -> Router {
+        delegating(Arc::clone(&self.routes))
+    }
+
+    /// Builds the routes of `cfg` against the engine as it is now and serves
+    /// them from the next request on; requests already running finish on
+    /// the old routes.
+    ///
+    /// A pull consumer that `cfg` no longer has is still served, with the
+    /// token it had, while the engine drains it, so its clients can fetch
+    /// and ack what it holds; it is dropped from the routes at the first
+    /// rebuild after its drain.
+    pub(crate) fn rebuild(
+        &self,
+        cfg: &Config,
+        server: &Server,
+        engine: &Arc<Engine>,
+        ingest: &CancellationToken,
+    ) {
+        let mut current = self.auth.lock();
+        let auth = pull_auth(cfg, &current, engine);
+        self.routes
+            .store(Arc::new(router(cfg, server, engine, ingest, auth.clone())));
+        *current = auth;
+    }
+}
+
+/// The pull consumers of `cfg` with their tokens, plus those of `previous`
+/// that `cfg` dropped but `engine` still drains, with the token they had.
+fn pull_auth(cfg: &Config, previous: &PullAuth, engine: &Engine) -> PullAuth {
+    let mut auth: PullAuth = cfg
+        .consumers
+        .iter()
+        .filter_map(|consumer| match &consumer.kind {
+            ConsumerKind::Pull(pull) => {
+                Some((Arc::from(consumer.name.as_str()), pull.auth_token.clone()))
+            }
+            ConsumerKind::Push(_) => None,
+        })
+        .collect();
+    for (name, token) in previous {
+        if !auth.contains_key(name) && engine.pull_consumer(name).is_some() {
+            auth.insert(Arc::clone(name), token.clone());
+        }
+    }
+    auth
+}
+
+/// The routes of `cfg`; `auth` lists the pull consumers served.
+fn router(
     cfg: &Config,
     server: &Server,
     engine: &Arc<Engine>,
     ingest: &CancellationToken,
-    probes: Probes,
+    auth: PullAuth,
 ) -> Router {
-    let mut router = Router::new()
-        .route("/livez", get(livez))
-        .route("/readyz", get(readyz).with_state(probes));
-
+    let mut router = Router::new();
     for bot in &cfg.bots {
         let Some(Ingress::Webhook(hook)) = &bot.ingress else {
             continue;
@@ -108,14 +172,12 @@ pub(crate) fn router(
         router = router.merge(with_timeout(webhook, WEBHOOK_REQUEST_TIMEOUT));
     }
 
-    let mut auth = HashMap::new();
     let mut aliases = Vec::new();
     for consumer in &cfg.consumers {
         let ConsumerKind::Pull(pull) = &consumer.kind else {
             continue;
         };
         let name: Arc<str> = Arc::from(consumer.name.as_str());
-        auth.insert(Arc::clone(&name), pull.auth_token.clone());
         for alias in &pull.aliases {
             aliases.push((alias.expose().clone(), Arc::clone(&name)));
         }
@@ -137,7 +199,7 @@ pub(crate) fn router(
 
 /// A router that hands every request to the router current in `routes`;
 /// requests already running finish on the router they started on.
-pub(crate) fn delegating(routes: Arc<ArcSwap<Router>>) -> Router {
+fn delegating(routes: Arc<ArcSwap<Router>>) -> Router {
     Router::new().fallback_service(Delegate(routes))
 }
 
@@ -170,45 +232,12 @@ async fn request_timeout(State(timeout): State<Duration>, req: Request, next: Ne
     }
 }
 
-async fn livez() -> &'static str {
-    "ok"
-}
-
-/// 200 while running with every component ready, else 503; the body lists
-/// each component's readiness.
-async fn readyz(State(probes): State<Probes>) -> Response {
-    let (components_ready, components) = probes.health.ready();
-    let phase = probes.lifecycle.phase();
-    let ready = phase == Phase::Running && components_ready;
-    let components: serde_json::Map<String, Value> = components
-        .into_iter()
-        .map(|(name, readiness)| {
-            let shown = match readiness {
-                Readiness::Ready => "ready".to_owned(),
-                Readiness::NotReady(reason) => reason,
-            };
-            (name, Value::from(shown))
-        })
-        .collect();
-    let body = json!({
-        "ready": ready,
-        "phase": format!("{phase:?}").to_lowercase(),
-        "components": components,
-    });
-    let status = if ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, axum::Json(body)).into_response()
-}
-
 /// The pull consumers the data plane serves.
 struct PullRoutes {
     engine: Arc<Engine>,
-    /// Every pull consumer of the config, with its bearer token if it has
-    /// one. A consumer not listed is not served.
-    auth: HashMap<Arc<str>, Option<Secret<String>>>,
+    /// The pull consumers served, each with its bearer token if it has one;
+    /// a consumer not listed is not served.
+    auth: PullAuth,
     trusted_proxies: Vec<IpNet>,
 }
 
@@ -285,8 +314,9 @@ impl PullRoutes {
     }
 }
 
-/// Whether `headers` carry `Authorization: Bearer <expected>`.
-fn bearer_matches(headers: &HeaderMap, expected: &Secret<String>) -> bool {
+/// Whether `headers` carry `Authorization: Bearer <expected>`; the token
+/// is compared in constant time.
+pub(crate) fn bearer_matches(headers: &HeaderMap, expected: &Secret<String>) -> bool {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return false;
     };

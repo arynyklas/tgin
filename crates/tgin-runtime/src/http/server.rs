@@ -63,7 +63,7 @@ impl Default for ServerOptions {
 pub struct RunningServer {
     /// Bound addresses, in the order of [`ServerOptions::listen`].
     pub local_addrs: Vec<SocketAddr>,
-    tls: Option<Tls>,
+    tls: Option<ServerTls>,
     permits: Arc<Semaphore>,
     max_connections: usize,
     /// One per listener. A graceful-shutdown signal latches in its `Handle`,
@@ -72,11 +72,25 @@ pub struct RunningServer {
     tasks: Vec<JoinHandle<()>>,
 }
 
-struct Tls {
-    /// Shared by every listener's acceptor; a reload swaps the certificate
-    /// for all of them.
-    config: RustlsConfig,
-    files: TlsFiles,
+/// The certificate of a TLS server, shared by every listener's acceptor; a
+/// reload swaps it for all of them. Cloning shares it.
+#[derive(Clone)]
+pub struct ServerTls(RustlsConfig);
+
+impl ServerTls {
+    /// Loads the certificate and key from `files`, which may differ from the
+    /// files the server started with. New handshakes on every listener
+    /// present the new certificate; open connections keep the old one.
+    ///
+    /// # Errors
+    ///
+    /// The files cannot be loaded; the previous certificate then stays in
+    /// use.
+    pub async fn reload(&self, files: &TlsFiles) -> io::Result<()> {
+        let reloaded = load_tls(files).await?;
+        self.0.reload_from_config(reloaded.get_inner());
+        Ok(())
+    }
 }
 
 /// Binds every address in `opts.listen`, then serves `router` on each, with
@@ -99,10 +113,7 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
     }
 
     let tls = match &opts.tls {
-        Some(files) => Some(Tls {
-            config: load_tls(files).await?,
-            files: files.clone(),
-        }),
+        Some(files) => Some(ServerTls(load_tls(files).await?)),
         None => None,
     };
 
@@ -139,7 +150,7 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
             // cannot fail.
             match &tls {
                 Some(tls) => {
-                    let acceptor = RustlsAcceptor::new(tls.config.clone()).acceptor(limit);
+                    let acceptor = RustlsAcceptor::new(tls.0.clone()).acceptor(limit);
                     let server = harden(server.acceptor(acceptor), opts.header_read_timeout);
                     tokio::spawn(async move {
                         let _ = server.serve(make_service).await;
@@ -166,22 +177,9 @@ pub async fn serve(router: Router, opts: &ServerOptions) -> io::Result<RunningSe
 }
 
 impl RunningServer {
-    /// Reloads the certificate and key from the configured files. New
-    /// handshakes on every listener present the new certificate; open
-    /// connections keep the old one.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the server runs without TLS or the files cannot be loaded; the
-    /// previous certificate then stays in use.
-    pub async fn reload_tls(&self) -> io::Result<()> {
-        let tls = self
-            .tls
-            .as_ref()
-            .ok_or_else(|| invalid_input("the server runs without TLS"))?;
-        let reloaded = load_tls(&tls.files).await?;
-        tls.config.reload_from_config(reloaded.get_inner());
-        Ok(())
+    /// The server's certificate, to reload; `None` without TLS.
+    pub fn tls(&self) -> Option<ServerTls> {
+        self.tls.clone()
     }
 
     /// Stops accepting on every listener and lets open connections finish;
@@ -276,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_tls_without_tls_fails() {
+    async fn plain_server_has_no_tls_to_reload() {
         let server = serve(
             Router::new(),
             &ServerOptions {
@@ -286,7 +284,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = server.reload_tls().await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(server.tls().is_none());
     }
 }

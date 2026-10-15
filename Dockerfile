@@ -46,5 +46,10 @@ EXPOSE 8080 9090
 
 # Mount the config here, or point TGIN_CONFIG (or `-c`) elsewhere.
 ENV TGIN_CONFIG=/etc/tgin/tgin.yaml
+# `tgin admin health` asks the admin plane's /readyz (default
+# http://127.0.0.1:9090, the admin.listen default); exec form, as
+# distroless has no shell.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/tgin", "admin", "health"]
 ENTRYPOINT ["/usr/local/bin/tgin"]
 CMD []

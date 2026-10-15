@@ -1,5 +1,5 @@
-//! The command line: `tgin [run]`, `tgin config validate|schema|print` and
-//! `tgin version`.
+//! The command line: `tgin [run]`, `tgin config validate|schema|print`,
+//! `tgin admin …` and `tgin version`.
 
 use std::borrow::Cow;
 use std::ffi::OsString;
@@ -16,8 +16,10 @@ use tgin_runtime::config::{ConfigError, OsEnv};
 use tgin_runtime::lifecycle::Signals;
 use tgin_runtime::obs::{LogFormat, LogOptions, init_tracing};
 use tgin_runtime::secret::Redactor;
+use url::Url;
 
-use crate::app;
+use crate::admin::client::{self, Action};
+use crate::app::{self, Boot};
 use crate::exit;
 
 /// The tgin version.
@@ -68,8 +70,52 @@ enum Command {
     /// Check, print or describe config files.
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Talk to a running tgin through its admin API.
+    Admin(AdminArgs),
     /// Print the version.
     Version,
+}
+
+#[derive(Debug, Args)]
+struct AdminArgs {
+    /// The admin API.
+    #[arg(
+        long,
+        env = "TGIN_ADMIN_URL",
+        default_value = client::DEFAULT_URL,
+        value_parser = client::parse_url,
+        value_name = "URL"
+    )]
+    url: Url,
+    /// A file holding the admin token (`admin.token`).
+    #[arg(long, env = "TGIN_ADMIN_TOKEN_FILE", value_name = "PATH")]
+    token_file: Option<PathBuf>,
+    /// Print the API's JSON instead of tables.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    action: AdminCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    /// Show the sources, consumers and config generation.
+    Status,
+    /// Reload the config file.
+    Reload,
+    /// Show the consumers.
+    Consumers,
+    /// Stop handing out a consumer's updates; it still queues them.
+    Pause { name: String },
+    /// Hand out a paused consumer's updates again.
+    Resume { name: String },
+    /// Let a consumer's pollers wind down: polls on an empty queue return
+    /// at once.
+    Drain { name: String },
+    /// Drop a consumer's queued updates.
+    Purge { name: String },
+    /// Exit 0 when tgin is ready, else 1 (for container health checks).
+    Health,
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,6 +136,7 @@ pub enum Invocation {
     Schema,
     Print(PathBuf),
     Version,
+    Admin(client::Command),
     /// The 0.2 `-f/--file` flag with its value.
     LegacyFile(PathBuf),
 }
@@ -115,6 +162,21 @@ where
         Some(Command::Config(ConfigCommand::Schema)) => Invocation::Schema,
         Some(Command::Config(ConfigCommand::Print { path })) => Invocation::Print(path),
         Some(Command::Version) => Invocation::Version,
+        Some(Command::Admin(admin)) => Invocation::Admin(client::Command {
+            url: admin.url,
+            token_file: admin.token_file,
+            json: admin.json,
+            action: match admin.action {
+                AdminCommand::Status => Action::Status,
+                AdminCommand::Reload => Action::Reload,
+                AdminCommand::Consumers => Action::Consumers,
+                AdminCommand::Pause { name } => Action::Pause(name),
+                AdminCommand::Resume { name } => Action::Resume(name),
+                AdminCommand::Drain { name } => Action::Drain(name),
+                AdminCommand::Purge { name } => Action::Purge(name),
+                AdminCommand::Health => Action::Health,
+            },
+        }),
     })
 }
 
@@ -149,6 +211,7 @@ where
             println!("{}", version());
             exit::OK
         }
+        Invocation::Admin(command) => client::run(&command),
         Invocation::LegacyFile(file) => {
             eprintln!(
                 "tgin 1.0 reads YAML; convert with: tgin config migrate {} -o tgin.yaml",
@@ -251,15 +314,14 @@ fn print(path: &Path) -> u8 {
 /// `tgin run`: loads the config, starts logging and the runtime, runs the
 /// app until it shuts down and returns its exit code.
 fn run(path: &Path) -> u8 {
-    let cfg = match load(path) {
-        Ok(cfg) => cfg,
+    let boot = match Boot::load(path, Arc::new(OsEnv)) {
+        Ok(boot) => boot,
         Err(err) => {
             report(path, &err);
             return exit::FAILURE;
         }
     };
-
-    let redactor = Arc::new(ArcSwap::from_pointee(Redactor::new(app::secrets(&cfg))));
+    let cfg = &boot.cfg;
     let log = LogOptions {
         level: level_name(cfg.log.level).to_owned(),
         format: match cfg.log.format {
@@ -267,7 +329,7 @@ fn run(path: &Path) -> u8 {
             config::LogFormat::Json => LogFormat::Json,
         },
     };
-    if let Err(err) = init_tracing(&log, redacting(redactor)) {
+    if let Err(err) = init_tracing(&log, redacting(Arc::clone(&boot.redactor))) {
         eprintln!("tgin: {err}");
         return exit::FAILURE;
     }
@@ -303,7 +365,7 @@ fn run(path: &Path) -> u8 {
         for (kind, err) in signals.failed() {
             tracing::warn!(signal = ?kind, error = %err, "a signal listener could not be registered; that signal is not handled");
         }
-        match app::launch(cfg, signals).await {
+        match app::launch(boot, signals).await {
             Ok(outcome) => outcome.code(),
             Err(err) => {
                 tracing::error!(error = %err, "tgin could not start");
