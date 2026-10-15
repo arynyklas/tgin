@@ -50,15 +50,48 @@ pub fn load(text: &str, origin: &Path, env: &dyn Env) -> Result<Config, Vec<Conf
     Ok(config)
 }
 
-/// The config as written, for `/v1/config`: defaults filled in and `${…}`
-/// references unexpanded. Every secret is `"[redacted]"`, and in every other
-/// string URL userinfo, queries and fragments, bot tokens and the config's
-/// secrets are masked.
+/// The config as written, for `/v1/config`, with defaults filled in.
+///
+/// - Every secret is `"[redacted]"`.
+/// - URL fields (`api_url`, `public_url`, endpoint `url`) show only the
+///   resolved URL's origin, `scheme://host[:port]`, followed by `/…` when a
+///   path, query or fragment was elided; their `${…}` references are not
+///   shown.
+/// - Every other string is as written, `${…}` references unexpanded, with
+///   bot tokens and the config's secrets masked as `#####`.
 pub fn redacted_json(cfg: &Config) -> serde_json::Value {
+    use serde_json::Value;
+
     // Serializing to a `Value` fails only on non-string map keys, which the
     // model does not have.
-    let mut json = serde_json::to_value(&cfg.raw).unwrap_or(serde_json::Value::Null);
+    let mut json = serde_json::to_value(&cfg.raw).unwrap_or(Value::Null);
     mask_strings(&mut json, &cfg.masker);
+    // A loaded config resolved every bot and consumer, in document order.
+    for (bot, out) in cfg
+        .bots
+        .iter()
+        .zip(json["bots"].as_array_mut().into_iter().flatten())
+    {
+        out["api_url"] = Value::from(bot.api_url.masked());
+        if let Some(Ingress::Webhook(hook)) = &bot.ingress
+            && let Some(url) = &hook.public_url
+        {
+            out["ingress"]["webhook"]["public_url"] = Value::from(url.masked());
+        }
+    }
+    for consumer in &cfg.consumers {
+        let ConsumerKind::Push(push) = &consumer.kind else {
+            continue;
+        };
+        let endpoints = &mut json["consumers"][consumer.name.as_str()]["push"]["endpoints"];
+        for (endpoint, out) in push
+            .endpoints
+            .iter()
+            .zip(endpoints.as_array_mut().into_iter().flatten())
+        {
+            out["url"] = Value::from(endpoint.url.masked());
+        }
+    }
     json
 }
 

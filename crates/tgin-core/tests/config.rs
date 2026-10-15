@@ -1321,59 +1321,100 @@ consumers:
     }
     let json = config::redacted_json(&cfg);
     let endpoints = &json["consumers"]["p"]["push"]["endpoints"];
-    assert_eq!(endpoints[0]["url"], "${env:PUSH_URL}");
-    assert_eq!(
-        endpoints[1]["url"],
-        "https://api.telegram.org/bot#####/sendMessage"
-    );
-    assert_eq!(endpoints[2]["url"], "http://hooks.example/#####/x");
+    assert_eq!(endpoints[0]["url"], "https://push.example/…");
+    assert_eq!(endpoints[1]["url"], "https://api.telegram.org/…");
+    assert_eq!(endpoints[2]["url"], "http://hooks.example/…");
+    assert_eq!(json["bots"][0]["api_url"], "https://bot-api.internal");
     let hook = &json["bots"][1]["ingress"]["webhook"];
-    assert_eq!(hook["public_url"], "https://bot.example/hook?[redacted]");
+    assert_eq!(hook["public_url"], "https://bot.example/…");
     assert_eq!(hook["path"], "/hook/#####");
 }
 
-/// A `${…}` in the host must not stop the credentials around it from being
-/// masked; the reference itself is shown as written.
+/// Every URL renders as its parsed origin, whatever the written text looks
+/// like, so no parser quirk can expose the rest.
 #[test]
-fn templated_urls_masked_as_written() {
-    let yaml = r#"version: 1
-server: {}
-bots:
-  - name: a
-    token: "1:t"
-    api_url: "https://api.telegram.org/bot${env:TOKEN}/"
-    ingress: { webhook: { public_url: "https://${env:HOOK_HOST}/hook?token=literal-query-secret", register: true } }
-consumers:
-  p: { push: { endpoints: [{ url: "http://admin:pa55w0rd-literal@${env:HOST}:8080/hook" }] } }
-"#;
+fn urls_render_origin_only() {
+    let probes = [
+        (
+            "https://${env:HOOK_HOST}/hook?token=literal-query-secret",
+            "https://bot.example/…",
+        ),
+        (
+            "http://admin:pa55w0rd-literal@${env:HOST}:8080/hook",
+            "http://push.internal:8080/…",
+        ),
+        (
+            "${env:BASE}/hook?token=literal-query-secret",
+            "https://base.example/…",
+        ),
+        ("${env:BASE}/hook#frag-secret", "https://base.example/…"),
+        (
+            "${env:BASE}/cb?token=lit-secret&next=http://x/",
+            "https://base.example/…",
+        ),
+        (
+            "https:///user:pa55w0rd-literal@push.example/x",
+            "https://push.example/…",
+        ),
+        (
+            "https:////h0st-secret.example/x",
+            "https://h0st-secret.example/…",
+        ),
+        ("http://[::1]:9000/path-secret", "http://[::1]:9000/…"),
+        ("https://h.example/путь-secret", "https://h.example/…"),
+        (
+            "https://api.telegram.org/bot${env:TOKEN}/sendMessage",
+            "https://api.telegram.org/…",
+        ),
+    ];
     let env = env(&[
-        ("TOKEN", "123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq"),
         ("HOOK_HOST", "bot.example"),
         ("HOST", "push.internal"),
+        ("BASE", "https://base.example"),
+        ("TOKEN", "123456789:AAbbccddeeffgghhiijjkkllmmnnoopp_qq"),
     ]);
-    let [debug, json, raw] = renderings(yaml, &env);
-    for rendering in [&debug, &json, &raw] {
+    let endpoints: String = probes
+        .iter()
+        .map(|(url, _)| format!("        - url: \"{url}\"\n"))
+        .collect();
+    let yaml = format!(
+        "version: 1\nserver: {{}}\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"{}\"\n    ingress: {{ webhook: {{ public_url: \"{}\", register: true }} }}\nconsumers:\n  p:\n    push:\n      endpoints:\n{endpoints}",
+        probes[3].0, probes[2].0
+    );
+    let cfg = config::load(&yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let [debug, json_text, raw] = renderings(&yaml, &env);
+    for rendering in [&debug, &json_text, &raw] {
         for leaked in [
             "literal-query-secret",
             "pa55w0rd-literal",
+            "frag-secret",
+            "lit-secret",
+            "path-secret",
+            "путь",
+            "user:pa55",
+            "admin:pa55",
             "AAbbccddeeffgghhiijjkkllmmnnoopp_qq",
-            "push.internal",
+            "${env:",
         ] {
             assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
         }
     }
-    for written in [
-        "https://api.telegram.org/bot${env:TOKEN}/",
-        "https://${env:HOOK_HOST}/hook?[redacted]",
-        "http://[redacted]@${env:HOST}:8080/hook",
-    ] {
-        assert!(debug.contains(written), "{written} not in {debug}");
-        assert!(json.contains(written), "{written} not in {json}");
+    let json = config::redacted_json(&cfg);
+    let urls = &json["consumers"]["p"]["push"]["endpoints"];
+    for (k, (written, shown)) in probes.iter().enumerate() {
+        assert_eq!(urls[k]["url"], *shown, "{written}");
+        let resolved = push(&cfg, "p").endpoints[k].url.clone();
+        assert_eq!(format!("{resolved:?}"), format!("{shown:?}"), "{written}");
     }
-    // `RawConfig` cannot know the config's secrets, so it shows no
-    // URL or path text at all.
+    assert_eq!(json["bots"][0]["api_url"], "https://base.example/…");
+    assert_eq!(
+        json["bots"][0]["ingress"]["webhook"]["public_url"],
+        "https://base.example/…"
+    );
+    // `RawConfig` cannot know the config's secrets, so it shows no URL or
+    // path text at all.
     assert!(raw.contains("Template(..)"), "{raw}");
-    assert!(!raw.contains("${env:"), "{raw}");
 }
 
 #[test]
@@ -1436,7 +1477,9 @@ fn regex_set_error_located() {
 #[test]
 fn duration_schema_matches_loader() {
     let schema: serde_json::Value = serde_json::from_str(&config::schema()).unwrap();
-    let pattern = schema["$defs"]["Duration"]["pattern"].as_str().unwrap();
+    let branches = schema["$defs"]["Duration"]["anyOf"].as_array().unwrap();
+    let pattern = branches[0]["pattern"].as_str().unwrap();
+    assert_eq!(branches[1], serde_json::json!({ "const": 0 }));
     let re = regex_automata::meta::Regex::new(pattern).unwrap();
     for ok in ["0", "1.5s", "0.5h", "500ms", "1h 30m", "2d"] {
         assert!(re.is_match(ok), "schema rejects {ok}");
@@ -1451,10 +1494,14 @@ fn duration_schema_matches_loader() {
     for bad in ["5M", "1y", "2 months", "1.s", "s", ""] {
         assert!(!re.is_match(bad), "schema accepts {bad}");
     }
+    // An unquoted YAML `0` is the integer the schema's `const` branch takes.
     assert_eq!(
-        loads("version: 1\nreload: { drain_timeout: \"0\" }\n")
+        loads("version: 1\nreload: { drain_timeout: 0 }\n")
             .reload
             .drain_timeout,
         Duration::ZERO
     );
+    let yaml = "version: 1\nreload: { drain_timeout: 30 }\n";
+    let err = single_error(yaml);
+    assert_message(&err, "add a unit, such as `30s`");
 }

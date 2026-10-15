@@ -588,13 +588,45 @@ impl From<Duration> for HumanDuration {
 
 impl<'de> Deserialize<'de> for HumanDuration {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        match humantime::parse_duration(&text) {
-            Ok(value) => Ok(Self { value, text }),
-            Err(err) => Err(de::Error::custom(format_args!(
-                "invalid duration `{text}`: {err}"
-            ))),
+        struct DurationVisitor;
+
+        impl Visitor<'_> for DurationVisitor {
+            type Value = HumanDuration;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a duration such as `30s`, or 0")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<HumanDuration, E> {
+                match humantime::parse_duration(text) {
+                    Ok(value) => Ok(HumanDuration {
+                        value,
+                        text: text.to_owned(),
+                    }),
+                    Err(err) => Err(E::custom(format_args!("invalid duration `{text}`: {err}"))),
+                }
+            }
+
+            /// An unquoted `0`; any other number needs a unit.
+            fn visit_u64<E: de::Error>(self, n: u64) -> Result<HumanDuration, E> {
+                if n == 0 {
+                    self.visit_str("0")
+                } else {
+                    Err(E::custom(format_args!(
+                        "invalid duration `{n}`: add a unit, such as `{n}s`"
+                    )))
+                }
+            }
+
+            fn visit_i64<E: de::Error>(self, n: i64) -> Result<HumanDuration, E> {
+                match u64::try_from(n) {
+                    Ok(n) => self.visit_u64(n),
+                    Err(_) => Err(E::invalid_value(de::Unexpected::Signed(n), &self)),
+                }
+            }
         }
+
+        deserializer.deserialize_any(DurationVisitor)
     }
 }
 
