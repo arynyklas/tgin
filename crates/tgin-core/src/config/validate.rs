@@ -12,16 +12,8 @@ use super::model::{
 };
 
 /// Paths that tgin itself serves; configured paths must not start with them.
-const RESERVED_PREFIXES: [&str; 8] = [
-    "/c/",
-    "/bot",
-    "/file/",
-    "/mtproto/",
-    "/v1/",
-    "/livez",
-    "/readyz",
-    "/metrics",
-];
+/// The Bot API gateway's paths are reserved by [`gateway_path`] instead.
+const RESERVED_PREFIXES: [&str; 6] = ["/c/", "/mtproto/", "/v1/", "/livez", "/readyz", "/metrics"];
 
 /// The shortest `reload.debounce`.
 const MIN_DEBOUNCE: Duration = Duration::from_millis(10);
@@ -540,10 +532,30 @@ fn path_problem(path: &str) -> Option<String> {
     {
         return Some("has a segment starting with `:` or `*`; paths are literal".to_owned());
     }
+    if let Some(kind) = gateway_path(path) {
+        return Some(format!(
+            "starts with a bot-token {kind}, which tgin reserves for its Bot API gateway"
+        ));
+    }
     RESERVED_PREFIXES
         .iter()
         .find(|prefix| path.starts_with(*prefix) || path == prefix.trim_end_matches('/'))
         .map(|prefix| format!("starts with `{prefix}`, which tgin reserves"))
+}
+
+/// What the Bot API gateway would serve at `path`, if anything: a first
+/// segment `bot<id>:<secret>` (a method path) or `/file/bot<id>:` (a file
+/// path). The gateway serves only token-shaped segments, so other `/bot…`
+/// paths, such as 0.2's `/bot1/getUpdates`, stay free.
+fn gateway_path(path: &str) -> Option<&'static str> {
+    let rest = path.strip_prefix('/')?;
+    let (rest, kind) = match rest.strip_prefix("file/") {
+        Some(file) => (file, "file path"),
+        None => (rest, "path segment"),
+    };
+    let ids = rest.strip_prefix("bot")?;
+    let digits = ids.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0 && ids.as_bytes().get(digits) == Some(&b':')).then_some(kind)
 }
 
 #[cfg(test)]
@@ -552,7 +564,26 @@ mod tests {
 
     #[test]
     fn path_rules() {
-        for ok in ["/", "/hook", "/webhook/shop", "/a:b", "/vone/x", "/v1x"] {
+        for ok in [
+            "/",
+            "/hook",
+            "/webhook/shop",
+            "/a:b",
+            "/vone/x",
+            "/v1x",
+            // 0.2 long-poll paths; the gateway serves only token-shaped
+            // `bot<id>:<secret>` segments.
+            "/bot1/getUpdates",
+            "/bot",
+            "/bot/x",
+            "/botx",
+            "/bot123",
+            "/botx123:abc",
+            "/a/bot123:abc",
+            "/file/x",
+            "/file/bot123",
+            "/files/bot123:abc",
+        ] {
             assert_eq!(path_problem(ok), None, "{ok}");
         }
         for bad in [
@@ -562,9 +593,11 @@ mod tests {
             "/a/:id",
             "/a/*rest",
             "/c/x",
-            "/bot123",
-            "/botx",
-            "/file/x",
+            "/bot123:abc",
+            "/bot123:abc/getUpdates",
+            "/bot1:",
+            "/file/bot123:abc/x",
+            "/file/bot1:",
             "/mtproto/x",
             "/v1/x",
             "/v1",
@@ -574,6 +607,18 @@ mod tests {
             "/c",
         ] {
             assert!(path_problem(bad).is_some(), "{bad} accepted");
+        }
+    }
+
+    /// A token-shaped segment may hold a real token, so the message never
+    /// quotes it.
+    #[test]
+    fn gateway_path_problem_never_quotes_the_token() {
+        for path in ["/bot123:abc/getUpdates", "/file/bot123:abc/x"] {
+            let problem = path_problem(path).expect("reserved");
+            assert!(problem.contains("which tgin reserves"), "{problem}");
+            assert!(!problem.contains("123:abc"), "{problem}");
+            assert!(!problem.contains("123"), "{problem}");
         }
     }
 }

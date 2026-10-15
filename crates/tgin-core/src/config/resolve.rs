@@ -387,6 +387,8 @@ impl Resolver<'_> {
         }
     }
 
+    /// A file path; a relative one resolves against the config file's
+    /// directory, never the process CWD.
     fn file(&mut self, path: &str, text: &Template) -> Option<SensitivePath> {
         let value = self.template(path, text)?;
         if value.is_empty() {
@@ -394,7 +396,14 @@ impl Resolver<'_> {
                 .error(path, text.0.location, "the file path is empty");
             return None;
         }
-        Some(Sensitive::new(PathBuf::from(value), &text.0.value))
+        let file = PathBuf::from(value);
+        // `has_root` keeps `/x` as written on Windows too.
+        let file = if file.is_absolute() || file.has_root() {
+            file
+        } else {
+            self.base_dir.join(file)
+        };
+        Some(Sensitive::new(file, &text.0.value))
     }
 
     /// An HTTP route path, checked against every other configured path.

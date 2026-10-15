@@ -574,8 +574,8 @@ consumers:
 fn rule_paths_not_reserved() {
     for reserved in [
         "/c/x",
-        "/bot1",
-        "/file/x",
+        "/bot123:abc/getUpdates",
+        "/file/bot123:abc/x",
         "/mtproto/x",
         "/v1/x",
         "/livez",
@@ -587,7 +587,22 @@ fn rule_paths_not_reserved() {
         );
         let err = single_error(&yaml);
         assert_message(&err, "which tgin reserves");
+        assert!(!err.to_string().contains("123:abc"), "{err}");
     }
+}
+
+/// Only token-shaped `bot<id>:<secret>` segments belong to the Bot API
+/// gateway, so 0.2-style long-poll paths remain usable aliases.
+#[test]
+fn bot_paths_without_a_token_are_not_reserved() {
+    let yaml = "version: 1\nserver: {}\nconsumers:\n  q: { pull: { aliases: [/bot1/getUpdates, /bot/x, /file/x] } }\n";
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default())
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let ConsumerKind::Pull(pull) = &cfg.consumers[0].kind else {
+        panic!("{:?}", cfg.consumers[0].kind);
+    };
+    let aliases: Vec<&str> = pull.aliases.iter().map(|a| a.expose().as_str()).collect();
+    assert_eq!(aliases, ["/bot1/getUpdates", "/bot/x", "/file/x"]);
 }
 
 #[test]
@@ -1685,6 +1700,42 @@ fn empty_file_path_rejected() {
         pos(yaml, "\"${env:EMPTY}"),
     );
     assert_message(&errors[0], "the file path is empty");
+}
+
+/// Relative file paths, written or expanded from a reference, resolve
+/// against the config file's directory, never the process CWD (a Windows
+/// service runs in `System32`); absolute paths stay as written.
+#[test]
+fn relative_file_paths_resolve_against_the_config_directory() {
+    let dir = std::env::temp_dir().join("tgin-relative-file-paths");
+    let absolute = std::env::temp_dir().join("elsewhere").join("tls.key");
+    let yaml = format!(
+        "version: 1\nserver:\n  tls: {{ cert_file: tls/tls.crt, key_file: \"{}\" }}\nbots:\n  - name: a\n    token: t\n    ingress: {{ webhook: {{ public_url: \"https://bot.example\", register: true, certificate_file: \"${{env:CERT}}\" }} }}\n",
+        absolute.display().to_string().replace('\\', "\\\\")
+    );
+    let cfg = config::load(
+        &yaml,
+        &dir.join("tgin.yaml"),
+        &env(&[("CERT", "certs/public.pem")]),
+    )
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let tls = cfg.server.as_ref().unwrap().tls.as_ref().unwrap();
+    assert_eq!(tls.cert_file.expose(), &dir.join("tls/tls.crt"));
+    assert_eq!(tls.key_file.expose(), &absolute);
+    let Some(Ingress::Webhook(hook)) = &cfg.bots[0].ingress else {
+        panic!("{:?}", cfg.bots[0].ingress);
+    };
+    assert_eq!(
+        hook.certificate_file.as_ref().map(|file| file.expose()),
+        Some(&dir.join("certs/public.pem"))
+    );
+
+    // A rooted path stays as written, on every platform.
+    let yaml = "version: 1\nserver:\n  tls: { cert_file: /tls/tls.crt, key_file: /tls/tls.key }\n";
+    let cfg = config::load(yaml, &dir.join("tgin.yaml"), &MapEnv::default())
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let tls = cfg.server.as_ref().unwrap().tls.as_ref().unwrap();
+    assert_eq!(tls.cert_file.expose(), Path::new("/tls/tls.crt"));
 }
 
 /// A combined-regex failure has no single rule; it is reported at the

@@ -848,12 +848,12 @@
       "additionalProperties": false,
       "properties": {
         "cert_file": {
-          "description": "PEM certificate chain file. Supports `${env:…}` and `${file:…}`.",
+          "description": "PEM certificate chain file; a relative path is relative to the config\nfile's directory. Supports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": "string"
         },
         "key_file": {
-          "description": "PEM private key file. Supports `${env:…}` and `${file:…}`.",
+          "description": "PEM private key file; a relative path is relative to the config\nfile's directory. Supports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": "string"
         }
@@ -878,7 +878,7 @@
           ]
         },
         "certificate_file": {
-          "description": "Self-signed certificate to upload with `setWebhook`; needs\n`register: true`. Supports `${env:…}` and `${file:…}`.",
+          "description": "Self-signed certificate to upload with `setWebhook`; needs\n`register: true`. A relative path is relative to the config file's\ndirectory. Supports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",

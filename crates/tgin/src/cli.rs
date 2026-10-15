@@ -1,4 +1,4 @@
-//! The command line: `tgin [run]`, `tgin config validate|schema|print`,
+//! The command line: `tgin [run]`, `tgin config validate|schema|print|migrate`,
 //! `tgin admin …` and `tgin version`.
 
 use std::borrow::Cow;
@@ -126,6 +126,13 @@ enum ConfigCommand {
     Schema,
     /// Print a config file with defaults filled in and secrets redacted.
     Print { path: PathBuf },
+    /// Convert a tgin 0.2 RON config to YAML.
+    Migrate {
+        path: PathBuf,
+        /// Write the YAML here instead of stdout.
+        #[arg(short = 'o', long = "out", value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 /// What the command line asks for.
@@ -135,6 +142,10 @@ pub enum Invocation {
     Validate(PathBuf),
     Schema,
     Print(PathBuf),
+    Migrate {
+        path: PathBuf,
+        out: Option<PathBuf>,
+    },
     Version,
     Admin(client::Command),
     /// The 0.2 `-f/--file` flag with its value.
@@ -161,6 +172,9 @@ where
         Some(Command::Config(ConfigCommand::Validate { path })) => Invocation::Validate(path),
         Some(Command::Config(ConfigCommand::Schema)) => Invocation::Schema,
         Some(Command::Config(ConfigCommand::Print { path })) => Invocation::Print(path),
+        Some(Command::Config(ConfigCommand::Migrate { path, out })) => {
+            Invocation::Migrate { path, out }
+        }
         Some(Command::Version) => Invocation::Version,
         Some(Command::Admin(admin)) => Invocation::Admin(client::Command {
             url: admin.url,
@@ -207,6 +221,7 @@ where
             exit::OK
         }
         Invocation::Print(path) => print(&path),
+        Invocation::Migrate { path, out } => crate::migrate::run(&path, out.as_deref()),
         Invocation::Version => {
             println!("{}", version());
             exit::OK

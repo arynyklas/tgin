@@ -1,0 +1,49 @@
+# Converted from a tgin 0.2 config by `tgin config migrate`.
+# Warnings:
+# - `api` was dropped: tgin 1.0 has no route-management API; edit the routes in this file instead, which tgin reloads on change
+# - updates[0]: bot-1 is a webhook without `registration`, so the 0.2 config has no bot token; set TGIN_BOT_1_TOKEN to it
+# - updates[0]: bot-1: the webhook has no secret token, so anyone who can reach its path can post updates; set secret_token and register it with Telegram
+
+version: 1
+runtime:
+  worker_threads: 6
+log:
+  level: info
+  format: text
+server:
+  listen:
+    - "0.0.0.0:3000"
+admin:
+  # tgin 0.2's auth_token. The status and metrics endpoints moved from the data port to admin.listen (default 127.0.0.1:9090).
+  token: "bench"
+bots:
+  - name: bot-1
+    token: "${env:TGIN_BOT_1_TOKEN}"
+    ingress:
+      webhook:
+        path: "/webhook"
+        secret_token: none
+    routes:
+      - to:
+          - split:
+              strategy: round_robin
+              among:
+                - push-10-5-0-11-8080
+                - push-10-5-0-12-8080
+consumers:
+  push-10-5-0-11-8080:
+    push:
+      endpoints:
+        - url: "http://10.5.0.11:8080/webhook"
+      # tgin 0.2 made one delivery attempt and dropped what its downstream did not take, never pausing the source; delete on_full and retry for tgin 1.0's backpressure and retries.
+      on_full: drop_oldest
+      retry:
+        max_attempts: 1
+  push-10-5-0-12-8080:
+    push:
+      endpoints:
+        - url: "http://10.5.0.12:8080/webhook"
+      # tgin 0.2 made one delivery attempt and dropped what its downstream did not take, never pausing the source; delete on_full and retry for tgin 1.0's backpressure and retries.
+      on_full: drop_oldest
+      retry:
+        max_attempts: 1
