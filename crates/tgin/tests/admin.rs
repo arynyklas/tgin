@@ -2,6 +2,8 @@
 //! as Telegram and as push downstreams, real loopback sockets on ports the
 //! OS picks, and the `tgin admin` command line against them.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1680,37 +1682,25 @@ fn admin_non_loopback_requires_token() {
     );
 }
 
-/// A free loopback port, found by binding port 0.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free port")
-        .port()
-}
-
 /// Real SIGHUP to the binary: the reload shows in the generation.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn os_sighup_reloads() {
     let telegram = telegram().await;
-    let (data_port, admin_port) = (free_port(), free_port());
     // No watch: the rewrite alone would reload.
     let yaml = |consumers: &str| {
         format!(
-            "version: 1\n{QUICK}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:{data_port}\"] }}\nadmin: {{ listen: [\"127.0.0.1:{admin_port}\"] }}\nbots:\n{}consumers:\n{consumers}",
+            "version: 1\n{QUICK}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n{}consumers:\n{consumers}",
             hook_bot(&telegram, "hooked", TOKEN, "/hook", "workers")
         )
     };
     let file = write_config("os_sighup_reloads", &yaml("  workers: { pull: {} }\n"));
     let log = file.with_file_name("tgin.log");
-    let sink = std::fs::File::create(&log).expect("the log file");
-    let mut child = binary(&["-c", file.to_str().unwrap()])
-        .stderr(sink.try_clone().expect("the log file"))
-        .stdout(sink)
-        .spawn()
-        .expect("tgin starts");
+    let (mut child, admin) =
+        support::spawn_listening(&mut binary(&["-c", file.to_str().unwrap()]), &log, PATIENCE)
+            .await;
     let http = client();
-    let base = format!("http://127.0.0.1:{admin_port}");
+    let base = format!("http://{admin}");
     let generation = || {
         let http = http.clone();
         let url = format!("{base}/v1/status");
@@ -1772,24 +1762,22 @@ async fn os_sighup_reloads() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_level_follows_reloads() {
     let telegram = telegram().await;
-    let admin_port = free_port();
     let yaml = |level: &str| {
         format!(
-            "version: 1\n{QUICK}\nlog: {{ level: {level} }}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:{admin_port}\"] }}\nbots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            "version: 1\n{QUICK}\nlog: {{ level: {level} }}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
             hook_bot(&telegram, "hooked", TOKEN, "/hook", "workers")
         )
     };
     let file = write_config("log_level_follows_reloads", &yaml("info"));
     let log = file.with_file_name("tgin.log");
-    let sink = std::fs::File::create(&log).expect("the log file");
-    let mut child = binary(&["-c", file.to_str().unwrap()])
-        .env_remove("RUST_LOG")
-        .stderr(sink.try_clone().expect("the log file"))
-        .stdout(sink)
-        .spawn()
-        .expect("tgin starts");
+    let (mut child, admin) = support::spawn_listening(
+        binary(&["-c", file.to_str().unwrap()]).env_remove("RUST_LOG"),
+        &log,
+        PATIENCE,
+    )
+    .await;
     let http = client();
-    let admin = format!("http://127.0.0.1:{admin_port}");
+    let admin = format!("http://{admin}");
     let logged = || std::fs::read_to_string(&log).unwrap_or_default();
     // Waits for the `n`th reload's info line, written after its debug one.
     let reloaded = |n: usize| async move {

@@ -790,11 +790,11 @@ mod tests {
             .await;
         let bot = client_for(&server.uri());
 
-        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Bound but not listening, and held for the whole test: connecting
+        // is refused, and no other socket can take the port meanwhile.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
         let unreachable = client_for(&format!("http://127.0.0.1:{closed_port}"));
 
         // A 2xx body that is not `"ok":false` is returned for `split_updates`.

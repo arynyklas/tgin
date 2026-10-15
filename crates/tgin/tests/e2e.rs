@@ -1,6 +1,9 @@
 //! End to end: the app in process, wiremock as Telegram and as push
 //! downstreams, real loopback sockets on ports the OS picks.
 
+#[cfg(unix)]
+mod support;
+
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -1329,33 +1332,23 @@ fn shipped_config_is_valid() {
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
 
-/// A free loopback port, found by binding port 0.
-#[cfg(unix)]
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free port")
-        .port()
-}
-
-/// The `tgin` binary serving a webhook bot backed by `telegram`, on free
-/// ports, with `runtime` timings; waits until ready. Returns the child and
-/// the admin plane's base URL.
+/// The `tgin` binary serving a webhook bot backed by `telegram`, its
+/// listeners on ports the OS picks, with `runtime` timings; waits until
+/// ready. Returns the child and the admin plane's base URL.
 #[cfg(unix)]
 async fn spawn_tgin(
     test: &str,
     telegram: &MockServer,
     runtime: &str,
 ) -> (std::process::Child, String) {
-    let (port, admin_port) = (free_port(), free_port());
     let file = scratch(test).join("tgin.yaml");
     std::fs::write(
         &file,
         format!(
             r#"version: 1
 {runtime}
-server: {{ listen: ["127.0.0.1:{port}"] }}
-admin: {{ listen: ["127.0.0.1:{admin_port}"] }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
 bots:
   - name: hooked
     token: "{TOKEN}"
@@ -1369,12 +1362,13 @@ consumers:
         ),
     )
     .unwrap();
-    let mut child = tgin(&["-c", file.to_str().unwrap()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("tgin starts");
-    let base = format!("http://127.0.0.1:{admin_port}");
+    let (mut child, admin) = support::spawn_listening(
+        &mut tgin(&["-c", file.to_str().unwrap()]),
+        &file.with_file_name("tgin.log"),
+        PATIENCE,
+    )
+    .await;
+    let base = format!("http://{admin}");
     let http = client();
     let started = Instant::now();
     while started.elapsed() < PATIENCE {
