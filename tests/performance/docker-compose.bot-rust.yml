@@ -1,0 +1,27 @@
+# BOT_IMPL=rust (the makefile adds this file): every bot is a
+# `tgin-bench bot` process from the bench image instead of an aiogram bot. It
+# reads the same environment (TELEGRAM_API_URL, TGIN_ENDPOINT, PORT,
+# WEBHOOK_PATH, BOT_SLEEP_MS) as the Python bots.
+
+x-rust-bot: &rust-bot
+  image: tgin-bench-load:local
+  build: ./benchmark
+  healthcheck:
+    test: ["CMD", "tgin-bench", "health", "--server", "http://127.0.0.1:8080", "--path", "/healthz"]
+
+x-rust-webhook-bot: &rust-webhook-bot
+  <<: *rust-bot
+  command: ["tgin-bench", "bot", "webhook"]
+
+x-rust-longpoll-bot: &rust-longpoll-bot
+  <<: *rust-bot
+  command: ["tgin-bench", "bot", "longpoll"]
+
+services:
+  webhook_bot1: *rust-webhook-bot
+  webhook_bot2: *rust-webhook-bot
+  webhook_bot3: *rust-webhook-bot
+  longpull_bot_direct: *rust-longpoll-bot
+  longpull_bot1: *rust-longpoll-bot
+  longpull_bot2: *rust-longpoll-bot
+  longpull_bot3: *rust-longpoll-bot

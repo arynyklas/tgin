@@ -8,6 +8,7 @@
 //! update's text back through `sendMessage`, and latency runs from the
 //! update's scheduled send time to that reply.
 
+mod bot;
 mod load;
 mod mock;
 mod report;
@@ -51,13 +52,20 @@ enum Command {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
     },
-    /// Exit 0 when the server answers.
+    /// Exit 0 when `<server><path>` answers with a success status.
     Health {
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
+        #[arg(long, default_value = "/bench/health")]
+        path: String,
     },
     /// Print the CSV header matching `run --format csv-row`.
     CsvHeader,
+    /// Run a fast downstream bot that echoes every update via `sendMessage`.
+    Bot {
+        #[command(flatten)]
+        options: bot::BotOptions,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +85,14 @@ async fn main() -> ExitCode {
             format,
             server,
         } => run(&options, format, &server).await,
-        Command::Health { server } => health(&server).await,
+        Command::Health { server, path } => health(&server, &path).await,
+        Command::Bot { options } => match bot::run(options).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
         Command::CsvHeader => {
             println!("{}", report::csv_header());
             ExitCode::SUCCESS
@@ -143,12 +158,8 @@ async fn run(options: &RunOptions, format: OutputFormat, server: &str) -> ExitCo
     ExitCode::SUCCESS
 }
 
-async fn health(server: &str) -> ExitCode {
-    match Client::new()
-        .get(format!("{server}/bench/health"))
-        .send()
-        .await
-    {
+async fn health(server: &str, path: &str) -> ExitCode {
+    match Client::new().get(format!("{server}{path}")).send().await {
         Ok(response) if response.status().is_success() => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }

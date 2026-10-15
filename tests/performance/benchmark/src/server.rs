@@ -452,6 +452,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_rust_long_poll_bot_answers_every_update_once() {
+        let bench = start_bench().await;
+        let replier =
+            crate::bot::Replier::new(crate::bot::client(), &bench, "123:test", Duration::ZERO);
+        let poller = tokio::spawn(crate::bot::poll_loop(
+            crate::bot::client(),
+            format!("{bench}/bot123:test/getUpdates"),
+            replier,
+        ));
+
+        let report = run_remote(&bench, &options(Mode::Longpoll, ""))
+            .await
+            .unwrap();
+        poller.abort();
+
+        assert_eq!(
+            (report.sent, report.received, report.unreceived),
+            (200, 200, 0)
+        );
+        assert_eq!((report.unmatched_replies, report.duplicate_replies), (0, 0));
+        assert_on_target(&report);
+    }
+
+    #[tokio::test]
+    async fn the_rust_webhook_bot_answers_every_update_once() {
+        let bench = start_bench().await;
+        let replier =
+            crate::bot::Replier::new(crate::bot::client(), &bench, "123:test", Duration::ZERO);
+        let app = crate::bot::router(crate::bot::BotMode::Webhook, "/webhook", replier);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bot = format!("http://{}/webhook", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let report = run_remote(&bench, &options(Mode::Webhook, &bot))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (report.sent, report.received, report.unreceived),
+            (200, 200, 0)
+        );
+        assert_eq!((report.unmatched_replies, report.duplicate_replies), (0, 0));
+        assert_on_target(&report);
+    }
+
+    #[tokio::test]
     async fn repeated_replies_count_as_duplicates_not_as_received() {
         let bench = start_bench().await;
         start_long_poll_bot(bench.clone(), 2);

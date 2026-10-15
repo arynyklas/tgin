@@ -10,6 +10,19 @@
 #       cfgs/v1/, data plane on 8080, admin plane on 9090 (/readyz).
 #   v0  tgin 0.2: image tgin-bench:v0 built from V0_REF, RON configs in cfgs/,
 #       management API on 3000 (webhook) or 3030 (long poll).
+#
+# BOT_IMPL selects the downstream bots:
+#   rust  `tgin-bench bot` (default): answers far faster than any target rate,
+#         so a scenario measures the engine, not the bots.
+#   py    aiogram 3 bots (bot/); one process answers about 2 000 updates/s.
+
+BOT_IMPL ?= rust
+ifeq ($(BOT_IMPL),rust)
+export COMPOSE_FILE := docker-compose.yml:docker-compose.bot-rust.yml
+export COMPOSE_PATH_SEPARATOR := :
+else ifneq ($(BOT_IMPL),py)
+$(error BOT_IMPL must be rust or py, got '$(BOT_IMPL)')
+endif
 
 ENGINE ?= v1
 RPS ?= 1000

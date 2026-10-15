@@ -1521,6 +1521,7 @@ dependencies = [
  "clap",
  "dashmap",
  "hdrhistogram",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
