@@ -278,15 +278,7 @@ impl<S> Ingress<S> {
     /// peer is a trusted proxy. `None` when unknown.
     fn client_ip(&self, parts: &Parts) -> Option<IpAddr> {
         let ConnectInfo(peer) = parts.extensions.get::<ConnectInfo<SocketAddr>>()?;
-        let peer = peer.ip().to_canonical();
-        if !self.trusted(peer) {
-            return Some(peer);
-        }
-        forwarded_client(&parts.headers, |ip| self.trusted(ip)).unwrap_or(Some(peer))
-    }
-
-    fn trusted(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies.iter().any(|n| n.contains(&ip))
+        client_ip(peer.ip(), &parts.headers, &self.trusted_proxies)
     }
 
     fn secret_matches(&self, headers: &HeaderMap) -> bool {
@@ -298,6 +290,20 @@ impl<S> Ingress<S> {
             .get(SECRET_HEADER)
             .is_some_and(|v| secret_eq(v.as_bytes(), expected.expose().as_bytes()))
     }
+}
+
+/// The address of the client behind a request from `peer`: `peer` itself,
+/// or, when `peer` is in `trusted_proxies`, the right-most `X-Forwarded-For`
+/// address not in `trusted_proxies` (the left-most if all are). An
+/// IPv4-mapped IPv6 address counts as its IPv4 address. `None` when an entry
+/// that has to be read is not an IP address.
+pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted_proxies: &[IpNet]) -> Option<IpAddr> {
+    let trusted = |ip: IpAddr| trusted_proxies.iter().any(|n| n.contains(&ip));
+    let peer = peer.to_canonical();
+    if !trusted(peer) {
+        return Some(peer);
+    }
+    forwarded_client(headers, trusted).unwrap_or(Some(peer))
 }
 
 /// The client named by `X-Forwarded-For`: the right-most address that is not
@@ -456,6 +462,27 @@ mod tests {
         assert_eq!(pick(&["2.2.2.2, junk"]), Some(None));
         assert_eq!(pick(&["2.2.2.2,"]), Some(None));
         assert_eq!(pick(&["1.1.1.1:443"]), Some(None));
+    }
+
+    #[test]
+    fn client_ip_believes_only_trusted_peers() {
+        let proxies = [net("10.0.0.0/8")];
+        let mut headers = HeaderMap::new();
+        headers.insert(FORWARDED_FOR, "1.1.1.1".parse().unwrap());
+        assert_eq!(
+            client_ip(ip("2.2.2.2"), &headers, &proxies),
+            Some(ip("2.2.2.2"))
+        );
+        assert_eq!(
+            client_ip(ip("::ffff:10.0.0.1"), &headers, &proxies),
+            Some(ip("1.1.1.1"))
+        );
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &HeaderMap::new(), &proxies),
+            Some(ip("10.0.0.1"))
+        );
+        headers.insert(FORWARDED_FOR, "junk".parse().unwrap());
+        assert_eq!(client_ip(ip("10.0.0.1"), &headers, &proxies), None);
     }
 
     #[test]
