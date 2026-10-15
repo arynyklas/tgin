@@ -1,0 +1,24 @@
+# Scenario webhook-tgin-1: webhook ingress -> push consumer with one downstream bot.
+version: 1
+server:
+  listen: ["0.0.0.0:8080"]
+admin:
+  # Reachable from the host for /readyz; a non-loopback admin listener needs a token.
+  listen: ["0.0.0.0:9090"]
+  token: bench
+bots:
+  - name: bench
+    token: "123:test"
+    api_url: http://10.5.0.3:8090
+    ingress:
+      webhook:
+        path: /webhook
+        # The load generator posts updates without a secret header.
+        secret_token: none
+    routes:
+      - to: [bots]
+consumers:
+  bots:
+    push:
+      endpoints:
+        - url: http://10.5.0.11:8080/webhook

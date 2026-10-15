@@ -1,0 +1,21 @@
+# Scenario longpoll-tgin-1: long-poll ingress from the fake Bot API -> pull
+# consumer; one bot instance polls /c/bots/getUpdates. tgin tells instances apart
+# by their address, so scaling out needs no config change.
+version: 1
+server:
+  listen: ["0.0.0.0:8080"]
+admin:
+  # Reachable from the host for /readyz; a non-loopback admin listener needs a token.
+  listen: ["0.0.0.0:9090"]
+  token: bench
+bots:
+  - name: bench
+    token: "123:test"
+    api_url: http://10.5.0.3:8090
+    ingress:
+      long_poll: {}
+    routes:
+      - to: [bots]
+consumers:
+  bots:
+    pull: {}
