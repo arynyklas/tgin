@@ -574,8 +574,8 @@ consumers:
 fn rule_paths_not_reserved() {
     for reserved in [
         "/c/x",
-        "/bot1",
-        "/file/x",
+        "/bot123:abc/getUpdates",
+        "/file/bot123:abc/x",
         "/mtproto/x",
         "/v1/x",
         "/livez",
@@ -587,7 +587,22 @@ fn rule_paths_not_reserved() {
         );
         let err = single_error(&yaml);
         assert_message(&err, "which tgin reserves");
+        assert!(!err.to_string().contains("123:abc"), "{err}");
     }
+}
+
+/// Only token-shaped `bot<id>:<secret>` segments belong to the Bot API
+/// gateway, so 0.2-style long-poll paths remain usable aliases.
+#[test]
+fn bot_paths_without_a_token_are_not_reserved() {
+    let yaml = "version: 1\nserver: {}\nconsumers:\n  q: { pull: { aliases: [/bot1/getUpdates, /bot/x, /file/x] } }\n";
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default())
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    let ConsumerKind::Pull(pull) = &cfg.consumers[0].kind else {
+        panic!("{:?}", cfg.consumers[0].kind);
+    };
+    let aliases: Vec<&str> = pull.aliases.iter().map(|a| a.expose().as_str()).collect();
+    assert_eq!(aliases, ["/bot1/getUpdates", "/bot/x", "/file/x"]);
 }
 
 #[test]
