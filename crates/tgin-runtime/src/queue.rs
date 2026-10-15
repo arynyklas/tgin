@@ -98,6 +98,9 @@ pub enum Full {
     Items,
     #[error("queue is full: byte limit reached")]
     Bytes,
+    /// The item is larger than `capacity_bytes`: it never fits.
+    #[error("item is larger than the queue's byte limit")]
+    TooLarge,
 }
 
 /// [`LeaseQueue::commit`] got a permit that another queue granted. Nothing was
@@ -370,12 +373,13 @@ impl<T: Clone> LeaseQueue<T> {
     }
 
     /// Reserves room for one item of `size` bytes. An item larger than
-    /// `capacity_bytes` never fits. With `OnFull::DropOldest` it evicts the
-    /// oldest unleased items when that makes room, and nothing when it cannot.
+    /// `capacity_bytes` never fits: [`Full::TooLarge`], whatever `on_full`.
+    /// With `OnFull::DropOldest` it evicts the oldest unleased items when
+    /// that makes room, and nothing when it cannot.
     pub fn try_reserve(&self, size: usize) -> Result<Permit, Full> {
         let mut inner = self.inner.lock();
         if size > inner.cfg.capacity_bytes {
-            return Err(Full::Bytes);
+            return Err(Full::TooLarge);
         }
         let reserved = self.reservations.load();
         let mut evicted = 0;
@@ -897,7 +901,7 @@ mod tests {
                 on_full,
                 ..config(10, 10)
             });
-            assert_eq!(q.try_reserve(11).unwrap_err(), Full::Bytes);
+            assert_eq!(q.try_reserve(11).unwrap_err(), Full::TooLarge);
             assert_eq!(q.stats(), QueueStats::default());
             assert!(q.try_reserve(10).is_ok());
         }
@@ -907,7 +911,7 @@ mod tests {
             ..config(10, 10)
         });
         push(&q, "a", None, 1, 5);
-        assert_eq!(q.try_reserve(11).unwrap_err(), Full::Bytes);
+        assert_eq!(q.try_reserve(11).unwrap_err(), Full::TooLarge);
         assert_eq!(q.stats().available, 1, "an oversized item evicts nothing");
     }
 
@@ -1465,7 +1469,7 @@ mod tests {
 
         fn reserve(&mut self, size: usize) -> Result<usize, Full> {
             if size > self.cfg.capacity_bytes {
-                return Err(Full::Bytes);
+                return Err(Full::TooLarge);
             }
             let mut evicted = 0;
             if let Err(full) = self.room(self.entries.len(), self.bytes(false), size) {

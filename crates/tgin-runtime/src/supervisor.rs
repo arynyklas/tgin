@@ -136,6 +136,22 @@ impl Supervisor {
             .map(|entry| entry.state.subscribe())
     }
 
+    /// Forgets the task `name` if it has ended, `Stopped` or `Failed`, so
+    /// that [`Supervisor::states`] no longer lists it; a task still starting,
+    /// running or backing off stays.
+    pub fn remove(&self, name: &str) {
+        let mut tasks = self.tasks.lock();
+        let ended = tasks.entries.get(name).is_some_and(|entry| {
+            matches!(
+                *entry.state.borrow(),
+                TaskState::Stopped | TaskState::Failed { .. }
+            )
+        });
+        if ended {
+            tasks.entries.remove(name);
+        }
+    }
+
     /// Waits for every task spawned so far to end, until `deadline`; then
     /// aborts the rest and returns how many it aborted. Aborted tasks end
     /// in [`TaskState::Stopped`]. Tasks spawned while this runs are not
@@ -400,6 +416,56 @@ mod tests {
                 reason: "bad token".into()
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_forgets_finished_tasks_only() {
+        let supervisor = Supervisor::new();
+        supervisor.spawn(
+            "done".into(),
+            fixed_backoff(Duration::from_secs(1)),
+            CancellationToken::new(),
+            || async { Exit::Done },
+        );
+        supervisor.spawn(
+            "failed".into(),
+            fixed_backoff(Duration::from_secs(1)),
+            CancellationToken::new(),
+            || async { Exit::Fatal("bad token".into()) },
+        );
+        let running = CancellationToken::new();
+        supervisor.spawn(
+            "running".into(),
+            fixed_backoff(Duration::from_secs(1)),
+            running.clone(),
+            std::future::pending::<Exit>,
+        );
+        supervisor.spawn(
+            "backoff".into(),
+            fixed_backoff(Duration::from_secs(60)),
+            CancellationToken::new(),
+            || async { Exit::Retry("down".into()) },
+        );
+        let mut done = supervisor.subscribe("done").unwrap();
+        wait_until(&mut done, |s| *s == TaskState::Stopped).await;
+        let mut failed = supervisor.subscribe("failed").unwrap();
+        wait_until(&mut failed, |s| matches!(s, TaskState::Failed { .. })).await;
+        let mut rx = supervisor.subscribe("running").unwrap();
+        wait_until(&mut rx, is_running).await;
+        let mut backoff = supervisor.subscribe("backoff").unwrap();
+        wait_until(&mut backoff, is_backoff).await;
+
+        for name in ["done", "failed", "running", "backoff", "unknown"] {
+            supervisor.remove(name);
+        }
+        let names: Vec<Arc<str>> = supervisor.states().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, [Arc::<str>::from("backoff"), Arc::from("running")]);
+        assert!(supervisor.subscribe("done").is_none());
+
+        running.cancel();
+        wait_until(&mut rx, |s| *s == TaskState::Stopped).await;
+        supervisor.remove("running");
+        assert!(supervisor.subscribe("running").is_none());
     }
 
     #[tokio::test(start_paused = true)]
