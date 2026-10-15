@@ -1657,10 +1657,15 @@ async fn admin_cli_health_exit_codes() {
     let outcome = timeout(PATIENCE, tgin.run).await.unwrap().unwrap();
     assert_eq!(outcome, Outcome::Forced);
 
-    // Nothing listens there any more.
-    let gone = output(binary(&["admin", "--url", &url, "health"])).await;
+    // Nothing listens: a socket bound but not listening, held until the
+    // end, so no other test's listener can take its port meanwhile.
+    let dead = tokio::net::TcpSocket::new_v4().unwrap();
+    dead.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let dead_url = format!("http://{}", dead.local_addr().unwrap());
+    let gone = output(binary(&["admin", "--url", &dead_url, "health"])).await;
     assert_eq!(gone.code, Some(1), "{}", gone.stdout);
     assert!(gone.took < Duration::from_secs(4), "took {:?}", gone.took);
+    drop(dead);
 }
 
 #[test]
@@ -1770,12 +1775,9 @@ async fn log_level_follows_reloads() {
     };
     let file = write_config("log_level_follows_reloads", &yaml("info"));
     let log = file.with_file_name("tgin.log");
-    let (mut child, admin) = support::spawn_listening(
-        binary(&["-c", file.to_str().unwrap()]).env_remove("RUST_LOG"),
-        &log,
-        PATIENCE,
-    )
-    .await;
+    let (mut child, admin) =
+        support::spawn_listening(&mut binary(&["-c", file.to_str().unwrap()]), &log, PATIENCE)
+            .await;
     let http = client();
     let admin = format!("http://{admin}");
     let logged = || std::fs::read_to_string(&log).unwrap_or_default();

@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 /// within `patience`, until the child has logged where its admin plane
 /// listens; returns the child and that address. Kills and reaps the child
 /// and panics with its log if it exits or takes longer.
+///
+/// The child does not inherit `RUST_LOG`, which overrides `log.level`: the
+/// address comes from an info line.
 pub async fn spawn_listening(
     command: &mut Command,
     log: &Path,
@@ -22,6 +25,7 @@ pub async fn spawn_listening(
 ) -> (Child, SocketAddr) {
     let sink = std::fs::File::create(log).expect("the log file");
     let mut child = command
+        .env_remove("RUST_LOG")
         .stderr(sink.try_clone().expect("the log file"))
         .stdout(sink)
         .spawn()
