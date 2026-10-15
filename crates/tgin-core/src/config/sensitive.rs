@@ -59,6 +59,12 @@ impl Sensitive<Url> {
     pub(super) fn mask(&mut self, redactor: &Redactor) {
         self.shown = origin(&self.value, redactor);
     }
+
+    /// The masked rendering without its `/…` marker: the URL's origin,
+    /// `scheme://host[:port]`.
+    pub fn origin(&self) -> &str {
+        self.shown.strip_suffix("/…").unwrap_or(&self.shown)
+    }
 }
 
 impl Sensitive<PathBuf> {

@@ -50,6 +50,9 @@ const ATTEMPT_HEADER: &str = "x-tgin-attempt";
 pub struct Endpoint {
     /// May carry a secret: it is never logged or formatted.
     pub url: reqwest::Url,
+    /// How status shows the endpoint: the URL's origin, `scheme://host[:port]`,
+    /// as config renderings show it.
+    pub origin: Arc<str>,
     pub secret_token: Option<Secret<String>>,
     /// Bound on one request, from connecting to the end of the response.
     pub timeout: Duration,
@@ -78,8 +81,11 @@ pub struct PushConsumer {
     /// Deliveries the dispatcher holds, sending or waiting to retry.
     in_flight: AtomicUsize,
     draining: AtomicBool,
+    /// While set, the dispatcher leases nothing new.
+    paused: AtomicBool,
     /// Wakes deliveries waiting for a breaker after an attempt's outcome, and
-    /// the dispatcher after [`PushConsumer::set_endpoints`].
+    /// the dispatcher after [`PushConsumer::set_endpoints`] and
+    /// [`PushConsumer::resume`].
     changed: Notify,
 }
 
@@ -107,6 +113,7 @@ impl PushConsumer {
             cursor: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             changed: Notify::new(),
         }
     }
@@ -167,6 +174,32 @@ impl PushConsumer {
         self.draining.load(Ordering::SeqCst)
     }
 
+    /// Stops leasing new updates; deliveries in flight, retries included,
+    /// go on, and admissions still queue.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Leases again, waking the dispatcher.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// The current endpoints in order: each one's origin and breaker state.
+    pub fn endpoints(&self) -> Vec<(Arc<str>, BreakerState)> {
+        self.targets
+            .load()
+            .slots
+            .iter()
+            .map(|slot| (Arc::clone(&slot.origin), slot.breaker.state()))
+            .collect()
+    }
+
     async fn dispatch(&self, cancel: CancellationToken, force: CancellationToken) {
         let mut deliveries = FuturesUnordered::new();
         loop {
@@ -181,7 +214,7 @@ impl PushConsumer {
                 if deliveries.is_empty() {
                     break;
                 }
-            } else {
+            } else if !self.is_paused() {
                 let max = self.targets.load().opts.max_in_flight;
                 let room = max.saturating_sub(deliveries.len());
                 if room > 0 {
@@ -478,7 +511,8 @@ impl PushConsumer {
         );
     }
 
-    fn update_depth(&self) {
+    /// Publishes the queue's depth and in-flight gauges.
+    pub fn update_depth(&self) {
         let stats = self.queue.stats();
         let gauge = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         self.metrics.set_depth(
@@ -529,6 +563,7 @@ impl Targets {
                 };
                 Slot {
                     url: endpoint.url,
+                    origin: endpoint.origin,
                     secret,
                     timeout: endpoint.timeout,
                     breaker: endpoint.breaker,
@@ -552,6 +587,7 @@ impl Targets {
 
 struct Slot {
     url: reqwest::Url,
+    origin: Arc<str>,
     secret: SecretHeader,
     timeout: Duration,
     breaker: Breaker,

@@ -85,6 +85,14 @@ label_enum!(
     }
 );
 
+label_enum!(
+    /// `outcome` of `tgin_config_reloads_total`.
+    ReloadOutcome {
+        Applied => "applied",
+        Rejected => "rejected",
+    }
+);
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SourceLabels {
     source: Arc<str>,
@@ -121,6 +129,11 @@ struct AttemptLabels {
     outcome: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct OutcomeLabels {
+    outcome: &'static str,
+}
+
 /// How many endpoint indices each consumer resolved handles for, so that
 /// [`CoreMetrics::remove_consumer`] finds every label set it created.
 type EndpointCounts = Arc<Mutex<HashMap<Arc<str>, usize>>>;
@@ -147,12 +160,17 @@ pub struct CoreMetrics {
     consumer_backpressure: Family<ConsumerLabels, SecondsCounter>,
     delivery_attempts: Family<AttemptLabels, Counter>,
     delivery_latency: Family<ConsumerLabels, Histogram, HistogramCtor>,
+    /// Handles of `tgin_config_reloads_total`, by [`ReloadOutcome`].
+    config_reloads: [Counter; ReloadOutcome::ALL.len()],
+    config_generation: Gauge,
+    shutdown_abandoned: Counter,
     endpoints: EndpointCounts,
 }
 
 impl CoreMetrics {
     /// Creates the families and registers them (names without the `tgin` prefix).
     pub fn register(reg: &mut Registry) -> CoreMetrics {
+        let config_reloads: Family<OutcomeLabels, Counter> = Family::default();
         let m = CoreMetrics {
             source_updates: Family::default(),
             source_errors: Family::default(),
@@ -166,6 +184,13 @@ impl CoreMetrics {
             consumer_backpressure: Family::default(),
             delivery_attempts: Family::default(),
             delivery_latency: Family::new_with_constructor(latency_histogram),
+            config_reloads: ReloadOutcome::ALL.map(|o| {
+                config_reloads.get_or_create_owned(&OutcomeLabels {
+                    outcome: o.as_str(),
+                })
+            }),
+            config_generation: Gauge::default(),
+            shutdown_abandoned: Counter::default(),
             endpoints: EndpointCounts::default(),
         };
         reg.register(
@@ -228,7 +253,37 @@ impl CoreMetrics {
             "Delivery latency",
             m.delivery_latency.clone(),
         );
+        reg.register(
+            "config_reloads",
+            "Config reloads by outcome",
+            config_reloads,
+        );
+        reg.register(
+            "config_generation",
+            "Generation of the config in effect",
+            m.config_generation.clone(),
+        );
+        reg.register(
+            "shutdown_abandoned",
+            "Updates still pending when shutdown ended",
+            m.shutdown_abandoned.clone(),
+        );
         m
+    }
+
+    /// One config reload attempt with its outcome.
+    pub fn reload(&self, outcome: ReloadOutcome) {
+        self.config_reloads[outcome as usize].inc();
+    }
+
+    pub fn set_generation(&self, generation: u64) {
+        self.config_generation
+            .set(i64::try_from(generation).unwrap_or(i64::MAX));
+    }
+
+    /// Updates left pending when shutdown gave up on them.
+    pub fn shutdown_abandoned(&self, n: u64) {
+        self.shutdown_abandoned.inc_by(n);
     }
 
     /// Resolves the handles of every label combination of one source.
@@ -492,6 +547,9 @@ mod tests {
         c.endpoint(0).attempt(DeliveryOutcome::Delivered);
         c.endpoint(1).attempt(DeliveryOutcome::Retry);
         c.latency(0.002);
+        m.reload(ReloadOutcome::Applied);
+        m.set_generation(7);
+        m.shutdown_abandoned(4);
         let out = text(&reg);
         let got = lines(&out);
         for want in [
@@ -515,6 +573,10 @@ mod tests {
             r#"tgin_delivery_latency_seconds_count{consumer="c1"} 1"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.002",consumer="c1"} 1"#,
             r#"tgin_delivery_latency_seconds_bucket{le="0.001",consumer="c1"} 0"#,
+            r#"tgin_config_reloads_total{outcome="applied"} 1"#,
+            r#"tgin_config_reloads_total{outcome="rejected"} 0"#,
+            "tgin_config_generation 7",
+            "tgin_shutdown_abandoned_total 4",
         ] {
             assert!(got.contains(&want), "missing {want:?} in\n{out}");
         }
@@ -531,6 +593,9 @@ mod tests {
             "tgin_consumer_backpressure_seconds",
             "tgin_delivery_attempts",
             "tgin_delivery_latency_seconds",
+            "tgin_config_reloads",
+            "tgin_config_generation",
+            "tgin_shutdown_abandoned",
         ] {
             assert!(out.contains(&format!("# TYPE {name} ")), "no family {name}");
         }

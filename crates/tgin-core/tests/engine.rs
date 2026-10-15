@@ -1,0 +1,696 @@
+//! The engine: admission, hot reload, control and status. Time logic runs on
+//! tokio's paused clock; tests that reach a wiremock endpoint run in real
+//! time with bounded waits.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::registry::Registry;
+use tgin_core::config::{self, Config};
+use tgin_core::consumer::{PollRequest, PullConsumer};
+use tgin_core::engine::{Consumer, Engine, EngineRuntime};
+use tgin_core::facts::Facts;
+use tgin_core::ids::SourceId;
+use tgin_core::metrics::CoreMetrics;
+use tgin_core::sink::{Admit, Sink};
+use tgin_runtime::config::MapEnv;
+use tgin_runtime::queue::{HolderId, QueueStats};
+use tgin_runtime::supervisor::{Supervisor, TaskState};
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Bound on every wait for a condition.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// `message` goes to both pull consumers, `callback_query` to `p1` only and
+/// `edited_message` to `p2` only. `p1` refuses when full; `p2` evicts.
+const BASE: &str = r#"version: 1
+server: {}
+reload: { drain_timeout: 2s }
+bots:
+  - name: a
+    token: "1:aaa"
+    routes:
+      - match: { update_types: [message] }
+        to: [{ all: [p1, p2] }]
+      - match: { update_types: [callback_query] }
+        to: [p1]
+      - match: { update_types: [edited_message] }
+        to: [p2]
+consumers:
+  p1: { pull: { capacity: 1 } }
+  p2: { pull: { capacity: 1, on_full: drop_oldest } }
+"#;
+
+fn load(yaml: &str) -> Config {
+    config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).unwrap_or_else(|errors| {
+        panic!(
+            "{}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .expect("client")
+}
+
+struct Harness {
+    reg: Registry,
+    engine: Engine,
+    supervisor: Arc<Supervisor>,
+    force: CancellationToken,
+}
+
+impl Harness {
+    fn new(yaml: &str) -> Self {
+        let mut reg = Registry::with_prefix("tgin");
+        let metrics = CoreMetrics::register(&mut reg);
+        let supervisor = Arc::new(Supervisor::new());
+        let force = CancellationToken::new();
+        let rt = EngineRuntime {
+            supervisor: Arc::clone(&supervisor),
+            stop: CancellationToken::new(),
+            force: force.clone(),
+        };
+        let engine = Engine::new(&load(yaml), metrics, client(), rt).expect("engine");
+        Self {
+            reg,
+            engine,
+            supervisor,
+            force,
+        }
+    }
+
+    fn admit(&self, update_type: &str, update_id: i64) -> Admit {
+        admit_to(&self.engine, SourceId(0), update_type, update_id)
+    }
+
+    fn pull(&self, name: &str) -> Arc<PullConsumer> {
+        match self.engine.consumer(name) {
+            Some(Consumer::Pull(c)) => c,
+            other => panic!("{name} is no pull consumer: {}", other.is_some()),
+        }
+    }
+
+    fn stats(&self, name: &str) -> QueueStats {
+        match self.engine.consumer(name).expect("consumer") {
+            Consumer::Pull(c) => c.queue().stats(),
+            Consumer::Push(c) => c.queue().stats(),
+        }
+    }
+
+    fn metrics(&self) -> String {
+        let mut s = String::new();
+        encode(&mut s, &self.reg).expect("encode");
+        s
+    }
+
+    #[track_caller]
+    fn assert_metric(&self, line: &str) {
+        let out = self.metrics();
+        assert!(out.lines().any(|l| l == line), "missing {line:?} in\n{out}");
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.force.cancel();
+    }
+}
+
+fn payload(update_type: &str, update_id: i64) -> Bytes {
+    Bytes::from(format!(
+        r#"{{"update_id":{update_id},"{update_type}":{{"chat":{{"id":7}}}}}}"#
+    ))
+}
+
+fn admit_to(engine: &Engine, source: SourceId, update_type: &str, update_id: i64) -> Admit {
+    let facts = Facts {
+        update_type,
+        chat_id: Some(7),
+        ..Facts::default()
+    };
+    engine.admit(source, update_id, payload(update_type, update_id), &facts)
+}
+
+fn req(instance: &str, offset: i64, wait: Duration) -> PollRequest {
+    PollRequest {
+        instance: HolderId(Arc::from(instance)),
+        offset,
+        limit: 100,
+        timeout: wait,
+    }
+}
+
+/// Polls without waiting; returns the update ids handed out.
+async fn poll(c: &PullConsumer, instance: &str, offset: i64) -> Vec<i64> {
+    let resp = c
+        .poll(
+            req(instance, offset, Duration::ZERO),
+            &CancellationToken::new(),
+        )
+        .await;
+    resp.items
+        .iter()
+        .map(|p| {
+            let v: serde_json::Value = serde_json::from_slice(p).expect("json");
+            v["update_id"].as_i64().expect("update_id")
+        })
+        .collect()
+}
+
+async fn eventually(what: &str, cond: impl Fn() -> bool) {
+    timeout(WAIT, async {
+        while !cond() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admit_fanout_commits_all() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("message", 1), Admit::Admitted);
+    assert_eq!(poll(&h.pull("p1"), "i", 0).await, [1]);
+    assert_eq!(poll(&h.pull("p2"), "i", 0).await, [1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admit_backpressure_reserves_nothing() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    assert_eq!(h.admit("message", 2), Admit::Backpressure);
+    let p2 = h.stats("p2");
+    assert_eq!((p2.available, p2.leased, p2.reserved), (0, 0, 0));
+    let p1 = h.stats("p1");
+    assert_eq!((p1.available, p1.reserved), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admit_backpressure_reserves_nothing_and_never_evicts() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    assert_eq!(h.admit("edited_message", 2), Admit::Admitted);
+    assert_eq!(h.admit("message", 3), Admit::Backpressure);
+    assert_eq!(poll(&h.pull("p2"), "i", 0).await, [2]);
+    assert_eq!(h.stats("p2").reserved, 0);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p2",reason="overflow"} 0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admit_drop_oldest_target_does_not_block_others() {
+    let h = Harness::new(BASE);
+    let (p1, p2) = (h.pull("p1"), h.pull("p2"));
+
+    // p2 is full of unleased updates: the oldest is evicted.
+    assert_eq!(h.admit("edited_message", 1), Admit::Admitted);
+    assert_eq!(h.admit("message", 2), Admit::Admitted);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p2",reason="overflow"} 1"#);
+    assert_eq!(poll(&p2, "i", 0).await, [2]);
+
+    // p2 is full of leased updates: it skips the update, p1 still gets it.
+    assert_eq!(poll(&p1, "i", 0).await, [2]);
+    assert!(poll(&p1, "i", 3).await.is_empty());
+    assert_eq!(h.admit("message", 3), Admit::Admitted);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p2",reason="overflow"} 2"#);
+    assert_eq!(poll(&p1, "i", 0).await, [3]);
+    let s = h.stats("p2");
+    assert_eq!((s.available, s.leased, s.reserved), (0, 1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admit_unroutable_counts() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("poll", 1), Admit::Unroutable);
+    assert_eq!(
+        admit_to(&h.engine, SourceId(9), "message", 2),
+        Admit::Unroutable
+    );
+    for name in ["p1", "p2"] {
+        let s = h.stats(name);
+        assert_eq!((s.available, s.reserved), (0, 0), "{name}");
+    }
+    h.assert_metric(r#"tgin_routes_unmatched_total{source="a"} 1"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unmatched_counted_once_by_engine() {
+    let h = Harness::new(BASE);
+    for id in 1..=2 {
+        assert_eq!(h.admit("poll", id), Admit::Unroutable);
+    }
+    h.assert_metric(r#"tgin_routes_unmatched_total{source="a"} 2"#);
+    // Received updates are the source's to count, not the engine's.
+    h.assert_metric(r#"tgin_source_updates_total{source="a"} 0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn backpressure_seconds_counted_until_relieved() {
+    let h = Harness::new(BASE);
+    let p1 = h.pull("p1");
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    assert_eq!(h.admit("callback_query", 2), Admit::Backpressure);
+    sleep(Duration::from_secs(1)).await;
+    // Refusing again does not restart the clock.
+    assert_eq!(h.admit("callback_query", 2), Admit::Backpressure);
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(poll(&p1, "i", 0).await, [1]);
+    assert!(poll(&p1, "i", 2).await.is_empty());
+    assert_eq!(h.admit("callback_query", 2), Admit::Admitted);
+    h.assert_metric(r#"tgin_consumer_backpressure_seconds_total{consumer="p1"} 3.0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn set_username_enables_bot_suffixed_commands() {
+    let h = Harness::new(
+        r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "1:aaa"
+    routes:
+      - match: { commands: [start] }
+        to: [p1]
+consumers:
+  p1: { pull: {} }
+"#,
+    );
+    let start = |id| {
+        let facts = Facts {
+            update_type: "message",
+            command: Some(("start", Some("MyBot"))),
+            ..Facts::default()
+        };
+        h.engine
+            .admit(SourceId(0), id, payload("message", id), &facts)
+    };
+    assert_eq!(start(1), Admit::Unroutable);
+    h.engine.set_username(SourceId(0), Some("mybot".to_owned()));
+    assert_eq!(start(2), Admit::Admitted);
+    assert_eq!(h.engine.state().generation, 1);
+    assert_eq!(poll(&h.pull("p1"), "i", 0).await, [2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_keeps_queue_of_unchanged_consumer() {
+    let h = Harness::new(BASE);
+    let before = h.pull("p1");
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    let report = h
+        .engine
+        .apply(&load(&format!("{BASE}  p3: {{ pull: {{}} }}\n")))
+        .expect("apply");
+    assert_eq!(report.added, ["p3"]);
+    assert!(report.removed.is_empty() && report.changed.is_empty());
+    assert!(Arc::ptr_eq(&before, &h.pull("p1")));
+    assert_eq!(poll(&h.pull("p1"), "i", 0).await, [1]);
+}
+
+#[tokio::test]
+async fn reload_changes_params_live() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let yaml = |capacity: u32, route: &str| {
+        format!(
+            r#"{BASE}  h: {{ push: {{ endpoints: [{{ url: "{}{route}" }}] }} }}
+"#,
+            server.uri()
+        )
+        .replace(
+            "p1: { pull: { capacity: 1 } }",
+            &format!("p1: {{ pull: {{ capacity: {capacity} }} }}"),
+        )
+        .replace(
+            "        to: [p2]\n",
+            "        to: [p2]\n      - match: { update_types: [channel_post] }\n        to: [h]\n",
+        )
+    };
+    let h = Harness::new(&yaml(1, "/a"));
+    let p1 = h.pull("p1");
+    let Some(Consumer::Push(hook)) = h.engine.consumer("h") else {
+        panic!("h is a push consumer");
+    };
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    assert_eq!(h.admit("callback_query", 2), Admit::Backpressure);
+
+    let report = h.engine.apply(&load(&yaml(3, "/b"))).expect("apply");
+    assert_eq!(report.changed, ["h", "p1"]);
+    assert!(Arc::ptr_eq(&p1, &h.pull("p1")));
+    let Some(Consumer::Push(after)) = h.engine.consumer("h") else {
+        panic!("h is a push consumer");
+    };
+    assert!(Arc::ptr_eq(&hook, &after));
+
+    assert_eq!(h.admit("callback_query", 2), Admit::Admitted);
+    assert_eq!(h.admit("callback_query", 3), Admit::Admitted);
+    assert_eq!(h.admit("channel_post", 4), Admit::Admitted);
+    timeout(WAIT, async {
+        loop {
+            let got = server.received_requests().await.expect("recording");
+            if let Some(req) = got.first() {
+                assert_eq!(req.url.path(), "/b");
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivered to the new endpoint");
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_mode_change_drains_then_drops() {
+    let h = Harness::new(BASE);
+    let old = h.pull("p2");
+    assert_eq!(h.admit("edited_message", 1), Admit::Admitted);
+    let pushed = BASE.replace(
+        "p2: { pull: { capacity: 1, on_full: drop_oldest } }",
+        r#"p2: { push: { endpoints: [{ url: "http://127.0.0.1:9/" }] } }"#,
+    );
+    let report = h.engine.apply(&load(&pushed)).expect("apply");
+    assert_eq!(report.changed, ["p2"]);
+    assert!(matches!(h.engine.consumer("p2"), Some(Consumer::Push(_))));
+    assert_eq!(h.stats("p2").available, 0, "the new instance starts empty");
+
+    // The old instance drains for `drain_timeout`; nobody polls it.
+    sleep(Duration::from_millis(1900)).await;
+    assert_eq!(old.pending(), 1);
+    assert_eq!(h.engine.pending(), 1);
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(old.pending(), 0);
+    assert_eq!(h.engine.pending(), 0);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p2",reason="reload"} 1"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mode_change_keeps_metric_series() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.admit("edited_message", 1), Admit::Admitted);
+    let pushed = BASE.replace(
+        "p2: { pull: { capacity: 1, on_full: drop_oldest } }",
+        r#"p2: { push: { endpoints: [{ url: "http://127.0.0.1:9/" }] } }"#,
+    );
+    h.engine.apply(&load(&pushed)).expect("apply");
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(h.engine.pending(), 0);
+    let out = h.metrics();
+    for series in [
+        r#"tgin_consumer_dropped_total{consumer="p2",reason="reload"} 1"#,
+        r#"tgin_consumer_queue_depth{consumer="p2"}"#,
+        r#"tgin_delivery_latency_seconds_count{consumer="p2"}"#,
+    ] {
+        assert!(out.contains(series), "missing {series:?} in\n{out}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_removed_consumer_metrics_removed() {
+    // A second bot, `b`, routes to a push consumer `p3`.
+    let two_bots = BASE.replace(
+        "consumers:\n",
+        "  - name: b\n    token: \"2:bbb\"\n    routes: [{ to: [p3] }]\nconsumers:\n  p3: { push: { endpoints: [{ url: \"http://127.0.0.1:9/\" }] } }\n",
+    );
+    let h = Harness::new(&two_bots);
+    h.assert_metric(r#"tgin_routes_unmatched_total{source="b"} 0"#);
+    let without = BASE
+        .replace("        to: [{ all: [p1, p2] }]\n", "        to: [p1]\n")
+        .replace(
+            "      - match: { update_types: [edited_message] }\n        to: [p2]\n",
+            "",
+        )
+        .replace(
+            "  p2: { pull: { capacity: 1, on_full: drop_oldest } }\n",
+            "",
+        );
+    let report = h.engine.apply(&load(&without)).expect("apply");
+    assert_eq!(report.removed, ["p2", "p3"]);
+    eventually("the removed consumers drained", || h.engine.pending() == 0).await;
+    let removed = || {
+        let out = h.metrics();
+        !out.contains(r#"consumer="p2""#)
+            && !out.contains(r#"consumer="p3""#)
+            && !out.contains(r#"source="b""#)
+    };
+    eventually("the removed label sets are gone", removed).await;
+    let out = h.metrics();
+    assert!(out.contains(r#"consumer="p1""#), "{out}");
+    assert!(out.contains(r#"source="a""#), "{out}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_consumer_drains_then_drops_and_cancels_tasks() {
+    let yaml = BASE.replace(
+        "consumers:\n",
+        "consumers:\n  h: { push: { endpoints: [{ url: \"http://127.0.0.1:9/\" }] } }\n",
+    );
+    let h = Harness::new(&yaml);
+    let p1 = h.pull("p1");
+    let Some(Consumer::Push(hook)) = h.engine.consumer("h") else {
+        panic!("h is a push consumer");
+    };
+    let mut dispatcher = h.supervisor.subscribe("push:h").expect("supervised");
+    dispatcher
+        .wait_for(|s| *s == TaskState::Running)
+        .await
+        .expect("running");
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+
+    let only_p2 = r#"version: 1
+server: {}
+reload: { drain_timeout: 2s }
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{ to: [p2] }]
+consumers:
+  p2: { pull: { capacity: 1, on_full: drop_oldest } }
+"#;
+    let report = h.engine.apply(&load(only_p2)).expect("apply");
+    assert_eq!(report.removed, ["h", "p1"]);
+    assert!(h.engine.consumer("p1").is_none());
+    assert_eq!(
+        h.admit("callback_query", 2),
+        Admit::Admitted,
+        "routed to p2"
+    );
+
+    // `h` is empty: its drain ends at once and its dispatcher stops.
+    dispatcher
+        .wait_for(|s| *s == TaskState::Stopped)
+        .await
+        .expect("stopped");
+    eventually("h is released", || Arc::strong_count(&hook) == 1).await;
+
+    // `p1` holds an update until the drain timeout.
+    sleep(Duration::from_millis(1900)).await;
+    assert!(Arc::strong_count(&p1) > 1, "p1 is still draining");
+    assert_eq!(p1.pending(), 1);
+    sleep(Duration::from_millis(200)).await;
+    eventually("p1 is released", || Arc::strong_count(&p1) == 1).await;
+    assert_eq!(p1.pending(), 0);
+    assert_eq!(h.engine.pending(), 1, "only p2's update is left");
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_reports_restart_required() {
+    let h = Harness::new(BASE);
+    let same = h.engine.apply(&load(BASE)).expect("apply");
+    assert!(same.restart_required.is_empty() && same.sources_restarted.is_empty());
+    assert!(same.added.is_empty() && same.removed.is_empty() && same.changed.is_empty());
+
+    let changed = BASE
+        .replace(
+            "server: {}\n",
+            "server: { listen: [\"127.0.0.1:8081\"] }\nadmin: { listen: [\"127.0.0.1:9191\"] }\nruntime: { worker_threads: 2 }\n",
+        )
+        .replace("token: \"1:aaa\"", "token: \"1:bbb\"");
+    let report = h.engine.apply(&load(&changed)).expect("apply");
+    assert_eq!(
+        report.restart_required,
+        ["server.listen", "admin.listen", "runtime.worker_threads"]
+    );
+    assert_eq!(report.sources_restarted, ["a"]);
+
+    let api = changed.replace(
+        "token: \"1:bbb\"",
+        "token: \"1:bbb\"\n    api_url: \"http://127.0.0.1:8082/\"",
+    );
+    let report = h.engine.apply(&load(&api)).expect("apply");
+    assert!(report.restart_required.is_empty());
+    assert_eq!(report.sources_restarted, ["a"]);
+
+    let ingress = api.replace(
+        "api_url: \"http://127.0.0.1:8082/\"",
+        "api_url: \"http://127.0.0.1:8082/\"\n    ingress: { long_poll: {} }",
+    );
+    let report = h.engine.apply(&load(&ingress)).expect("apply");
+    assert_eq!(report.sources_restarted, ["a"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_generation_increments() {
+    let h = Harness::new(BASE);
+    assert_eq!(h.engine.state().generation, 1);
+    h.assert_metric("tgin_config_generation 1");
+    for want in 2..=3 {
+        let report = h.engine.apply(&load(BASE)).expect("apply");
+        assert_eq!(report.generation, want);
+        assert_eq!(h.engine.state().generation, want);
+        assert_eq!(h.engine.status().generation, want);
+    }
+    h.assert_metric("tgin_config_generation 3");
+    h.assert_metric(r#"tgin_config_reloads_total{outcome="applied"} 2"#);
+    h.assert_metric(r#"tgin_config_reloads_total{outcome="rejected"} 0"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_resume_purge() {
+    let yaml = BASE
+        .replace(
+            "consumers:\n",
+            "consumers:\n  h: { push: { endpoints: [{ url: \"http://127.0.0.1:9/\" }] } }\n",
+        )
+        .replace(
+            "        to: [p2]\n",
+            "        to: [p2]\n      - match: { update_types: [channel_post] }\n        to: [h]\n",
+        );
+    let h = Harness::new(&yaml);
+    let p1 = h.pull("p1");
+    assert!(!h.engine.pause("nope"));
+    assert!(!h.engine.resume("nope"));
+    assert_eq!(h.engine.purge("nope"), None);
+
+    // A paused pull consumer admits but leases nothing new.
+    assert!(h.engine.pause("p1"));
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    assert!(poll(&p1, "i", 0).await.is_empty());
+    let status = h.engine.status();
+    let p1_status = status.consumers.iter().find(|c| c.name == "p1").unwrap();
+    assert!(p1_status.paused);
+    assert_eq!(p1_status.depth, 1);
+
+    // It stays paused across a reload that keeps it.
+    h.engine.apply(&load(&yaml)).expect("apply");
+    assert!(poll(&p1, "i", 0).await.is_empty());
+
+    // A parked poll leases once the consumer resumes.
+    let parked = {
+        let p1 = Arc::clone(&p1);
+        tokio::spawn(async move {
+            p1.poll(
+                req("i", 0, Duration::from_secs(30)),
+                &CancellationToken::new(),
+            )
+            .await
+        })
+    };
+    sleep(Duration::from_secs(1)).await;
+    assert!(!parked.is_finished());
+    assert!(h.engine.resume("p1"));
+    let resp = timeout(Duration::from_secs(1), parked)
+        .await
+        .expect("woken")
+        .expect("poll");
+    assert_eq!(resp.items.len(), 1);
+
+    // Purge drops unleased updates only.
+    assert_eq!(h.admit("edited_message", 2), Admit::Admitted);
+    assert_eq!(h.engine.purge("p2"), Some(1));
+    assert_eq!(h.engine.purge("p1"), Some(0), "p1's update is leased");
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p2",reason="purge"} 1"#);
+    assert_eq!(h.stats("p2").available, 0);
+
+    // A paused push consumer admits but does not dispatch.
+    assert!(h.engine.pause("h"));
+    assert_eq!(h.admit("channel_post", 3), Admit::Admitted);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let s = h.stats("h");
+    assert_eq!((s.available, s.leased), (1, 0));
+    assert!(h.engine.resume("h"));
+    eventually("h leases after resuming", || h.stats("h").available == 0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_snapshot_has_no_secrets() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "123:t0kens3cret"
+    routes:
+      - match: { update_types: [message] }
+        to: [h]
+      - to: [p1]
+consumers:
+  h:
+    push:
+      endpoints:
+        - url: "https://user:pa55word@hooks.example:8443/s3cretpath?token=qs3cret"
+          secret_token: hdrs3cret
+        - url: "http://plain.example/"
+  p1: { pull: { auth_token: pulls3cret } }
+"#;
+    let h = Harness::new(yaml);
+    h.engine.pause("p1");
+    let status = h.engine.status();
+    let json = serde_json::to_value(&status).expect("serialize");
+    let text = json.to_string();
+    for secret in [
+        "t0kens3cret",
+        "pa55word",
+        "s3cretpath",
+        "qs3cret",
+        "hdrs3cret",
+        "pulls3cret",
+        "user",
+    ] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+    assert_eq!(json["generation"], 1);
+    assert_eq!(
+        json["consumers"],
+        serde_json::json!([
+            {
+                "name": "h",
+                "mode": "push",
+                "depth": 0,
+                "leased": 0,
+                "in_flight": 0,
+                "paused": false,
+                "endpoints": [
+                    { "index": 0, "origin": "https://hooks.example:8443", "breaker": "closed" },
+                    { "index": 1, "origin": "http://plain.example", "breaker": "closed" },
+                ],
+            },
+            {
+                "name": "p1",
+                "mode": "pull",
+                "depth": 0,
+                "leased": 0,
+                "in_flight": 0,
+                "paused": true,
+            },
+        ])
+    );
+}

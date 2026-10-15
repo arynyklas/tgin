@@ -58,8 +58,9 @@ pub struct PullConsumer {
     queue: LeaseQueue<Envelope>,
     metrics: ConsumerMetrics,
     draining: AtomicBool,
-    /// Wakes parked polls when the drain begins.
-    drain_started: Notify,
+    paused: AtomicBool,
+    /// Wakes parked polls when the drain begins or the consumer resumes.
+    wake: Notify,
 }
 
 impl PullConsumer {
@@ -69,7 +70,8 @@ impl PullConsumer {
             queue: LeaseQueue::new(cfg),
             metrics,
             draining: AtomicBool::new(false),
-            drain_started: Notify::new(),
+            paused: AtomicBool::new(false),
+            wake: Notify::new(),
         }
     }
 
@@ -80,7 +82,8 @@ impl PullConsumer {
     /// Acks by `offset`, then returns the oldest `limit` updates the instance
     /// still holds from `offset` on, else leases up to `limit` new updates,
     /// waiting for them until the timeout, `cancel`, or the drain hold ends
-    /// the wait.
+    /// the wait. While paused it leases nothing new: such a poll waits as on
+    /// an empty queue, and leases once the consumer resumes.
     pub async fn poll(&self, req: PollRequest, cancel: &CancellationToken) -> PollResponse {
         debug_assert!(
             (1..=MAX_LIMIT).contains(&req.limit),
@@ -108,14 +111,16 @@ impl PullConsumer {
             // Enabled before looking at the queue, so no wake-up is lost.
             let mut changed = pin!(self.queue.notified());
             changed.as_mut().enable();
-            let mut drain_started = pin!(self.drain_started.notified());
-            drain_started.as_mut().enable();
+            let mut woken = pin!(self.wake.notified());
+            woken.as_mut().enable();
 
             let now = Instant::now();
-            let leased = self.queue.lease(&req.instance, req.limit, now);
-            if !leased.is_empty() {
-                self.update_depth();
-                return PollResponse::from_leases(leased);
+            if !self.is_paused() {
+                let leased = self.queue.lease(&req.instance, req.limit, now);
+                if !leased.is_empty() {
+                    self.update_depth();
+                    return PollResponse::from_leases(leased);
+                }
             }
             let mut until = deadline;
             if self.draining.load(Ordering::SeqCst) {
@@ -127,7 +132,7 @@ impl PullConsumer {
             }
             tokio::select! {
                 () = &mut changed => {}
-                () = &mut drain_started => {}
+                () = &mut woken => {}
                 () = sleep_until(until) => break,
                 () = cancel.cancelled() => break,
             }
@@ -140,11 +145,33 @@ impl PullConsumer {
         &self.queue
     }
 
+    /// Updates not yet acked: queued and leased.
+    pub fn pending(&self) -> usize {
+        let stats = self.queue.stats();
+        stats.available + stats.leased
+    }
+
     /// From now on a poll on an empty queue answers within 500 ms; parked
     /// polls re-evaluate their wait with that cap.
     pub fn begin_drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
-        self.drain_started.notify_waiters();
+        self.wake.notify_waiters();
+    }
+
+    /// Stops leasing new updates; admissions, acks and redelivery of held
+    /// leases go on.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Leases again, waking parked polls.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 
     /// Returns expired leases to the queue every second until `cancel`.
@@ -182,7 +209,8 @@ impl PullConsumer {
         }
     }
 
-    fn update_depth(&self) {
+    /// Publishes the queue's depth gauges.
+    pub fn update_depth(&self) {
         let stats = self.queue.stats();
         let gauge = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         self.metrics

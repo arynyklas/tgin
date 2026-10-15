@@ -68,6 +68,7 @@ fn breaker(failure_threshold: u32, open_for: Duration) -> Breaker {
 fn endpoint_with(server: &MockServer, route: &str, breaker: Breaker) -> Endpoint {
     Endpoint {
         url: format!("{}{route}", server.uri()).parse().expect("url"),
+        origin: Arc::from(server.uri()),
         secret_token: None,
         timeout: Duration::from_secs(5),
         breaker,
