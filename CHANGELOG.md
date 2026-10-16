@@ -8,133 +8,140 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ## [Unreleased]
 
+tgin 1.0 is a rewrite of the engine, the config and the HTTP surface.
+[docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) lists every change a
+0.2 operator has to act on; `tgin config migrate` converts a 0.2 config.
+
 ### Upgrade notes
 
-1. The container image's `ENTRYPOINT` is the tgin binary itself: run
-   `docker run IMAGE -f /path/config.ron`, not `docker run IMAGE tgin -f …`
-   (the latter fails with a clap usage error, exit code 2).
-2. The image has no shell, so a `CMD-SHELL` healthcheck never passes. Probe
-   `/livez` and `/readyz` over HTTP instead.
-3. Shutdown now takes at least the 5 s lame duck and at most about
-   lame duck + grace + 1 s (≈ 21 s with the defaults). Raise Docker's 10 s
+1. The config file is YAML (`version: 1`), read from `tgin.yaml`, `-c PATH`
+   or `TGIN_CONFIG`. Convert a 0.2 file with
+   `tgin config migrate tgin.ron -o tgin.yaml`; the 0.2 flag `-f` now exits
+   1 with that hint.
+2. HTTP moved to two listeners: the data plane (`server.listen`, default
+   `0.0.0.0:8080`; a migrated config keeps its `server_port`) serves
+   webhooks and pull consumers, and the admin plane (`admin.listen`, default
+   `127.0.0.1:9090`) serves `/livez`, `/readyz`, `/metrics` and the admin API.
+   `/status` is now `/v1/status`. Move probes and scrapers to the admin plane.
+3. Every metric was renamed and relabelled by bot and consumer name; the
+   migration guide maps the 0.2 names.
+4. A malformed command line exits 64 (it exited 2). Exit code 2 now means
+   only that every source failed: Telegram rejected the token of every
+   long-poll bot and no webhook bot exists.
+5. The container image reads `/etc/tgin/tgin.yaml` (`TGIN_CONFIG`) instead of
+   `-f /etc/tgin/config.ron`, declares ports 8080 and 9090, and has a
+   `HEALTHCHECK` running `tgin admin health`. Its `ENTRYPOINT` is the tgin
+   binary: pass arguments directly (`docker run IMAGE -c /path/tgin.yaml`).
+6. The management API (`api`) is gone: edit the config file, which tgin
+   reloads on change, on `SIGHUP` or on `POST /v1/reload`.
+7. Push consumers retry failed deliveries and hold back their bot's source
+   when their queue is full. Migrated push consumers keep 0.2's single
+   attempt and drop-oldest queue until you delete those two lines.
+8. Shutdown takes up to about 22 s with the defaults. Raise Docker's 10 s
    default stop timeout: `docker run --stop-timeout 30`, Compose
    `stop_grace_period: 30s`, Kubernetes `terminationGracePeriodSeconds: 30`.
-4. A config with a `WebhookUpdate`, a `LongPollRoute` or `api` but no
-   `server_port` no longer starts (see Changed).
-5. Shutdown is bounded: dispatches still running at the drain deadline are
-   aborted and counted as abandoned (see Fixed).
-6. A second shutdown signal during the drain exits at once with code 130
-   (see Added).
-
-### Security
-
-- Bot tokens in Bot API and downstream URLs no longer leak into logs or
-  startup banners. HTTP client errors are logged without their request URL
-  (which carries the token), and the `WebhookRoute` banner redacts its URL
-  like the other banners.
-- Bot tokens embedded in configured paths (`WebhookUpdate.path`,
-  `LongPollRoute.path`, a common webhook pattern) are redacted too: in log
-  lines, startup banners, the warning for a webhook without `secret_token`,
-  `/status` and `/api/routes`.
-- Startup configuration errors redact bot tokens in echoed URLs and paths.
-- `WebhookUpdate` now sends its `secret_token` to `setWebhook` when it
-  registers the webhook, so Telegram includes the
-  `X-Telegram-Bot-Api-Secret-Token` header that tgin checks. Previously a
-  configured secret was never registered. `secret_token` must be 1-256
-  characters of `A-Za-z0-9_-`, as Telegram requires.
-- tgin warns at startup for every `WebhookUpdate` without a `secret_token`:
-  anyone who can reach that path can inject forged updates.
-- The management API can no longer run without authentication: enabling `api`
-  requires `auth_token`, and every `/api/*` request must send that token
-  in the `Authorization` header using the bearer scheme.
-
-### Fixed
-
-- Shutdown drains updates that were already acknowledged to Telegram instead
-  of dropping them (best effort; DOCS.md lists the remaining gap). On a
-  shutdown signal tgin reports not-ready on `/readyz`, keeps
-  accepting connections for a short lame-duck period (5 s), stops ingesting,
-  answers webhook ingress with `503` and `Retry-After`, and keeps serving
-  buffered updates to long-poll routes until they are drained or a 15 s grace
-  period ends. A long poll on an empty buffer is answered with an empty batch
-  within 500 ms instead of being held for its full timeout.
-- Shutdown is bounded at about lame duck + grace + 1 s (≈ 21 s with the
-  defaults), whatever the downstreams do. Once the HTTP plane has closed, the
-  workers keep dispatching only until the end of the grace (at least 1 s after
-  the HTTP close begins); dispatches still in flight then are aborted. Updates
-  still queued, aborted or left in long-poll buffers are logged once as
-  `abandoned`. Previously a slow or dead webhook downstream could hold the
-  process for its request timeout per queued update.
-- `Compact` logs contain ANSI colour codes only when stdout is a terminal and
-  `NO_COLOR` is unset or empty; `docker logs` and log files get plain text.
-- Long-poll ingress recovers from `409 Conflict` instead of retrying it as a
-  transient error. If a webhook is active, tgin deletes it (at most once per
-  60 s, and only when the poll URL ends in `/getUpdates`) and resumes
-  polling; if another process polls the same token, tgin backs off for 5 s
-  and logs that only one poller per token can run.
-- tgin exits with code 2 when every long-poll ingress has failed permanently
-  and there is no webhook ingress, instead of running with nothing to route.
-- Long-poll routes clamp `getUpdates` parameters to Telegram's bounds: `limit`
-  defaults to 100 and is clamped to 1-100, `timeout` is capped at 50 s.
-- HTTP paths that the router would panic on or treat as captures (no leading
-  `/`, `{` or `}`, a segment starting with `:` or `*`, or `api.base_path` set
-  to `/`) are rejected by config validation and by the management API (`400`).
-
-### Changed
-
-- **Breaking:** unknown fields in the configuration are rejected at startup.
-  A misspelled key such as `server_prot` used to be silently ignored.
-- **Breaking:** a `WebhookUpdate`, a `LongPollRoute` or `api` without
-  `server_port` is a validation error (`RequiresServerPort`). Without an HTTP
-  listener none of them can be reached; such a config used to start and
-  silently never receive or serve updates.
-- **Breaking:** enabling the management API (`api`) requires a non-blank
-  `auth_token`. The shipped example configs read it from `TGIN_AUTH_TOKEN`.
-- **Breaking:** the minimum supported Rust version is now 1.89
-  (`rust-version = "1.89"` in the workspace manifest). The `icu_*` 2.3 crates
-  pulled in by `url`/`idna` already require 1.88.
-- **Breaking:** the container image is a static musl binary on distroless and
-  runs as the numeric user and group `65532:65532`. Mounted configuration
-  files (and TLS keys) must be readable by uid 65532.
-- Linux musl builds (the static release archives and the container image) use
-  mimalloc as the global allocator; musl's allocator is slow under
-  multi-threaded load.
-- The `examples/simple` compose stack publishes tgin on `127.0.0.1` only.
 
 ### Added
 
-- `GET /livez` (always `200`) and `GET /readyz` (`200`, or `503` while
-  draining) probes. They stay unauthenticated when `auth_token` is set.
-- Graceful shutdown on Windows console events: Ctrl+C, Ctrl+Break, console
-  close and system shutdown.
-- A second shutdown signal (SIGINT or SIGTERM; Ctrl+C or Ctrl+Break on
-  Windows) during the drain exits at once with code 130. On Windows the second
-  Ctrl+C used to kill the process with status `0xC000013A`.
-- `tgin --version`.
+- Several bots per process, each with its own token, `api_url` and ingress
+  (long poll or webhook), and per-bot routing rules on update type, chat,
+  chat type, user, command, text and callback data. Targets send an update to
+  consumers, to `all` of a group, or to one of a `split` (`round_robin`,
+  sticky `hash_chat`, or `weighted`).
+- Pull consumers: a Telegram-shaped `getUpdates` on `/c/<name>/getUpdates`
+  and on alias paths, with leases acknowledged by `offset`, redelivery after
+  `lease_timeout`, instances named by `X-Tgin-Instance` or client address,
+  and an optional per-consumer token.
+- Push consumers: delivery to one or more endpoints with `round_robin`,
+  `hash_chat` or `least_in_flight` balancing, retries with backoff and
+  `Retry-After`, dead letters, a circuit breaker per endpoint, and
+  `X-Tgin-Source`, `X-Tgin-Update-Type` and `X-Tgin-Attempt` headers.
+- Bounded queues per consumer (`capacity`, `capacity_bytes`) with
+  `on_full: backpressure` or `drop_oldest`, and `ordering: per_chat`.
+- Webhook ingress with a secret derived from the bot token by default,
+  `setWebhook` registration, an IP allowlist (including Telegram's
+  networks) and trusted proxies for `X-Forwarded-For`.
+- Hot reload on file change, `SIGHUP` and `POST /v1/reload`: rules,
+  consumers and bots change live; only bots whose token, `api_url` or
+  ingress changed restart; removed consumers drain; settings that need a
+  restart are reported.
+- Admin API v1: `/v1/status`, `/v1/config` (secrets redacted),
+  `/v1/reload`, and pause, resume, drain and purge per consumer; and
+  `tgin admin`, its command-line client (`status`, `reload`, `consumers`,
+  `pause`, `resume`, `drain`, `purge`, `health`).
+- `tgin config validate`, `print`, `schema` and `migrate`; config errors
+  carry YAML path, line and column; a JSON Schema
+  (`schema/tgin.v1.schema.json`) and a generated reference
+  (`docs/config-reference.md`).
+- Metrics for sources, routing, consumer queues, deliveries, reloads and
+  shutdown, plus `tgin_build_info`.
+- TLS on the data plane with certificate reload; listener limits
+  (`server.max_connections`, `server.header_read_timeout`).
+- Graceful shutdown with a lame duck and a drain, on SIGTERM and SIGINT and
+  on Windows console events (Ctrl+C, Ctrl+Break, console close, system
+  shutdown); a second signal exits at once with code 130.
+- `tgin version` and `tgin --version`.
+- Release binaries for Linux (glibc and static musl), macOS and Windows on
+  x86_64 and aarch64, with shell and PowerShell installers, SHA-256
+  checksums, a CycloneDX SBOM, embedded dependency metadata
+  (`cargo auditable`) and build provenance attestations.
 - Multi-arch (amd64, arm64) container image at `ghcr.io/arynyklas/tgin`,
   tagged `<version>`, `<major>.<minor>` and, for the highest stable release
   only, `latest`, with a build provenance attestation.
-- Release binaries for Linux (glibc and static musl), macOS and Windows on
-  x86_64 and aarch64, with shell and PowerShell installers, SHA-256 checksums,
-  a CycloneDX SBOM, embedded dependency metadata (`cargo auditable`) and
-  build provenance attestations.
+
+### Changed
+
+- **Breaking:** the config format, CLI, ports, endpoints, metrics, exit
+  code 2 and the container image, as listed under Upgrade notes.
+- **Breaking:** unknown config keys are errors.
+- **Breaking:** the minimum supported Rust version is 1.89.
+- **Breaking:** the container image is a static musl binary on distroless,
+  without a shell, running as the numeric user and group `65532:65532`.
+  Mounted config files, secrets and TLS keys must be readable by uid 65532.
+- References in the config (`${env:NAME}`, `${file:PATH}`) are expanded
+  only in secrets, URLs and file paths; relative file paths resolve against
+  the config file's directory.
+- Long-poll bots delete an active webhook before polling
+  (`delete_webhook_on_start`, on by default), keeping pending updates.
+- Linux musl builds (the static release archives and the container image)
+  use mimalloc as the global allocator.
+
+### Removed
+
+- The RON config format (still read by `tgin config migrate`), the `-f`
+  flag, the `api` route-management API, `/status` and the 0.2 metric
+  names.
+
+### Security
+
+- Secrets are masked in every log line, including panics, as are strings
+  shaped like bot tokens; secrets of earlier configs stay masked after a
+  reload.
+- `/v1/config`, `/v1/status` and `tgin config print` never show secrets,
+  and show URLs only as `scheme://host[:port]`. Metric labels carry no URLs.
+- The admin API requires `admin.token` unless every admin listener is on
+  loopback; removing the token by a reload while a non-loopback listener
+  is bound refuses every protected request until restart.
+- `tgin admin` reads the admin token only from a file and never sends it
+  through an HTTP proxy.
+- Webhook secrets are checked in constant time before the request body is
+  read.
+- Outgoing requests never follow redirects; a push endpoint answering with
+  a redirect dead-letters the update.
+- Config errors never quote secret values or the source line.
 
 ### Dependencies
 
-- All Rust dependencies were updated, including axum 0.8, axum-server 0.8,
-  reqwest 0.13 and rand 0.10. reqwest is built with rustls only, so OpenSSL,
-  native-tls and ring are out of the build graph; one aws-lc-rs provider is
-  shared by the HTTP client and the TLS listener. tgin's own code uses
-  `std::sync::LazyLock` instead of `once_cell`.
-- `cargo deny check advisories` reports no known RustSec advisories against
-  the lockfile; CI runs `cargo deny check` on every push and pull request.
-- The benchmark harness, examples and Docker base images were updated as well.
+- Rust dependencies were updated, including axum 0.8, axum-server 0.8 and
+  reqwest 0.13. reqwest is built with rustls only, so OpenSSL, native-tls
+  and ring are out of the build graph; one aws-lc-rs provider serves the
+  HTTP client and the TLS listener.
+- CI runs `cargo deny check` on every push and pull request.
 
 ### Docs
 
-- README, DOCS, AGENTS and PERF now describe the actual behaviour: delivery
-  semantics, shutdown and exit codes, configuration strictness, probes,
-  container usage and the known limits of the benchmark numbers.
+- README, DOCS and AGENTS describe tgin 1.0; new migration guide and
+  generated config reference; PERF compares 1.0 with 0.2.
 - Added `SECURITY.md` (supported versions, private reporting, verifying
   release attestations) and this changelog.
 

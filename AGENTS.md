@@ -1,108 +1,79 @@
 # Repository Guidelines
 
-`tgin` is a routing layer between the Telegram Bot API and one-or-more downstream bot instances ("NGINX for Telegram bots"). A single Rust binary loads a RON config, ingests updates via long poll or webhook, and dispatches each update through a tree of routes / load balancers. See `README.md` and `DOCS.md` for end-user documentation; `DOCS.md` is the reference for runtime behaviour (delivery semantics, shutdown, exit codes).
+`tgin` routes Telegram Bot API updates to downstream bot processes ("NGINX for Telegram bots"). One binary reads a YAML config (`version: 1`), ingests each bot's updates by long poll or webhook, routes every update by the bot's rules into named consumers, and serves them: **pull** consumers through a Telegram-shaped `getUpdates` endpoint, **push** consumers by POSTing to HTTP endpoints. `README.md` and `DOCS.md` are the user documentation; `DOCS.md` is the reference for runtime behaviour (delivery semantics, reload, admin API, metrics, shutdown, exit codes), and `docs/config-reference.md` is generated from the config model.
 
 ## Architecture & Data Flow
 
 ```
-Telegram ──► UpdaterComponent (ingress) ──► mpsc<Bytes> (1024) ──► worker pool (dark_threads) ──► RouteableComponent tree ──► downstream bots
-                                                                                                        ▲
-                                                                          ApiMessage (mpsc) for hot-reconfig, api::Api loop
+Telegram ─► source (long poll task, or webhook route on the data plane)
+              │ extract facts once (update type, chat, user, text, command)
+              ▼
+           Engine::admit ─► RouteTable (rules, compiled) ─► reserve in every target queue ─► commit
+                                                                   │
+                         pull: LeaseQueue ◄─ getUpdates polls ─────┤
+                         push: LeaseQueue ─► dispatcher ─► HTTP endpoints (retries, breakers)
 ```
 
-Pipeline stages, all glued together by `crates/tgin/src/tgin.rs::Tgin::run_until` (`run_async` = `run_until(OsSignals::default(), ShutdownTiming::default())`):
+1. **Sources** (`crates/tgin-botapi`): `LongPollSource` polls `getUpdates` and offers each update to a `Sink`, moving its offset past an update only once it is admitted; on backpressure it holds the batch. `webhook_router` serves one `POST <path>` per webhook bot, checks allowlist and secret on the head alone, and answers `503` + `Retry-After` on backpressure. `facts::extract` reads the routing facts from the raw JSON without building a `serde_json::Value`.
+2. **Engine** (`crates/tgin-core/src/engine.rs`, `admission.rs`): `Sink::admit` routes with the current `RouteTable` (swapped atomically on reload) and reserves room in every target (`backpressure` targets first, then `drop_oldest`), then commits; one queue lock at a time, nothing awaits.
+3. **Consumers** (`crates/tgin-core/src/consumer/`): `PullConsumer::poll` acks by offset, returns held leases, else leases new updates and parks until the timeout; `PushConsumer` runs one dispatcher per consumer that leases up to `max_in_flight` and delivers with retries, per-endpoint breakers and balancing.
+4. **App** (`crates/tgin/src`): `app.rs` assembles the engine, the admin plane, the data plane and the sources, and runs the shutdown sequence; `data_server.rs` serves webhook routes and `/c/{consumer}/getUpdates` plus aliases through an `ArcSwap<Router>` that reloads replace; `admin/` is the admin plane (probes, `/metrics`, `/v1/*`) and `tgin admin`; `reload.rs` serializes reloads (SIGHUP, `POST /v1/reload`, file watcher) and applies them through `Engine::apply` (`crates/tgin-core/src/reload.rs`); `sources.rs` starts, stops and restarts bot sources; `migrate/` is `tgin config migrate` (0.2 RON → YAML).
 
-1. **Ingress** (`crates/tgin/src/update/`): each `Box<dyn UpdaterComponent>` runs as a `tokio::spawn`ed task that pushes each update's raw JSON as `bytes::Bytes` into a shared bounded `mpsc::Sender<Bytes>` (`UPDATE_CHANNEL_CAPACITY` = 1024). Updates are never parsed into `serde_json::Value` on the hot path; ingress validates the JSON shape once and the bytes are forwarded verbatim.
-   - `LongPollUpdate` polls `https://api.telegram.org/bot<token>/getUpdates` (or the full `url` override) via `reqwest`, with jittered backoff, `Retry-After` on 429, 409 recovery and permanent-failure detection (401/403/404).
-   - `WebhookUpdate` registers a POST endpoint on the shared axum router, checks `x-telegram-bot-api-secret-token` in a middleware before the body is read, and optionally calls `setWebhook` at start.
-2. **Dispatch**: `spawn_worker_pool` runs `dark_threads` workers over the shared receiver; each runs one update through `route.process` to completion before taking the next.
-3. **Routing tree** (`crates/tgin/src/route/`, `crates/tgin/src/lb/`): a single `Arc<dyn RouteableComponent>` owns all destinations.
-   - Leaves: `LongPollRoute` (bounded `Arc<std::sync::Mutex<VecDeque<Bytes>>>` + `Notify`, drained on read by a Telegram-shaped `getUpdates` endpoint), `WebhookRoute` (one POST per update, no retries).
-   - Inner nodes: `RoundRobinLB` (atomic cursor → one child per update), `AllLB` (fans out to every child on a `JoinSet` and waits for all).
-4. **HTTP plane** (axum): every component implements `Serverable::set_server(Router<Sender<Bytes>>) -> Router<Sender<Bytes>>`; `Tgin` chains the `set_server` calls, merges `observability_routes`, then binds on `0.0.0.0:<server_port>` on the calling task (TLS via `axum_server::tls_rustls` when `ssl` is set). When `api` is enabled, `dynamic_handler` is installed as the fallback so long-poll routes added at runtime resolve through `LONGPOLL_REGISTRY`. `/livez` and `/readyz` are always open; `/status` and `/metrics` are wrapped by `utils::auth::guard` and need `Authorization: Bearer <auth_token>` when `auth_token` is set, as does `/<base_path>/*`. The data plane (webhook ingress, long-poll routes) is never gated.
-5. **Management API** (`crates/tgin/src/api/`): owns its own `mpsc` pair; HTTP handlers send `ApiMessage::{GetRoutes, AddRoute, RmRoute}` with a `oneshot` reply, and the loop in `run_until` mutates the routing tree (`add_route` / `remove_route` on `Routeable`) and maps `AddRouteError` / `RemoveRouteError` to `ApiError` (409 / 404).
-6. **Shutdown**: a coordinator task waits for a `ShutdownCause` from the injected `ShutdownSignals` source (`OsSignals` in production) or `AllIngressFailed` from `IngressHealth`, then runs lame duck → cancel `ingest` → `begin_drain` → wait for `backlog_drained` (bounded by `ShutdownTiming::grace`) → close HTTP → cancel `drain` → at `drain_deadline` cancel `stop` (workers abort in-flight dispatches and exit). Without `server_port` it cancels `ingest` and `drain` at once and `stop` after the grace. A further signal during any of this cancels `forced` and `run_until` returns `ShutdownOutcome::Forced`; otherwise it returns `Completed { abandoned }`. `main` maps the outcome to exit codes 0 / 1 / 2 / 130.
-
-### Core traits (`crates/tgin/src/base.rs`, `crates/tgin/src/update/base.rs`)
-
-- `Updater` — `async fn start(&self, tx: Sender<Bytes>, shutdown: CancellationToken)`, plus `metrics()` for `/status`.
-- `Routeable` — `async fn process(&self, update: Bytes)`; `id()` (`RouteId::Path` / `RouteId::Url` for leaves, `None` for LBs); `add_route` / `remove_route` returning `AddRouteError` / `RemoveRouteError` (defaults: `Conflict` / `NotFound`, overridden by load balancers); `begin_drain()` and `pending()` for shutdown.
-- `Serverable` — `async fn set_server(&self, Router<Sender<Bytes>>) -> Router<Sender<Bytes>>`; default returns the router unchanged.
-- `Printable` — `print()` for the boot banner, `json_struct()` for `/api/routes`, `/status` and `/metrics`.
-- Blanket-impl supertraits combine the above: `UpdaterComponent = Updater + Serverable + Printable`, `RouteableComponent = Routeable + Serverable + Printable`. Implementing the constituents is enough; the blanket impl provides the supertrait.
-
-All async trait methods use `#[async_trait]`.
-
-## Key Directories
+## Workspace Layout
 
 | Path | Role |
 | --- | --- |
-| `Cargo.toml` | Virtual workspace: `[workspace.package]` (version `1.0.0-dev`, `rust-version`), `[workspace.lints]`, release/dist profiles. `tests/performance/benchmark` is excluded (own Cargo.lock). |
-| `crates/tgin/` | The `tgin` binary package (edition 2021; dist builds it via `[package.metadata.dist] dist = true`). |
-| `crates/tgin-core/`, `crates/tgin-runtime/`, `crates/tgin-botapi/` | Library crates of the new engine (currently empty). |
-| `xtask/` | Repository automation, `cargo xtask` (alias in `.cargo/config.toml`). `cargo xtask schema` regenerates `schema/tgin.v1.schema.json` from `tgin_core::config::schema()`; `--check` fails if it is stale. |
-| `schema/tgin.v1.schema.json` | Generated JSON Schema of the v1 YAML config (`crates/tgin-core/src/config/`). Never edit by hand; the `schema_is_up_to_date` test and CI check it. |
-| `crates/tgin/src/main.rs` | clap CLI (`-f/--file`, default `tgin.ron`; `--version`), `load_config` → `observe::init` → `build_updates` / `build_route` → `Tgin::run`; exit codes 0 / 1 / 2 / 130 (`RunOutcome::exit_code`). Declares the musl-only global allocator: `#[global_allocator]` `mimalloc::MiMalloc` under `#[cfg(target_env = "musl")]`, with the `mimalloc` dependency in `crates/tgin/Cargo.toml`'s `[target.'cfg(target_env = "musl")'.dependencies]`. |
-| `crates/tgin/src/tgin.rs` | `Tgin` struct: runtime, bind, worker pool (`WorkerPool`), API loop, shutdown coordinator (`ShutdownTiming`, `ShutdownCause`, `ShutdownSignals` / `OsSignals`, `ShutdownOutcome`, `IngressHealth`), `observability_routes`. |
-| `crates/tgin/src/base.rs` | Trait definitions, `RouteId`, `AddRouteError` / `RemoveRouteError`, component supertraits. |
-| `crates/tgin/src/config/schema.rs` | RON-deserialized types: `TginConfig`, `UpdateConfig`, `RouteConfig`, `SslConfig`, `ApiConfig`, `RegistrationWebhookConfig`, `LogFormat`. |
-| `crates/tgin/src/config/setup.rs` | `load_config`, `${VAR}` substitution (regex `\$\{(\w+)\}`; collects every unset variable), `validate`, `effective_auth_token`, `build_updates`, recursive `build_route`. |
-| `crates/tgin/src/config/error.rs` | `ConfigError` (`FileRead`, `MissingEnvVars`, `Parse`, `Validation`) and `ValidationError`; `main` prints them as one `tgin: …` message and exits 1. |
-| `crates/tgin/src/update/{longpull,webhook}.rs` | Ingress adapters. **Note the spelling: the module is `longpull`, not `longpoll`.** |
-| `crates/tgin/src/route/{longpull,webhook}.rs` | Egress routes. Same `longpull` spelling. |
-| `crates/tgin/src/lb/{roundrobin,all}.rs` | Load balancers, both `ArcSwap<Vec<Arc<dyn RouteableComponent>>>` with RCU add/remove. |
-| `crates/tgin/src/api/{router,methods,message,schemas}.rs` | Hot-reconfig HTTP API, `ApiMessage`, `ApiError` → status codes. |
-| `crates/tgin/src/dynamic/handler.rs` | Axum fallback that dispatches to runtime-added long-poll routes via `LONGPOLL_REGISTRY` (`crates/tgin/src/dynamic/longpoll_registry.rs`, `std::sync::LazyLock<ArcSwap<HashMap<String, Arc<LongPollRoute>>>>`). |
-| `crates/tgin/src/utils/defaults.rs` | `redact(&str) -> Cow<str>`: the one token-redaction helper (replaces bot tokens with `#####` via a `LazyLock<Regex>` compiled once). |
-| `crates/tgin/src/utils/http.rs` | `build_shared_client`: the one process-wide `reqwest::Client`. |
-| `crates/tgin/src/utils/auth.rs` | `secret_eq` (the single constant-time compare, used by the webhook secret check and the bearer gate) and `guard` (optional `Bearer` middleware). |
-| `crates/tgin/src/observe.rs` | tracing subscriber init, `dispatch_span`, `UpdaterMetrics`, process-global metrics registry, `/status` + `/metrics` handlers. |
-| `crates/tgin/src/mock/routes.rs` | `MockCallsRoute` test double, gated by `#[cfg(test)]` on `mod mock` in `main.rs`. |
-| `tests/performance/` | Docker-compose load-test harness: Rust `tgin-bench` (load generator, fake Bot API and the `bot` downstream), Python aiogram bots (`BOT_IMPL=py`), Python (matplotlib) plotter in `diagram/`. |
-| `examples/simple/` | docker-compose example with two long-poll bots and one webhook bot. |
-| `integrations/pytgin/` | Python `aiogram` shim that reroutes `getUpdates` through tgin. |
+| `Cargo.toml` | Virtual workspace: `[workspace.package]` (version `1.0.0-dev`, edition 2024, `rust-version = "1.89"`), shared `[workspace.dependencies]`, `[workspace.lints]` (`unsafe_code = "deny"`, clippy `all`), `[profile.release]` (`lto = true`, `codegen-units = 1`) and `[profile.dist]`. `tests/performance/benchmark` is excluded (own `Cargo.lock`). No `default-members`: bare `cargo test` tests every crate. |
+| `crates/tgin-runtime/` | Generic building blocks with no tgin domain knowledge: `queue` (`LeaseQueue`: bounded, leases, acks, per-key ordering), `supervisor` (restarting tasks), `lifecycle` (phases, signals, shutdown timing), `http` (hardened HTTP/1.1 server with TLS reload, outbound client, URL-free error rendering), `obs` (tracing with a redacting writer, metrics registry, readiness), `config` (YAML parsing with locations, `${env:…}`/`${file:…}` interpolation, file watcher), `secret` (`Secret`, `Redactor`, constant-time compare), `backoff`, `breaker`. |
+| `crates/tgin-core/` | The engine: `config/` (YAML model, validation, resolution, JSON Schema), `rules/` (compiled route table), `engine.rs` + `admission.rs`, `consumer/{pull,push}.rs`, `reload.rs` (config diff and live apply), `metrics.rs` (every metric family and pre-resolved handles). |
+| `crates/tgin-botapi/` | Telegram side: `client.rs` (Bot API client), `facts.rs` (fact extraction from raw JSON), `longpoll.rs`, `webhook.rs`, `secret.rs` (derived webhook secret); `benches/` and `tests/alloc_budget.rs` (hot-path gates). |
+| `crates/tgin/` | The `tgin` binary (dist builds it via `[package.metadata.dist] dist = true`): `cli.rs`, `app.rs`, `data_server.rs`, `admin/`, `reload.rs`, `sources.rs`, `migrate/`, `exit.rs`. `main.rs` declares mimalloc as the global allocator on musl only. |
+| `xtask/` | `cargo xtask schema [--check]` writes `schema/tgin.v1.schema.json`; `cargo xtask config-docs [--check]` writes `docs/config-reference.md` from that schema (`.cargo/config.toml` holds the alias). |
+| `schema/tgin.v1.schema.json`, `docs/config-reference.md` | Generated from the doc comments of `crates/tgin-core/src/config/model.rs` (and the hand-written schemas in `config/schema.rs`). Never edit them: change the source, then run both xtask commands. The tests `schema_is_up_to_date` (tgin-core) and `config_reference_is_up_to_date` (xtask), and CI, check them. |
+| `tgin.yaml` | Root example config (one long-poll bot, one pull consumer; reads `${env:TOKEN}`). |
+| `Dockerfile` | Builder `rust:1.99.0-alpine3.24`, runtime `gcr.io/distroless/static-debian13`, both pinned by digest; `cargo build --release --locked -p tgin` (static musl), `TGIN_COMMIT` from the `REVISION` build arg; uid/gid `65532:65532`; `EXPOSE 8080 9090`; `ENV TGIN_CONFIG=/etc/tgin/tgin.yaml`; exec-form `HEALTHCHECK` running `tgin admin health`; `ENTRYPOINT ["/usr/local/bin/tgin"]`, `CMD []`. |
+| `examples/simple/` | Compose stack: one bot, two pull consumers polled by aiogram bots, one push consumer. `tgin.ron` is its 0.2 config, kept as `tgin config migrate` input. |
+| `integrations/pytgin/` | aiogram shim that points `getUpdates` at a tgin URL. |
+| `tests/performance/` | Load-test harness (see Testing). `cfgs/v1/*.yaml` are the 1.0 scenario configs, `cfgs/*.ron` the 0.2 ones. |
+
+### Crate boundaries
+
+Dependencies point one way: `tgin-runtime` ← `tgin-core` ← `tgin-botapi` ← `tgin` (and `xtask` → `tgin-core`). `tgin-runtime` knows nothing of Telegram or of the config model; `tgin-core` knows nothing of the Bot API's HTTP shapes (sources reach it only through the `Sink` trait and `Facts`); `tgin-botapi` does not know the app. Put code in the lowest crate whose concepts it needs; never add an upward dependency.
 
 ## Important Files
 
-- `Cargo.toml` — virtual workspace, `rust-version = "1.89"` (MSRV, checked in CI) and version in `[workspace.package]`; the `tgin` binary package stays on edition 2021. `[profile.release]` sets `lto = true` and `codegen-units = 1`; `[profile.dist]` inherits it for release archives.
-- `tgin.ron` — root example config; reads `${TOKEN}` and `${TGIN_AUTH_TOKEN}` (it enables `api`).
-- `Dockerfile` — BuildKit multi-stage: builder `rust:1.99.0-alpine3.24` and runtime `gcr.io/distroless/static-debian13`, both pinned by digest. Builds a static musl binary, runs as numeric `65532:65532`, no shell in the image. `ENTRYPOINT ["/usr/local/bin/tgin"]`, `CMD ["-f","/etc/tgin/config.ron"]`, OCI labels from build args `VERSION`/`REVISION`/`CREATED`.
-- `.github/workflows/ci.yml` — `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D warnings` (plus the Linux-only `hot_path_ir` bench, which `bench = false` keeps out of `--all-targets`) and `cargo xtask schema --check`, `cargo test --workspace` on Linux, macOS and Windows, MSRV `cargo check --workspace`, `cargo deny check`, static musl build, build-only Docker image on native amd64 and arm64 runners, clippy + tests for `tests/performance/benchmark`, and `bench-gate` (the Callgrind instruction-count gate, `cargo bench -p tgin-botapi --bench hot_path_ir` on a pinned toolchain via `gungraun/setup-gungraun`).
-- `crates/tgin-botapi/benches/` and `crates/tgin-botapi/tests/alloc_budget.rs` — hot-path benchmarks over the 1000 updates in `tests/fixtures/updates.jsonl`, routed by `tests/fixtures/hot_path.yaml` (shared setup in `benches/common/mod.rs`). `hot_path.rs` is criterion (`cargo bench -p tgin-botapi -- --quick`). `hot_path_ir.rs` is gungraun under Callgrind (Linux, needs Valgrind and `gungraun-runner`), with a hard `Ir` limit per benchmark set to 1.5× the measured count. `alloc_budget.rs` is the allocation gate: a thread-local counting allocator asserting at most 2 allocations per update on the warm path. The gungraun limits are re-measured (Docker `rust:<version>` with `--security-opt seccomp=unconfined`) whenever the toolchain pinned in `bench-gate` changes: limits and toolchain move together.
-- `.github/workflows/release.yml` — generated by dist (cargo-dist 0.32.0) from `dist-workspace.toml`, with hand edits listed in its header. To regenerate, follow the steps in the `allow-dirty` comment in `dist-workspace.toml`, then re-apply the hand edits from the `release.yml` header. The release notes come from the matching `CHANGELOG.md` section; never write credential-shaped text there (e.g. `Bearer` followed by a word), because the Actions runner masks it and drops any job output that contains it.
-- `.github/workflows/image.yml` — on `v*` semver tags, builds amd64/arm64 images natively, publishes the multi-arch index to `ghcr.io/arynyklas/tgin` and attests it. `latest` goes only to the highest stable `vX.Y.Z` tag.
-- `deny.toml` — cargo-deny policy: advisories (unmaintained, unsound, yanked are errors), license allow-list, bans on `openssl`, `openssl-sys`, `native-tls`, `ring`, crates.io only.
-- `.github/dependabot.yml` — weekly grouped updates for cargo, GitHub Actions, Docker, uv and pip.
-- `DOCS.md`, `PERF.md`, `CHANGELOG.md`, `SECURITY.md` — user docs, benchmarks, release notes, security policy.
+- `.github/workflows/ci.yml` — every check listed under [CI checklist](#ci-checklist).
+- `.github/workflows/release.yml` — generated by dist (cargo-dist 0.32.0) from `dist-workspace.toml` (8 targets), with hand edits listed in its header. To regenerate, follow the steps in the `allow-dirty` comment in `dist-workspace.toml`, then re-apply the hand edits. Dry run: `dist plan --tag v1.0.0-dev` (the tag must match the package version). The release notes come from the matching `CHANGELOG.md` section; never write credential-shaped text there (e.g. `Bearer` followed by a word): the Actions runner masks it and drops any job output that contains it.
+- `.github/workflows/image.yml` — on `v*` semver tags, builds amd64/arm64 images natively, publishes the multi-arch index to `ghcr.io/arynyklas/tgin` and attests it; `latest` goes only to the highest stable `vX.Y.Z`.
+- `deny.toml` — cargo-deny: advisories, license allow-list, bans on `openssl`, `openssl-sys`, `native-tls`, `ring`; crates.io only.
+- `crates/tgin-botapi/benches/` and `crates/tgin-botapi/tests/alloc_budget.rs` — hot-path benchmarks over the 1000 updates in `crates/tgin-botapi/tests/fixtures/updates.jsonl`, routed by `crates/tgin-botapi/tests/fixtures/hot_path.yaml` (shared setup in `crates/tgin-botapi/benches/common/mod.rs`). `hot_path.rs` is criterion (`cargo bench -p tgin-botapi -- --quick`). `hot_path_ir.rs` is gungraun under Callgrind (Linux, needs Valgrind and `gungraun-runner`), with a hard `Ir` limit per benchmark set to 1.5× the measured count. `alloc_budget.rs` is the allocation gate: a thread-local counting allocator asserting at most 2 allocations per update on the warm path. The gungraun limits are re-measured (Docker `rust:<version>` with `--security-opt seccomp=unconfined`) whenever the toolchain pinned in `bench-gate` changes: limits and toolchain move together.
+- `DOCS.md`, `docs/migrating-to-1.0.md`, `PERF.md`, `CHANGELOG.md`, `SECURITY.md` — user docs, migration guide, benchmarks, release notes, security policy.
 
 ## Development Commands
 
 ```bash
 # Build
-cargo build --workspace                 # debug, every crate
-cargo build -p tgin --release           # ship build → target/release/tgin
+cargo build --workspace                  # debug, every crate
+cargo build --release -p tgin            # → target/release/tgin
 
-# Run with the shipped config (it enables the management API, so it needs TGIN_AUTH_TOKEN)
-export TOKEN=123456:ABC TGIN_AUTH_TOKEN=$(openssl rand -hex 32)
-cargo run -p tgin -- -f tgin.ron
-./target/release/tgin -f tgin.ron
+# Run (reads ./tgin.yaml; or -c PATH / TGIN_CONFIG)
+TOKEN=123456:ABC cargo run -p tgin
+TOKEN=123456:ABC cargo run -p tgin -- config validate tgin.yaml
+cargo run -p tgin -- admin status        # against a running tgin
 
-# Tests (inline #[cfg(test)] modules; uses tokio + wiremock)
-cargo test --workspace              # every crate
-cargo test -p tgin lb::roundrobin   # single module
-cargo test -p tgin test_round_robin_distribution_even -- --nocapture
+# Tests
+cargo test --workspace                   # every crate
+cargo test -p tgin-core --test engine    # one integration test file
+cargo test -p tgin-runtime queue::       # one module's unit tests
 
-# What CI runs besides tests
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo deny check
+# Generated files
+cargo xtask schema && cargo xtask config-docs
 
 # Docker (the config must be readable by uid 65532)
 docker build -t tgin .
-docker run --rm -v "$PWD/tgin.ron:/etc/tgin/config.ron:ro" \
-  -e TOKEN=... -e TGIN_AUTH_TOKEN="$TGIN_AUTH_TOKEN" -p 3000:3000 tgin
+docker run --rm -v "$PWD/tgin.yaml:/etc/tgin/tgin.yaml:ro" -e TOKEN=... -p 8080:8080 tgin
 
-# Example stack (long-poll + webhook bots)
+# Example stack
 cd examples/simple && TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
 
 # Performance harness (ENGINE=v1 default or v0 = tgin 0.2 from 1af6aaa;
@@ -114,58 +85,77 @@ ENGINE="v0 v1" ./benchmark.sh      # both engines, 6 scenarios × 3 rates × 3 r
 ./rerun-invalid.sh results/<run_id>.csv              # rerun runs with lag_p99_ms > 0.5
 ```
 
-There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses stock `rustfmt` and `clippy` on stable, with clippy warnings as errors.
-
-## Configuration
-
-`tgin.ron` is RON. `${VAR}` placeholders are substituted from env before parse; every unset variable is collected into `ConfigError::MissingEnvVars`, printed once, and the process exits 1. Skeleton:
-
-```ron
-(
-    dark_threads: 6,                                 // tokio worker threads and dispatch workers (default 4)
-    server_port: Some(3000),                         // None disables the HTTP listener
-    ssl: Some(SslConfig(cert: "...", key: "...")),   // optional rustls
-    api: Some(ApiConfig(base_path: "/api")),         // optional management API
-    auth_token: Some("${TGIN_AUTH_TOKEN}"),          // required when `api` is set
-    updates: [ LongPollUpdate(token: "${TOKEN}") ],
-    route: RoundRobinLB(routes: [
-        LongPollRoute(path: "/bot1/getUpdates"),
-        WebhookRoute(url: "http://127.0.0.1:8080/bot2"),
-    ]),
-)
-```
-
-Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is `#[serde(deny_unknown_fields)]`, so a misspelt field is a parse error, never a silent default. `validate` collects every semantic error in one pass (e.g. `ValidationError::ApiWithoutAuthToken` for `api` without a non-blank `auth_token`, `RequiresServerPort` for a `WebhookUpdate`, `LongPollRoute` or `api` without `server_port`, `InvalidPath`, `DuplicatePath` including the reserved `/status`, `/metrics`, `/livez`, `/readyz`). The HTTP API `POST /<base_path>/route` body uses `"type": "Longpull"` or `"Webhook"` (matching `AddRouteTypeSch`, **not** "Longpoll").
+There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses stock `rustfmt` and `clippy` on stable, warnings as errors; `bench-gate` pins its own toolchain.
 
 ## Code Conventions & Patterns
 
-- **Composition over inheritance.** New ingress adapter = a struct implementing `Updater + Serverable + Printable`; new route = `Routeable + Serverable + Printable`. The blanket impl wires it into `*Component`. Default trait methods (e.g. `Serverable::set_server` returning the router unchanged) make stubs cheap.
-- **Async everywhere via `async_trait`.** Match the pattern on these traits; the cheap accessors `Routeable::{id, begin_drain, pending}` and `Updater::metrics` are deliberately sync.
-- **Payloads are `Bytes`.** An update is one valid JSON value as raw bytes, from ingress to egress; cloning is a ref-count bump. New ingress adapters must validate JSON shape before sending into the channel (see the `Routeable::process` doc comment).
-- **Shared state**: `ArcSwap<Vec<Arc<dyn RouteableComponent>>>` for LB children, `Arc<std::sync::Mutex<VecDeque<Bytes>>>` + `Arc<Notify>` for the long-poll buffer (never held across `.await`), `AtomicUsize` for the round-robin cursor, `std::sync::LazyLock<ArcSwap<HashMap<...>>>` (`arc-swap`) for `LONGPOLL_REGISTRY`, `CancellationToken` (`tokio-util`) for shutdown. Reach for the matching primitive rather than introducing a new pattern.
-- **Update flow is one direction.** Producers own a `Sender<Bytes>`; the routing tree lives behind `Arc<dyn RouteableComponent>` and is `process`-called from the worker pool. Don't bypass the channel.
-- **Errors on the egress path are logged and counted, never retried** (`WebhookRoute` records success / failure / error and moves on). Preserve this unless explicitly changing the contract — downstreams must be resilient. A slow downstream still holds its worker for up to `request_timeout_ms`.
-- **Token redaction**: when logging, printing or returning anything that may carry a Telegram token — URLs, and also configured paths (`WebhookUpdate.path`, `LongPollRoute.path`), which may embed one — wrap it in `utils::defaults::redact`, and log `reqwest` errors via `err.without_url()`. This includes `json_struct` outputs (they feed `/status`, `/metrics` and `/api/routes`), so `WebhookRoute::json_struct` redacts its `url` and `LongPollRoute::json_struct` its `path`.
-- **Constant-time secret compares go through `utils::auth::secret_eq`.** The optional control-plane `Bearer` gate is `utils::auth::guard`; a blank `auth_token` is normalized to `None` by `config::setup::effective_auth_token` (auth disabled) with a startup warning, never reaching the gate.
-- **One HTTP client.** Every outbound call uses the `reqwest::Client` from `utils::http::build_shared_client` and sets its own per-request timeout.
-- **`build_route` recurses** through `RouteConfig::{RoundRobinLB,AllLB}` — keep it the single construction site for the routing tree.
-- **Naming quirk**: long-poll modules and types are spelled `longpull` (`crates/tgin/src/update/longpull.rs`, `crates/tgin/src/route/longpull.rs`, `AddRouteType::Longpull`, API `"type":"Longpull"`). User-facing docs say "long poll" / "LongPoll"; keep the in-code spelling unless doing a deliberate, repo-wide rename.
-- **Errors are typed.** Config loading returns `ConfigError` instead of panicking; route mutations return `AddRouteError` / `RemoveRouteError`; API handlers return `ApiError`. `expect` is reserved for invariants (poisoned mutex, static JSON, client construction). The crate has no `unsafe`.
-- **Imports**: follow the grouping of the file you are editing; `cargo fmt` sorts within groups.
+### Hot path
+
+The path from a source through `Engine::admit` to a queue, and from a queue to a poll response or a push request, is measured by `alloc_budget.rs` (≤ 2 allocations per update) and `bench-gate` (instruction counts). On it:
+
+- **Payloads stay `Bytes`.** An update is its raw JSON from ingress to egress, never re-serialized; a pull response is assembled from the payloads as body chunks without copying (`data_server.rs::batch_response`). Facts are extracted once, borrowing from the payload.
+- **Metrics handles are pre-resolved.** `CoreMetrics::source(name)` / `::consumer(name)` resolve every label combination once; the hot path increments handles and never hashes labels. A metric has one owner (e.g. only `Engine::admit` counts `tgin_routes_unmatched_total`).
+- **No awaits and one lock at a time in admission.** Reserve, then commit; cancel reservations on refusal.
+- **Rules are compiled.** `RouteTable::compile` does the work at load time; `route` writes into reusable scratch and does not allocate.
+- **Swap, don't lock, for config-derived state.** The engine state, route table, data-plane router, running config and redactor sit in `ArcSwap`s that reloads replace.
+
+### Secrets and redaction
+
+- Secrets are `Secret<T>` (never shown by `Debug`/`Display`/serde); config URLs and paths are `Sensitive<T>`, used through `.expose()` and rendered masked (URLs as their origin only). Log through `tracing`, whose writer passes every line through the current `Redactor`; never print config text or URLs to stderr directly.
+- Render `reqwest` errors with `tgin_runtime::http::describe_error` (no URL). Config errors never quote secret values or source lines.
+- Every constant-time compare goes through `tgin_runtime::secret::secret_eq`.
+- Outbound HTTP clients come from `tgin_runtime::http::client`, which never follows redirects; `tgin admin` asks it for `no_proxy`, so the admin token never passes a proxy.
+
+### Config model
+
+`crates/tgin-core/src/config/model.rs` keeps line and column for every error, so it uses no `#[serde(untagged)]`, no internally tagged enums and no `flatten` (they make serde-saphyr buffer and lose locations); string-or-object fields have hand-written visitors and schemas (`schema.rs`). Every field is either applied live by a reload or listed in `restart_required` (`crates/tgin-core/src/reload.rs`). Doc comments are the user-facing descriptions: they become the JSON Schema and `docs/config-reference.md`.
+
+### Errors and tasks
+
+- Errors are typed (`thiserror`); `expect` only for invariants. Exit codes live in `crates/tgin/src/exit.rs`.
+- Long-running tasks run under `tgin_runtime::supervisor::Supervisor` (restart with backoff on `Exit::Retry` or panic, `Failed` on `Exit::Fatal`); graceful stops use `CancellationToken`s, never the supervisor's abort token.
+
+### Unsafe
+
+`unsafe_code` is denied workspace-wide. The only exception is `crates/tgin-botapi/tests/alloc_budget.rs` (`#![allow(unsafe_code)]`), whose counting `GlobalAlloc` forwards to `System` with a `// SAFETY:` comment on each block. New unsafe code needs the same: a test-only or proven need, a scoped `allow`, and a `SAFETY` comment per block.
+
+### Style
+
+Imports follow the grouping of the file you edit; `cargo fmt` sorts within groups. Comments say why, not what.
 
 ## Testing & QA
 
-- **Unit tests are inline.** Each module ends with `#[cfg(test)] mod tests { ... }`; async tests use `#[tokio::test]`. Examples: `crates/tgin/src/lb/roundrobin.rs`, `crates/tgin/src/lb/all.rs`, `crates/tgin/src/route/longpull.rs`, `crates/tgin/src/route/webhook.rs`, `crates/tgin/src/update/{longpull,webhook}.rs`, and the shutdown tests in `crates/tgin/src/tgin.rs`.
-- **Test doubles** live in `crates/tgin/src/mock/routes.rs` (`MockCallsRoute` records every received update as `Bytes` in `Arc<tokio::sync::Mutex<Vec<Bytes>>>`; `get_calls` parses them). The `mod mock` declaration in `crates/tgin/src/main.rs` is `#[cfg(test)]`-gated, so production builds don't see it.
-- **HTTP mocking**: `wiremock` for outbound assertions (see `crates/tgin/src/route/webhook.rs::tests::test_process_sends_correct_post_request`). `tower::ServiceExt` and `http_body_util` are available via dev-deps for in-process axum requests.
-- **Dependencies must not be mocked at the boundary** the system actually crosses — prefer real `wiremock` HTTP servers and real `tokio::sync::mpsc` channels over hand-rolled fakes.
+- **Unit tests** are inline (`#[cfg(test)] mod tests`); **integration tests** live in each crate's `tests/`: `tgin-core/tests/{config,engine,push}.rs`, `tgin-botapi/tests/{longpoll,webhook,alloc_budget}.rs`, `tgin-runtime/tests/{http,watch}.rs`, `tgin/tests/{e2e,admin,migrate,panic_hook}.rs`.
+- **Real boundaries.** HTTP peers are real servers (`wiremock`, or axum on `127.0.0.1:0`); config tests use `MapEnv` instead of mutating the process environment.
+- **Paused clock.** Timer-driven logic (queue leases, supervisor backoff, engine drains, long-poll backoff) is tested on a paused clock (`#[tokio::test(start_paused = true)]` or `tokio::time::pause()`), so tests take no wall time and do not flake on slow machines; use real time only where real I/O has to make progress, with bounded waits.
+- **Child processes bind port 0.** `crates/tgin/tests/support/mod.rs::spawn_listening` starts the `tgin` binary with a config whose listeners use port 0 and reads the bound address from the `admin plane listening` / `data plane listening` log lines; it removes `RUST_LOG` from the child's environment (it would hide those info lines). Never pick a port by binding and releasing it: another socket can take it before the child binds.
+- **Signals.** Unix tests deliver real signals to a child process with `kill`; other app tests feed signals through `Signals::from_channel`.
+- **Property tests** (`proptest`) cover the queue's invariants (`tgin-runtime/src/queue.rs`) and fact extraction against a `serde_json::Value` reference (`tgin-botapi/src/facts.rs`).
 - **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE` selects the engine (`v1` default, `v0` = 0.2 built from `1af6aaa`, or both: `ENGINE="v0 v1"` alternates them run by run); `BOT_IMPL` selects the downstream (`rust` default = `tgin-bench bot`, 50 000+ updates/s; `py` = the aiogram bots, ~2 000/s, which saturate before tgin does). A full pass over both engines is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 70 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) next to `<run_id>.log` (per-run counters) and `<run_id>.stats.log` (`docker stats`). A run with `lag_p99_ms` above 0.5 measured the host, not the engine: `./rerun-invalid.sh results/<run_id>.csv` reruns those. Charts come from `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`); without arguments it plots the `results/*.csv` whose run id sorts last, and it deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the v0/v1 gate and the harness's known limits.
-- Always exercise the actual change before claiming it passes: run the specific `cargo test -p tgin <name>` for the touched module, and for HTTP-affecting changes spin up `examples/simple` or a perf scenario.
+- Exercise the actual change before claiming it works: run the touched crate's tests, and for HTTP-facing changes a binary (`examples/simple`, or `tgin` against a fake Bot API).
+
+### CI checklist
+
+What `.github/workflows/ci.yml` runs; run the same locally before pushing:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p tgin-botapi --bench hot_path_ir --locked -- -D warnings   # `bench = false` keeps it out of --all-targets
+cargo xtask schema --check
+cargo xtask config-docs --check
+cargo test --workspace --locked                                           # CI: Linux, macOS, Windows
+cargo check --workspace --locked                                          # with the MSRV toolchain (1.89)
+cargo deny --locked check
+cargo build -p tgin                                                       # and the static musl release build
+```
+
+CI also builds the Docker image on native amd64 and arm64 runners, runs clippy and tests for `tests/performance/benchmark`, and runs `bench-gate`: `cargo bench -p tgin-botapi --bench hot_path_ir` on a pinned toolchain under Callgrind (`gungraun/setup-gungraun`), failing past any benchmark's `Ir` limit.
 
 ## Runtime / Tooling
 
-- **Rust** workspace edition 2024 (the `tgin` package stays on 2021), MSRV 1.89, no `rust-toolchain` pin. Tokio multi-threaded runtime with `dark_threads` workers. Linux musl builds use mimalloc as the global allocator (see `crates/tgin/src/main.rs`).
-- **Async runtime is fixed**: tokio + axum 0.8 + axum-server 0.8 (TLS via rustls) + reqwest 0.13 (`default-features = false`, rustls only). One aws-lc-rs crypto provider serves both; the platform verifier checks server certificates. OpenSSL, native-tls and ring are banned in `deny.toml`. Keep to this HTTP / TLS stack.
-- **Config format**: RON 0.12 only. JSON-shaped types in `crates/tgin/src/api/schemas.rs` use `serde` + `serde_json`.
-- **Python**: `examples/simple/` and `tests/performance/diagram/` are `uv` projects with a committed `uv.lock`; the perf bots (`tests/performance/bot/`) install `requirements.txt` with pip in their Dockerfile; `integrations/pytgin/` is a setuptools package without a lock file.
-- No package manager wrappers and no `Makefile` at the repo root — interact with the project through `cargo` directly (the perf harness has its own `makefile`).
+- **Rust** edition 2024 in every crate, MSRV 1.89 (checked in CI), no toolchain pin. Tokio multi-threaded runtime with `runtime.worker_threads` workers (`auto` = one per CPU). Linux musl builds use mimalloc.
+- **HTTP / TLS stack is fixed**: tokio, axum 0.8 + axum-server 0.8 (HTTP/1.1 only, rustls with ALPN `http/1.1`), reqwest 0.13 (`default-features = false`, rustls); one aws-lc-rs crypto provider. OpenSSL, native-tls and ring are banned in `deny.toml`.
+- **Config**: YAML through serde-saphyr; JSON Schema through schemars. RON (`ron`) is used only by `tgin config migrate` to read 0.2 configs.
+- **Python**: `examples/simple/` and `tests/performance/diagram/` are `uv` projects with a committed `uv.lock`; the perf bots (`tests/performance/bot/`) install `requirements.txt` with pip; `integrations/pytgin/` is a setuptools package without a lock file.
+- No package-manager wrappers and no root `Makefile`: work through `cargo` (the perf harness has its own `makefile`).
