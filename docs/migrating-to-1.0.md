@@ -182,7 +182,7 @@ New in 1.0: `tgin_build_info`, `tgin_source_dropped_total`, `tgin_consumer_in_fl
 
 ## Docker and Kubernetes
 
-- **Config path.** The image reads `TGIN_CONFIG=/etc/tgin/tgin.yaml`. The 0.2 default arguments `-f /etc/tgin/config.ron` are gone: mount the converted YAML at `/etc/tgin/tgin.yaml`, or pass `-c <path>`. An old `docker run IMAGE -f …` now exits 1 with the migrate hint.
+- **Config path.** The image reads `TGIN_CONFIG=/etc/tgin/tgin.yaml`. The 0.2 default arguments `-f /etc/tgin/config.ron` are gone: put the converted YAML in a directory as `tgin.yaml` and mount the directory at `/etc/tgin` (`-v "$PWD/config:/etc/tgin:ro"`), or pass `-c <path>`. Mount the directory, not the single file: a single-file bind mount keeps the old inode, so an edit saved by rename never reaches the container. An old `docker run IMAGE -f …` now exits 1 with the migrate hint.
 - **Ports.** The image declares `8080` and `9090` instead of `3000`. A migrated config keeps its old data port; publish whatever `server.listen` says.
 - **Health check.** The image has a `HEALTHCHECK` (0.2 had none, since the image has no shell): exec-form `tgin admin health`, which asks `/readyz` on `http://127.0.0.1:9090`. Set `TGIN_ADMIN_URL` if `admin.listen` moves the admin plane.
 - **Admin token.** Mount it as a secret file, reference it as `admin.token: ${file:/run/secrets/…}`, and set `TGIN_ADMIN_TOKEN_FILE` to the same file, so `docker exec <container> tgin admin status` works ([DOCS.md → Docker](../DOCS.md#docker)).

@@ -168,8 +168,11 @@ impl<S: Sink> LongPollSource<S> {
         let exit = self.poll(&ingest).await;
         self.metrics.set_state(match exit {
             Exit::Done => SourceStateLabel::Stopped,
-            Exit::Retry(_) => SourceStateLabel::Backoff,
             Exit::Fatal(_) => SourceStateLabel::Failed,
+            // `poll` waits out every failure a retry may fix and never
+            // returns `Retry`; the arm is here only because `Exit`, the
+            // supervisor's type, has the variant.
+            Exit::Retry(_) => SourceStateLabel::Backoff,
         });
         exit
     }

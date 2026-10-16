@@ -200,7 +200,7 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
         Ok(body) => body,
         Err(BodyError::TooLarge) => {
             ingress.metrics.error(SourceErrorReason::Decode);
-            tracing::warn!(source = %ingress.name, limit = ingress.body_limit, "webhook request body over the size limit; refused");
+            tracing::debug!(source = %ingress.name, limit = ingress.body_limit, "webhook request body over the size limit");
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
         }
         Err(BodyError::Read) => {

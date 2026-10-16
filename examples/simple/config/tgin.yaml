@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=../../../schema/tgin.v1.schema.json
 #
 # One bot, three downstream instances: two poll tgin (pull), one receives
-# webhooks (push). Updates are shared round robin. Started from
-# `tgin config migrate ../tgin.ron` of the 0.2 example; check it with
-# `TOKEN=… TGIN_ADMIN_TOKEN=… TELEGRAM_API_URL=https://api.telegram.org
-# tgin config validate config/tgin.yaml` (every `${env:…}` must be set).
-# docker-compose.yml mounts this directory as /etc/tgin.
+# webhooks (push). Updates are shared round robin. From examples/simple:
+# made with `tgin config migrate tgin.ron -o config/tgin.yaml` from the 0.2
+# example; check it with `TOKEN=… TGIN_ADMIN_TOKEN=…
+# TELEGRAM_API_URL=https://api.telegram.org tgin config validate
+# config/tgin.yaml` (every `${env:…}` must be set). docker-compose.yml
+# mounts this directory as /etc/tgin.
 version: 1
 
 # The data plane: the pull endpoints the polling bots call.
