@@ -34,17 +34,21 @@
       "type": "object"
     },
     "Balance": {
+      "description": "How a push consumer picks the endpoint for each attempt, among those\nwhose circuit breaker admits a request.",
       "oneOf": [
         {
-          "enum": [
-            "round_robin",
-            "least_in_flight"
-          ],
+          "const": "round_robin",
+          "description": "Each endpoint in turn.",
           "type": "string"
         },
         {
           "const": "hash_chat",
-          "description": "Sticky by chat (or user).",
+          "description": "Sticky by chat (or user); round robin without either.",
+          "type": "string"
+        },
+        {
+          "const": "least_in_flight",
+          "description": "The endpoint with the fewest requests in flight.",
           "type": "string"
         }
       ]
@@ -198,6 +202,7 @@
     },
     "Endpoint": {
       "additionalProperties": false,
+      "description": "One downstream URL.",
       "properties": {
         "secret_token": {
           "anyOf": [
@@ -276,14 +281,17 @@
     },
     "Log": {
       "additionalProperties": false,
+      "description": "Logging, to stdout.",
       "properties": {
         "format": {
           "$ref": "#/$defs/LogFormat",
-          "default": "text"
+          "default": "text",
+          "description": "Log line format; a change takes effect after a restart."
         },
         "level": {
           "$ref": "#/$defs/LogLevel",
-          "default": "info"
+          "default": "info",
+          "description": "The most verbose level logged; a reload applies it. A non-empty\n`RUST_LOG` overrides it."
         }
       },
       "type": "object"
@@ -307,6 +315,7 @@
     },
     "LongPoll": {
       "additionalProperties": false,
+      "description": "Long polling: tgin calls `getUpdates` on the Bot API.",
       "properties": {
         "allowed_updates": {
           "description": "Update types to receive. Omitted, Telegram's default applies.",
@@ -320,7 +329,7 @@
         },
         "delete_webhook_on_start": {
           "default": true,
-          "description": "Call `deleteWebhook` before polling.",
+          "description": "Call `deleteWebhook` (keeping pending updates) before polling, and\nagain when a poll finds a webhook set. Off, an active webhook stops\nthe polling until something else deletes it.",
           "type": "boolean"
         },
         "limit": {
@@ -351,10 +360,12 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Callback query data."
         },
         "chat_ids": {
           "default": [],
+          "description": "Chat ids.",
           "items": {
             "format": "int64",
             "type": "integer"
@@ -363,6 +374,7 @@
         },
         "chat_types": {
           "default": [],
+          "description": "Chat types.",
           "items": {
             "$ref": "#/$defs/ChatType"
           },
@@ -398,6 +410,7 @@
         },
         "user_ids": {
           "default": [],
+          "description": "Sender user ids.",
           "items": {
             "format": "int64",
             "type": "integer"
@@ -423,22 +436,23 @@
       ]
     },
     "Ordering": {
+      "description": "The order a consumer hands out updates in.",
       "oneOf": [
         {
-          "enum": [
-            "none"
-          ],
+          "const": "none",
+          "description": "Queue order, any number per chat at once.",
           "type": "string"
         },
         {
           "const": "per_chat",
-          "description": "One update per chat in flight at a time.",
+          "description": "One update per chat (or user) in flight at a time; updates with\nneither are never held back.",
           "type": "string"
         }
       ]
     },
     "Pull": {
       "additionalProperties": false,
+      "description": "Bots fetch updates from tgin with `getUpdates` on\n`/c/<consumer>/getUpdates` and on each alias.",
       "properties": {
         "aliases": {
           "default": [],
@@ -490,6 +504,7 @@
     },
     "Push": {
       "additionalProperties": false,
+      "description": "tgin posts each update to HTTP endpoints, with retries and a circuit\nbreaker per endpoint.",
       "properties": {
         "balance": {
           "$ref": "#/$defs/Balance",
@@ -523,7 +538,7 @@
         },
         "max_in_flight": {
           "default": 32,
-          "description": "Most requests in flight over all endpoints.",
+          "description": "Most deliveries at once over all endpoints, counting those waiting\nto retry.",
           "format": "uint",
           "minimum": 1,
           "type": "integer"
@@ -553,6 +568,7 @@
     },
     "Reload": {
       "additionalProperties": false,
+      "description": "Hot reload of the config file.",
       "properties": {
         "debounce": {
           "$ref": "#/$defs/Duration",
@@ -631,12 +647,12 @@
     },
     "Runtime": {
       "additionalProperties": false,
-      "description": "Process settings; changing them needs a restart.",
+      "description": "Process settings. `worker_threads` takes effect after a restart; a\nshutdown uses the `lame_duck` and `shutdown_grace` of the config in\neffect when it begins.",
       "properties": {
         "lame_duck": {
           "$ref": "#/$defs/Duration",
           "default": "5s",
-          "description": "How long readiness reports \"not ready\" before shutdown starts."
+          "description": "How long, once shutdown begins, tgin keeps serving while readiness\nreports \"not ready\", before it stops ingesting; skipped without a\n`server` block."
         },
         "shutdown_grace": {
           "$ref": "#/$defs/Duration",
@@ -691,7 +707,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Serve HTTPS with these files. Turning TLS on or off takes effect\nafter a restart."
         },
         "trusted_proxies": {
           "default": [],
@@ -706,8 +723,10 @@
     },
     "Split": {
       "additionalProperties": false,
+      "description": "Exactly one child of `among` receives each update.",
       "properties": {
         "among": {
+          "description": "The children: consumer names or nested targets.",
           "items": {
             "$ref": "#/$defs/Target"
           },
@@ -736,11 +755,11 @@
       "type": "object"
     },
     "SplitStrategy": {
+      "description": "How a split picks its child.",
       "oneOf": [
         {
-          "enum": [
-            "round_robin"
-          ],
+          "const": "round_robin",
+          "description": "Each child in turn.",
           "type": "string"
         },
         {
@@ -846,6 +865,7 @@
     },
     "Tls": {
       "additionalProperties": false,
+      "description": "The data plane's certificate. Every config reload reads both files\nagain and swaps the certificate in if they changed.",
       "properties": {
         "cert_file": {
           "description": "PEM certificate chain file; a relative path is relative to the config\nfile's directory. Supports `${env:…}` and `${file:…}`.",
@@ -866,6 +886,7 @@
     },
     "Webhook": {
       "additionalProperties": false,
+      "description": "Telegram posts updates to the data plane.",
       "properties": {
         "allowed_updates": {
           "description": "Update types to receive. Omitted, Telegram's default applies.",
@@ -887,6 +908,7 @@
         },
         "drop_pending_updates": {
           "default": false,
+          "description": "Telegram's `drop_pending_updates` for `setWebhook`.",
           "type": "boolean"
         },
         "ip_address": {
@@ -921,7 +943,7 @@
           ]
         },
         "public_url": {
-          "description": "The public HTTPS URL of `path`, for `setWebhook`. Supports `${env:…}`\nand `${file:…}`.",
+          "description": "The public HTTPS base URL Telegram reaches tgin at; `setWebhook`\nregisters it followed by `path`. Supports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",

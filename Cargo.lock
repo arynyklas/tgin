@@ -3222,6 +3222,7 @@ dependencies = [
 name = "xtask"
 version = "1.0.0-dev"
 dependencies = [
+ "serde_json",
  "tgin-core",
 ]
 

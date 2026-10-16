@@ -61,22 +61,30 @@ pub struct RawConfig {
     pub consumers: IndexMap<Name, At<Consumer>>,
 }
 
-/// Process settings; changing them needs a restart.
+/// Process settings. `worker_threads` takes effect after a restart; a
+/// shutdown uses the `lame_duck` and `shutdown_grace` of the config in
+/// effect when it begins.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Runtime {
     /// Tokio worker threads: `auto` (one per CPU) or a count.
     pub worker_threads: WorkerThreads,
-    /// How long readiness reports "not ready" before shutdown starts.
+    /// How long, once shutdown begins, tgin keeps serving while readiness
+    /// reports "not ready", before it stops ingesting; skipped without a
+    /// `server` block.
     pub lame_duck: At<HumanDuration>,
     /// How long shutdown waits for queues to drain.
     pub shutdown_grace: At<HumanDuration>,
 }
 
+/// Logging, to stdout.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Log {
+    /// The most verbose level logged; a reload applies it. A non-empty
+    /// `RUST_LOG` overrides it.
     pub level: LogLevel,
+    /// Log line format; a change takes effect after a restart.
     pub format: LogFormat,
 }
 
@@ -103,6 +111,8 @@ pub enum LogFormat {
 pub struct Server {
     /// Addresses to listen on, as `ip:port`.
     pub listen: Vec<At<SocketAddr>>,
+    /// Serve HTTPS with these files. Turning TLS on or off takes effect
+    /// after a restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
     /// Proxies whose `X-Forwarded-For` is trusted, as networks.
@@ -114,6 +124,8 @@ pub struct Server {
     pub header_read_timeout: At<HumanDuration>,
 }
 
+/// The data plane's certificate. Every config reload reads both files
+/// again and swaps the certificate in if they changed.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Tls {
@@ -139,6 +151,7 @@ pub struct Admin {
     pub public_metrics: bool,
 }
 
+/// Hot reload of the config file.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Reload {
@@ -182,6 +195,7 @@ pub enum Ingress {
     Webhook(Webhook),
 }
 
+/// Long polling: tgin calls `getUpdates` on the Bot API.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct LongPoll {
@@ -193,10 +207,13 @@ pub struct LongPoll {
     /// Update types to receive. Omitted, Telegram's default applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<Vec<String>>,
-    /// Call `deleteWebhook` before polling.
+    /// Call `deleteWebhook` (keeping pending updates) before polling, and
+    /// again when a poll finds a webhook set. Off, an active webhook stops
+    /// the polling until something else deletes it.
     pub delete_webhook_on_start: bool,
 }
 
+/// Telegram posts updates to the data plane.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Webhook {
@@ -204,8 +221,8 @@ pub struct Webhook {
     /// Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Template>,
-    /// The public HTTPS URL of `path`, for `setWebhook`. Supports `${env:…}`
-    /// and `${file:…}`.
+    /// The public HTTPS base URL Telegram reaches tgin at; `setWebhook`
+    /// registers it followed by `path`. Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_url: Option<Template>,
     /// Call `setWebhook` at start; needs `public_url`.
@@ -219,6 +236,7 @@ pub struct Webhook {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100))]
     pub max_connections: Option<At<u32>>,
+    /// Telegram's `drop_pending_updates` for `setWebhook`.
     pub drop_pending_updates: bool,
     /// Telegram's `ip_address` for `setWebhook`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,8 +269,11 @@ pub struct Route {
 pub struct Match {
     /// Update types such as `message` or `callback_query`.
     pub update_types: Vec<String>,
+    /// Chat ids.
     pub chat_ids: Vec<i64>,
+    /// Chat types.
     pub chat_types: Vec<ChatType>,
+    /// Sender user ids.
     pub user_ids: Vec<i64>,
     /// Commands, with or without the leading `/`: 1 to 32 ASCII letters,
     /// digits or `_`, with no `@bot` suffix.
@@ -261,6 +282,7 @@ pub struct Match {
     /// Message text or caption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextMatch>,
+    /// Callback query data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_data: Option<TextMatch>,
 }
@@ -309,10 +331,12 @@ pub enum Target {
     All(Vec<At<Target>>),
 }
 
+/// Exactly one child of `among` receives each update.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Split {
     pub strategy: At<SplitStrategy>,
+    /// The children: consumer names or nested targets.
     pub among: Vec<At<Target>>,
     /// One weight per `among` entry, each above 0; only with `weighted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,9 +344,11 @@ pub struct Split {
     pub weights: Option<At<Vec<At<u32>>>>,
 }
 
+/// How a split picks its child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitStrategy {
+    /// Each child in turn.
     RoundRobin,
     /// Sticky by chat (or user); round robin without either.
     HashChat,
@@ -343,6 +369,8 @@ pub enum Consumer {
     Push(Push),
 }
 
+/// Bots fetch updates from tgin with `getUpdates` on
+/// `/c/<consumer>/getUpdates` and on each alias.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Pull {
@@ -364,6 +392,8 @@ pub struct Pull {
     pub aliases: Vec<Template>,
 }
 
+/// tgin posts each update to HTTP endpoints, with retries and a circuit
+/// breaker per endpoint.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Push {
@@ -371,7 +401,8 @@ pub struct Push {
     pub endpoints: At<Vec<Endpoint>>,
     #[serde(default = "defaults::balance")]
     pub balance: Balance,
-    /// Most requests in flight over all endpoints.
+    /// Most deliveries at once over all endpoints, counting those waiting
+    /// to retry.
     #[serde(default = "defaults::max_in_flight")]
     #[schemars(range(min = 1))]
     pub max_in_flight: At<usize>,
@@ -392,6 +423,7 @@ pub struct Push {
     pub breaker: Breaker,
 }
 
+/// One downstream URL.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Endpoint {
@@ -405,12 +437,16 @@ pub struct Endpoint {
     pub timeout: At<HumanDuration>,
 }
 
+/// How a push consumer picks the endpoint for each attempt, among those
+/// whose circuit breaker admits a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Balance {
+    /// Each endpoint in turn.
     RoundRobin,
-    /// Sticky by chat (or user).
+    /// Sticky by chat (or user); round robin without either.
     HashChat,
+    /// The endpoint with the fewest requests in flight.
     LeastInFlight,
 }
 
@@ -424,11 +460,14 @@ pub enum OnFull {
     DropOldest,
 }
 
+/// The order a consumer hands out updates in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Ordering {
+    /// Queue order, any number per chat at once.
     None,
-    /// One update per chat in flight at a time.
+    /// One update per chat (or user) in flight at a time; updates with
+    /// neither are never held back.
     PerChat,
 }
 

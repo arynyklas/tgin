@@ -50,6 +50,8 @@ jobs:
         run: cargo clippy -p tgin-botapi --bench hot_path_ir --locked -- -D warnings
       - name: Check the config JSON Schema is up to date
         run: cargo xtask schema --check
+      - name: Check the config reference is up to date
+        run: cargo xtask config-docs --check
 
   test:
     strategy:
