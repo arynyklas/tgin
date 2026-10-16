@@ -35,14 +35,24 @@ pub fn update_payload(update_id: u64, text: &str) -> Bytes {
     Bytes::from(serde_json::to_vec(&update).expect("a JSON value serializes"))
 }
 
+/// Most webhook requests in flight at once, so most connections open to the
+/// system under test: Telegram's largest `setWebhook` `max_connections`.
+/// Without a cap, a short stall in the system under test made the generator
+/// open thousands of connections at once, overflow the server's listen
+/// backlog and wait out SYN retransmits, whatever the engine.
+pub const MAX_CONNECTIONS: usize = 100;
+
 pub enum Sender {
     /// POST each update to a webhook URL, at most `budget` in flight. Sends
     /// that find the budget spent are dropped and counted, never queued, so
-    /// the schedule does not wait for responses.
+    /// the schedule does not wait for responses. At most `connections` of
+    /// the in-flight sends are on the wire; the rest wait for one to finish,
+    /// and that wait counts in their latency (it runs from the due time).
     Webhook {
         client: Client,
         target: Arc<str>,
         budget: Arc<Semaphore>,
+        connections: Arc<Semaphore>,
         tracker: Arc<Tracker>,
         /// Where the requests run.
         runtime: Handle,
@@ -55,17 +65,20 @@ pub enum Sender {
 }
 
 impl Sender {
-    /// A webhook sender whose requests run on the current runtime.
+    /// A webhook sender whose requests run on the current runtime, with at
+    /// most `max_connections` of them on the wire.
     pub fn webhook(
         client: Client,
         target: &str,
         max_in_flight: usize,
+        max_connections: usize,
         tracker: Arc<Tracker>,
     ) -> Self {
         Self::Webhook {
             client,
             target: target.into(),
             budget: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            connections: Arc::new(Semaphore::new(max_connections.max(1))),
             tracker,
             runtime: Handle::current(),
         }
@@ -81,6 +94,7 @@ impl Sender {
                 client,
                 target,
                 budget,
+                connections,
                 tracker,
                 runtime,
             } => {
@@ -89,11 +103,18 @@ impl Sender {
                     return;
                 };
                 tracker.issued(update_id, due);
-                let (client, target, tracker) = (client.clone(), target.clone(), tracker.clone());
+                let (client, target, tracker, connections) = (
+                    client.clone(),
+                    target.clone(),
+                    tracker.clone(),
+                    connections.clone(),
+                );
                 // The payload is built on the runtime, off the send loop.
                 runtime.spawn(async move {
                     let payload = update_payload(update_id, &update_id.to_string());
+                    let connection = connections.acquire_owned().await;
                     let delivered = deliver(post_json(&client, &target, payload)).await;
+                    drop(connection);
                     drop(permit);
                     if let Err((failure, _)) = delivered {
                         tracker.failed(update_id, failure);
@@ -117,13 +138,16 @@ impl Sender {
             Self::Webhook {
                 client,
                 target,
+                connections,
                 tracker,
                 runtime,
                 ..
             } => {
                 tracker.warmup_issued(update_id);
                 let request = post_json(client, target, payload);
+                let connections = connections.clone();
                 runtime.spawn(async move {
+                    let _connection = connections.acquire_owned().await;
                     if let Err((_, reason)) = deliver(request).await {
                         eprintln!("warm-up update {update_id} failed: {reason}");
                     }
@@ -176,25 +200,29 @@ mod tests {
         assert_eq!(payload["message"]["chat"]["id"], 1);
     }
 
-    #[tokio::test]
-    async fn webhook_drops_sends_once_the_in_flight_budget_is_spent() {
-        // A server that accepts connections and never answers keeps every
-        // issued send in flight.
+    /// A server that accepts connections and never answers, so every issued
+    /// send stays in flight; returns its URL and how many connections it
+    /// accepted.
+    async fn start_silent_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
         tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 held.push(socket);
             }
         });
+        (format!("http://{addr}/webhook"), accepted)
+    }
+
+    #[tokio::test]
+    async fn webhook_drops_sends_once_the_in_flight_budget_is_spent() {
+        let (url, _) = start_silent_server().await;
         let tracker = Arc::new(Tracker::new());
-        let sender = Sender::webhook(
-            Client::new(),
-            &format!("http://{addr}/webhook"),
-            2,
-            tracker.clone(),
-        );
+        let sender = Sender::webhook(Client::new(), &url, 2, MAX_CONNECTIONS, tracker.clone());
 
         let started = Instant::now();
         for id in 1..=5 {
@@ -205,6 +233,25 @@ mod tests {
         let counts = tracker.counts();
         assert_eq!(counts.sent, 2);
         assert_eq!(counts.dropped_by_generator, 3);
+    }
+
+    #[tokio::test]
+    async fn webhook_opens_at_most_max_connections_and_queues_the_rest() {
+        let (url, accepted) = start_silent_server().await;
+        let tracker = Arc::new(Tracker::new());
+        let sender = Sender::webhook(Client::new(), &url, 100, 3, tracker.clone());
+
+        let started = Instant::now();
+        for id in 1..=20 {
+            sender.send(id, Instant::now());
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "send blocked");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Every send was issued (none dropped), but only 3 reached the wire.
+        let counts = tracker.counts();
+        assert_eq!((counts.sent, counts.dropped_by_generator), (20, 0));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     /// A webhook bot that answers every update with 503.
@@ -226,6 +273,7 @@ mod tests {
             Client::new(),
             &start_failing_bot().await,
             10,
+            MAX_CONNECTIONS,
             tracker.clone(),
         );
 
@@ -247,6 +295,7 @@ mod tests {
             Client::new(),
             &start_failing_bot().await,
             10,
+            MAX_CONNECTIONS,
             tracker.clone(),
         ));
 

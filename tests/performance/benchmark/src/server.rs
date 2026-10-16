@@ -151,6 +151,7 @@ async fn run(
             server.client.clone(),
             &options.target,
             options.max_in_flight,
+            crate::send::MAX_CONNECTIONS,
             tracker.clone(),
         ),
         Mode::Longpoll => Sender::LongPoll {
