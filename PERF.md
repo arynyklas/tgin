@@ -16,6 +16,7 @@ tgin 1.0 (milestone M1) against tgin 0.2 (commit `1af6aaa`), measured on one mac
 - [Charts](#charts)
 - [What was fixed to get here](#what-was-fixed-to-get-here)
 - [`max_in_flight`](#max_in_flight)
+- [Pull wake-ups with competing instances](#pull-wake-ups-with-competing-instances)
 - [Python bots](#python-bots)
 - [Known limits of the harness](#known-limits-of-the-harness)
 - [Reproducing the benchmarks](#reproducing-the-benchmarks)
@@ -219,6 +220,22 @@ A push consumer's `max_in_flight` (requests in flight over all its endpoints) st
 | webhook-tgin-3 | 10 000 | 9 999.96 / 0.59 ms | 9 999.92 / 0.62 ms |
 
 With a **single-process** downstream (one aiogram bot) at 5 000 RPS, the value mattered a great deal. Medians of 1.0's `delivered_rps`: 1 651 with 256 ([`20261015T1945Z-py-mif256-v1`](tests/performance/results/20261015T1945Z-py-mif256-v1.csv), 3 runs), 1 781 with 64 ([`20261015T1955Z-py-mif64-v1`](tests/performance/results/20261015T1955Z-py-mif64-v1.csv), 2 runs), 1 809 with the default 32 ([`20261015T1752Z-v1`](tests/performance/results/20261015T1752Z-v1.csv), 3 runs), and with 8, 2 280 ([`20261015T1955Z-py-mif8-v1`](tests/performance/results/20261015T1955Z-py-mif8-v1.csv), 2 runs) and 2 268 ([`20261015T2005Z-webhook-mif-v1`](tests/performance/results/20261015T2005Z-webhook-mif-v1.csv), 3 runs). A bot that handles one request at a time is fastest with few requests in flight; tune `max_in_flight` to what the downstream can actually overlap.
+
+## Pull wake-ups with competing instances
+
+Each commit to a pull consumer's queue wakes every parked poll (`notify_waiters`), so with several bot instances polling one consumer most wake-ups find nothing to lease. Before changing that, the cost was measured at `longpoll-tgin-3`, 10 000 RPS, Rust bots, on 2026-10-16, with the threshold set in advance: change the wake-up only if empty wake-ups cost at least 5 % of tgin's CPU.
+
+**Method.** Two throwaway builds of this tree, both with counters in `PullConsumer::poll` (wake-ups, and empty wake-ups whose lease returned nothing): **A**, the code as it is, and **B**, a prototype that wakes one waiter per newly leasable item, and none while a woken waiter has not leased yet. The CPU of tgin is the change in `/proc/1/stat` utime + stime and in the summed `/proc/1/task/*/schedstat` of the tgin process, read from a container in its PID namespace right before and after each `tgin-bench run` (the two agree within 0.01 s); CPU per update divides it by the updates sent. A and B ran interleaved, alternating which went first, 30 s per run.
+
+| `longpoll-tgin-3`, 10 000 RPS | A (current) | B (prototype) |
+|---|---:|---:|
+| Empty wake-ups per update | 0.809 | 0.072 |
+| tgin CPU per update, median of 5 | 118.02 µs (117.61–118.22) | 114.93 µs (114.41–115.14), −2.6 % |
+| p99, median of 5 | 0.73 ms | 0.71 ms |
+
+Removing 0.74 empty wake-ups per update saved 3.1 µs, about 4.2 µs per empty wake-up, so all of them together cost about 3.4 µs per update: **about 2.9 % of tgin's CPU**. At 5 000 RPS the set was noisy: A 179.72 µs per update (median of 3, 1.70 empty wake-ups per update), B 175.62 µs (169.88 and 181.37, 0.07 empty wake-ups per update); B's third run was invalid (`lag_p99_ms` 1.44) and is left out. `longpoll-tgin-1` at 10 000 RPS has no empty wake-ups and shows no difference (92.49 against 92.96 µs). Every run answered every update.
+
+**Decision:** below the 5 % threshold, so commits still wake every parked poll.
 
 ## Python bots
 
