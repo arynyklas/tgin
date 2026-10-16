@@ -1,45 +1,71 @@
-[package]
-name = "tgin"
-version = "0.2.0-rc.2"
-edition = "2021"
-rust-version = "1.88"
-description = "Routing layer between the Telegram Bot API and downstream bot instances"
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+# The benchmark harness is a separate crate with its own Cargo.lock.
+exclude = ["tests/performance/benchmark"]
+
+[workspace.package]
+version = "1.0.0-dev"
+edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/arynyklas/tgin"
 publish = false
 
-# `publish = false` makes dist skip the package unless it is opted in.
-[package.metadata.dist]
-dist = true
-
-[dependencies]
-tokio = { version = "1.53.3", features = ["full"] }
-axum = "0.8.9"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "query"] }
-async-trait = "0.1.92"
-ron = "0.12.2"
-clap = "4.6.7"
-regex = "1.13.1"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-rand = "0.10.3"
-serde_urlencoded = "0.7.1"
-subtle = "2.6.1"
+[workspace.dependencies]
+aho-corasick = "1.1.5"
 arc-swap = "1.9.2"
+aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+axum = "0.8.9"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.23.1"
 bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+gungraun = "0.20.0"
+humantime = "2.4.0"
+http-body = "1.1.0"
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+ipnet = "2.12.2"
+mimalloc = { version = "0.1.52", default-features = false }
+notify-debouncer-full = "0.7.0"
+parking_lot = "0.12.5"
+prometheus-client = "0.25.1"
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+rand = "0.10.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+regex = "1.13.1"
+regex-automata = "0.4.18"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
+ron = "0.12.2"
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.154"
+serde_path_to_error = "0.1.20"
+smallvec = "1.16.3"
+subtle = "2.6.1"
+tempfile = "3.27.0"
+tgin-botapi = { path = "crates/tgin-botapi" }
+tgin-core = { path = "crates/tgin-core" }
+tgin-runtime = { path = "crates/tgin-runtime" }
+thiserror = "2.0.21"
+tokio = "1.53.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tokio-util = "0.7.20"
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false }
-
-[dev-dependencies]
-tokio = { version = "1.53.3", features = ["test-util"] }
+url = "2.5.8"
 wiremock = "0.6.5"
-tower = { version = "0.5.3", features = ["util"] }
-http-body-util = "0.1.5"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
 
 [profile.release]
 lto = true

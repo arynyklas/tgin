@@ -10,7 +10,5 @@ RUN uv sync
 
 COPY . .
 
-
-COPY bot1.py /app/main.py
-
-CMD ["uv", "run", "main.py"]
+# bot1; docker-compose.yml also runs bot2 (bot1.py with another reply) and bot3.py from this image.
+CMD ["uv", "run", "bot1.py"]

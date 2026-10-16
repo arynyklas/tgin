@@ -21,125 +21,122 @@
   <a href="PERF.md"><img src="https://img.shields.io/badge/benchmarks-PERF.md-orange" alt="benchmarks"></a>
 </p>
 
-tgin distributes incoming Telegram updates between multiple bot instances. It was built for teams scaling Telegram bots into a microservices-style deployment.
+tgin receives your Telegram bots' updates — by long polling the Bot API or as webhooks — and routes each one, by rules you write, to the processes that handle it: bot instances that poll tgin the way they would poll Telegram, or HTTP services tgin posts to.
 
 > [!IMPORTANT]
-> tgin is pre-1.0 (`0.x`). Until 1.0, a minor release (`0.x.0`) may contain breaking changes; each one is listed in [CHANGELOG.md](CHANGELOG.md).
+> This is tgin 1.0 in development (`1.0.0-dev`): a rewrite with a new YAML config, new ports and new metrics. There is no stable release yet: the last published artifacts are the 0.2.0 release candidates (`v0.2.0-rc.1`, `v0.2.0-rc.2`), and 1.0 will be the first stable release. Coming from 0.2? Read [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md); `tgin config migrate` converts your config.
 
 ## Contents
 
-- [Why tgin](#why-tgin)
-- [Architecture](#architecture)
+- [What it does](#what-it-does)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
 - [Performance](#performance)
 - [Roadmap](#roadmap)
 - [Goal](#goal)
 
-## Why tgin
-
-- **Load balancing** — round-robin or broadcast updates across multiple bot instances.
-- **Protocol flexibility** — long poll and webhook on both ingress and egress, in any combination.
-- **Framework-agnostic** — works with any bot framework that can receive webhooks or point its `getUpdates` call at a custom URL.
-- **Horizontal scaling** — add or remove downstream instances at runtime through the management API.
-- **Buffering for long-poll bots** — while a long-poll downstream restarts, tgin keeps its updates in a bounded per-route buffer (`max_buffered_updates`). Webhook routes have no retries: an update sent to a webhook bot that is down is lost.
-- **Microservices-friendly** — fan every update out to several specialized services with `AllLB`.
-- **Operational basics** — `/livez` and `/readyz` probes, Prometheus `/metrics`, JSON logs, and a graceful drain on shutdown. There are no downstream health checks or failover yet: round-robin keeps sending a dead downstream its share.
-
-## Architecture
+## What it does
 
 ```mermaid
-graph TD
-    Telegram[Telegram Bot API] -->|Update| TGIN[tgin router]
-    TGIN -->|Route /bot1| Instance1[Bot Instance 1]
-    TGIN -->|Route /bot2| Instance2[Bot Instance 2]
-    TGIN -->|...| InstanceN[Bot Instance N]
+graph LR
+    Telegram[Telegram Bot API] -->|long poll or webhook| TGIN[tgin]
+    TGIN -->|rules| Pull[pull consumer: bots poll /c/name/getUpdates]
+    TGIN -->|rules| Push[push consumer: tgin POSTs to your service]
 ```
 
-Updates arrive over a long-poll or webhook ingress, traverse a tree of routes and load balancers, and land on one or more downstream bots. See [DOCS.md](DOCS.md) for the full data flow and configuration reference.
+- **Many bots, one process.** Each bot has its own token, ingress (long poll or webhook) and rules.
+- **Rules.** Route by update type, chat, chat type, user, command, text or callback data; send an update to one consumer, to several, or to one of a group (round robin, sticky by chat, or weighted).
+- **Pull consumers** speak Telegram's `getUpdates`, so most frameworks only need a different URL. Updates are leased and acknowledged by `offset`; one lost by a crashed bot instance goes to another after its lease times out.
+- **Push consumers** post each update to HTTP endpoints with retries, backoff, per-endpoint circuit breakers and optional per-chat ordering.
+- **Bounded queues** per consumer, with backpressure to the source or dropping the oldest updates, your choice per consumer.
+- **Hot reload** of the config file on change, `SIGHUP` or the admin API; only bots whose token, URL or ingress changed restart.
+- **Operations.** An admin plane with `/livez`, `/readyz`, Prometheus `/metrics` and the admin API (`tgin admin` on the command line), JSON logs with secrets masked, and a graceful drain on shutdown.
+
+Delivery is at least once while the process lives: queues are in memory, so a crash loses what they hold ([DOCS.md → Delivery semantics](DOCS.md#delivery-semantics)).
 
 ## Quick start
 
-Building from source requires Rust 1.88 or newer (`rust-version` in `Cargo.toml`) and a C compiler for `aws-lc-sys`, the TLS crypto backend. Prebuilt binaries and a container image are described under [Install a release](#install-a-release).
+### Binary
 
-### 1. Clone and build
+Building needs Rust 1.89 or newer and a C compiler (for `aws-lc-sys`, the TLS crypto backend).
 
 ```bash
 git clone https://github.com/arynyklas/tgin.git
 cd tgin
-cargo build --release
+cargo build --release -p tgin
 ```
 
-### 2. Configure `tgin.ron`
+The repository's [`tgin.yaml`](tgin.yaml) polls one bot and hands its updates to the pull consumer `bots`:
 
-```ron
-(
-    dark_threads: 6,
-    server_port: Some(3000),
-    updates: [
-        LongPollUpdate(
-            token: "${TOKEN}",
-        ),
-    ],
-    route: RoundRobinLB(
-        routes: [
-            LongPollRoute(path: "/test-bot/getUpdates"),
-            WebhookRoute(url: "http://127.0.0.1:8080/bot2"),
-        ],
-    ),
-)
+```yaml
+version: 1
+
+server:
+  listen: ["0.0.0.0:8080"]
+
+bots:
+  - name: main
+    token: ${env:TOKEN}
+    ingress:
+      long_poll: {}
+    routes:
+      - to: [bots]
+
+consumers:
+  bots:
+    pull: {}
 ```
-
-`${VAR}` placeholders are substituted from the process environment before parsing; if any are unset, tgin lists them on stderr and exits with code `1`.
-
-### 3. Run
 
 ```bash
-TOKEN=123456:ABC ./target/release/tgin -f tgin.ron
+./target/release/tgin config validate tgin.yaml   # every ${env:…} must be set
+TOKEN=123456:ABC ./target/release/tgin            # reads ./tgin.yaml
 ```
 
-This config has no `api` block, so it needs no `auth_token`. The `tgin.ron` shipped in the repository enables the management API and also reads `TGIN_AUTH_TOKEN`; tgin only requires it to be non-blank, so generate a strong one, e.g. `openssl rand -hex 32`.
-
-Or run the bundled docker-compose example:
+Point your bot instances' `getUpdates` at `http://127.0.0.1:8080/c/bots/getUpdates` instead of Telegram; they share the updates. The admin plane listens on `127.0.0.1:9090`:
 
 ```bash
-cd examples/simple
-TOKEN=... TGIN_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up --build
+./target/release/tgin admin status
+curl -s http://127.0.0.1:9090/readyz
 ```
 
-### Install a release
+### Docker
 
-Each GitHub release carries archives for Linux (glibc and static musl), macOS and Windows on x86_64 and aarch64, shell and PowerShell installers, checksums and a CycloneDX SBOM. The container image is published as `ghcr.io/arynyklas/tgin` for `linux/amd64` and `linux/arm64`; see [DOCS.md → Running in Docker](DOCS.md#running-in-docker) for how to run it. Release archives and images carry build provenance attestations; [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify them.
+```bash
+docker build -t tgin .
+# tgin.yaml lives in ./config: mount the directory, so edits reach the container
+docker run -d --name tgin -p 8080:8080 \
+  -v "$PWD/config:/etc/tgin:ro" \
+  -e TOKEN=123456:ABC --stop-timeout 30 tgin
+docker exec tgin tgin admin status
+```
 
-The image runs as uid/gid `65532` and contains no shell: a mounted config file (and TLS key) must be readable by uid `65532` (e.g. `chmod 0644 tgin.ron`), and health checks probe `/livez` and `/readyz` over HTTP from outside the container.
+The image runs as uid `65532` with no shell (the mounted config must be readable by that uid), reads `/etc/tgin/tgin.yaml`, and checks its own health with `tgin admin health`. [examples/simple](examples/simple) is a Compose stack with pull and push consumers; [DOCS.md → Deployment](DOCS.md#deployment) covers Docker secrets, Kubernetes probes and binaries for Windows, macOS and Linux.
+
+Releases carry archives for Linux (glibc and static musl), macOS and Windows on x86_64 and aarch64, shell and PowerShell installers, checksums and a CycloneDX SBOM, and the image is published as `ghcr.io/arynyklas/tgin` for `linux/amd64` and `linux/arm64`; [SECURITY.md](SECURITY.md#verifying-releases) shows how to verify them.
 
 ## Documentation
 
-- [DOCS.md](DOCS.md) — configuration reference, delivery semantics, HTTP management API, observability, shutdown, Docker and TLS.
-- [PERF.md](PERF.md) — benchmark methodology, charts and the known limits of the current numbers.
+- [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, hot reload, admin API, metrics, security, shutdown and deployment.
+- [docs/config-reference.md](docs/config-reference.md) — every config key, generated from the config model.
+- [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) — moving from tgin 0.2.
+- [PERF.md](PERF.md) — benchmark methodology, results and the harness's limits.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release, including breaking ones.
 - [SECURITY.md](SECURITY.md) — supported versions, private vulnerability reporting, release verification.
-- [examples/simple](examples/simple) — minimal docker-compose deployment with two long-poll bots and one webhook bot.
-- [integrations/pytgin](integrations/pytgin) — Python `aiogram` shim that reroutes `getUpdates` through tgin.
+- [examples/simple](examples/simple) — a Compose stack: one bot, two polling instances and one webhook service.
+- [integrations/pytgin](integrations/pytgin) — an `aiogram` shim that points `getUpdates` at tgin.
 
 ## Performance
 
-Headline scale-out runs — full charts (overhead and per-metric breakdowns for both transports) live in [PERF.md](PERF.md). These numbers come from a harness with known measurement defects and will be re-measured; read the warning at the top of PERF.md before relying on them.
+tgin 1.0 against 0.2 at 1 000, 5 000 and 10 000 updates per second, with one and three downstream bots, webhook and long poll; methodology, the full table, the raw CSVs and the harness's limits are in [PERF.md](PERF.md). Routing an update costs a fraction of a millisecond: at 10 000 RPS the median end-to-end latency through tgin is 0.24–0.28 ms and p99 0.52–0.65 ms, against 0.13–0.15 ms and 0.33–0.46 ms straight to the bot. tgin 1.0 matches 0.2 at every point (p99 between 0.88× and 1.11×, every update delivered) and uses less CPU on the long-poll path.
 
 <table>
   <tr>
-    <td colspan="2" align="center"><strong>Webhook — tgin scale-out</strong></td>
+    <td><img src="tests/performance/diagram/generated/webhook-delivered-rps.png" alt="Webhook delivered RPS" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-latency-p99.png" alt="Webhook p99 latency" width="500"></td>
   </tr>
   <tr>
-    <td><img src="tests/performance/diagram/generated/webhook-scale-loss.png" alt="Webhook Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/webhook-scale-median.png" alt="Webhook Median Latency" width="500"></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><strong>Long-poll — tgin scale-out</strong></td>
-  </tr>
-  <tr>
-    <td><img src="tests/performance/diagram/generated/longpoll-scale-loss.png" alt="Long-poll Loss Rate" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/longpoll-scale-median.png" alt="Long-poll Median Latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-delivered-rps.png" alt="Long-poll delivered RPS" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-latency-p99.png" alt="Long-poll p99 latency" width="500"></td>
   </tr>
 </table>
 

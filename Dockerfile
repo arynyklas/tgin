@@ -11,12 +11,16 @@ RUN apk add --no-cache musl-dev build-base cmake perl
 WORKDIR /usr/src/tgin
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
+COPY xtask ./xtask
+
+# The commit `tgin version` reports; empty leaves it out.
+ARG REVISION=
 
 # `target` lives in a cache mount, so the binary is copied out in the same step.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/tgin/target \
-    cargo build --release --locked && \
+    TGIN_COMMIT="${REVISION}" cargo build --release --locked -p tgin && \
     install -D -m 0755 target/release/tgin /out/tgin
 
 # gcr.io/distroless/static-debian13:latest (multi-arch index digest)
@@ -37,7 +41,15 @@ LABEL org.opencontainers.image.title="tgin" \
 COPY --from=builder /out/tgin /usr/local/bin/tgin
 
 USER 65532:65532
-EXPOSE 3000
+# The data plane (server.listen) and the admin plane (admin.listen) defaults.
+EXPOSE 8080 9090
 
+# Mount the config here, or point TGIN_CONFIG (or `-c`) elsewhere.
+ENV TGIN_CONFIG=/etc/tgin/tgin.yaml
+# `tgin admin health` asks the admin plane's /readyz (default
+# http://127.0.0.1:9090, the admin.listen default); exec form, as
+# distroless has no shell.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/tgin", "admin", "health"]
 ENTRYPOINT ["/usr/local/bin/tgin"]
-CMD ["-f", "/etc/tgin/config.ron"]
+CMD []

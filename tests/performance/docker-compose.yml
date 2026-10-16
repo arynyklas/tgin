@@ -1,377 +1,136 @@
 name: tgin-bench
 
-x-bot-healthcheck: &bot-healthcheck
-  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=1)"]
-  interval: 2s
-  timeout: 1s
-  retries: 30
+# The makefile sets the TGIN_* and PULL_URL_* variables per engine and
+# scenario; the defaults here are the v1 webhook scenario.
 
-x-bench-healthcheck: &bench-healthcheck
-  test: ["CMD", "tgin-bench", "--version"]
-  interval: 2s
-  timeout: 1s
-  retries: 30
+x-bot: &bot
+  image: tgin-bench-bot:local
+  build: ./bot
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=1)"]
+    interval: 2s
+    timeout: 1s
+    retries: 30
 
 services:
-  tgin_webhook:
-    build:
-      context: ../../
-      dockerfile: Dockerfile
+  # The engine under test: tgin 0.2 (ENGINE=v0, RON config) or tgin 1.x
+  # (ENGINE=v1, YAML config, data plane 8080, admin plane 9090).
+  tgin:
+    image: ${TGIN_IMAGE:-tgin-bench:v1}
+    pull_policy: never
+    environment:
+      TGIN_CONFIG: ${TGIN_CONFIG_TARGET:-/etc/tgin/tgin.yaml}
     volumes:
-      - ./cfgs/webhook.ron:/etc/tgin/config.ron
-    depends_on:
-      webhook_bot1:
-        condition: service_healthy
-      webhook_bot2:
-        condition: service_healthy
+      - ${TGIN_CONFIG_FILE:-./cfgs/v1/webhook-1.yaml}:${TGIN_CONFIG_TARGET:-/etc/tgin/tgin.yaml}:ro
     ports:
-      - "3000:3000"
+      # Readiness probe (v1 admin plane) or management API (v0) for the host.
+      - "${TGIN_PROBE_PORT:-9090}:${TGIN_PROBE_PORT:-9090}"
+    depends_on:
+      bench:
+        condition: service_healthy
     networks:
       testing_net:
         ipv4_address: 10.5.0.2
 
-  tgin_webhook_one:
-    build:
-      context: ../../
-      dockerfile: Dockerfile
-    volumes:
-      - ./cfgs/webhook-one.ron:/etc/tgin/config.ron
-    depends_on:
-      webhook_bot1:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.2
-
-  tgin_longpull:
-    build:
-      context: ../../
-      dockerfile: Dockerfile
-    volumes:
-      - ./cfgs/longpull.ron:/etc/tgin/config.ron
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090/bot123:test/getUpdates
-    depends_on:
-      bench:
-        condition: service_healthy
-    ports:
-      - "3030:3030"
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.21
-
-  tgin_longpull_one:
-    build:
-      context: ../../
-      dockerfile: Dockerfile
-    volumes:
-      - ./cfgs/longpull-one.ron:/etc/tgin/config.ron
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090/bot123:test/getUpdates
-    depends_on:
-      bench:
-        condition: service_healthy
-    ports:
-      - "3030:3030"
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.21
-
+  # Load generator and fake Telegram Bot API. The fake API is up for the
+  # container's life; `tgin-bench run` (through `docker compose exec`) asks
+  # it for one measured run.
   bench:
+    image: tgin-bench-load:local
     build: ./benchmark
-    command: tail -f /dev/null
-    healthcheck: *bench-healthcheck
+    healthcheck:
+      test: ["CMD", "tgin-bench", "health"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
     networks:
       testing_net:
         ipv4_address: 10.5.0.3
 
   webhook_bot1:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
+    <<: *bot
+    environment: &webhook-env
+      TELEGRAM_API_URL: http://10.5.0.3:8090
+      WEBHOOK_PATH: /webhook
+      PORT: "8080"
+      BOT_SLEEP_MS: ${BOT_SLEEP_MS:-0}
+    depends_on: &needs-bench
       bench:
         condition: service_healthy
-    healthcheck: *bot-healthcheck
     networks:
       testing_net:
         ipv4_address: 10.5.0.11
 
   webhook_bot2:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
+    <<: *bot
+    environment: *webhook-env
+    depends_on: *needs-bench
     networks:
       testing_net:
         ipv4_address: 10.5.0.12
 
   webhook_bot3:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
+    <<: *bot
+    environment: *webhook-env
+    depends_on: *needs-bench
     networks:
       testing_net:
         ipv4_address: 10.5.0.13
 
-  webhook_bot4:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.14
-
-  webhook_bot5:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.15
-
-  webhook_bot6:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.16
-
-  webhook_bot7:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.17
-
-  webhook_bot8:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.18
-
-  webhook_bot9:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.19
-
-  webhook_bot10:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - WEBHOOK_PATH=/webhook
-      - PORT=8080
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.199
-
+  # Polls the fake Bot API directly: the long-poll baseline without tgin.
   longpull_bot_direct:
-    build: ./bot
+    <<: *bot
+    command: ["python", "longpull.py"]
     environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.3:8090/bot123:test/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    depends_on:
-      bench:
-        condition: service_healthy
-    healthcheck: *bot-healthcheck
+      TELEGRAM_API_URL: http://10.5.0.3:8090
+      TGIN_ENDPOINT: http://10.5.0.3:8090/bot123:test/getUpdates
+      PORT: "8080"
+      BOT_SLEEP_MS: ${BOT_SLEEP_MS:-0}
+    depends_on: *needs-bench
     networks:
       testing_net:
         ipv4_address: 10.5.0.20
 
   longpull_bot1:
-    build: ./bot
+    <<: *bot
+    command: ["python", "longpull.py"]
     environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot1/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
+      TELEGRAM_API_URL: http://10.5.0.3:8090
+      TGIN_ENDPOINT: ${PULL_URL_1:-http://10.5.0.2:8080/c/bots/getUpdates}
+      PORT: "8080"
+      BOT_SLEEP_MS: ${BOT_SLEEP_MS:-0}
+    depends_on: &needs-tgin
+      tgin:
+        condition: service_started
     networks:
       testing_net:
-        ipv4_address: 10.5.0.23
+        ipv4_address: 10.5.0.21
 
   longpull_bot2:
-    build: ./bot
+    <<: *bot
+    command: ["python", "longpull.py"]
     environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot2/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
+      TELEGRAM_API_URL: http://10.5.0.3:8090
+      TGIN_ENDPOINT: ${PULL_URL_2:-http://10.5.0.2:8080/c/bots/getUpdates}
+      PORT: "8080"
+      BOT_SLEEP_MS: ${BOT_SLEEP_MS:-0}
+    depends_on: *needs-tgin
     networks:
       testing_net:
         ipv4_address: 10.5.0.22
 
   longpull_bot3:
-    build: ./bot
+    <<: *bot
+    command: ["python", "longpull.py"]
     environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot3/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
+      TELEGRAM_API_URL: http://10.5.0.3:8090
+      TGIN_ENDPOINT: ${PULL_URL_3:-http://10.5.0.2:8080/c/bots/getUpdates}
+      PORT: "8080"
+      BOT_SLEEP_MS: ${BOT_SLEEP_MS:-0}
+    depends_on: *needs-tgin
     networks:
       testing_net:
-        ipv4_address: 10.5.0.24
-
-  longpull_bot4:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot4/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.25
-
-  longpull_bot5:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot5/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.26
-
-  longpull_bot6:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot6/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.27
-
-  longpull_bot7:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot7/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.28
-
-  longpull_bot8:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot8/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.29
-
-  longpull_bot9:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot9/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.30
-
-  longpull_bot10:
-    build: ./bot
-    environment:
-      - TELEGRAM_API_URL=http://10.5.0.3:8090
-      - TGIN_ENDPOINT=http://10.5.0.21:3030/bot10/getUpdates
-      - PORT=8080
-    volumes:
-      - ./bot/longpull.py:/app/bot.py
-    healthcheck: *bot-healthcheck
-    networks:
-      testing_net:
-        ipv4_address: 10.5.0.31
+        ipv4_address: 10.5.0.23
 
 networks:
   testing_net:

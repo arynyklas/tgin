@@ -16,6 +16,8 @@ TGIN_ENDPOINT = os.getenv("TGIN_ENDPOINT", "http://localhost:8090/bot123:test/ge
 TOKEN = os.getenv("BOT_TOKEN", "123:test")
 API_URL = os.getenv("TELEGRAM_API_URL", "http://localhost:8090")
 PORT = int(os.getenv("PORT", 8080))
+# Simulated per-update work before the reply, in milliseconds.
+BOT_SLEEP = float(os.getenv("BOT_SLEEP_MS", "0")) / 1000
 
 
 
@@ -62,7 +64,8 @@ async def main() -> None:
     @dp.message()
     async def echo_handler(message: Message):
         try:
-            await asyncio.sleep(0.01)
+            if BOT_SLEEP:
+                await asyncio.sleep(BOT_SLEEP)
             await message.answer(message.text)
         except Exception as e:
             print(f"Error sending reply: {e}")

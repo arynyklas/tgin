@@ -1,0 +1,27 @@
+# The hot-path benchmarks and the allocation budget route `updates.jsonl`
+# through this config: one long-poll bot, six rules, two pull consumers and
+# one push consumer.
+version: 1
+server: {}
+bots:
+  - name: shop
+    token: "123456789:fixture-token_not-a-real-one"
+    ingress:
+      long_poll: { timeout: 30s, limit: 100 }
+    routes:
+      - match: { commands: [start, help, settings] }
+        to: [workers]
+      - match: { chat_ids: [-1001234567890, -1009876543210] }
+        to: [analytics]
+      - match: { update_types: [callback_query], callback_data: { prefix: ["pay:", "buy:"] } }
+        to: [hooks]
+      - match: { text: { regex: ['(?i)order\s+#\d+', '^\d{6}$'] } }
+        to: [workers, hooks]
+      - match: { text: { prefix: ["!", "#report"] } }
+        to: [analytics]
+      - to: [workers, analytics]
+
+consumers:
+  workers: { pull: { ordering: per_chat } }
+  analytics: { pull: { on_full: drop_oldest } }
+  hooks: { push: { endpoints: [{ url: "http://127.0.0.1:9/hook" }] } }

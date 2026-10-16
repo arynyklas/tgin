@@ -1,0 +1,6 @@
+scenario,engine,target_rps,achieved_rps,delivered_rps,p50_ms,p95_ms,p99_ms,max_ms,unreceived,duplicate_replies,dropped_by_generator,lag_p99_ms
+longpoll-tgin-3,v1,1000,1000.00,1000.02,0.27,0.44,0.53,1.79,0,0,0,0.042
+webhook-tgin-1,v0,1000,1000.00,1000.02,0.27,0.44,0.56,3.83,0,0,0,0.037
+webhook-tgin-1,v1,10000,10000.00,9999.93,0.24,0.40,0.54,107.20,0,0,0,0.038
+webhook-tgin-3,v0,10000,10000.00,9999.96,0.24,0.39,0.57,118.85,0,0,0,0.036
+webhook-tgin-3,v1,1000,1000.00,1000.02,0.31,0.49,0.59,3.78,0,0,0,0.035

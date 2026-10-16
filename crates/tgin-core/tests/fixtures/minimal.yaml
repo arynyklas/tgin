@@ -1,0 +1,17 @@
+# Every optional field left out, so that defaults apply.
+version: 1
+server: {}
+bots:
+  - name: poller
+    token: "1:poller-token"
+    ingress: { long_poll: {} }
+    routes:
+      - to: [queue]
+  - name: hooked
+    token: "2:hooked-token"
+    ingress: { webhook: {} }
+    routes:
+      - to: [pusher]
+consumers:
+  queue: { pull: {} }
+  pusher: { push: { endpoints: [{ url: "http://pusher:8000/tg" }] } }
