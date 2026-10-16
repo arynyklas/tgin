@@ -109,8 +109,8 @@ enum AdminCommand {
     Pause { name: String },
     /// Hand out a paused consumer's updates again; also ends a drain.
     Resume { name: String },
-    /// Let a consumer's pollers wind down: polls on an empty queue return
-    /// at once, until `resume`.
+    /// Let a consumer's pollers wind down: polls on an empty queue answer
+    /// within 500 ms instead of waiting their timeout, until `resume`.
     Drain { name: String },
     /// Drop a consumer's queued updates.
     Purge { name: String },

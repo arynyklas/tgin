@@ -14,7 +14,9 @@
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
-//! `admin.token` (loopback listeners only) the API needs none. Failures
+//! `admin.token` (loopback listeners only) the API needs none. After a
+//! reload removes the token while a non-loopback listener is bound, the
+//! protected endpoints answer 401 until a restart. Failures
 //! answer `{"error":"…"}`: 401 `unauthorized`, 404 `unknown consumer`, 503
 //! `draining` for a reload during the shutdown, 409 `draining` for a resume
 //! during it.

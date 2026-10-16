@@ -362,7 +362,7 @@ impl<'r> Migrator<'r> {
                     );
                 }
                 let mut hook =
-                    Node::map().field("path", self.string(&format!("updates[{i}].path"), path));
+                    Node::map().field("path", self.route_path(&format!("updates[{i}].path"), path));
                 if let Some(registration) = registration {
                     hook = hook
                         .field(
@@ -461,7 +461,7 @@ impl<'r> Migrator<'r> {
                     Some(slug) => self.unique(&format!("pull-{slug}")),
                     None => self.unique(&format!("pull-{}", self.pulls)),
                 };
-                let alias = self.string(&format!("{at}.path"), path);
+                let alias = self.route_path(&format!("{at}.path"), path);
                 let pull = Node::map()
                     .field("capacity", Node::plain(max_buffered_updates))
                     .field("on_full", Node::plain("drop_oldest"))
@@ -574,6 +574,29 @@ impl<'r> Migrator<'r> {
                 Node::string("")
             }
         }
+    }
+
+    /// A 0.2 HTTP path, as [`Migrator::string`]. A first segment that is
+    /// a literal bot token (`bot<digits>:…`, or `file/bot<digits>:…`) is a
+    /// path tgin 1.0 reserves for its Bot API gateway: an error naming the
+    /// field, never the path. `bot` and a placeholder may expand to one,
+    /// which migrate cannot know without the environment: a warning.
+    fn route_path(&mut self, field: &str, path: &str) -> Node {
+        let rest = path.strip_prefix('/').unwrap_or(path);
+        let rest = rest.strip_prefix("file/").unwrap_or(rest);
+        if let Some(ids) = rest.strip_prefix("bot") {
+            let digits = ids.bytes().take_while(u8::is_ascii_digit).count();
+            if digits > 0 && ids.as_bytes().get(digits) == Some(&b':') {
+                self.errors.push(format!(
+                    "{field}: the path starts with a bot token, which tgin 1.0 reserves for its Bot API gateway; choose another path"
+                ));
+            } else if ids.starts_with("${") {
+                self.warnings.push(format!(
+                    "{field}: the path starts with `bot` and a placeholder; tgin 1.0 rejects the path if that expands to a bot token (it reserves token paths for its Bot API gateway), and migrate does not read the environment to check"
+                ));
+            }
+        }
+        self.string(field, path)
     }
 }
 

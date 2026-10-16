@@ -800,3 +800,45 @@ fn parse_error_never_quotes_config_text() {
         assert_eq!(out.stdout, "", "case {i}");
     }
 }
+
+/// A 0.2 path whose first segment is a literal bot token is a path tgin 1.0
+/// reserves for its gateway: an error naming the field, never the path.
+#[test]
+fn token_shaped_paths_are_errors() {
+    for (ron, field) in [
+        (
+            r#"(server_port: Some(3000), updates: [WebhookUpdate(path: "/bot123456:secretpart/hook")], route: LongPollRoute(path: "/poll"))"#,
+            "updates[0].path",
+        ),
+        (
+            r#"(server_port: Some(3000), updates: [LongPollUpdate(token: "1:a")], route: LongPollRoute(path: "/file/bot123456:secretpart/getUpdates"))"#,
+            "route.path",
+        ),
+    ] {
+        let errors = errors(ron);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(field), "{}", errors[0]);
+        assert!(errors[0].contains("reserves"), "{}", errors[0]);
+        assert!(!errors[0].contains("secretpart"), "{}", errors[0]);
+        assert!(!errors[0].contains("123456"), "{}", errors[0]);
+    }
+}
+
+/// `bot` followed by a placeholder may expand to a token, which migrate
+/// cannot see: a warning, since it never reads the environment.
+#[test]
+fn bot_placeholder_paths_warn() {
+    let ron = r#"(server_port: Some(3000), updates: [LongPollUpdate(token: "${TOKEN}")], route: LongPollRoute(path: "/bot${TOKEN}/getUpdates"))"#;
+    let out = migrated(ron);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0].contains("route.path"),
+        "{}",
+        out.warnings[0]
+    );
+    assert!(
+        out.warnings[0].contains("placeholder"),
+        "{}",
+        out.warnings[0]
+    );
+}
