@@ -10,6 +10,7 @@ use reqwest::{RequestBuilder, StatusCode, Url};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tgin_core::config::valid_bot_token;
 use tgin_runtime::http::describe_error;
 use tgin_runtime::secret::Secret;
 
@@ -54,7 +55,9 @@ pub struct BotUser {
 pub struct SetWebhook {
     pub url: Url,
     pub secret_token: Option<Secret<String>>,
-    pub allowed_updates: Option<Vec<String>>,
+    /// Always sent: `[]` is Telegram's default set, while an absent list
+    /// would keep the one Telegram stored from an earlier call.
+    pub allowed_updates: Vec<String>,
     pub max_connections: Option<u32>,
     pub drop_pending_updates: bool,
     pub ip_address: Option<IpAddr>,
@@ -108,18 +111,14 @@ pub struct BotClient {
 
 impl BotClient {
     /// A client for `{api_url}/bot{token}/`; a path on `api_url` is kept. The
-    /// token must be non-empty and use only `[A-Za-z0-9:_-]`.
+    /// token must pass [`valid_bot_token`], as the config loader checks.
     pub fn new(
         http: reqwest::Client,
         api_url: &Url,
         token: &Secret<String>,
     ) -> Result<Self, ApiError> {
         let t = token.expose();
-        if t.is_empty()
-            || !t
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
-        {
+        if !valid_bot_token(t) {
             return Err(ApiError::Config(
                 "the bot token must be non-empty and use only [A-Za-z0-9:_-]",
             ));
@@ -147,23 +146,27 @@ impl BotClient {
         self.scrubbed(parse_result(&body))
     }
 
-    /// The raw `getUpdates` response body, for [`split_updates`]. The request
-    /// may take up to `timeout` plus 10 s. An `"ok": false` body is returned
-    /// as an [`ApiError::Http`] with the token masked.
+    /// The raw `getUpdates` response body, for [`split_updates`]. `allowed`
+    /// is always sent; `[]` asks for Telegram's default set. The request may
+    /// take up to `timeout` plus 10 s. An `"ok": false` body is returned as
+    /// an [`ApiError::Http`] with the token masked.
+    ///
+    /// The body is a copy of exactly its own size: the updates sliced out of
+    /// it may stay queued for long, and must not keep the connection's read
+    /// buffer alive with them.
     pub async fn get_updates(
         &self,
         offset: i64,
         limit: u32,
         timeout: Duration,
-        allowed: Option<&[String]>,
+        allowed: &[String],
     ) -> Result<Bytes, ApiError> {
         #[derive(Serialize)]
         struct Params<'a> {
             offset: i64,
             limit: u32,
             timeout: u64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            allowed_updates: Option<&'a [String]>,
+            allowed_updates: &'a [String],
         }
         let params = Params {
             offset,
@@ -185,7 +188,7 @@ impl BotClient {
         {
             return Err(self.scrub(envelope.into_error(StatusCode::OK.as_u16(), None)));
         }
-        Ok(body)
+        Ok(Bytes::copy_from_slice(&body))
     }
 
     /// Sends JSON, or `multipart/form-data` when a certificate is set.
@@ -195,8 +198,7 @@ impl BotClient {
             url: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             secret_token: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            allowed_updates: Option<&'a [String]>,
+            allowed_updates: &'a [String],
             #[serde(skip_serializing_if = "Option::is_none")]
             max_connections: Option<u32>,
             drop_pending_updates: bool,
@@ -209,7 +211,7 @@ impl BotClient {
                 &Params {
                     url: req.url.as_str(),
                     secret_token: req.secret_token.as_ref().map(|s| s.expose().as_str()),
-                    allowed_updates: req.allowed_updates.as_deref(),
+                    allowed_updates: &req.allowed_updates,
                     max_connections: req.max_connections,
                     drop_pending_updates: req.drop_pending_updates,
                     ip_address: req.ip_address,
@@ -319,10 +321,8 @@ fn webhook_form(req: &SetWebhook, certificate: &Bytes) -> Result<Form, ApiError>
     if let Some(secret) = &req.secret_token {
         form = form.text("secret_token", secret.expose().clone());
     }
-    if let Some(allowed) = &req.allowed_updates {
-        let list = serde_json::to_string(allowed).map_err(|_| encode_error())?;
-        form = form.text("allowed_updates", list);
-    }
+    let allowed = serde_json::to_string(&req.allowed_updates).map_err(|_| encode_error())?;
+    form = form.text("allowed_updates", allowed);
     if let Some(max) = req.max_connections {
         form = form.text("max_connections", max.to_string());
     }
@@ -548,7 +548,9 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path(at("getUpdates")))
-            .and(body_json(json!({"offset": -1, "limit": 1, "timeout": 0})))
+            .and(body_json(
+                json!({"offset": -1, "limit": 1, "timeout": 0, "allowed_updates": []}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true,"result":[]}"#))
             .expect(1)
             .mount(&server)
@@ -557,11 +559,32 @@ mod tests {
         let bot = client_for(&server.uri());
         let allowed = ["message".to_owned(), "callback_query".to_owned()];
         let got = bot
-            .get_updates(5, 100, Duration::from_secs(30), Some(&allowed))
+            .get_updates(5, 100, Duration::from_secs(30), &allowed)
             .await
             .unwrap();
         assert_eq!(&got[..], body.as_bytes());
-        bot.get_updates(-1, 1, Duration::ZERO, None).await.unwrap();
+        bot.get_updates(-1, 1, Duration::ZERO, &[]).await.unwrap();
+    }
+
+    /// The body is copied to an allocation of its own size: queued updates
+    /// slice it, and must not keep the connection's read buffer alive.
+    #[tokio::test]
+    async fn get_updates_body_owns_exactly_its_bytes() {
+        let server = MockServer::start().await;
+        let body = r#"{"ok":true,"result":[{"update_id":5}]}"#;
+        Mock::given(path(at("getUpdates")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let bot = client_for(&server.uri());
+        let got = bot.get_updates(0, 100, Duration::ZERO, &[]).await.unwrap();
+        assert_eq!(&got[..], body.as_bytes());
+        // `bot` keeps the connection pooled, with its read buffer.
+        match got.try_into_mut() {
+            Ok(owned) => assert_eq!(owned.capacity(), owned.len()),
+            Err(shared) => panic!("the body shares its memory ({} bytes)", shared.len()),
+        }
+        drop(bot);
     }
 
     #[tokio::test]
@@ -589,6 +612,7 @@ mod tests {
             .and(body_json(json!({
                 "url": "https://bot.example.com/webhook/shop",
                 "secret_token": "s3cret",
+                "allowed_updates": [],
                 "drop_pending_updates": false,
             })))
             .respond_with(
@@ -610,7 +634,7 @@ mod tests {
         bot.set_webhook(&SetWebhook {
             url: "https://bot.example.com/webhook/shop".parse().unwrap(),
             secret_token: Some(Secret::new("s3cret".into())),
-            allowed_updates: None,
+            allowed_updates: Vec::new(),
             max_connections: None,
             drop_pending_updates: false,
             ip_address: None,
@@ -671,7 +695,7 @@ mod tests {
 
         let bot = client_for(&server.uri());
         assert_eq!(
-            bot.get_updates(0, 100, Duration::ZERO, None).await,
+            bot.get_updates(0, 100, Duration::ZERO, &[]).await,
             Err(ApiError::Http {
                 status: 429,
                 description: "Too Many Requests: retry after 7".into(),
@@ -697,7 +721,7 @@ mod tests {
         let req = SetWebhook {
             url: "https://bot.example.com/hook".parse().unwrap(),
             secret_token: None,
-            allowed_updates: None,
+            allowed_updates: Vec::new(),
             max_connections: None,
             drop_pending_updates: false,
             ip_address: None,
@@ -736,7 +760,7 @@ mod tests {
         bot.set_webhook(&SetWebhook {
             url: "https://203.0.113.5:8443/webhook/shop".parse().unwrap(),
             secret_token: Some(Secret::new("s3cret".into())),
-            allowed_updates: Some(vec!["message".into(), "callback_query".into()]),
+            allowed_updates: vec!["message".into(), "callback_query".into()],
             max_connections: Some(40),
             drop_pending_updates: true,
             ip_address: Some("203.0.113.5".parse().unwrap()),
@@ -763,6 +787,37 @@ mod tests {
             "{body}"
         );
         assert!(body.contains(pem), "{body}");
+    }
+
+    /// Without a configured list the form still sends `allowed_updates`, as
+    /// `[]`: an absent one would keep the list Telegram stored before.
+    #[tokio::test]
+    async fn set_webhook_multipart_sends_empty_allowed_updates() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(at("setWebhook")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"ok":true,"result":true}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bot = client_for(&server.uri());
+        bot.set_webhook(&SetWebhook {
+            url: "https://203.0.113.5:8443/webhook/shop".parse().unwrap(),
+            secret_token: None,
+            allowed_updates: Vec::new(),
+            max_connections: None,
+            drop_pending_updates: false,
+            ip_address: None,
+            certificate: Some(Bytes::from_static(b"pem")),
+        })
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body);
+        let part = "name=\"allowed_updates\"\r\n\r\n[]\r\n";
+        assert!(body.contains(part), "missing {part:?} in {body}");
     }
 
     #[tokio::test]
@@ -802,7 +857,7 @@ mod tests {
         let errors = [
             bot.get_me().await.unwrap_err(),
             bot.delete_webhook(false).await.unwrap_err(),
-            bot.get_updates(0, 1, Duration::ZERO, None)
+            bot.get_updates(0, 1, Duration::ZERO, &[])
                 .await
                 .unwrap_err(),
             split_updates(&odd_body).unwrap_err(),
@@ -858,7 +913,7 @@ mod tests {
         let req = |url: &str| SetWebhook {
             url: url.parse().unwrap(),
             secret_token: Some(Secret::new("hush-hush-value".to_owned())),
-            allowed_updates: Some(vec!["message".to_owned()]),
+            allowed_updates: vec!["message".to_owned()],
             max_connections: Some(40),
             drop_pending_updates: true,
             ip_address: Some("1.2.3.4".parse().unwrap()),
@@ -876,10 +931,7 @@ mod tests {
             assert!(!shown.contains(hidden), "{hidden} in {shown}");
         }
         assert!(shown.contains("secret_token: Some([redacted])"), "{shown}");
-        assert!(
-            shown.contains(r#"allowed_updates: Some(["message"])"#),
-            "{shown}"
-        );
+        assert!(shown.contains(r#"allowed_updates: ["message"]"#), "{shown}");
         assert!(shown.contains("max_connections: Some(40)"), "{shown}");
         assert!(shown.contains("drop_pending_updates: true"), "{shown}");
         assert!(shown.contains("ip_address: Some(1.2.3.4)"), "{shown}");

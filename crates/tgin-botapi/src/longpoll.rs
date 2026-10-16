@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::{SourceErrorReason, SourceMetrics, SourceStateLabel};
@@ -41,7 +42,8 @@ pub struct LongPollOptions {
     pub timeout: Duration,
     /// Updates per `getUpdates`, 1 to 100.
     pub limit: u32,
-    pub allowed_updates: Option<Vec<String>>,
+    /// Sent with every `getUpdates`; empty asks for Telegram's default set.
+    pub allowed_updates: Vec<String>,
     /// Delete any webhook before the first poll, and again when a poll finds
     /// one active, keeping pending updates. When off, an active webhook
     /// stops the source polling until someone else deletes it.
@@ -60,7 +62,7 @@ impl Default for LongPollOptions {
         Self {
             timeout: Duration::from_secs(30),
             limit: MAX_LIMIT,
-            allowed_updates: None,
+            allowed_updates: Vec::new(),
             delete_webhook_on_start: true,
             backoff: (
                 Duration::from_millis(500),
@@ -83,6 +85,8 @@ pub struct LongPollSource<S: Sink> {
     sink: Arc<S>,
     metrics: SourceMetrics,
     on_identity: OnIdentity,
+    /// Why the source backs off, while it does.
+    last_error: Mutex<Option<String>>,
 }
 
 /// What the poll loop does after a failed `getUpdates`.
@@ -104,16 +108,19 @@ struct Poll {
 }
 
 impl Poll {
-    /// The error backoff's next delay, or the server's `retry_after` if
-    /// longer.
     fn error_delay(&mut self, err: &ApiError) -> Duration {
-        let retry_after = match err {
-            ApiError::Http { retry_after, .. } => *retry_after,
-            _ => None,
-        };
-        let computed = self.backoff.next_delay(&mut rand::rng());
-        honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+        error_delay(&mut self.backoff, err)
     }
+}
+
+/// The backoff's next delay, or the server's `retry_after` if longer.
+fn error_delay(backoff: &mut Backoff, err: &ApiError) -> Duration {
+    let retry_after = match err {
+        ApiError::Http { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+    let computed = backoff.next_delay(&mut rand::rng());
+    honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
 }
 
 impl<S: Sink> LongPollSource<S> {
@@ -139,17 +146,23 @@ impl<S: Sink> LongPollSource<S> {
             sink,
             metrics,
             on_identity,
+            last_error: Mutex::new(None),
         }
+    }
+
+    /// Why the source backs off (a failed `getMe` or `getUpdates`, with the
+    /// token masked), while it does.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().clone()
     }
 
     /// Calls `getMe`, then polls until `ingest` is cancelled.
     ///
-    /// Returns [`Exit::Done`] on cancellation, [`Exit::Fatal`] when Telegram
-    /// rejects the token (401, 403 or 404), and [`Exit::Retry`] when `getMe`
-    /// fails otherwise (after the server's `retry_after`, if it sent one).
-    /// Every other poll failure is waited out here. Updates not yet admitted
-    /// at cancellation are not confirmed, so Telegram delivers them again to
-    /// the next poller.
+    /// Returns [`Exit::Done`] on cancellation and [`Exit::Fatal`] when
+    /// Telegram rejects the token (401, 403 or 404). Every other failure,
+    /// of `getMe` too, is waited out here, on a sleep that cancelling
+    /// `ingest` ends at once. Updates not yet admitted at cancellation are
+    /// not confirmed, so Telegram delivers them again to the next poller.
     pub async fn run(&self, ingest: CancellationToken) -> Exit {
         self.metrics.set_state(SourceStateLabel::Starting);
         let exit = self.poll(&ingest).await;
@@ -161,39 +174,50 @@ impl<S: Sink> LongPollSource<S> {
         exit
     }
 
-    async fn poll(&self, ingest: &CancellationToken) -> Exit {
-        let user = match ingest.run_until_cancelled(self.client.get_me()).await {
-            None => return Exit::Done,
-            Some(Ok(user)) => user,
-            Some(Err(err)) => {
-                self.count(&err);
-                let message = format!("getMe failed: {err}");
-                return if is_fatal(&err) {
-                    tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
-                    Exit::Fatal(message)
-                } else {
-                    tracing::warn!(source = %self.name, error = %err, "getMe failed");
-                    if let ApiError::Http {
-                        retry_after: Some(retry_after),
-                        ..
-                    } = err
-                    {
-                        self.metrics.set_state(SourceStateLabel::Backoff);
-                        let wait =
-                            honor_retry_after(Duration::ZERO, Some(retry_after), RETRY_AFTER_CAP);
-                        if ingest
-                            .run_until_cancelled(tokio::time::sleep(wait))
-                            .await
-                            .is_none()
-                        {
-                            return Exit::Done;
-                        }
-                    }
-                    Exit::Retry(message)
-                };
+    /// The bot's account, once `getMe` succeeds; waits out the failures a
+    /// retry may fix with the error backoff (or the server's
+    /// `retry_after`). `Err` is the exit: cancellation, or the token
+    /// rejected.
+    async fn identify(
+        &self,
+        ingest: &CancellationToken,
+        backoff: &mut Backoff,
+    ) -> Result<BotUser, Exit> {
+        loop {
+            let err = match ingest.run_until_cancelled(self.client.get_me()).await {
+                None => return Err(Exit::Done),
+                Some(Ok(user)) => return Ok(user),
+                Some(Err(err)) => err,
+            };
+            self.count(&err);
+            let message = format!("getMe failed: {err}");
+            if is_fatal(&err) {
+                tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
+                return Err(Exit::Fatal(message));
             }
+            let delay = error_delay(backoff, &err);
+            tracing::warn!(source = %self.name, error = %err, ?delay, "getMe failed; trying again");
+            *self.last_error.lock() = Some(message);
+            self.metrics.set_state(SourceStateLabel::Backoff);
+            if ingest
+                .run_until_cancelled(tokio::time::sleep(delay))
+                .await
+                .is_none()
+            {
+                return Err(Exit::Done);
+            }
+        }
+    }
+
+    async fn poll(&self, ingest: &CancellationToken) -> Exit {
+        let (initial, max, floor) = self.opts.backoff;
+        let mut backoff = Backoff::new(initial, max, floor);
+        let user = match self.identify(ingest, &mut backoff).await {
+            Ok(user) => user,
+            Err(exit) => return exit,
         };
         (self.on_identity)(self.id, &user);
+        *self.last_error.lock() = None;
         self.metrics.set_state(SourceStateLabel::Running);
         tracing::info!(
             source = %self.name,
@@ -202,10 +226,10 @@ impl<S: Sink> LongPollSource<S> {
             "long poll started"
         );
 
-        let (initial, max, floor) = self.opts.backoff;
+        backoff.reset();
         let mut state = Poll {
             offset: 0,
-            backoff: Backoff::new(initial, max, floor),
+            backoff,
             webhook_deleted: None,
             running: true,
         };
@@ -229,7 +253,7 @@ impl<S: Sink> LongPollSource<S> {
                     state.offset,
                     self.opts.limit,
                     self.opts.timeout,
-                    self.opts.allowed_updates.as_deref(),
+                    &self.opts.allowed_updates,
                 ))
                 .await;
             let Some(polled) = polled else {
@@ -240,6 +264,7 @@ impl<S: Sink> LongPollSource<S> {
                     state.backoff.reset();
                     if !state.running {
                         state.running = true;
+                        *self.last_error.lock() = None;
                         self.metrics.set_state(SourceStateLabel::Running);
                     }
                     if !self.admit(&updates, &mut state.offset, ingest).await {
@@ -308,9 +333,11 @@ impl<S: Sink> LongPollSource<S> {
         true
     }
 
-    /// Counts a failed `getUpdates` and decides what to do next.
+    /// Counts a failed `getUpdates`, keeps it as the reason of a backoff, and
+    /// decides what to do next.
     async fn recover(&self, err: ApiError, state: &mut Poll, ingest: &CancellationToken) -> Step {
         self.count(&err);
+        *self.last_error.lock() = Some(format!("getUpdates failed: {err}"));
         match &err {
             ApiError::Http {
                 status: 409,
@@ -344,6 +371,16 @@ impl<S: Sink> LongPollSource<S> {
                         Step::Wait(state.error_delay(&err))
                     }
                 }
+            }
+            ApiError::Http {
+                status: 409,
+                description,
+                ..
+            } if description.contains("terminated by setWebhook") => {
+                // The next poll finds the webhook active, and deletes it
+                // (or waits) as `delete_webhook_on_start` says.
+                tracing::warn!(source = %self.name, "another process set a webhook on this bot token; polling again");
+                Step::Poll
             }
             ApiError::Http { status: 409, .. } => {
                 tracing::warn!(source = %self.name, error = %err, "another process is polling this bot token; run one tgin per token");

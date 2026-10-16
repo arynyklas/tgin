@@ -67,8 +67,7 @@ impl IpAllowlist {
     }
 }
 
-/// How a webhook route accepts updates. `Debug` shows neither the path nor
-/// the registration URL.
+/// How a webhook route accepts updates. `Debug` does not show the path.
 #[derive(Clone)]
 pub struct WebhookOptions {
     /// The route path; it must start with `/`. It may embed a token, so it
@@ -82,9 +81,6 @@ pub struct WebhookOptions {
     pub trusted_proxies: Vec<IpNet>,
     /// The largest accepted body, in bytes ([`DEFAULT_WEBHOOK_BODY_LIMIT`]).
     pub body_limit: usize,
-    /// The registration the app sends with [`register`] at start, if any.
-    /// The router does not use it.
-    pub register: Option<SetWebhook>,
 }
 
 impl fmt::Debug for WebhookOptions {
@@ -94,7 +90,6 @@ impl fmt::Debug for WebhookOptions {
             .field("ip_allowlist", &self.ip_allowlist)
             .field("trusted_proxies", &self.trusted_proxies)
             .field("body_limit", &self.body_limit)
-            .field("register", &self.register.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -122,8 +117,8 @@ struct Ingress<S> {
 /// 2. 403 if the client address is not in `opts.ip_allowlist`;
 /// 3. 401 without the right `X-Telegram-Bot-Api-Secret-Token`;
 /// 4. 503 with `Retry-After: 5` once `ingest` is cancelled;
-/// 5. 413 for a body over `opts.body_limit`, 400 for a body the client
-///    fails to send;
+/// 5. 413 for a body over `opts.body_limit` (counted as a `decode` error),
+///    400 for a body the client fails to send;
 /// 6. 400 for a body that is not a JSON object with an integer `update_id`;
 /// 7. 503 with `Retry-After: 5` when the sink pushes back, or when `ingest`
 ///    was cancelled by the time an update is admitted, so Telegram delivers
@@ -160,7 +155,6 @@ pub fn webhook_router<S: Sink>(
         ip_allowlist,
         trusted_proxies,
         body_limit,
-        register: _,
     } = opts;
     let ingress = Arc::new(Ingress {
         id,
@@ -204,7 +198,11 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
     }
     let body = match read_body(body, ingress.body_limit).await {
         Ok(body) => body,
-        Err(BodyError::TooLarge) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(BodyError::TooLarge) => {
+            ingress.metrics.error(SourceErrorReason::Decode);
+            tracing::warn!(source = %ingress.name, limit = ingress.body_limit, "webhook request body over the size limit; refused");
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
         Err(BodyError::Read) => {
             ingress.metrics.error(SourceErrorReason::Network);
             tracing::debug!(source = %ingress.name, "webhook request body could not be read");
@@ -342,8 +340,10 @@ enum BodyError {
 }
 
 /// Reads `body` whole, refusing it as soon as it is known to exceed `limit`:
-/// from its declared length before reading anything, else while reading. A
-/// body in a single frame is returned without a copy.
+/// from its declared length before reading anything, else while reading.
+/// A body in a single frame is copied once, to its exact size: the frame is
+/// a slice of the connection's read buffer, which a queued update would
+/// otherwise keep alive.
 async fn read_body(mut body: Body, limit: usize) -> Result<Bytes, BodyError> {
     let hint = body.size_hint();
     if hint.lower() > limit as u64 {
@@ -372,7 +372,7 @@ async fn read_body(mut body: Body, limit: usize) -> Result<Bytes, BodyError> {
             }
         }
     }
-    Ok(first.unwrap_or_else(|| rest.freeze()))
+    Ok(first.map_or_else(|| rest.freeze(), |data| Bytes::copy_from_slice(&data)))
 }
 
 #[cfg(test)]
@@ -493,7 +493,6 @@ mod tests {
             ip_allowlist: IpAllowlist::Telegram,
             trusted_proxies: vec![net("10.0.0.0/8")],
             body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
-            register: None,
         };
         let shown = format!("{opts:?}");
         assert!(!shown.contains("PathEmbeddedToken"), "{shown}");

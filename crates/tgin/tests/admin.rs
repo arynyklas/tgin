@@ -1247,7 +1247,9 @@ async fn status_redacts_task_errors() {
     let error = source.error.expect("the source's error");
     assert!(error.contains("getMe failed"), "{error}");
     assert!(error.contains("#####"), "{error}");
-    assert_eq!(task.error.as_deref(), Some(error.as_str()));
+    // The source waits out the failure itself: its task keeps running.
+    assert_eq!(task.state, "running");
+    assert_eq!(task.error, None);
     assert!(source.errors_total >= 1);
     tgin.stop().await;
 }

@@ -75,7 +75,10 @@ struct Started {
     kind: Kind,
     /// Stops this source and its background `getMe`; a child of ingest.
     stop: CancellationToken,
-    metrics: SourceMetrics,
+    /// `None` for a source that could not be prepared.
+    metrics: Option<SourceMetrics>,
+    /// A long poll, for the reason it backs off.
+    long_poll: Option<Arc<LongPollSource<Engine>>>,
 }
 
 /// A bot whose source is about to start.
@@ -135,7 +138,8 @@ impl Sources {
     /// # Errors
     ///
     /// The engine has no source for the bot, or its API client cannot be
-    /// set up; the bot is no longer starting then.
+    /// set up. The source then counts as failed for good, with that error,
+    /// as one whose token Telegram rejected does.
     pub(crate) fn prepare(&self, bot: &Bot) -> Result<Prepared, StartError> {
         self.registry.lock().starting.insert(bot.name.clone());
         self.health.set(
@@ -143,10 +147,50 @@ impl Sources {
             Readiness::NotReady("starting".to_owned()),
         );
         let prepared = self.prepared(bot);
-        if prepared.is_err() {
-            self.registry.lock().starting.remove(&bot.name);
+        if let Err(err) = &prepared {
+            self.fail(bot, err);
         }
         prepared
+    }
+
+    /// Records `bot`, whose source cannot be prepared, as a long poll that
+    /// failed for good with `err`: `failed` with the error in the status,
+    /// counted by [`Sources::all_failed`], and no longer starting. A source
+    /// that later fails does not make tgin unready, so its readiness
+    /// component is ready.
+    fn fail(&self, bot: &Bot, err: &StartError) {
+        let reason = err.to_string();
+        let metrics = self.engine.source_id(&bot.name).and_then(|id| {
+            let state = self.engine.state();
+            let info = state.sources.get(usize::from(id.0))?.as_ref()?;
+            Some(info.metrics.clone())
+        });
+        if let Some(metrics) = &metrics {
+            metrics.set_state(SourceStateLabel::Failed);
+        }
+        let task = source_task(&bot.name);
+        self.supervisor.spawn(
+            Arc::from(task.as_str()),
+            Backoff::new(Duration::ZERO, Duration::ZERO, Duration::ZERO),
+            self.force.clone(),
+            move || {
+                let reason = reason.clone();
+                async move { Exit::Fatal(reason) }
+            },
+        );
+        let mut registry = self.registry.lock();
+        registry.started.insert(
+            bot.name.clone(),
+            Started {
+                kind: Kind::LongPoll,
+                stop: self.ingest.child_token(),
+                metrics,
+                long_poll: None,
+            },
+        );
+        registry.starting.remove(&bot.name);
+        drop(registry);
+        self.health.set(&task, Readiness::Ready);
     }
 
     fn prepared(&self, bot: &Bot) -> Result<Prepared, StartError> {
@@ -223,7 +267,8 @@ impl Sources {
                 Started {
                     kind: Kind::Webhook,
                     stop: bot.stop.clone(),
-                    metrics: bot.metrics.clone(),
+                    metrics: Some(bot.metrics.clone()),
+                    long_poll: None,
                 },
             );
             registry.starting.remove(&*bot.name);
@@ -273,7 +318,8 @@ impl Sources {
             Started {
                 kind: Kind::LongPoll,
                 stop: stop.clone(),
-                metrics: metrics.clone(),
+                metrics: Some(metrics.clone()),
+                long_poll: Some(Arc::clone(&source)),
             },
         );
         let task_stop = stop.clone();
@@ -319,8 +365,10 @@ impl Sources {
             return;
         };
         started.stop.cancel();
-        if started.kind == Kind::Webhook {
-            started.metrics.set_state(SourceStateLabel::Stopped);
+        if started.kind == Kind::Webhook
+            && let Some(metrics) = &started.metrics
+        {
+            metrics.set_state(SourceStateLabel::Stopped);
         }
         // An ended background `getMe` is of no use, also for a bot that
         // starts again.
@@ -346,14 +394,17 @@ impl Sources {
             if tokio::time::timeout(REAP_WAIT, ended).await.is_err() {
                 return;
             }
-            let polling = |bot: &String| {
+            // Held across the removal, so that a long poll started again in
+            // between keeps its entry; registry, then supervisor, as in
+            // `all_failed`.
+            let registry = registry.lock();
+            let polling = unless_polling.as_ref().is_some_and(|bot| {
                 registry
-                    .lock()
                     .started
                     .get(bot)
                     .is_some_and(|s| s.kind == Kind::LongPoll)
-            };
-            if !unless_polling.as_ref().is_some_and(polling) {
+            });
+            if !polling {
                 supervisor.remove(&task);
             }
         });
@@ -366,6 +417,12 @@ impl Sources {
             .started
             .get(name)
             .map(|started| started.kind)
+    }
+
+    /// Why the long poll of the bot `name` backs off, while it does.
+    pub(crate) fn long_poll_error(&self, name: &str) -> Option<String> {
+        let source = self.registry.lock().started.get(name)?.long_poll.clone()?;
+        source.last_error()
     }
 
     /// Whether the source of the bot `name` is on its way up.
@@ -381,8 +438,10 @@ impl Sources {
     /// Reports the webhook sources stopped, once ingest has stopped.
     pub(crate) fn webhooks_stopped(&self) {
         for started in self.registry.lock().started.values() {
-            if started.kind == Kind::Webhook {
-                started.metrics.set_state(SourceStateLabel::Stopped);
+            if started.kind == Kind::Webhook
+                && let Some(metrics) = &started.metrics
+            {
+                metrics.set_state(SourceStateLabel::Stopped);
             }
         }
     }
@@ -476,11 +535,13 @@ impl Sources {
     }
 }
 
+/// The source's options; an omitted `allowed_updates` is sent as `[]`,
+/// Telegram's default set.
 fn long_poll_options(poll: &LongPoll) -> LongPollOptions {
     LongPollOptions {
         timeout: poll.timeout,
         limit: poll.limit,
-        allowed_updates: poll.allowed_updates.clone(),
+        allowed_updates: poll.allowed_updates.clone().unwrap_or_default(),
         delete_webhook_on_start: poll.delete_webhook_on_start,
         ..LongPollOptions::default()
     }
@@ -523,7 +584,7 @@ async fn register(bot: &Prepared, hook: &Webhook) {
     let request = SetWebhook {
         url,
         secret_token: webhook_secret(&bot.bot, hook),
-        allowed_updates: hook.allowed_updates.clone(),
+        allowed_updates: hook.allowed_updates.clone().unwrap_or_default(),
         max_connections: hook.max_connections,
         drop_pending_updates: hook.drop_pending_updates,
         ip_address: hook.ip_address,

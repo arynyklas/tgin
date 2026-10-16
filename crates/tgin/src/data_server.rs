@@ -195,7 +195,6 @@ fn router(
             },
             trusted_proxies: server.trusted_proxies.clone(),
             body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
-            register: None,
         };
         let webhook = tgin_botapi::webhook_router(
             id,

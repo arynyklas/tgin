@@ -436,6 +436,14 @@ impl SourceMetrics {
         }
     }
 
+    /// The state whose gauge is 1, if one is.
+    pub fn state(&self) -> Option<SourceStateLabel> {
+        SourceStateLabel::ALL
+            .into_iter()
+            .zip(&self.state)
+            .find_map(|(state, gauge)| (gauge.get() == 1).then_some(state))
+    }
+
     /// One update no rule matched.
     pub fn unmatched(&self) {
         self.unmatched.inc();

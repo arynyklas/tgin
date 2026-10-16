@@ -34,6 +34,8 @@ const FOREVER: Duration = Duration::from_secs(3600);
 
 const WEBHOOK_ACTIVE: &str = "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first";
 const OTHER_POLLER: &str = "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running";
+/// What a long poll in flight gets when another process calls `setWebhook`.
+const SET_WEBHOOK: &str = "Conflict: terminated by setWebhook request";
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -357,7 +359,7 @@ async fn admits_in_order_and_confirms_offset() {
     let first = tg.next_poll().await;
     assert_eq!(
         first.body,
-        json!({ "offset": 0, "limit": 100, "timeout": 30 })
+        json!({ "offset": 0, "limit": 100, "timeout": 30, "allowed_updates": [] })
     );
     // An unroutable update counts as admitted, so the offset passes it. The
     // sink, not the source, counts it as unmatched.
@@ -555,6 +557,49 @@ async fn deletes_webhook_on_409_and_polls_again_at_once() {
         r#"tgin_source_errors_total{source="lp",reason="conflict"} 1"#,
         r#"tgin_source_updates_total{source="lp"} 1"#,
     ]);
+
+    stop(ingest, handle).await;
+}
+
+/// Another process's `setWebhook` ends the poll in flight; tgin polls again
+/// at once, and that poll's "webhook is active" deletes the webhook.
+#[tokio::test]
+async fn set_webhook_409_polls_again_at_once() {
+    let mut tg = Telegram::start(vec![
+        api_error(409, SET_WEBHOOK, None),
+        api_error(409, WEBHOOK_ACTIVE, None),
+        batch(&[5]),
+    ])
+    .await;
+    tg.failing_start_delete().await;
+    tg.delete_webhook(ok(json!(true)), None).await;
+    // Any wait at all would outlast the test's patience.
+    let opts = deleting(LongPollOptions {
+        backoff: (FOREVER, FOREVER, FOREVER),
+        conflict_backoff: FOREVER,
+        ..options()
+    });
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), opts);
+    let (ingest, handle) = fx.spawn();
+
+    let mut offsets = Vec::new();
+    for _ in 0..4 {
+        offsets.push(tg.next_poll().await.body["offset"].clone());
+    }
+    assert_eq!(offsets, [0, 0, 0, 6]);
+    assert_eq!(
+        tg.methods().await,
+        [
+            "getMe",
+            "deleteWebhook",
+            "getUpdates",
+            "getUpdates",
+            "deleteWebhook",
+            "getUpdates",
+            "getUpdates"
+        ]
+    );
+    fx.assert_metrics(&[r#"tgin_source_errors_total{source="lp",reason="conflict"} 2"#]);
 
     stop(ingest, handle).await;
 }
@@ -788,12 +833,12 @@ async fn clamps_poll_timeout_and_limit() {
         (
             Duration::ZERO,
             0,
-            json!({ "offset": 0, "limit": 1, "timeout": 1 }),
+            json!({ "offset": 0, "limit": 1, "timeout": 1, "allowed_updates": [] }),
         ),
         (
             Duration::from_secs(120),
             500,
-            json!({ "offset": 0, "limit": 100, "timeout": 50 }),
+            json!({ "offset": 0, "limit": 100, "timeout": 50, "allowed_updates": [] }),
         ),
     ] {
         let mut tg = Telegram::start(vec![]).await;
@@ -809,28 +854,95 @@ async fn clamps_poll_timeout_and_limit() {
     }
 }
 
+/// Every poll sends `allowed_updates`: the configured list, or `[]` (all
+/// but Telegram's opt-in types) when none is configured, so a list stored
+/// at Telegram by an earlier client never decides what arrives.
+#[tokio::test]
+async fn sends_allowed_updates_on_every_poll() {
+    let mut tg = Telegram::start(vec![batch(&[1])]).await;
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), options());
+    let (ingest, handle) = fx.spawn();
+    for _ in 0..2 {
+        assert_eq!(tg.next_poll().await.body["allowed_updates"], json!([]));
+    }
+    stop(ingest, handle).await;
+}
+
+/// A `getMe` that fails for a reason a retry may fix is waited out inside
+/// the source, which then polls.
+#[tokio::test]
+async fn get_me_failure_waits_and_tries_again() {
+    let mut tg = Telegram::start(vec![]).await;
+    Mock::given(method("GET"))
+        .and(path(at("getMe")))
+        .respond_with(api_error(502, "Bad Gateway", None))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&tg.server)
+        .await;
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), options());
+    let (ingest, handle) = fx.spawn();
+
+    tg.next_poll().await;
+    assert_eq!(tg.count("getMe").await, 2);
+    assert!(!handle.is_finished());
+    fx.assert_metrics(&[
+        r#"tgin_source_errors_total{source="lp",reason="http"} 1"#,
+        r#"tgin_source_state{source="lp",state="running"} 1"#,
+    ]);
+    stop(ingest, handle).await;
+}
+
 #[tokio::test]
 async fn get_me_429_waits_retry_after() {
-    let tg = Telegram::start_with(
-        api_error(429, &format!("Too Many Requests {TOKEN}"), Some(1)),
-        vec![],
-    )
-    .await;
+    let mut tg = Telegram::start(vec![]).await;
+    Mock::given(method("GET"))
+        .and(path(at("getMe")))
+        .respond_with(api_error(
+            429,
+            &format!("Too Many Requests {TOKEN}"),
+            Some(1),
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&tg.server)
+        .await;
     let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), options());
     let start = Instant::now();
-    let exit = timeout(PATIENCE, fx.source.run(CancellationToken::new()))
-        .await
-        .expect("getMe 429 did not end the run");
-    assert!(start.elapsed() >= Duration::from_secs(1), "{exit:?}");
-    let Exit::Retry(message) = exit else {
-        panic!("expected Retry, got {exit:?}");
+    let (ingest, handle) = fx.spawn();
+
+    tg.next_poll().await;
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert_eq!(tg.count("getMe").await, 2);
+    fx.assert_metrics(&[r#"tgin_source_errors_total{source="lp",reason="rate_limited"} 1"#]);
+    stop(ingest, handle).await;
+}
+
+/// Stopping ingest ends a source that waits to call `getMe` again at once.
+#[tokio::test]
+async fn get_me_backoff_stops_on_cancel() {
+    let tg = Telegram::start_with(api_error(502, "Bad Gateway", None), vec![]).await;
+    let opts = LongPollOptions {
+        backoff: (FOREVER, FOREVER, FOREVER),
+        ..options()
     };
-    assert!(!message.contains(TOKEN), "{message}");
-    assert_eq!(tg.count("getUpdates").await, 0);
-    fx.assert_metrics(&[
-        r#"tgin_source_errors_total{source="lp",reason="rate_limited"} 1"#,
-        r#"tgin_source_state{source="lp",state="backoff"} 1"#,
-    ]);
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), opts);
+    let (ingest, handle) = fx.spawn();
+
+    fx.wait_metric(r#"tgin_source_state{source="lp",state="backoff"} 1"#)
+        .await;
+    // The source now waits on its timer only; see `ingest_cancel_stops_promptly`.
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    ingest.cancel();
+    let exit = timeout(PATIENCE, handle)
+        .await
+        .expect("the source did not stop")
+        .expect("the source panicked");
+    assert_eq!(exit, Exit::Done);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    assert_eq!(tg.count("getMe").await, 1);
+    fx.assert_metrics(&[r#"tgin_source_state{source="lp",state="stopped"} 1"#]);
 }
 
 #[tokio::test]

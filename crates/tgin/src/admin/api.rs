@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tgin_core::config::{self, Ingress};
 use tgin_core::engine::{BreakerStatus, Mode};
+use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
 use tgin_runtime::config::ConfigError;
 use tgin_runtime::lifecycle::Phase;
 use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
@@ -167,21 +168,32 @@ fn status_of(shared: &Shared) -> Status {
                     .map(|info| &info.metrics)
             });
             let ((state, error), ingress) = match &bot.ingress {
-                Some(Ingress::LongPoll(_)) => (
-                    task(&source_task(&bot.name)).unwrap_or(("starting", None)),
-                    Some("long_poll"),
-                ),
+                Some(Ingress::LongPoll(_)) => {
+                    let state = match task(&source_task(&bot.name)) {
+                        // The source waits out its failures inside its task.
+                        Some(("running", _))
+                            if metrics.and_then(SourceMetrics::state)
+                                == Some(SourceStateLabel::Backoff) =>
+                        {
+                            let error = shared.sources.long_poll_error(&bot.name);
+                            ("backoff", error.map(|e| redactor.redact(&e).into_owned()))
+                        }
+                        Some(state) => state,
+                        None => ("starting", None),
+                    };
+                    (state, Some("long_poll"))
+                }
                 Some(Ingress::Webhook(_)) => {
                     let serving = shared.sources.kind(&bot.name) == Some(Kind::Webhook)
                         && !shared.sources.ingest_stopped();
-                    let state = if serving {
-                        "running"
-                    } else if shared.sources.is_starting(&bot.name) {
-                        "starting"
-                    } else {
-                        "stopped"
+                    let state = match task(&source_task(&bot.name)) {
+                        // Its source could not be set up.
+                        Some(failed @ ("failed", _)) => failed,
+                        _ if serving => ("running", None),
+                        _ if shared.sources.is_starting(&bot.name) => ("starting", None),
+                        _ => ("stopped", None),
                     };
-                    ((state, None), Some("webhook"))
+                    (state, Some("webhook"))
                 }
                 None => (("stopped", None), None),
             };

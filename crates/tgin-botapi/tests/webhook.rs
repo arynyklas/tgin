@@ -63,7 +63,6 @@ fn options() -> WebhookOptions {
         ip_allowlist: IpAllowlist::None,
         trusted_proxies: Vec::new(),
         body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
-        register: None,
     }
 }
 
@@ -444,7 +443,27 @@ async fn body_limit_413() {
     .await;
 
     assert_eq!(hook.sink.ids(), [1, 5]);
-    hook.assert_metrics(&[r#"tgin_source_updates_total{source="wh"} 2"#]);
+    // Each refusal for size counts as a body that is not an update.
+    hook.assert_metrics(&[
+        r#"tgin_source_updates_total{source="wh"} 2"#,
+        r#"tgin_source_errors_total{source="wh",reason="decode"} 4"#,
+    ]);
+}
+
+/// A body that arrived in one frame is copied to an allocation of its own
+/// size: queued, it must not keep the connection's whole read buffer.
+#[tokio::test]
+async fn single_frame_body_owns_exactly_its_bytes() {
+    let hook = Hook::start(options(), admitted).await;
+    assert_status(hook.send(update(1)).await, StatusCode::OK).await;
+    let payload = hook.sink.calls.lock().pop().expect("admitted").payload;
+    assert_eq!(payload, update(1).as_bytes());
+    // The connection stays open in the client's pool, so a slice of the
+    // server's read buffer would not be unique.
+    match payload.try_into_mut() {
+        Ok(owned) => assert_eq!(owned.capacity(), owned.len()),
+        Err(shared) => panic!("the payload shares its memory ({} bytes)", shared.len()),
+    }
 }
 
 #[tokio::test]
@@ -683,7 +702,7 @@ async fn register_sends_derived_secret() {
     let req = SetWebhook {
         url: "https://tgin.example/hook/bot".parse().unwrap(),
         secret_token: Some(Secret::new(secret.clone())),
-        allowed_updates: None,
+        allowed_updates: Vec::new(),
         max_connections: None,
         drop_pending_updates: false,
         ip_address: None,
@@ -696,7 +715,6 @@ async fn register_sends_derived_secret() {
     let hook = Hook::start(
         WebhookOptions {
             secret: req.secret_token.clone(),
-            register: Some(req),
             ..options()
         },
         admitted,
