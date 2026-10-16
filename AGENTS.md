@@ -17,7 +17,7 @@ Telegram ─► source (long poll task, or webhook route on the data plane)
 1. **Sources** (`crates/tgin-botapi`): `LongPollSource` polls `getUpdates` and offers each update to a `Sink`, moving its offset past an update only once it is admitted; on backpressure it holds the batch. `webhook_router` serves one `POST <path>` per webhook bot, checks allowlist and secret on the head alone, and answers `503` + `Retry-After` on backpressure. `facts::extract` reads the routing facts from the raw JSON without building a `serde_json::Value`.
 2. **Engine** (`crates/tgin-core/src/engine.rs`, `admission.rs`): `Sink::admit` routes with the current `RouteTable` (swapped atomically on reload) and reserves room in every target (`backpressure` targets first, then `drop_oldest`), then commits; one queue lock at a time, nothing awaits.
 3. **Consumers** (`crates/tgin-core/src/consumer/`): `PullConsumer::poll` acks by offset, returns held leases, else leases new updates and parks until the timeout; `PushConsumer` runs one dispatcher per consumer that leases up to `max_in_flight` and delivers with retries, per-endpoint breakers and balancing.
-4. **App** (`crates/tgin/src`): `app.rs` assembles the engine, the admin plane, the data plane and the sources, and runs the shutdown sequence; `data_server.rs` serves webhook routes and `/c/{consumer}/getUpdates` plus aliases through an `ArcSwap<Router>` that reloads replace; `admin/` is the admin plane (probes, `/metrics`, `/v1/*`) and `tgin admin`; `reload.rs` serializes reloads (SIGHUP, `POST /v1/reload`, file watcher) and applies them through `Engine::apply` (`crates/tgin-core/src/reload.rs`); `sources.rs` starts, stops and restarts bot sources; `migrate/` is `tgin config migrate` (RON, the format of the original tgin, → YAML).
+4. **App** (`crates/tgin/src`): `app.rs` assembles the engine, the admin plane, the data plane and the sources, and runs the shutdown sequence; `data_server.rs` serves webhook routes and `/c/{consumer}/getUpdates` plus aliases through an `ArcSwap<Router>` that reloads replace; `admin/` is the admin plane (probes, `/metrics`, `/v1/*`) and `tgin admin`; `reload.rs` serializes reloads (SIGHUP, `POST /v1/reload`, file watcher) and applies them through `Engine::apply` (`crates/tgin-core/src/reload.rs`); `sources.rs` starts, stops and restarts bot sources.
 
 ## Workspace Layout
 
@@ -27,14 +27,14 @@ Telegram ─► source (long poll task, or webhook route on the data plane)
 | `crates/tgin-runtime/` | Generic building blocks with no tgin domain knowledge: `queue` (`LeaseQueue`: bounded, leases, acks, per-key ordering), `supervisor` (restarting tasks), `lifecycle` (phases, signals, shutdown timing), `http` (hardened HTTP/1.1 server with TLS reload, outbound client, URL-free error rendering), `obs` (tracing with a redacting writer, metrics registry, readiness), `config` (YAML parsing with locations, `${env:…}`/`${file:…}` interpolation, file watcher), `secret` (`Secret`, `Redactor`, constant-time compare), `backoff`, `breaker`. |
 | `crates/tgin-core/` | The engine: `config/` (YAML model, validation, resolution, JSON Schema), `rules/` (compiled route table), `engine.rs` + `admission.rs`, `consumer/{pull,push}.rs`, `reload.rs` (config diff and live apply), `metrics.rs` (every metric family and pre-resolved handles). |
 | `crates/tgin-botapi/` | Telegram side: `client.rs` (Bot API client), `facts.rs` (fact extraction from raw JSON), `longpoll.rs`, `webhook.rs`, `secret.rs` (derived webhook secret); `benches/` and `tests/alloc_budget.rs` (hot-path gates). |
-| `crates/tgin/` | The `tgin` binary (dist builds it via `[package.metadata.dist] dist = true`): `cli.rs`, `app.rs`, `data_server.rs`, `admin/`, `reload.rs`, `sources.rs`, `migrate/`, `exit.rs`. `main.rs` declares mimalloc as the global allocator on musl only. |
+| `crates/tgin/` | The `tgin` binary (dist builds it via `[package.metadata.dist] dist = true`): `cli.rs`, `app.rs`, `data_server.rs`, `admin/`, `reload.rs`, `sources.rs`, `exit.rs`. `main.rs` declares mimalloc as the global allocator on musl only. |
 | `xtask/` | `cargo xtask schema [--check]` writes `schema/tgin.v1.schema.json`; `cargo xtask config-docs [--check]` writes `docs/config-reference.md` from that schema (`.cargo/config.toml` holds the alias). |
 | `schema/tgin.v1.schema.json`, `docs/config-reference.md` | Generated from the doc comments of `crates/tgin-core/src/config/model.rs` (and the hand-written schemas in `config/schema.rs`). Never edit them: change the source, then run both xtask commands. The tests `schema_is_up_to_date` (tgin-core) and `config_reference_is_up_to_date` (xtask), and CI, check them. |
 | `tgin.yaml` | Root example config (one long-poll bot, one pull consumer; reads `${env:TOKEN}`). |
 | `Dockerfile` | Builder `rust:1.99.0-alpine3.24`, runtime `gcr.io/distroless/static-debian13`, both pinned by digest; `cargo build --release --locked -p tgin` (static musl), `TGIN_COMMIT` from the `REVISION` build arg; uid/gid `65532:65532`; `EXPOSE 8080 9090`; `ENV TGIN_CONFIG=/etc/tgin/tgin.yaml`; exec-form `HEALTHCHECK` running `tgin admin health`; `ENTRYPOINT ["/usr/local/bin/tgin"]`, `CMD []`. |
-| `examples/simple/` | Compose stack: one bot, two pull consumers polled by aiogram bots, one push consumer. `tgin.ron` is the same stack as a RON config, kept as `tgin config migrate` input and test fixture. |
+| `examples/simple/` | Compose stack: one bot, two pull consumers polled by aiogram bots, one push consumer. |
 | `integrations/pytgin/` | aiogram shim that points `getUpdates` at a tgin URL. |
-| `tests/performance/` | Load-test harness (see Testing). `cfgs/v1/*.yaml` are the 1.0 scenario configs, `cfgs/*.ron` the RON configs for the `v0` engine. |
+| `tests/performance/` | Load-test harness (see Testing). `cfgs/v1/*.yaml` are the 1.0 scenario configs, `cfgs/upstream/` the original engine's configs for `ENGINE=upstream`. |
 
 ### Crate boundaries
 
@@ -77,12 +77,12 @@ docker run --rm -v "$PWD/config:/etc/tgin:ro" -e TOKEN=... -p 8080:8080 tgin
 # Example stack
 cd examples/simple && TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
 
-# Performance harness (ENGINE=v1 default or v0 = 1af6aaa, the last commit before the engine rewrite;
+# Performance harness (ENGINE=v1 default, or upstream = the original engine at 4f0971a;
 # BOT_IMPL=rust default, py = the aiogram bots)
 cd tests/performance
-make build && make image ENGINE=v1
+make build && make image ENGINE=v1 && make image ENGINE=upstream
 make webhook-tgin-3 RPS=10000 DURATION=30            # one scenario
-ENGINE="v0 v1" ./benchmark.sh      # both engines, 6 scenarios × 3 rates × 3 runs (~70 min)
+ENGINE="upstream v1" ./benchmark.sh   # both engines, 6 scenarios × 3 rates × 3 runs (~70 min)
 ./rerun-invalid.sh results/<run_id>.csv              # rerun runs with lag_p99_ms > 0.5
 ```
 
@@ -126,13 +126,13 @@ Imports follow the grouping of the file you edit; `cargo fmt` sorts within group
 
 ## Testing & QA
 
-- **Unit tests** are inline (`#[cfg(test)] mod tests`); **integration tests** live in each crate's `tests/`: `tgin-core/tests/{config,engine,push}.rs`, `tgin-botapi/tests/{longpoll,webhook,alloc_budget}.rs`, `tgin-runtime/tests/{http,watch}.rs`, `tgin/tests/{e2e,admin,migrate,panic_hook}.rs`.
+- **Unit tests** are inline (`#[cfg(test)] mod tests`); **integration tests** live in each crate's `tests/`: `tgin-core/tests/{config,engine,push}.rs`, `tgin-botapi/tests/{longpoll,webhook,alloc_budget}.rs`, `tgin-runtime/tests/{http,watch}.rs`, `tgin/tests/{e2e,admin,panic_hook}.rs`.
 - **Real boundaries.** HTTP peers are real servers (`wiremock`, or axum on `127.0.0.1:0`); config tests use `MapEnv` instead of mutating the process environment.
 - **Paused clock.** Timer-driven logic (queue leases, supervisor backoff, engine drains, long-poll backoff) is tested on a paused clock (`#[tokio::test(start_paused = true)]` or `tokio::time::pause()`), so tests take no wall time and do not flake on slow machines; use real time only where real I/O has to make progress, with bounded waits.
 - **Child processes bind port 0.** `crates/tgin/tests/support/mod.rs::spawn_listening` starts the `tgin` binary with a config whose listeners use port 0 and reads the admin plane's bound address from the `admin plane listening` log line; it removes `RUST_LOG` from the child's environment (it would hide that info line). Never pick a port by binding and releasing it: another socket can take it before the child binds.
 - **Signals.** Unix tests deliver real signals to a child process with `kill`; other app tests feed signals through `Signals::from_channel`.
 - **Property tests** (`proptest`) cover the queue's invariants (`tgin-runtime/src/queue.rs`) and fact extraction against a `serde_json::Value` reference (`tgin-botapi/src/facts.rs`).
-- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE` selects the engine (`v1` default, `v0` = built from `1af6aaa`, this project's last commit before the engine rewrite, or both: `ENGINE="v0 v1"` alternates them run by run); `BOT_IMPL` selects the downstream (`rust` default = `tgin-bench bot`, 50 000+ updates/s; `py` = the aiogram bots, ~2 000/s, which saturate before tgin does). A full pass over both engines is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 70 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) next to `<run_id>.log` (per-run counters) and `<run_id>.stats.log` (`docker stats`). A run with `lag_p99_ms` above 0.5 measured the host, not the engine: `./rerun-invalid.sh results/<run_id>.csv` reruns those. Charts come from `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`); without arguments it plots the `results/*.csv` whose run id sorts last, and it deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the v0/v1 gate and the harness's known limits.
+- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE` selects the engine (`v1` default; `upstream` = the original engine, chesnokpeter/tgin at `UPSTREAM_REF` `4f0971a`, built with its own Dockerfile, its long-poll routes added through its management API; or both: `ENGINE="upstream v1"` alternates them run by run); `BOT_IMPL` selects the downstream (`rust` default = `tgin-bench bot`, 50 000+ updates/s; `py` = the aiogram bots, ~2 000/s, which saturate before tgin does). A full pass over both engines is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 70 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) next to `<run_id>.log` (per-run counters) and `<run_id>.stats.log` (`docker stats`). A run with `lag_p99_ms` above 0.5 measured the host, not the engine: `./rerun-invalid.sh results/<run_id>.csv` reruns those. Charts come from `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`); without arguments it plots the `results/*.csv` whose run id sorts last, and it deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the upstream/v1 results and the harness's known limits.
 - Exercise the actual change before claiming it works: run the touched crate's tests, and for HTTP-facing changes a binary (`examples/simple`, or `tgin` against a fake Bot API).
 
 ### CI checklist
@@ -157,6 +157,6 @@ CI also builds the Docker image on native amd64 and arm64 runners, runs clippy a
 
 - **Rust** edition 2024 in every crate, MSRV 1.89 (checked in CI), no toolchain pin. Tokio multi-threaded runtime with `runtime.worker_threads` workers (`auto` = one per CPU). Linux musl builds use mimalloc.
 - **HTTP / TLS stack is fixed**: tokio, axum 0.8 + axum-server 0.8 (HTTP/1.1 only, rustls with ALPN `http/1.1`), reqwest 0.13 (`default-features = false`, rustls); one aws-lc-rs crypto provider. OpenSSL, native-tls and ring are banned in `deny.toml`.
-- **Config**: YAML through serde-saphyr; JSON Schema through schemars. RON (`ron`) is used only by `tgin config migrate` to read RON configs.
+- **Config**: YAML through serde-saphyr; JSON Schema through schemars.
 - **Python**: `examples/simple/` and `tests/performance/diagram/` are `uv` projects with a committed `uv.lock`; the perf bots (`tests/performance/bot/`) install `requirements.txt` with pip; `integrations/pytgin/` is a setuptools package without a lock file.
 - No package-manager wrappers and no root `Makefile`: work through `cargo` (the perf harness has its own `makefile`).

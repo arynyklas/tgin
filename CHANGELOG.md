@@ -43,8 +43,6 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   carry YAML path, line and column; a JSON Schema
   (`schema/tgin.v1.schema.json`) and a generated reference
   (`docs/config-reference.md`).
-- `tgin config migrate` converts a RON config (the format of the original
-  tgin) to YAML.
 - Metrics for sources, routing, consumer queues, deliveries, reloads and
   shutdown, plus `tgin_build_info`.
 - TLS on the data plane with certificate reload; listener limits
@@ -117,8 +115,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 ### Docs
 
 - README, DOCS and AGENTS describe tgin 1.0; generated config reference;
-  PERF.md with benchmarks and their method.
+  PERF.md compares tgin 1.0 with the original engine (`4f0971a`) and lists
+  the changes behind the difference.
 - Added `SECURITY.md` (supported versions, private reporting, verifying
   release attestations) and this changelog.
 
-[Unreleased]: https://github.com/arynyklas/tgin/compare/v0.2.0-rc.2...HEAD
+[Unreleased]: https://github.com/arynyklas/tgin/compare/4f0971a...HEAD

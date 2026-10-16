@@ -1,0 +1,44 @@
+Rerunning longpoll-tgin-1 v1 5000 RPS (rerun 1)
+docker compose down --remove-orphans
+docker compose up -d --wait --wait-timeout 90 bench tgin longpull_bot1
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-tgin-1 Creating 
+ Container tgin-bench-tgin-1 Created 
+ Container tgin-bench-longpull_bot1-1 Creating 
+ Container tgin-bench-longpull_bot1-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-tgin-1 Starting 
+ Container tgin-bench-tgin-1 Started 
+ Container tgin-bench-longpull_bot1-1 Starting 
+ Container tgin-bench-longpull_bot1-1 Started 
+ Container tgin-bench-tgin-1 Waiting 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-longpull_bot1-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot1-1 Healthy 
+ Container tgin-bench-tgin-1 Healthy 
+Waiting for http://localhost:9090/readyz ...
+docker compose exec -T bench tgin-bench run --mode longpoll --rps "5000" --duration "30" --scenario "longpoll-tgin-1" --engine "v1" --completion-timeout "30" --format "csv-row" >> "results/20261016T-upstream-rerun.csv"
+longpoll-tgin-1 (v1) at 5000 RPS: achieved 5000.00 RPS, delivered 5000.00 RPS, sent 150000, received 150000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.009 ms p99 0.113 ms max 9.781 ms, completion wait 0.00 s, getUpdates calls 147406
+docker compose down --remove-orphans
+ Container tgin-bench-longpull_bot1-1 Stopping 
+ Container tgin-bench-longpull_bot1-1 Stopped 
+ Container tgin-bench-longpull_bot1-1 Removing 
+ Container tgin-bench-longpull_bot1-1 Removed 
+ Container tgin-bench-tgin-1 Stopping 
+ Container tgin-bench-tgin-1 Stopped 
+ Container tgin-bench-tgin-1 Removing 
+ Container tgin-bench-tgin-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+failed=0

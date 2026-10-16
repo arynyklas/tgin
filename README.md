@@ -131,16 +131,22 @@ Releases carry archives for Linux (glibc and static musl), macOS and Windows on 
 
 ## Performance
 
-tgin 1.0 against 0.2 at 1 000, 5 000 and 10 000 updates per second, with one and three downstream bots, webhook and long poll; methodology, the full table, the raw CSVs and the harness's limits are in [PERF.md](PERF.md). Routing an update costs a fraction of a millisecond: at 10 000 RPS the median end-to-end latency through tgin is 0.24–0.28 ms and p99 0.52–0.65 ms, against 0.13–0.15 ms and 0.33–0.46 ms straight to the bot. tgin 1.0 matches 0.2 at every point (p99 between 0.88× and 1.11×, every update delivered) and uses less CPU on the long-poll path.
+tgin 1.0 against the original engine it was forked from ([chesnokpeter/tgin](https://github.com/chesnokpeter/tgin) at `4f0971a`), on one machine, at 1 000, 5 000 and 10 000 updates per second, with one and three downstream bots, webhook and long poll. Both engines delivered every update at every rate.
+
+- **Long poll → pull:** median latency through tgin 1.0 is 0.26–0.38 ms; through the original engine it is 0.81–1.53 ms. Median p99 is 0.60–1.79 ms against 2.25–3.28 ms.
+- **Webhook → push:** p50 is about the same (0.30–0.36 ms against 0.28–0.36 ms), and the p99s of both engines vary from run to run on this host.
+- **Overload** (one aiogram bot offered 5 000 updates per second): tgin 1.0 stays at about 50 MiB and pushes back. On long poll it leaves updates at the Bot API; on the webhook it answers `503` with `Retry-After`. The original engine buffers without limit (up to 599 MiB and 6.4 cores on the webhook), and from the same bot it got 600–1 010 answers per second against 1.0's 1 170–1 560.
+
+[PERF.md](PERF.md) has the methodology, the full tables, the raw CSVs, the code changes behind these numbers ([What changed for performance](PERF.md#what-changed-for-performance)) and the harness's limits.
 
 <table>
   <tr>
-    <td><img src="tests/performance/diagram/generated/webhook-delivered-rps.png" alt="Webhook delivered RPS" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/webhook-latency-p99.png" alt="Webhook p99 latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-latency-p50.png" alt="Long-poll p50 latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/longpoll-latency-p99.png" alt="Long-poll p99 latency" width="500"></td>
   </tr>
   <tr>
-    <td><img src="tests/performance/diagram/generated/longpoll-delivered-rps.png" alt="Long-poll delivered RPS" width="500"></td>
-    <td><img src="tests/performance/diagram/generated/longpoll-latency-p99.png" alt="Long-poll p99 latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-latency-p50.png" alt="Webhook p50 latency" width="500"></td>
+    <td><img src="tests/performance/diagram/generated/webhook-latency-p99.png" alt="Webhook p99 latency" width="500"></td>
   </tr>
 </table>
 

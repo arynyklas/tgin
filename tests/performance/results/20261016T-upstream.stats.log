@@ -1,0 +1,2364 @@
+== 10:23:32
+## 10:23:32 start webhook-direct-1 upstream 1000 RPS (run 1/3)
+tgin-bench-bench-1 2.55% 3.41MiB / 62.79GiB
+== 10:23:40
+tgin-bench-webhook_bot1-1 16.96% 4.402MiB / 62.79GiB
+tgin-bench-bench-1 126.52% 7.527MiB / 62.79GiB
+== 10:23:48
+tgin-bench-webhook_bot1-1 22.32% 4.203MiB / 62.79GiB
+tgin-bench-bench-1 126.40% 8.074MiB / 62.79GiB
+== 10:23:55
+tgin-bench-webhook_bot1-1 20.54% 3.762MiB / 62.79GiB
+tgin-bench-bench-1 126.68% 8.734MiB / 62.79GiB
+== 10:24:03
+tgin-bench-webhook_bot1-1 17.22% 4.043MiB / 62.79GiB
+tgin-bench-bench-1 126.29% 8.758MiB / 62.79GiB
+## 10:24:10 end webhook-direct-1 upstream 1000 RPS (run 1/3)
+## 10:24:10 start webhook-tgin-1 upstream 1000 RPS (run 1/3)
+== 10:24:11
+tgin-bench-bench-1 2.45% 5.789MiB / 62.79GiB
+== 10:24:18
+tgin-bench-tgin-1 3.61% 4.492MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 2.59% 3.188MiB / 62.79GiB
+tgin-bench-bench-1 17.70% 6.902MiB / 62.79GiB
+== 10:24:26
+tgin-bench-tgin-1 22.31% 4.988MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 19.22% 3.57MiB / 62.79GiB
+tgin-bench-bench-1 123.06% 7.742MiB / 62.79GiB
+== 10:24:33
+tgin-bench-tgin-1 17.41% 5.164MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 14.61% 4.008MiB / 62.79GiB
+tgin-bench-bench-1 120.74% 8.473MiB / 62.79GiB
+== 10:24:41
+tgin-bench-tgin-1 17.24% 4.715MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 19.15% 4.016MiB / 62.79GiB
+tgin-bench-bench-1 124.60% 8.062MiB / 62.79GiB
+== 10:24:48
+tgin-bench-tgin-1 18.73% 5.645MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 15.00% 4.254MiB / 62.79GiB
+tgin-bench-bench-1 121.84% 9.035MiB / 62.79GiB
+## 10:24:52 end webhook-tgin-1 upstream 1000 RPS (run 1/3)
+## 10:24:52 start webhook-tgin-1 v1 1000 RPS (run 1/3)
+== 10:24:56
+tgin-bench-bench-1 2.27% 3.484MiB / 62.79GiB
+== 10:25:03
+tgin-bench-tgin-1 1.72% 20.28MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.92% 3.355MiB / 62.79GiB
+tgin-bench-bench-1 2.73% 4.832MiB / 62.79GiB
+== 10:25:11
+tgin-bench-tgin-1 23.88% 22.88MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 18.68% 3.715MiB / 62.79GiB
+tgin-bench-bench-1 125.22% 7.539MiB / 62.79GiB
+== 10:25:18
+tgin-bench-tgin-1 25.02% 23.11MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 19.46% 4.758MiB / 62.79GiB
+tgin-bench-bench-1 124.22% 8.211MiB / 62.79GiB
+== 10:25:26
+tgin-bench-tgin-1 23.50% 22.42MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 19.60% 4.055MiB / 62.79GiB
+tgin-bench-bench-1 124.04% 7.965MiB / 62.79GiB
+== 10:25:33
+tgin-bench-tgin-1 22.10% 26.82MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 17.36% 4.645MiB / 62.79GiB
+tgin-bench-bench-1 122.16% 9.031MiB / 62.79GiB
+## 10:25:36 end webhook-tgin-1 v1 1000 RPS (run 1/3)
+## 10:25:36 start webhook-tgin-3 upstream 1000 RPS (run 1/3)
+== 10:25:41
+tgin-bench-bench-1 2.60% 3.402MiB / 62.79GiB
+== 10:25:48
+tgin-bench-tgin-1 21.87% 7.527MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 6.96% 3.359MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.07% 3.594MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 10.27% 3.383MiB / 62.79GiB
+tgin-bench-bench-1 127.07% 7.262MiB / 62.79GiB
+== 10:25:56
+tgin-bench-tgin-1 21.77% 8.051MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 6.91% 3.398MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.89% 3.367MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 6.91% 3.879MiB / 62.79GiB
+tgin-bench-bench-1 126.38% 7.688MiB / 62.79GiB
+== 10:26:04
+tgin-bench-tgin-1 19.43% 7.852MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 9.05% 3.641MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.94% 3.395MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.13% 3.711MiB / 62.79GiB
+tgin-bench-bench-1 122.80% 8.641MiB / 62.79GiB
+== 10:26:11
+tgin-bench-tgin-1 17.50% 8.148MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 6.12% 3.656MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.15% 3.879MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 6.23% 3.715MiB / 62.79GiB
+tgin-bench-bench-1 125.03% 8.25MiB / 62.79GiB
+== 10:26:19
+## 10:26:19 end webhook-tgin-3 upstream 1000 RPS (run 1/3)
+## 10:26:19 start webhook-tgin-3 v1 1000 RPS (run 1/3)
+tgin-bench-bench-1 2.38% 5.633MiB / 62.79GiB
+== 10:26:26
+tgin-bench-webhook_bot3-1 0.00% 3.121MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 18.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 2.61% 3.246MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.121MiB / 62.79GiB
+tgin-bench-bench-1 2.20% 3.844MiB / 62.79GiB
+== 10:26:34
+tgin-bench-webhook_bot3-1 6.84% 3.383MiB / 62.79GiB
+tgin-bench-tgin-1 19.41% 24.65MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.22% 3.594MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 7.02% 3.844MiB / 62.79GiB
+tgin-bench-bench-1 124.40% 8.941MiB / 62.79GiB
+== 10:26:41
+tgin-bench-webhook_bot3-1 6.37% 3.883MiB / 62.79GiB
+tgin-bench-tgin-1 20.35% 25.21MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.13% 3.672MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.58% 3.371MiB / 62.79GiB
+tgin-bench-bench-1 125.77% 7.992MiB / 62.79GiB
+== 10:26:49
+tgin-bench-webhook_bot3-1 8.05% 3.895MiB / 62.79GiB
+tgin-bench-tgin-1 19.65% 25.19MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.58% 3.766MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 8.02% 3.395MiB / 62.79GiB
+tgin-bench-bench-1 129.04% 8.262MiB / 62.79GiB
+== 10:26:56
+tgin-bench-webhook_bot3-1 10.33% 3.652MiB / 62.79GiB
+tgin-bench-tgin-1 22.80% 24.46MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 11.01% 3.648MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 10.58% 3.645MiB / 62.79GiB
+tgin-bench-bench-1 127.85% 8.113MiB / 62.79GiB
+## 10:27:04 end webhook-tgin-3 v1 1000 RPS (run 1/3)
+## 10:27:04 start longpoll-direct-1 upstream 1000 RPS (run 1/3)
+== 10:27:04
+tgin-bench-bench-1 3.27% 5.672MiB / 62.79GiB
+== 10:27:11
+tgin-bench-longpull_bot_direct-1 2.89% 4.004MiB / 62.79GiB
+tgin-bench-bench-1 4.91% 6.992MiB / 62.79GiB
+== 10:27:19
+tgin-bench-longpull_bot_direct-1 20.08% 4.02MiB / 62.79GiB
+tgin-bench-bench-1 126.57% 7.668MiB / 62.79GiB
+== 10:27:26
+tgin-bench-longpull_bot_direct-1 17.07% 4.25MiB / 62.79GiB
+tgin-bench-bench-1 126.15% 8.254MiB / 62.79GiB
+== 10:27:34
+tgin-bench-longpull_bot_direct-1 16.43% 4.598MiB / 62.79GiB
+tgin-bench-bench-1 126.59% 8.414MiB / 62.79GiB
+== 10:27:41
+tgin-bench-longpull_bot_direct-1 16.82% 4.852MiB / 62.79GiB
+tgin-bench-bench-1 125.68% 8.918MiB / 62.79GiB
+## 10:27:45 end longpoll-direct-1 upstream 1000 RPS (run 1/3)
+## 10:27:45 start longpoll-tgin-1 upstream 1000 RPS (run 1/3)
+== 10:27:49
+tgin-bench-bench-1 2.20% 3.41MiB / 62.79GiB
+== 10:27:56
+tgin-bench-longpull_bot1-1 21.38% 3.684MiB / 62.79GiB
+tgin-bench-tgin-1 23.85% 5.184MiB / 62.79GiB
+tgin-bench-bench-1 86.18% 6.738MiB / 62.79GiB
+== 10:28:04
+tgin-bench-longpull_bot1-1 17.95% 4.184MiB / 62.79GiB
+tgin-bench-tgin-1 24.13% 5.461MiB / 62.79GiB
+tgin-bench-bench-1 118.93% 7.934MiB / 62.79GiB
+== 10:28:11
+tgin-bench-longpull_bot1-1 17.46% 4.527MiB / 62.79GiB
+tgin-bench-tgin-1 23.16% 5.48MiB / 62.79GiB
+tgin-bench-bench-1 120.37% 7.852MiB / 62.79GiB
+== 10:28:19
+tgin-bench-longpull_bot1-1 21.88% 4.941MiB / 62.79GiB
+tgin-bench-tgin-1 29.05% 5.547MiB / 62.79GiB
+tgin-bench-bench-1 124.22% 8.363MiB / 62.79GiB
+== 10:28:26
+## 10:28:28 end longpoll-tgin-1 upstream 1000 RPS (run 1/3)
+## 10:28:28 start longpoll-tgin-1 v1 1000 RPS (run 1/3)
+tgin-bench-longpull_bot1-1 16.59% 5.441MiB / 62.79GiB
+tgin-bench-tgin-1 8.93% 5.328MiB / 62.79GiB
+tgin-bench-bench-1 50.81% 6.125MiB / 62.79GiB
+== 10:28:34
+tgin-bench-bench-1 2.14% 3.441MiB / 62.79GiB
+== 10:28:41
+tgin-bench-longpull_bot1-1 17.29% 3.703MiB / 62.79GiB
+tgin-bench-tgin-1 0.06% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 4.42% 8.484MiB / 62.79GiB
+== 10:28:49
+tgin-bench-longpull_bot1-1 22.26% 4.551MiB / 62.79GiB
+tgin-bench-tgin-1 24.52% 25.11MiB / 62.79GiB
+tgin-bench-bench-1 120.00% 7.242MiB / 62.79GiB
+== 10:28:56
+tgin-bench-longpull_bot1-1 26.15% 4.68MiB / 62.79GiB
+tgin-bench-tgin-1 26.17% 25.59MiB / 62.79GiB
+tgin-bench-bench-1 122.59% 7.828MiB / 62.79GiB
+== 10:29:04
+tgin-bench-longpull_bot1-1 17.60% 4.379MiB / 62.79GiB
+tgin-bench-tgin-1 24.01% 24.91MiB / 62.79GiB
+tgin-bench-bench-1 118.38% 8.492MiB / 62.79GiB
+== 10:29:11
+tgin-bench-longpull_bot1-1 20.79% 4.879MiB / 62.79GiB
+tgin-bench-tgin-1 20.48% 24.42MiB / 62.79GiB
+tgin-bench-bench-1 118.73% 9.125MiB / 62.79GiB
+## 10:29:14 end longpoll-tgin-1 v1 1000 RPS (run 1/3)
+## 10:29:14 start longpoll-tgin-3 upstream 1000 RPS (run 1/3)
+== 10:29:19
+tgin-bench-bench-1 2.66% 3.414MiB / 62.79GiB
+== 10:29:27
+tgin-bench-longpull_bot3-1 1.91% 3.625MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 11.28% 3.469MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.78% 3.41MiB / 62.79GiB
+tgin-bench-tgin-1 26.71% 5.305MiB / 62.79GiB
+tgin-bench-bench-1 120.63% 6.809MiB / 62.79GiB
+== 10:29:35
+tgin-bench-longpull_bot3-1 10.65% 3.797MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 7.86% 3.848MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 7.87% 3.734MiB / 62.79GiB
+tgin-bench-tgin-1 25.55% 5.711MiB / 62.79GiB
+tgin-bench-bench-1 120.09% 7.117MiB / 62.79GiB
+== 10:29:43
+tgin-bench-longpull_bot3-1 11.41% 4.078MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 11.18% 4.336MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 11.24% 4.008MiB / 62.79GiB
+tgin-bench-tgin-1 27.65% 5.98MiB / 62.79GiB
+tgin-bench-bench-1 121.25% 7.973MiB / 62.79GiB
+== 10:29:50
+tgin-bench-longpull_bot3-1 12.11% 3.859MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 7.34% 3.617MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 7.28% 4.27MiB / 62.79GiB
+tgin-bench-tgin-1 23.69% 5.996MiB / 62.79GiB
+tgin-bench-bench-1 118.80% 7.66MiB / 62.79GiB
+== 10:29:58
+## 10:30:00 end longpoll-tgin-3 upstream 1000 RPS (run 1/3)
+## 10:30:00 start longpoll-tgin-3 v1 1000 RPS (run 1/3)
+tgin-bench-longpull_bot3-1 8.30% 3.855MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 8.29% 3.883MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 6.95% 3.637MiB / 62.79GiB
+tgin-bench-tgin-1 13.90% 5.508MiB / 62.79GiB
+tgin-bench-bench-1 70.75% 5.484MiB / 62.79GiB
+== 10:30:05
+tgin-bench-bench-1 2.37% 3.414MiB / 62.79GiB
+== 10:30:14
+tgin-bench-longpull_bot2-1 0.00% 3.223MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.69% 3.246MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 2.25% 4.148MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 0.00% 3.188MiB / 62.79GiB
+== 10:30:22
+tgin-bench-longpull_bot3-1 4.77% 3.457MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 8.72% 4.199MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 12.41% 3.461MiB / 62.79GiB
+tgin-bench-tgin-1 24.89% 24.95MiB / 62.79GiB
+tgin-bench-bench-1 121.60% 7.047MiB / 62.79GiB
+== 10:30:30
+tgin-bench-longpull_bot3-1 14.92% 3.762MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 11.25% 3.777MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 15.21% 3.715MiB / 62.79GiB
+tgin-bench-tgin-1 39.45% 24.73MiB / 62.79GiB
+tgin-bench-bench-1 138.50% 8.188MiB / 62.79GiB
+== 10:30:38
+tgin-bench-longpull_bot3-1 11.13% 4.074MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 7.05% 3.855MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 13.71% 4.707MiB / 62.79GiB
+tgin-bench-tgin-1 28.26% 24.76MiB / 62.79GiB
+tgin-bench-bench-1 126.59% 8.074MiB / 62.79GiB
+== 10:30:45
+tgin-bench-longpull_bot3-1 9.66% 4.426MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 6.14% 3.867MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 11.05% 4.117MiB / 62.79GiB
+tgin-bench-tgin-1 25.62% 26.73MiB / 62.79GiB
+tgin-bench-bench-1 123.18% 8.641MiB / 62.79GiB
+## 10:30:50 end longpoll-tgin-3 v1 1000 RPS (run 1/3)
+## 10:30:50 start webhook-direct-1 upstream 1000 RPS (run 2/3)
+== 10:30:53
+== 10:31:01
+tgin-bench-webhook_bot1-1 18.55% 8.496MiB / 62.79GiB
+tgin-bench-bench-1 113.42% 7.812MiB / 62.79GiB
+== 10:31:08
+tgin-bench-webhook_bot1-1 20.85% 5.812MiB / 62.79GiB
+tgin-bench-bench-1 127.39% 7.934MiB / 62.79GiB
+== 10:31:16
+tgin-bench-webhook_bot1-1 22.06% 4.113MiB / 62.79GiB
+tgin-bench-bench-1 129.32% 8.703MiB / 62.79GiB
+== 10:31:23
+tgin-bench-webhook_bot1-1 21.51% 3.887MiB / 62.79GiB
+tgin-bench-bench-1 129.95% 8.414MiB / 62.79GiB
+== 10:31:31
+tgin-bench-webhook_bot1-1 21.30% 3.965MiB / 62.79GiB
+tgin-bench-bench-1 127.97% 6.879MiB / 62.79GiB
+## 10:31:33 end webhook-direct-1 upstream 1000 RPS (run 2/3)
+## 10:31:33 start webhook-tgin-1 upstream 1000 RPS (run 2/3)
+== 10:31:38
+tgin-bench-bench-1 3.97% 3.379MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.125MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 3.973MiB / 62.79GiB
+== 10:31:47
+tgin-bench-tgin-1 16.93% 5.133MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 15.37% 3.617MiB / 62.79GiB
+tgin-bench-bench-1 118.00% 8.742MiB / 62.79GiB
+== 10:31:54
+tgin-bench-tgin-1 19.04% 5.055MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.48% 3.785MiB / 62.79GiB
+tgin-bench-bench-1 121.41% 7.688MiB / 62.79GiB
+== 10:32:02
+tgin-bench-tgin-1 17.84% 5.617MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 17.76% 3.816MiB / 62.79GiB
+tgin-bench-bench-1 120.29% 8.32MiB / 62.79GiB
+== 10:32:09
+tgin-bench-tgin-1 16.26% 4.898MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.87% 3.824MiB / 62.79GiB
+tgin-bench-bench-1 122.32% 8.254MiB / 62.79GiB
+## 10:32:15 end webhook-tgin-1 upstream 1000 RPS (run 2/3)
+## 10:32:15 start webhook-tgin-1 v1 1000 RPS (run 2/3)
+== 10:32:17
+== 10:32:24
+tgin-bench-tgin-1 0.02% 18.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.164MiB / 62.79GiB
+tgin-bench-bench-1 2.53% 3.539MiB / 62.79GiB
+== 10:32:32
+tgin-bench-tgin-1 19.27% 22.86MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.13% 4.141MiB / 62.79GiB
+tgin-bench-bench-1 126.44% 8.262MiB / 62.79GiB
+== 10:32:39
+tgin-bench-tgin-1 23.72% 24.49MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 20.88% 4.582MiB / 62.79GiB
+tgin-bench-bench-1 130.48% 8.121MiB / 62.79GiB
+== 10:32:47
+tgin-bench-tgin-1 20.78% 25.52MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.45% 3.871MiB / 62.79GiB
+tgin-bench-bench-1 125.75% 8.289MiB / 62.79GiB
+== 10:32:55
+tgin-bench-tgin-1 19.08% 24.75MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 20.25% 4.117MiB / 62.79GiB
+tgin-bench-bench-1 125.65% 9.031MiB / 62.79GiB
+## 10:32:59 end webhook-tgin-1 v1 1000 RPS (run 2/3)
+## 10:32:59 start webhook-tgin-3 upstream 1000 RPS (run 2/3)
+== 10:33:02
+== 10:33:10
+tgin-bench-tgin-1 15.61% 7.461MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 7.55% 3.594MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 7.50% 3.348MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 7.29% 3.363MiB / 62.79GiB
+tgin-bench-bench-1 125.57% 7.094MiB / 62.79GiB
+== 10:33:17
+tgin-bench-tgin-1 22.70% 7.797MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.88% 3.621MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 9.99% 3.359MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.87% 3.387MiB / 62.79GiB
+tgin-bench-bench-1 126.28% 7.539MiB / 62.79GiB
+== 10:33:25
+tgin-bench-tgin-1 20.50% 7.781MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.25% 3.625MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 6.07% 3.617MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 6.40% 3.668MiB / 62.79GiB
+tgin-bench-bench-1 121.60% 8.121MiB / 62.79GiB
+== 10:33:32
+tgin-bench-tgin-1 18.83% 8.273MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.56% 4.133MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 8.55% 3.641MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 8.58% 3.668MiB / 62.79GiB
+tgin-bench-bench-1 121.53% 7.887MiB / 62.79GiB
+== 10:33:40
+## 10:33:41 end webhook-tgin-3 upstream 1000 RPS (run 2/3)
+## 10:33:41 start webhook-tgin-3 v1 1000 RPS (run 2/3)
+tgin-bench-tgin-1 5.81% 7.484MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 1.86% 3.441MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 1.95% 3.418MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 12.71% 3.75MiB / 62.79GiB
+tgin-bench-bench-1 39.46% 6.383MiB / 62.79GiB
+== 10:33:47
+tgin-bench-bench-1 2.18% 3.383MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.00% 3.129MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.117MiB / 62.79GiB
+tgin-bench-tgin-1 0.02% 18.27MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.133MiB / 62.79GiB
+== 10:33:56
+tgin-bench-webhook_bot3-1 10.23% 3.348MiB / 62.79GiB
+tgin-bench-tgin-1 23.35% 22.64MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 10.02% 3.594MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.86% 3.324MiB / 62.79GiB
+tgin-bench-bench-1 128.73% 7.133MiB / 62.79GiB
+== 10:34:03
+tgin-bench-webhook_bot3-1 7.09% 3.598MiB / 62.79GiB
+tgin-bench-tgin-1 22.35% 22.9MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 6.96% 3.848MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.94% 3.367MiB / 62.79GiB
+tgin-bench-bench-1 126.59% 7.648MiB / 62.79GiB
+== 10:34:11
+tgin-bench-webhook_bot3-1 7.21% 3.641MiB / 62.79GiB
+tgin-bench-tgin-1 21.53% 22.41MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.58% 3.637MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.67% 3.621MiB / 62.79GiB
+tgin-bench-bench-1 126.96% 8.195MiB / 62.79GiB
+== 10:34:18
+tgin-bench-webhook_bot3-1 7.18% 3.383MiB / 62.79GiB
+tgin-bench-tgin-1 21.72% 22.93MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 7.01% 3.656MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.99% 3.387MiB / 62.79GiB
+tgin-bench-bench-1 126.33% 7.824MiB / 62.79GiB
+== 10:34:26
+## 10:34:27 end webhook-tgin-3 v1 1000 RPS (run 2/3)
+## 10:34:27 start longpoll-direct-1 upstream 1000 RPS (run 2/3)
+tgin-bench-webhook_bot3-1 2.38% 3.398MiB / 62.79GiB
+tgin-bench-tgin-1 13.15% 22.44MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 2.53% 3.398MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 2.52% 3.371MiB / 62.79GiB
+tgin-bench-bench-1 2.22% 5.602MiB / 62.79GiB
+== 10:34:33
+tgin-bench-bench-1 2.31% 3.789MiB / 62.79GiB
+tgin-bench-longpull_bot_direct-1 0.00% 3.211MiB / 62.79GiB
+== 10:34:41
+tgin-bench-longpull_bot_direct-1 17.42% 4.477MiB / 62.79GiB
+tgin-bench-bench-1 126.09% 7.832MiB / 62.79GiB
+== 10:34:49
+tgin-bench-longpull_bot_direct-1 19.25% 3.996MiB / 62.79GiB
+tgin-bench-bench-1 126.89% 8.035MiB / 62.79GiB
+== 10:34:56
+tgin-bench-longpull_bot_direct-1 21.84% 4.586MiB / 62.79GiB
+tgin-bench-bench-1 128.15% 8.48MiB / 62.79GiB
+== 10:35:04
+tgin-bench-longpull_bot_direct-1 17.16% 4.707MiB / 62.79GiB
+tgin-bench-bench-1 125.90% 8.234MiB / 62.79GiB
+## 10:35:09 end longpoll-direct-1 upstream 1000 RPS (run 2/3)
+## 10:35:09 start longpoll-tgin-1 upstream 1000 RPS (run 2/3)
+== 10:35:11
+tgin-bench-bench-1 2.22% 3.805MiB / 62.79GiB
+== 10:35:19
+tgin-bench-longpull_bot1-1 10.15% 3.539MiB / 62.79GiB
+tgin-bench-tgin-1 21.95% 5.652MiB / 62.79GiB
+tgin-bench-bench-1 119.66% 7.59MiB / 62.79GiB
+== 10:35:27
+tgin-bench-longpull_bot1-1 19.54% 4.422MiB / 62.79GiB
+tgin-bench-tgin-1 23.33% 5.969MiB / 62.79GiB
+tgin-bench-bench-1 119.62% 7.484MiB / 62.79GiB
+== 10:35:34
+tgin-bench-longpull_bot1-1 18.62% 4.656MiB / 62.79GiB
+tgin-bench-tgin-1 23.09% 5.992MiB / 62.79GiB
+tgin-bench-bench-1 120.57% 7.777MiB / 62.79GiB
+== 10:35:42
+tgin-bench-longpull_bot1-1 21.54% 4.531MiB / 62.79GiB
+tgin-bench-tgin-1 26.76% 5.742MiB / 62.79GiB
+tgin-bench-bench-1 120.27% 7.762MiB / 62.79GiB
+== 10:35:50
+## 10:35:52 end longpoll-tgin-1 upstream 1000 RPS (run 2/3)
+## 10:35:52 start longpoll-tgin-1 v1 1000 RPS (run 2/3)
+tgin-bench-longpull_bot1-1 13.20% 3.891MiB / 62.79GiB
+tgin-bench-tgin-1 13.13% 5.266MiB / 62.79GiB
+tgin-bench-bench-1 65.11% 5.504MiB / 62.79GiB
+== 10:35:57
+tgin-bench-bench-1 2.45% 3.402MiB / 62.79GiB
+== 10:36:05
+tgin-bench-longpull_bot1-1 0.87% 3.594MiB / 62.79GiB
+tgin-bench-tgin-1 18.24% 24.88MiB / 62.79GiB
+tgin-bench-bench-1 117.55% 7.68MiB / 62.79GiB
+== 10:36:12
+tgin-bench-longpull_bot1-1 18.22% 4.348MiB / 62.79GiB
+tgin-bench-tgin-1 19.26% 24.86MiB / 62.79GiB
+tgin-bench-bench-1 124.70% 7.297MiB / 62.79GiB
+== 10:36:20
+tgin-bench-longpull_bot1-1 20.86% 4.391MiB / 62.79GiB
+tgin-bench-tgin-1 20.24% 24.81MiB / 62.79GiB
+tgin-bench-bench-1 124.72% 8.359MiB / 62.79GiB
+== 10:36:27
+tgin-bench-longpull_bot1-1 18.25% 4.164MiB / 62.79GiB
+tgin-bench-tgin-1 19.22% 25.07MiB / 62.79GiB
+tgin-bench-bench-1 124.49% 7.777MiB / 62.79GiB
+== 10:36:35
+tgin-bench-longpull_bot1-1 17.69% 4.457MiB / 62.79GiB
+tgin-bench-tgin-1 21.13% 25.14MiB / 62.79GiB
+tgin-bench-bench-1 128.13% 8.723MiB / 62.79GiB
+## 10:36:37 end longpoll-tgin-1 v1 1000 RPS (run 2/3)
+## 10:36:37 start longpoll-tgin-3 upstream 1000 RPS (run 2/3)
+== 10:36:42
+tgin-bench-bench-1 2.39% 3.414MiB / 62.79GiB
+== 10:36:51
+tgin-bench-longpull_bot3-1 4.62% 4.094MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.78% 3.449MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 10.65% 3.418MiB / 62.79GiB
+tgin-bench-tgin-1 25.18% 5.531MiB / 62.79GiB
+tgin-bench-bench-1 119.55% 6.801MiB / 62.79GiB
+== 10:36:58
+tgin-bench-longpull_bot3-1 10.77% 3.746MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 7.60% 4.207MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 7.70% 3.457MiB / 62.79GiB
+tgin-bench-tgin-1 24.33% 5.586MiB / 62.79GiB
+tgin-bench-bench-1 119.33% 7.172MiB / 62.79GiB
+== 10:37:06
+tgin-bench-longpull_bot3-1 8.06% 4.238MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.16% 3.98MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 10.18% 4.277MiB / 62.79GiB
+tgin-bench-tgin-1 24.12% 5.359MiB / 62.79GiB
+tgin-bench-bench-1 119.37% 7.934MiB / 62.79GiB
+== 10:37:13
+tgin-bench-longpull_bot3-1 10.55% 3.75MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.41% 3.973MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 7.64% 3.844MiB / 62.79GiB
+tgin-bench-tgin-1 23.78% 5.742MiB / 62.79GiB
+tgin-bench-bench-1 119.01% 7.625MiB / 62.79GiB
+== 10:37:21
+## 10:37:23 end longpoll-tgin-3 upstream 1000 RPS (run 2/3)
+## 10:37:23 start longpoll-tgin-3 v1 1000 RPS (run 2/3)
+tgin-bench-longpull_bot3-1 6.46% 3.535MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 6.27% 3.496MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 6.52% 3.555MiB / 62.79GiB
+tgin-bench-tgin-1 12.07% 5.523MiB / 62.79GiB
+tgin-bench-bench-1 57.57% 5.539MiB / 62.79GiB
+== 10:37:28
+tgin-bench-bench-1 2.35% 3.395MiB / 62.79GiB
+== 10:37:36
+tgin-bench-longpull_bot2-1 2.24% 3.27MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.23% 3.32MiB / 62.79GiB
+tgin-bench-tgin-1 0.05% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 2.85% 3.422MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 0.00% 3.195MiB / 62.79GiB
+== 10:37:44
+tgin-bench-longpull_bot3-1 8.13% 3.965MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 5.98% 3.5MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 9.87% 3.738MiB / 62.79GiB
+tgin-bench-tgin-1 21.25% 25.39MiB / 62.79GiB
+tgin-bench-bench-1 121.82% 7.785MiB / 62.79GiB
+== 10:37:52
+tgin-bench-longpull_bot3-1 5.76% 3.805MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 6.55% 3.777MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 6.93% 3.816MiB / 62.79GiB
+tgin-bench-tgin-1 21.24% 25.41MiB / 62.79GiB
+tgin-bench-bench-1 121.75% 7.848MiB / 62.79GiB
+== 10:37:59
+tgin-bench-longpull_bot3-1 9.98% 4.141MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 6.75% 3.848MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.15% 3.832MiB / 62.79GiB
+tgin-bench-tgin-1 22.07% 24.73MiB / 62.79GiB
+tgin-bench-bench-1 121.91% 7.922MiB / 62.79GiB
+== 10:38:07
+tgin-bench-longpull_bot3-1 6.91% 3.926MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 5.32% 4.121MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 8.72% 4.133MiB / 62.79GiB
+tgin-bench-tgin-1 22.16% 25.68MiB / 62.79GiB
+tgin-bench-bench-1 122.76% 8.078MiB / 62.79GiB
+## 10:38:13 end longpoll-tgin-3 v1 1000 RPS (run 2/3)
+## 10:38:13 start webhook-direct-1 upstream 1000 RPS (run 3/3)
+== 10:38:14
+tgin-bench-longpull_bot2-1 0.00% 0B / 0B
+tgin-bench-bench-1 2.53% 5.465MiB / 62.79GiB
+== 10:38:22
+tgin-bench-webhook_bot1-1 0.00% 3.137MiB / 62.79GiB
+tgin-bench-bench-1 2.80% 3.445MiB / 62.79GiB
+== 10:38:29
+tgin-bench-webhook_bot1-1 30.36% 5.727MiB / 62.79GiB
+tgin-bench-bench-1 129.75% 10.54MiB / 62.79GiB
+== 10:38:37
+tgin-bench-webhook_bot1-1 18.00% 6.539MiB / 62.79GiB
+tgin-bench-bench-1 133.74% 10.32MiB / 62.79GiB
+== 10:38:44
+tgin-bench-webhook_bot1-1 17.39% 6.254MiB / 62.79GiB
+tgin-bench-bench-1 127.30% 10.5MiB / 62.79GiB
+== 10:38:52
+tgin-bench-webhook_bot1-1 15.54% 5.523MiB / 62.79GiB
+tgin-bench-bench-1 124.68% 10.58MiB / 62.79GiB
+## 10:38:56 end webhook-direct-1 upstream 1000 RPS (run 3/3)
+## 10:38:56 start webhook-tgin-1 upstream 1000 RPS (run 3/3)
+== 10:39:00
+tgin-bench-bench-1 2.30% 3.516MiB / 62.79GiB
+== 10:39:07
+tgin-bench-tgin-1 16.99% 5.211MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.93% 3.961MiB / 62.79GiB
+tgin-bench-bench-1 124.80% 8.027MiB / 62.79GiB
+== 10:39:15
+tgin-bench-tgin-1 20.59% 4.996MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 17.81% 3.938MiB / 62.79GiB
+tgin-bench-bench-1 124.90% 7.781MiB / 62.79GiB
+== 10:39:22
+tgin-bench-tgin-1 25.05% 5.281MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 21.54% 3.836MiB / 62.79GiB
+tgin-bench-bench-1 132.91% 8.43MiB / 62.79GiB
+== 10:39:30
+tgin-bench-tgin-1 23.18% 4.82MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 26.62% 4.109MiB / 62.79GiB
+tgin-bench-bench-1 130.90% 8.168MiB / 62.79GiB
+## 10:39:37 end webhook-tgin-1 upstream 1000 RPS (run 3/3)
+## 10:39:37 start webhook-tgin-1 v1 1000 RPS (run 3/3)
+== 10:39:37
+tgin-bench-bench-1 3.36% 5.656MiB / 62.79GiB
+== 10:39:45
+tgin-bench-tgin-1 0.05% 18.26MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.129MiB / 62.79GiB
+tgin-bench-bench-1 2.31% 3.453MiB / 62.79GiB
+== 10:39:52
+tgin-bench-tgin-1 22.06% 23.11MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 17.37% 3.742MiB / 62.79GiB
+tgin-bench-bench-1 123.08% 7.109MiB / 62.79GiB
+== 10:40:00
+tgin-bench-tgin-1 23.57% 22.9MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 21.12% 4.062MiB / 62.79GiB
+tgin-bench-bench-1 124.30% 8.117MiB / 62.79GiB
+== 10:40:07
+tgin-bench-tgin-1 22.40% 22.91MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 20.46% 7.973MiB / 62.79GiB
+tgin-bench-bench-1 123.95% 8.004MiB / 62.79GiB
+== 10:40:15
+tgin-bench-tgin-1 19.53% 22.62MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.34% 3.852MiB / 62.79GiB
+tgin-bench-bench-1 121.34% 8.195MiB / 62.79GiB
+## 10:40:22 end webhook-tgin-1 v1 1000 RPS (run 3/3)
+## 10:40:22 start webhook-tgin-3 upstream 1000 RPS (run 3/3)
+== 10:40:22
+tgin-bench-bench-1 2.57% 5.648MiB / 62.79GiB
+== 10:40:30
+tgin-bench-tgin-1 3.58% 6.875MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.09% 3.246MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 2.55% 3.191MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.08% 3.738MiB / 62.79GiB
+tgin-bench-bench-1 4.91% 6.582MiB / 62.79GiB
+== 10:40:37
+tgin-bench-tgin-1 20.59% 7.801MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 9.39% 3.625MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.46% 3.402MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.23% 3.379MiB / 62.79GiB
+tgin-bench-bench-1 127.81% 7.664MiB / 62.79GiB
+== 10:40:45
+tgin-bench-tgin-1 20.20% 8.211MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 7.00% 3.664MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 6.97% 3.656MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 6.94% 3.637MiB / 62.79GiB
+tgin-bench-bench-1 130.21% 8.387MiB / 62.79GiB
+== 10:40:53
+tgin-bench-tgin-1 21.12% 7.766MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 10.31% 3.676MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 7.19% 3.66MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 10.39% 3.707MiB / 62.79GiB
+tgin-bench-bench-1 129.75% 8.352MiB / 62.79GiB
+== 10:41:00
+tgin-bench-tgin-1 23.40% 8.152MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 7.76% 3.449MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 7.95% 3.953MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 7.73% 3.5MiB / 62.79GiB
+tgin-bench-bench-1 130.47% 9.094MiB / 62.79GiB
+## 10:41:04 end webhook-tgin-3 upstream 1000 RPS (run 3/3)
+## 10:41:04 start webhook-tgin-3 v1 1000 RPS (run 3/3)
+== 10:41:08
+tgin-bench-bench-1 2.70% 3.676MiB / 62.79GiB
+== 10:41:16
+tgin-bench-tgin-1 7.46% 22.88MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 4.67% 3.574MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.191MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 4.74% 3.59MiB / 62.79GiB
+tgin-bench-bench-1 33.21% 7MiB / 62.79GiB
+== 10:41:24
+tgin-bench-tgin-1 23.49% 22.4MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 10.64% 3.605MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 7.97% 3.367MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 7.65% 3.871MiB / 62.79GiB
+tgin-bench-bench-1 124.59% 7.879MiB / 62.79GiB
+== 10:41:31
+tgin-bench-tgin-1 21.82% 22.66MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 7.46% 4.109MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 10.22% 3.629MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 9.89% 3.633MiB / 62.79GiB
+tgin-bench-bench-1 122.87% 8.023MiB / 62.79GiB
+== 10:41:39
+tgin-bench-tgin-1 21.51% 22.67MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 11.09% 3.535MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 11.03% 3.422MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 10.79% 3.391MiB / 62.79GiB
+tgin-bench-bench-1 135.87% 8.434MiB / 62.79GiB
+== 10:41:46
+tgin-bench-tgin-1 22.68% 25.3MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 9.45% 3.777MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.38% 3.723MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 9.28% 3.406MiB / 62.79GiB
+tgin-bench-bench-1 122.87% 9.438MiB / 62.79GiB
+## 10:41:50 end webhook-tgin-3 v1 1000 RPS (run 3/3)
+## 10:41:50 start longpoll-direct-1 upstream 1000 RPS (run 3/3)
+== 10:41:54
+tgin-bench-bench-1 2.54% 4.098MiB / 62.79GiB
+== 10:42:01
+tgin-bench-longpull_bot_direct-1 19.73% 4.176MiB / 62.79GiB
+tgin-bench-bench-1 130.03% 7.738MiB / 62.79GiB
+== 10:42:09
+tgin-bench-longpull_bot_direct-1 18.81% 4.426MiB / 62.79GiB
+tgin-bench-bench-1 128.29% 7.461MiB / 62.79GiB
+== 10:42:17
+tgin-bench-longpull_bot_direct-1 23.64% 3.98MiB / 62.79GiB
+tgin-bench-bench-1 130.19% 7.723MiB / 62.79GiB
+== 10:42:24
+tgin-bench-longpull_bot_direct-1 24.80% 4.477MiB / 62.79GiB
+tgin-bench-bench-1 129.63% 7.988MiB / 62.79GiB
+## 10:42:31 end longpoll-direct-1 upstream 1000 RPS (run 3/3)
+## 10:42:31 start longpoll-tgin-1 upstream 1000 RPS (run 3/3)
+== 10:42:32
+tgin-bench-bench-1 2.30% 6.262MiB / 62.79GiB
+== 10:42:39
+tgin-bench-tgin-1 0.03% 4.895MiB / 62.79GiB
+tgin-bench-bench-1 3.92% 3.473MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.78% 4.988MiB / 62.79GiB
+== 10:42:48
+tgin-bench-longpull_bot1-1 19.49% 4.125MiB / 62.79GiB
+tgin-bench-tgin-1 25.95% 5.25MiB / 62.79GiB
+tgin-bench-bench-1 122.30% 7.535MiB / 62.79GiB
+== 10:42:55
+tgin-bench-longpull_bot1-1 25.50% 5.258MiB / 62.79GiB
+tgin-bench-tgin-1 29.66% 6.438MiB / 62.79GiB
+tgin-bench-bench-1 124.67% 7.352MiB / 62.79GiB
+== 10:43:03
+tgin-bench-longpull_bot1-1 19.84% 5.148MiB / 62.79GiB
+tgin-bench-tgin-1 31.27% 6.121MiB / 62.79GiB
+tgin-bench-bench-1 128.59% 8.242MiB / 62.79GiB
+== 10:43:11
+tgin-bench-longpull_bot1-1 30.81% 6.223MiB / 62.79GiB
+tgin-bench-tgin-1 32.31% 5.988MiB / 62.79GiB
+tgin-bench-bench-1 129.12% 8.562MiB / 62.79GiB
+## 10:43:15 end longpoll-tgin-1 upstream 1000 RPS (run 3/3)
+## 10:43:15 start longpoll-tgin-1 v1 1000 RPS (run 3/3)
+== 10:43:18
+== 10:43:26
+tgin-bench-longpull_bot1-1 0.00% 3.203MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.33MiB / 62.79GiB
+tgin-bench-bench-1 2.26% 3.496MiB / 62.79GiB
+== 10:43:33
+tgin-bench-longpull_bot1-1 24.18% 4.023MiB / 62.79GiB
+tgin-bench-tgin-1 23.69% 24.6MiB / 62.79GiB
+tgin-bench-bench-1 129.76% 7.82MiB / 62.79GiB
+== 10:43:41
+tgin-bench-longpull_bot1-1 22.44% 4.586MiB / 62.79GiB
+tgin-bench-tgin-1 21.55% 24.83MiB / 62.79GiB
+tgin-bench-bench-1 127.06% 7.617MiB / 62.79GiB
+== 10:43:49
+tgin-bench-longpull_bot1-1 18.66% 5.094MiB / 62.79GiB
+tgin-bench-tgin-1 20.37% 24.87MiB / 62.79GiB
+tgin-bench-bench-1 128.45% 7.836MiB / 62.79GiB
+== 10:43:56
+tgin-bench-longpull_bot1-1 23.95% 4.59MiB / 62.79GiB
+tgin-bench-tgin-1 19.95% 25.1MiB / 62.79GiB
+tgin-bench-bench-1 129.26% 9.023MiB / 62.79GiB
+## 10:44:01 end longpoll-tgin-1 v1 1000 RPS (run 3/3)
+## 10:44:01 start longpoll-tgin-3 upstream 1000 RPS (run 3/3)
+== 10:44:04
+== 10:44:11
+tgin-bench-longpull_bot1-1 0.00% 3.203MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.922MiB / 62.79GiB
+tgin-bench-bench-1 2.46% 3.457MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 2.69% 4.148MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.49% 6.059MiB / 62.79GiB
+== 10:44:19
+tgin-bench-longpull_bot2-1 11.81% 4.48MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 8.03% 3.988MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 8.07% 3.699MiB / 62.79GiB
+tgin-bench-tgin-1 26.14% 5.586MiB / 62.79GiB
+tgin-bench-bench-1 122.78% 7.164MiB / 62.79GiB
+== 10:44:26
+tgin-bench-longpull_bot2-1 7.70% 3.832MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 9.85% 4.777MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 9.83% 3.562MiB / 62.79GiB
+tgin-bench-tgin-1 24.27% 6.188MiB / 62.79GiB
+tgin-bench-bench-1 121.63% 7.43MiB / 62.79GiB
+== 10:44:34
+tgin-bench-longpull_bot2-1 10.65% 4.645MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 7.79% 3.996MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 10.35% 4.723MiB / 62.79GiB
+tgin-bench-tgin-1 24.73% 6.102MiB / 62.79GiB
+tgin-bench-bench-1 122.26% 7.832MiB / 62.79GiB
+== 10:44:42
+tgin-bench-longpull_bot2-1 8.28% 3.891MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 11.53% 3.617MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 11.66% 3.539MiB / 62.79GiB
+tgin-bench-tgin-1 28.61% 6.504MiB / 62.79GiB
+tgin-bench-bench-1 124.43% 8.172MiB / 62.79GiB
+## 10:44:46 end longpoll-tgin-3 upstream 1000 RPS (run 3/3)
+## 10:44:46 start longpoll-tgin-3 v1 1000 RPS (run 3/3)
+== 10:44:49
+== 10:44:57
+tgin-bench-longpull_bot1-1 0.00% 3.223MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.258MiB / 62.79GiB
+tgin-bench-tgin-1 0.03% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 2.74% 3.707MiB / 62.79GiB
+== 10:45:04
+tgin-bench-longpull_bot3-1 2.88% 3.383MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 12.50% 3.449MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 10.29% 3.453MiB / 62.79GiB
+tgin-bench-tgin-1 28.34% 24.65MiB / 62.79GiB
+tgin-bench-bench-1 132.10% 9.652MiB / 62.79GiB
+== 10:45:12
+tgin-bench-longpull_bot3-1 10.18% 3.973MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 11.08% 3.574MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 8.40% 3.609MiB / 62.79GiB
+tgin-bench-tgin-1 28.16% 25.17MiB / 62.79GiB
+tgin-bench-bench-1 133.58% 7.652MiB / 62.79GiB
+== 10:45:19
+tgin-bench-longpull_bot3-1 10.15% 3.758MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 12.03% 3.672MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 10.61% 4.137MiB / 62.79GiB
+tgin-bench-tgin-1 26.95% 24.97MiB / 62.79GiB
+tgin-bench-bench-1 130.37% 7.676MiB / 62.79GiB
+== 10:45:27
+tgin-bench-longpull_bot3-1 11.09% 3.52MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 10.52% 3.922MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 3.01% 3.684MiB / 62.79GiB
+tgin-bench-tgin-1 25.49% 25.42MiB / 62.79GiB
+tgin-bench-bench-1 130.12% 7.953MiB / 62.79GiB
+== 10:45:35
+## 10:45:36 end longpoll-tgin-3 v1 1000 RPS (run 3/3)
+## 10:45:36 start webhook-direct-1 upstream 5000 RPS (run 1/3)
+tgin-bench-longpull_bot3-1 7.99% 4.008MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 7.50% 3.707MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 5.81% 3.676MiB / 62.79GiB
+tgin-bench-tgin-1 9.78% 24.51MiB / 62.79GiB
+tgin-bench-bench-1 49.71% 5.504MiB / 62.79GiB
+== 10:45:42
+tgin-bench-bench-1 2.73% 3.75MiB / 62.79GiB
+== 10:45:50
+tgin-bench-webhook_bot1-1 78.42% 5.797MiB / 62.79GiB
+tgin-bench-bench-1 185.94% 10.1MiB / 62.79GiB
+== 10:45:57
+tgin-bench-webhook_bot1-1 71.58% 5.715MiB / 62.79GiB
+tgin-bench-bench-1 185.75% 12.12MiB / 62.79GiB
+== 10:46:05
+tgin-bench-webhook_bot1-1 73.53% 6.863MiB / 62.79GiB
+tgin-bench-bench-1 183.40% 13.38MiB / 62.79GiB
+== 10:46:13
+tgin-bench-webhook_bot1-1 82.59% 6.254MiB / 62.79GiB
+tgin-bench-bench-1 183.58% 16.76MiB / 62.79GiB
+## 10:46:20 end webhook-direct-1 upstream 5000 RPS (run 1/3)
+## 10:46:20 start webhook-tgin-1 upstream 5000 RPS (run 1/3)
+== 10:46:20
+tgin-bench-bench-1 2.29% 12.93MiB / 62.79GiB
+== 10:46:28
+tgin-bench-tgin-1 0.00% 3.957MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.71% 4.125MiB / 62.79GiB
+tgin-bench-bench-1 27.15% 7.918MiB / 62.79GiB
+== 10:46:35
+tgin-bench-tgin-1 82.16% 6.551MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 79.34% 5.641MiB / 62.79GiB
+tgin-bench-bench-1 184.56% 10.93MiB / 62.79GiB
+== 10:46:43
+tgin-bench-tgin-1 79.25% 7.578MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 82.70% 6.59MiB / 62.79GiB
+tgin-bench-bench-1 189.78% 13.92MiB / 62.79GiB
+== 10:46:51
+tgin-bench-tgin-1 77.79% 7.438MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 75.63% 6.785MiB / 62.79GiB
+tgin-bench-bench-1 189.01% 14.48MiB / 62.79GiB
+== 10:46:58
+tgin-bench-tgin-1 80.66% 7.582MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 78.13% 6.777MiB / 62.79GiB
+tgin-bench-bench-1 191.15% 17.25MiB / 62.79GiB
+## 10:47:02 end webhook-tgin-1 upstream 5000 RPS (run 1/3)
+## 10:47:02 start webhook-tgin-1 v1 5000 RPS (run 1/3)
+== 10:47:06
+tgin-bench-bench-1 3.16% 3.391MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.125MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 18.26MiB / 62.79GiB
+== 10:47:16
+tgin-bench-tgin-1 85.49% 27.26MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 76.18% 5.906MiB / 62.79GiB
+tgin-bench-bench-1 197.52% 8.84MiB / 62.79GiB
+== 10:47:23
+tgin-bench-tgin-1 212.09% 65.18MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 93.11% 11.92MiB / 62.79GiB
+tgin-bench-bench-1 196.26% 11.14MiB / 62.79GiB
+== 10:47:31
+tgin-bench-tgin-1 77.54% 65.15MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 69.66% 11.25MiB / 62.79GiB
+tgin-bench-bench-1 186.19% 20.72MiB / 62.79GiB
+== 10:47:38
+tgin-bench-tgin-1 79.04% 64.97MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 95.56% 11.17MiB / 62.79GiB
+tgin-bench-bench-1 212.18% 26.64MiB / 62.79GiB
+== 10:47:46
+## 10:47:46 end webhook-tgin-1 v1 5000 RPS (run 1/3)
+## 10:47:46 start webhook-tgin-3 upstream 5000 RPS (run 1/3)
+tgin-bench-bench-1 3.25% 20.13MiB / 62.79GiB
+== 10:47:54
+tgin-bench-tgin-1 0.00% 4.875MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.121MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 3.06% 3.148MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.00% 3.129MiB / 62.79GiB
+tgin-bench-bench-1 2.86% 3.531MiB / 62.79GiB
+== 10:48:01
+tgin-bench-tgin-1 104.76% 8.562MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 28.79% 3.766MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 28.43% 3.469MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 28.19% 3.664MiB / 62.79GiB
+tgin-bench-bench-1 196.35% 10.14MiB / 62.79GiB
+== 10:48:09
+tgin-bench-tgin-1 96.16% 8.656MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 33.68% 4.156MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 33.36% 3.875MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 33.19% 3.777MiB / 62.79GiB
+tgin-bench-bench-1 202.44% 12.25MiB / 62.79GiB
+== 10:48:17
+tgin-bench-tgin-1 91.29% 9.438MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 29.83% 4.266MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 33.13% 4.641MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 33.03% 4.41MiB / 62.79GiB
+tgin-bench-bench-1 199.59% 13.73MiB / 62.79GiB
+== 10:48:24
+tgin-bench-tgin-1 91.96% 9.945MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 30.20% 3.82MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 29.97% 4.707MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 29.70% 3.934MiB / 62.79GiB
+tgin-bench-bench-1 193.36% 17.35MiB / 62.79GiB
+## 10:48:29 end webhook-tgin-3 upstream 5000 RPS (run 1/3)
+## 10:48:29 start webhook-tgin-3 v1 5000 RPS (run 1/3)
+== 10:48:32
+tgin-bench-bench-1 0.78% 4.852MiB / 62.79GiB
+== 10:48:40
+tgin-bench-webhook_bot3-1 15.61% 3.367MiB / 62.79GiB
+tgin-bench-tgin-1 43.94% 25.14MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 16.07% 3.383MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.16MiB / 62.79GiB
+tgin-bench-bench-1 82.22% 7.602MiB / 62.79GiB
+== 10:48:48
+tgin-bench-webhook_bot3-1 33.06% 3.527MiB / 62.79GiB
+tgin-bench-tgin-1 98.16% 26.95MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 32.75% 3.492MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 32.68% 3.961MiB / 62.79GiB
+tgin-bench-bench-1 205.36% 10.12MiB / 62.79GiB
+== 10:48:56
+tgin-bench-webhook_bot3-1 36.87% 3.902MiB / 62.79GiB
+tgin-bench-tgin-1 103.38% 29.82MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 36.23% 4.184MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 31.84% 4.484MiB / 62.79GiB
+tgin-bench-bench-1 205.21% 12.6MiB / 62.79GiB
+== 10:49:04
+tgin-bench-webhook_bot3-1 34.80% 4.188MiB / 62.79GiB
+tgin-bench-tgin-1 98.67% 29.66MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 30.98% 4.004MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 31.29% 4.02MiB / 62.79GiB
+tgin-bench-bench-1 199.95% 14.23MiB / 62.79GiB
+== 10:49:11
+tgin-bench-webhook_bot3-1 39.71% 4.234MiB / 62.79GiB
+tgin-bench-tgin-1 116.00% 35.9MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 39.50% 4.207MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 35.93% 4.23MiB / 62.79GiB
+tgin-bench-bench-1 212.68% 16.7MiB / 62.79GiB
+## 10:49:14 end webhook-tgin-3 v1 5000 RPS (run 1/3)
+## 10:49:14 start longpoll-direct-1 upstream 5000 RPS (run 1/3)
+== 10:49:19
+tgin-bench-bench-1 0.00% 3.848MiB / 62.79GiB
+tgin-bench-longpull_bot_direct-1 0.00% 3.219MiB / 62.79GiB
+== 10:49:28
+tgin-bench-longpull_bot_direct-1 104.33% 6.035MiB / 62.79GiB
+tgin-bench-bench-1 197.09% 9.191MiB / 62.79GiB
+== 10:49:35
+tgin-bench-longpull_bot_direct-1 81.07% 6.5MiB / 62.79GiB
+tgin-bench-bench-1 182.55% 10.76MiB / 62.79GiB
+== 10:49:43
+tgin-bench-longpull_bot_direct-1 68.82% 7.012MiB / 62.79GiB
+tgin-bench-bench-1 186.72% 11.71MiB / 62.79GiB
+== 10:49:51
+tgin-bench-longpull_bot_direct-1 95.13% 7.273MiB / 62.79GiB
+tgin-bench-bench-1 184.41% 15.36MiB / 62.79GiB
+## 10:49:56 end longpoll-direct-1 upstream 5000 RPS (run 1/3)
+## 10:49:56 start longpoll-tgin-1 upstream 5000 RPS (run 1/3)
+== 10:49:58
+tgin-bench-bench-1 3.11% 3.48MiB / 62.79GiB
+== 10:50:07
+tgin-bench-longpull_bot1-1 16.06% 5.176MiB / 62.79GiB
+tgin-bench-tgin-1 35.14% 5.695MiB / 62.79GiB
+tgin-bench-bench-1 140.67% 7.449MiB / 62.79GiB
+== 10:50:15
+tgin-bench-longpull_bot1-1 48.92% 5.969MiB / 62.79GiB
+tgin-bench-tgin-1 34.66% 6.32MiB / 62.79GiB
+tgin-bench-bench-1 138.40% 9.648MiB / 62.79GiB
+== 10:50:22
+tgin-bench-longpull_bot1-1 47.18% 7.172MiB / 62.79GiB
+tgin-bench-tgin-1 37.48% 6.457MiB / 62.79GiB
+tgin-bench-bench-1 143.90% 11.09MiB / 62.79GiB
+== 10:50:30
+tgin-bench-longpull_bot1-1 48.63% 7.684MiB / 62.79GiB
+tgin-bench-tgin-1 34.52% 6.59MiB / 62.79GiB
+tgin-bench-bench-1 141.48% 13.17MiB / 62.79GiB
+== 10:50:37
+## 10:50:39 end longpoll-tgin-1 upstream 5000 RPS (run 1/3)
+## 10:50:39 start longpoll-tgin-1 v1 5000 RPS (run 1/3)
+tgin-bench-longpull_bot1-1 41.43% 6.758MiB / 62.79GiB
+tgin-bench-tgin-1 27.08% 5.926MiB / 62.79GiB
+tgin-bench-bench-1 137.89% 15.72MiB / 62.79GiB
+== 10:50:45
+tgin-bench-bench-1 2.55% 3.379MiB / 62.79GiB
+tgin-bench-tgin-1 0.02% 22.33MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.195MiB / 62.79GiB
+== 10:50:54
+tgin-bench-longpull_bot1-1 74.45% 4.219MiB / 62.79GiB
+tgin-bench-tgin-1 75.04% 24.77MiB / 62.79GiB
+tgin-bench-bench-1 176.16% 8.086MiB / 62.79GiB
+== 10:51:02
+tgin-bench-longpull_bot1-1 75.68% 5.371MiB / 62.79GiB
+tgin-bench-tgin-1 74.27% 27.12MiB / 62.79GiB
+tgin-bench-bench-1 173.89% 9.594MiB / 62.79GiB
+== 10:51:09
+tgin-bench-longpull_bot1-1 71.21% 6.34MiB / 62.79GiB
+tgin-bench-tgin-1 77.57% 26.89MiB / 62.79GiB
+tgin-bench-bench-1 178.08% 12.09MiB / 62.79GiB
+== 10:51:17
+tgin-bench-longpull_bot1-1 69.75% 5.672MiB / 62.79GiB
+tgin-bench-tgin-1 74.92% 27.14MiB / 62.79GiB
+tgin-bench-bench-1 174.85% 14.95MiB / 62.79GiB
+== 10:51:24
+## 10:51:26 end longpoll-tgin-1 v1 5000 RPS (run 1/3)
+## 10:51:26 start longpoll-tgin-3 upstream 5000 RPS (run 1/3)
+tgin-bench-longpull_bot1-1 74.75% 5.93MiB / 62.79GiB
+tgin-bench-tgin-1 75.18% 26.81MiB / 62.79GiB
+tgin-bench-bench-1 17.04% 11.3MiB / 62.79GiB
+== 10:51:32
+tgin-bench-bench-1 2.39% 3.523MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.879MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.195MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.191MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 0.00% 3.203MiB / 62.79GiB
+== 10:51:43
+tgin-bench-longpull_bot1-1 29.52% 4.637MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 29.89% 4.422MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 29.68% 4.68MiB / 62.79GiB
+tgin-bench-tgin-1 53.60% 6.496MiB / 62.79GiB
+tgin-bench-bench-1 146.81% 8.965MiB / 62.79GiB
+== 10:51:50
+tgin-bench-longpull_bot1-1 30.24% 6.68MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 30.16% 4.742MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 27.64% 4.945MiB / 62.79GiB
+tgin-bench-tgin-1 52.84% 6.27MiB / 62.79GiB
+tgin-bench-bench-1 146.53% 10.8MiB / 62.79GiB
+== 10:51:58
+tgin-bench-longpull_bot1-1 31.29% 4.473MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 33.23% 4.719MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 31.06% 5.012MiB / 62.79GiB
+tgin-bench-tgin-1 57.10% 6.328MiB / 62.79GiB
+tgin-bench-bench-1 153.02% 10.77MiB / 62.79GiB
+== 10:52:05
+tgin-bench-longpull_bot1-1 34.40% 4.574MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 29.42% 6.766MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 29.55% 6.691MiB / 62.79GiB
+tgin-bench-tgin-1 53.85% 6.133MiB / 62.79GiB
+tgin-bench-bench-1 148.52% 14.59MiB / 62.79GiB
+## 10:52:10 end longpoll-tgin-3 upstream 5000 RPS (run 1/3)
+## 10:52:10 start longpoll-tgin-3 v1 5000 RPS (run 1/3)
+== 10:52:13
+== 10:52:21
+tgin-bench-longpull_bot1-1 2.31% 3.488MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 2.27% 3.223MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 2.19% 3.43MiB / 62.79GiB
+== 10:52:28
+tgin-bench-longpull_bot3-1 27.12% 4.238MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 25.60% 3.605MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 27.38% 3.668MiB / 62.79GiB
+tgin-bench-tgin-1 80.75% 25.03MiB / 62.79GiB
+tgin-bench-bench-1 175.00% 8.246MiB / 62.79GiB
+== 10:52:36
+tgin-bench-longpull_bot3-1 31.56% 6.613MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 30.07% 4.762MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 30.12% 4.535MiB / 62.79GiB
+tgin-bench-tgin-1 86.30% 27.4MiB / 62.79GiB
+tgin-bench-bench-1 178.48% 9.129MiB / 62.79GiB
+== 10:52:43
+tgin-bench-longpull_bot3-1 31.17% 5.387MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 31.42% 5.656MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 28.38% 4.703MiB / 62.79GiB
+tgin-bench-tgin-1 85.26% 27.21MiB / 62.79GiB
+tgin-bench-bench-1 180.53% 12.04MiB / 62.79GiB
+== 10:52:51
+tgin-bench-longpull_bot3-1 29.18% 5.25MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 37.29% 5.172MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 31.62% 4.5MiB / 62.79GiB
+tgin-bench-tgin-1 93.41% 26.74MiB / 62.79GiB
+tgin-bench-bench-1 186.99% 14.81MiB / 62.79GiB
+== 10:52:58
+## 10:53:00 end longpoll-tgin-3 v1 5000 RPS (run 1/3)
+## 10:53:00 start webhook-direct-1 upstream 5000 RPS (run 2/3)
+tgin-bench-longpull_bot3-1 2.64% 5.016MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 37.71% 5.383MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 1.95% 5.789MiB / 62.79GiB
+tgin-bench-tgin-1 4.37% 26.55MiB / 62.79GiB
+tgin-bench-bench-1 22.26% 17.63MiB / 62.79GiB
+== 10:53:06
+tgin-bench-bench-1 2.44% 3.43MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.129MiB / 62.79GiB
+== 10:53:15
+tgin-bench-webhook_bot1-1 68.79% 6.109MiB / 62.79GiB
+tgin-bench-bench-1 177.40% 10.35MiB / 62.79GiB
+== 10:53:22
+tgin-bench-webhook_bot1-1 62.61% 6.258MiB / 62.79GiB
+tgin-bench-bench-1 171.96% 13.07MiB / 62.79GiB
+== 10:53:30
+tgin-bench-webhook_bot1-1 61.85% 6.461MiB / 62.79GiB
+tgin-bench-bench-1 172.24% 13.43MiB / 62.79GiB
+== 10:53:37
+tgin-bench-webhook_bot1-1 63.92% 6.168MiB / 62.79GiB
+tgin-bench-bench-1 172.35% 17.41MiB / 62.79GiB
+## 10:53:43 end webhook-direct-1 upstream 5000 RPS (run 2/3)
+## 10:53:43 start webhook-tgin-1 upstream 5000 RPS (run 2/3)
+== 10:53:45
+== 10:53:52
+tgin-bench-tgin-1 58.50% 6.016MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 74.35% 4.691MiB / 62.79GiB
+tgin-bench-bench-1 152.39% 8.535MiB / 62.79GiB
+== 10:54:00
+tgin-bench-tgin-1 79.44% 6.035MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 74.95% 5.578MiB / 62.79GiB
+tgin-bench-bench-1 184.69% 10.35MiB / 62.79GiB
+== 10:54:07
+tgin-bench-tgin-1 69.16% 6.633MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 63.32% 5.953MiB / 62.79GiB
+tgin-bench-bench-1 185.93% 12.48MiB / 62.79GiB
+== 10:54:15
+tgin-bench-tgin-1 69.39% 6.613MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 66.76% 5.906MiB / 62.79GiB
+tgin-bench-bench-1 178.59% 16.19MiB / 62.79GiB
+== 10:54:23
+## 10:54:24 end webhook-tgin-1 upstream 5000 RPS (run 2/3)
+## 10:54:24 start webhook-tgin-1 v1 5000 RPS (run 2/3)
+tgin-bench-tgin-1 3.97% 5.93MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 3.55% 5.973MiB / 62.79GiB
+tgin-bench-bench-1 180.81% 16.48MiB / 62.79GiB
+== 10:54:30
+tgin-bench-bench-1 2.52% 3.598MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.129MiB / 62.79GiB
+tgin-bench-tgin-1 0.03% 18.29MiB / 62.79GiB
+== 10:54:38
+tgin-bench-tgin-1 75.26% 27.5MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 71.07% 5.09MiB / 62.79GiB
+tgin-bench-bench-1 183.98% 9.098MiB / 62.79GiB
+== 10:54:45
+tgin-bench-tgin-1 78.36% 36.23MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 68.78% 6.711MiB / 62.79GiB
+tgin-bench-bench-1 185.67% 11.87MiB / 62.79GiB
+== 10:54:53
+tgin-bench-tgin-1 78.00% 36.53MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 77.22% 6.598MiB / 62.79GiB
+tgin-bench-bench-1 190.69% 13.03MiB / 62.79GiB
+== 10:55:00
+tgin-bench-tgin-1 76.90% 35.86MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 74.98% 6.887MiB / 62.79GiB
+tgin-bench-bench-1 190.18% 16.48MiB / 62.79GiB
+== 10:55:08
+## 10:55:09 end webhook-tgin-1 v1 5000 RPS (run 2/3)
+## 10:55:09 start webhook-tgin-3 upstream 5000 RPS (run 2/3)
+tgin-bench-bench-1 2.16% 13.35MiB / 62.79GiB
+== 10:55:16
+tgin-bench-webhook_bot2-1 0.00% 3.133MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.887MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 2.44% 3.152MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 2.55% 3.18MiB / 62.79GiB
+tgin-bench-bench-1 0.00% 3.488MiB / 62.79GiB
+== 10:55:23
+tgin-bench-webhook_bot2-1 23.28% 3.52MiB / 62.79GiB
+tgin-bench-tgin-1 69.24% 8.66MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 23.37% 3.684MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 23.09% 3.59MiB / 62.79GiB
+tgin-bench-bench-1 179.19% 9.422MiB / 62.79GiB
+== 10:55:31
+tgin-bench-webhook_bot2-1 25.63% 3.551MiB / 62.79GiB
+tgin-bench-tgin-1 69.10% 8.828MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 26.17% 3.879MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 25.92% 3.699MiB / 62.79GiB
+tgin-bench-bench-1 178.49% 12.54MiB / 62.79GiB
+== 10:55:38
+tgin-bench-webhook_bot2-1 26.49% 4.281MiB / 62.79GiB
+tgin-bench-tgin-1 83.97% 9.312MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 27.97% 4.398MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 26.11% 3.922MiB / 62.79GiB
+tgin-bench-bench-1 190.36% 12.61MiB / 62.79GiB
+== 10:55:46
+tgin-bench-webhook_bot2-1 23.29% 4.191MiB / 62.79GiB
+tgin-bench-tgin-1 69.61% 9.035MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 23.55% 4.047MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 25.61% 4.387MiB / 62.79GiB
+tgin-bench-bench-1 177.62% 16.67MiB / 62.79GiB
+## 10:55:51 end webhook-tgin-3 upstream 5000 RPS (run 2/3)
+## 10:55:51 start webhook-tgin-3 v1 5000 RPS (run 2/3)
+== 10:55:54
+== 10:56:01
+tgin-bench-tgin-1 1.82% 20.29MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.00% 3.184MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.156MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.152MiB / 62.79GiB
+tgin-bench-bench-1 2.60% 3.441MiB / 62.79GiB
+== 10:56:09
+tgin-bench-tgin-1 83.31% 29.56MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 29.86% 4.113MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 29.89% 3.91MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 30.07% 3.801MiB / 62.79GiB
+tgin-bench-bench-1 189.80% 10.69MiB / 62.79GiB
+== 10:56:16
+tgin-bench-tgin-1 85.05% 33.59MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 23.75% 4.07MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 23.51% 3.941MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 23.72% 3.824MiB / 62.79GiB
+tgin-bench-bench-1 181.62% 12.38MiB / 62.79GiB
+== 10:56:24
+tgin-bench-tgin-1 75.70% 38.01MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 25.12% 4.184MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 28.01% 3.879MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 28.50% 4.039MiB / 62.79GiB
+tgin-bench-bench-1 184.93% 13.18MiB / 62.79GiB
+== 10:56:31
+tgin-bench-tgin-1 73.39% 37.91MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 23.40% 4.059MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 23.89% 4.383MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 30.56% 3.844MiB / 62.79GiB
+tgin-bench-bench-1 180.26% 15.87MiB / 62.79GiB
+## 10:56:36 end webhook-tgin-3 v1 5000 RPS (run 2/3)
+## 10:56:36 start longpoll-direct-1 upstream 5000 RPS (run 2/3)
+== 10:56:39
+tgin-bench-bench-1 2.98% 4.082MiB / 62.79GiB
+== 10:56:47
+tgin-bench-longpull_bot_direct-1 86.80% 4.621MiB / 62.79GiB
+tgin-bench-bench-1 187.04% 9.352MiB / 62.79GiB
+== 10:56:55
+tgin-bench-longpull_bot_direct-1 79.70% 5.258MiB / 62.79GiB
+tgin-bench-bench-1 181.70% 9.258MiB / 62.79GiB
+== 10:57:03
+tgin-bench-longpull_bot_direct-1 83.50% 5.121MiB / 62.79GiB
+tgin-bench-bench-1 182.56% 11.23MiB / 62.79GiB
+== 10:57:10
+tgin-bench-longpull_bot_direct-1 77.16% 5.953MiB / 62.79GiB
+tgin-bench-bench-1 181.54% 15.37MiB / 62.79GiB
+## 10:57:18 end longpoll-direct-1 upstream 5000 RPS (run 2/3)
+## 10:57:18 start longpoll-tgin-1 upstream 5000 RPS (run 2/3)
+== 10:57:18
+tgin-bench-bench-1 2.39% 11.29MiB / 62.79GiB
+== 10:57:26
+tgin-bench-longpull_bot1-1 0.00% 3.207MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.891MiB / 62.79GiB
+tgin-bench-bench-1 2.52% 3.52MiB / 62.79GiB
+== 10:57:33
+tgin-bench-longpull_bot1-1 50.82% 6.605MiB / 62.79GiB
+tgin-bench-tgin-1 36.99% 6.477MiB / 62.79GiB
+tgin-bench-bench-1 142.15% 9.461MiB / 62.79GiB
+== 10:57:41
+tgin-bench-longpull_bot1-1 56.39% 8.586MiB / 62.79GiB
+tgin-bench-tgin-1 37.53% 7.16MiB / 62.79GiB
+tgin-bench-bench-1 144.02% 11.6MiB / 62.79GiB
+== 10:57:49
+tgin-bench-longpull_bot1-1 57.41% 8.43MiB / 62.79GiB
+tgin-bench-tgin-1 40.13% 6.668MiB / 62.79GiB
+tgin-bench-bench-1 148.99% 11.88MiB / 62.79GiB
+== 10:57:56
+tgin-bench-longpull_bot1-1 61.55% 8.551MiB / 62.79GiB
+tgin-bench-tgin-1 37.92% 6.945MiB / 62.79GiB
+tgin-bench-bench-1 146.91% 15.38MiB / 62.79GiB
+## 10:58:01 end longpoll-tgin-1 upstream 5000 RPS (run 2/3)
+## 10:58:01 start longpoll-tgin-1 v1 5000 RPS (run 2/3)
+== 10:58:04
+== 10:58:11
+tgin-bench-longpull_bot1-1 4.28% 4.043MiB / 62.79GiB
+tgin-bench-tgin-1 0.05% 22.34MiB / 62.79GiB
+tgin-bench-bench-1 3.38% 3.465MiB / 62.79GiB
+== 10:58:19
+tgin-bench-longpull_bot1-1 114.62% 32.68MiB / 62.79GiB
+tgin-bench-tgin-1 89.01% 35.1MiB / 62.79GiB
+tgin-bench-bench-1 202.30% 22.33MiB / 62.79GiB
+== 10:58:27
+tgin-bench-longpull_bot1-1 95.13% 32.59MiB / 62.79GiB
+tgin-bench-tgin-1 85.04% 30.75MiB / 62.79GiB
+tgin-bench-bench-1 192.15% 25.48MiB / 62.79GiB
+== 10:58:35
+tgin-bench-longpull_bot1-1 90.64% 32.69MiB / 62.79GiB
+tgin-bench-tgin-1 82.75% 31.52MiB / 62.79GiB
+tgin-bench-bench-1 186.56% 25.74MiB / 62.79GiB
+== 10:58:43
+tgin-bench-longpull_bot1-1 89.20% 32.46MiB / 62.79GiB
+tgin-bench-tgin-1 81.18% 31MiB / 62.79GiB
+tgin-bench-bench-1 183.90% 29.23MiB / 62.79GiB
+## 10:58:49 end longpoll-tgin-1 v1 5000 RPS (run 2/3)
+## 10:58:49 start longpoll-tgin-3 upstream 5000 RPS (run 2/3)
+== 10:58:50
+tgin-bench-bench-1 2.71% 24.2MiB / 62.79GiB
+== 10:58:58
+tgin-bench-tgin-1 0.06% 4.871MiB / 62.79GiB
+tgin-bench-bench-1 2.50% 3.438MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 0.00% 3.203MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.191MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.215MiB / 62.79GiB
+== 10:59:07
+tgin-bench-longpull_bot1-1 38.95% 4.715MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 39.39% 4.43MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 30.43% 4.676MiB / 62.79GiB
+tgin-bench-tgin-1 63.16% 6.535MiB / 62.79GiB
+tgin-bench-bench-1 150.81% 8.309MiB / 62.79GiB
+== 10:59:14
+tgin-bench-longpull_bot1-1 33.34% 6.578MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 46.44% 6.227MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 50.88% 6.809MiB / 62.79GiB
+tgin-bench-tgin-1 83.48% 7.332MiB / 62.79GiB
+tgin-bench-bench-1 177.11% 13.32MiB / 62.79GiB
+== 10:59:22
+tgin-bench-longpull_bot1-1 36.21% 8.395MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 45.17% 7.578MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 34.23% 7.641MiB / 62.79GiB
+tgin-bench-tgin-1 60.02% 7.746MiB / 62.79GiB
+tgin-bench-bench-1 157.60% 14.89MiB / 62.79GiB
+== 10:59:30
+tgin-bench-longpull_bot1-1 34.51% 8.027MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 32.04% 7.07MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 34.39% 7.688MiB / 62.79GiB
+tgin-bench-tgin-1 56.07% 8.238MiB / 62.79GiB
+tgin-bench-bench-1 153.21% 17.38MiB / 62.79GiB
+## 10:59:35 end longpoll-tgin-3 upstream 5000 RPS (run 2/3)
+## 10:59:35 start longpoll-tgin-3 v1 5000 RPS (run 2/3)
+== 10:59:37
+== 10:59:45
+tgin-bench-longpull_bot2-1 3.90% 3.211MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.215MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.35MiB / 62.79GiB
+tgin-bench-bench-1 2.66% 3.461MiB / 62.79GiB
+== 10:59:52
+tgin-bench-longpull_bot3-1 34.58% 4.484MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 25.79% 3.902MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 18.92% 4.375MiB / 62.79GiB
+tgin-bench-tgin-1 89.92% 26.95MiB / 62.79GiB
+tgin-bench-bench-1 183.48% 7.855MiB / 62.79GiB
+== 11:00:00
+tgin-bench-longpull_bot3-1 39.71% 8.703MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 41.24% 4.988MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 40.70% 5.191MiB / 62.79GiB
+tgin-bench-tgin-1 109.67% 27.46MiB / 62.79GiB
+tgin-bench-bench-1 198.34% 9.699MiB / 62.79GiB
+== 11:00:08
+tgin-bench-longpull_bot3-1 31.10% 5.273MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 32.38% 5.379MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 29.16% 5.613MiB / 62.79GiB
+tgin-bench-tgin-1 89.09% 27.12MiB / 62.79GiB
+tgin-bench-bench-1 186.13% 12.58MiB / 62.79GiB
+== 11:00:15
+tgin-bench-longpull_bot3-1 29.98% 5.062MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 33.62% 5.648MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 32.93% 4.957MiB / 62.79GiB
+tgin-bench-tgin-1 85.32% 27.48MiB / 62.79GiB
+tgin-bench-bench-1 181.88% 15.09MiB / 62.79GiB
+== 11:00:23
+## 11:00:25 end longpoll-tgin-3 v1 5000 RPS (run 2/3)
+## 11:00:25 start webhook-direct-1 upstream 5000 RPS (run 3/3)
+tgin-bench-longpull_bot3-1 0.00% 6.203MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 5.949MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 35.37% 5.969MiB / 62.79GiB
+tgin-bench-tgin-1 0.02% 26.6MiB / 62.79GiB
+tgin-bench-bench-1 2.67% 13.64MiB / 62.79GiB
+== 11:00:31
+tgin-bench-bench-1 2.92% 3.426MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.129MiB / 62.79GiB
+== 11:00:40
+tgin-bench-webhook_bot1-1 90.63% 9.832MiB / 62.79GiB
+tgin-bench-bench-1 198.07% 13.39MiB / 62.79GiB
+== 11:00:48
+tgin-bench-webhook_bot1-1 81.03% 9.379MiB / 62.79GiB
+tgin-bench-bench-1 209.30% 15.57MiB / 62.79GiB
+== 11:00:55
+tgin-bench-webhook_bot1-1 92.06% 10.34MiB / 62.79GiB
+tgin-bench-bench-1 199.91% 16.67MiB / 62.79GiB
+== 11:01:03
+tgin-bench-webhook_bot1-1 96.30% 9.902MiB / 62.79GiB
+tgin-bench-bench-1 188.65% 19.79MiB / 62.79GiB
+## 11:01:08 end webhook-direct-1 upstream 5000 RPS (run 3/3)
+## 11:01:08 start webhook-tgin-1 upstream 5000 RPS (run 3/3)
+== 11:01:11
+== 11:01:18
+tgin-bench-tgin-1 84.60% 7.223MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 119.96% 6.906MiB / 62.79GiB
+tgin-bench-bench-1 235.48% 10.75MiB / 62.79GiB
+== 11:01:26
+tgin-bench-tgin-1 102.44% 8.281MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 92.80% 8.82MiB / 62.79GiB
+tgin-bench-bench-1 208.03% 13.98MiB / 62.79GiB
+== 11:01:36
+tgin-bench-tgin-1 114.41% 8.242MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 105.22% 8.438MiB / 62.79GiB
+tgin-bench-bench-1 216.85% 15.82MiB / 62.79GiB
+== 11:01:44
+tgin-bench-tgin-1 134.01% 9.508MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 114.41% 9.156MiB / 62.79GiB
+tgin-bench-bench-1 236.28% 20.38MiB / 62.79GiB
+## 11:01:51 end webhook-tgin-1 upstream 5000 RPS (run 3/3)
+## 11:01:51 start webhook-tgin-1 v1 5000 RPS (run 3/3)
+== 11:01:52
+== 11:02:00
+tgin-bench-tgin-1 0.05% 18.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.176MiB / 62.79GiB
+tgin-bench-bench-1 3.06% 3.426MiB / 62.79GiB
+== 11:02:09
+tgin-bench-tgin-1 120.75% 40.54MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 115.93% 12.23MiB / 62.79GiB
+tgin-bench-bench-1 224.94% 14.59MiB / 62.79GiB
+== 11:02:16
+tgin-bench-tgin-1 85.71% 40MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 76.10% 12.46MiB / 62.79GiB
+tgin-bench-bench-1 192.16% 17.2MiB / 62.79GiB
+== 11:02:24
+tgin-bench-tgin-1 96.36% 39.97MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 90.20% 12.62MiB / 62.79GiB
+tgin-bench-bench-1 202.09% 17.62MiB / 62.79GiB
+== 11:02:32
+tgin-bench-tgin-1 94.51% 40.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 86.51% 12.22MiB / 62.79GiB
+tgin-bench-bench-1 202.48% 23.65MiB / 62.79GiB
+## 11:02:36 end webhook-tgin-1 v1 5000 RPS (run 3/3)
+## 11:02:36 start webhook-tgin-3 upstream 5000 RPS (run 3/3)
+== 11:02:39
+== 11:02:47
+tgin-bench-webhook_bot2-1 0.28% 3.781MiB / 62.79GiB
+tgin-bench-tgin-1 4.77% 7.113MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.27% 3.281MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 34.77% 3.719MiB / 62.79GiB
+tgin-bench-bench-1 6.38% 6.383MiB / 62.79GiB
+== 11:02:55
+tgin-bench-webhook_bot2-1 31.90% 4.637MiB / 62.79GiB
+tgin-bench-tgin-1 83.93% 8.801MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 27.66% 4.598MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 27.80% 3.969MiB / 62.79GiB
+tgin-bench-bench-1 192.09% 11.15MiB / 62.79GiB
+== 11:03:02
+tgin-bench-webhook_bot2-1 34.06% 8.742MiB / 62.79GiB
+tgin-bench-tgin-1 95.87% 21.87MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 34.04% 9.633MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 37.59% 9.434MiB / 62.79GiB
+tgin-bench-bench-1 209.08% 22.69MiB / 62.79GiB
+== 11:03:10
+tgin-bench-webhook_bot2-1 30.24% 9.25MiB / 62.79GiB
+tgin-bench-tgin-1 95.52% 22.97MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 34.43% 10.29MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 34.27% 10.13MiB / 62.79GiB
+tgin-bench-bench-1 203.03% 27.61MiB / 62.79GiB
+== 11:03:18
+## 11:03:20 end webhook-tgin-3 upstream 5000 RPS (run 3/3)
+## 11:03:20 start webhook-tgin-3 v1 5000 RPS (run 3/3)
+== 11:03:29
+tgin-bench-tgin-1 0.03% 18.26MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 4.03% 3.168MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 3.68% 3.156MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 3.10% 3.16MiB / 62.79GiB
+tgin-bench-bench-1 3.35% 3.426MiB / 62.79GiB
+== 11:03:39
+tgin-bench-tgin-1 84.56% 37.55MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 32.80% 4.695MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 30.16% 5.582MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 26.71% 4.836MiB / 62.79GiB
+tgin-bench-bench-1 190.74% 12.06MiB / 62.79GiB
+== 11:03:47
+tgin-bench-tgin-1 115.78% 37.89MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 39.99% 4.477MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 36.28% 4.898MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 38.75% 5.141MiB / 62.79GiB
+tgin-bench-bench-1 217.23% 13.55MiB / 62.79GiB
+== 11:03:55
+tgin-bench-tgin-1 113.73% 42.46MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 38.62% 5.359MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 38.72% 5.18MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 38.79% 5.023MiB / 62.79GiB
+tgin-bench-bench-1 215.18% 15.34MiB / 62.79GiB
+== 11:04:02
+tgin-bench-tgin-1 94.10% 44.98MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 30.33% 4.914MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 29.65% 5.441MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 30.09% 5.121MiB / 62.79GiB
+tgin-bench-bench-1 199.32% 19.52MiB / 62.79GiB
+## 11:04:07 end webhook-tgin-3 v1 5000 RPS (run 3/3)
+## 11:04:07 start longpoll-direct-1 upstream 5000 RPS (run 3/3)
+== 11:04:10
+== 11:04:17
+tgin-bench-longpull_bot_direct-1 89.86% 5.539MiB / 62.79GiB
+tgin-bench-bench-1 194.63% 7.816MiB / 62.79GiB
+== 11:04:25
+tgin-bench-longpull_bot_direct-1 86.48% 6.781MiB / 62.79GiB
+tgin-bench-bench-1 188.37% 10.01MiB / 62.79GiB
+== 11:04:33
+tgin-bench-longpull_bot_direct-1 80.04% 7.727MiB / 62.79GiB
+tgin-bench-bench-1 184.79% 12.22MiB / 62.79GiB
+== 11:04:41
+tgin-bench-longpull_bot_direct-1 82.49% 14.48MiB / 62.79GiB
+tgin-bench-bench-1 183.58% 18.79MiB / 62.79GiB
+== 11:04:48
+## 11:04:49 end longpoll-direct-1 upstream 5000 RPS (run 3/3)
+## 11:04:49 start longpoll-tgin-1 upstream 5000 RPS (run 3/3)
+tgin-bench-bench-1 96.39% 16.61MiB / 62.79GiB
+== 11:04:56
+tgin-bench-tgin-1 0.02% 4.895MiB / 62.79GiB
+tgin-bench-bench-1 2.51% 3.527MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.219MiB / 62.79GiB
+== 11:05:05
+tgin-bench-longpull_bot1-1 54.83% 6.07MiB / 62.79GiB
+tgin-bench-tgin-1 37.95% 6.242MiB / 62.79GiB
+tgin-bench-bench-1 144.15% 8.512MiB / 62.79GiB
+== 11:05:12
+tgin-bench-longpull_bot1-1 54.99% 7.477MiB / 62.79GiB
+tgin-bench-tgin-1 39.15% 5.855MiB / 62.79GiB
+tgin-bench-bench-1 147.43% 11.67MiB / 62.79GiB
+== 11:05:20
+tgin-bench-longpull_bot1-1 82.89% 7.781MiB / 62.79GiB
+tgin-bench-tgin-1 52.55% 6.156MiB / 62.79GiB
+tgin-bench-bench-1 162.87% 11.89MiB / 62.79GiB
+== 11:05:28
+tgin-bench-longpull_bot1-1 61.65% 8.875MiB / 62.79GiB
+tgin-bench-tgin-1 42.07% 6.684MiB / 62.79GiB
+tgin-bench-bench-1 148.20% 14.79MiB / 62.79GiB
+## 11:05:33 end longpoll-tgin-1 upstream 5000 RPS (run 3/3)
+## 11:05:33 start longpoll-tgin-1 v1 5000 RPS (run 3/3)
+== 11:05:35
+tgin-bench-bench-1 2.69% 12.68MiB / 62.79GiB
+== 11:05:43
+tgin-bench-longpull_bot1-1 0.00% 3.191MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.33MiB / 62.79GiB
+tgin-bench-bench-1 3.01% 3.449MiB / 62.79GiB
+== 11:05:51
+tgin-bench-longpull_bot1-1 86.53% 5.844MiB / 62.79GiB
+tgin-bench-tgin-1 80.14% 24.64MiB / 62.79GiB
+tgin-bench-bench-1 191.63% 8.824MiB / 62.79GiB
+== 11:06:01
+tgin-bench-longpull_bot1-1 93.74% 6.91MiB / 62.79GiB
+tgin-bench-tgin-1 85.50% 24.86MiB / 62.79GiB
+tgin-bench-bench-1 191.54% 11.26MiB / 62.79GiB
+== 11:06:09
+tgin-bench-longpull_bot1-1 117.08% 8.07MiB / 62.79GiB
+tgin-bench-tgin-1 82.67% 24.52MiB / 62.79GiB
+tgin-bench-bench-1 207.54% 12.78MiB / 62.79GiB
+## 11:06:20 end longpoll-tgin-1 v1 5000 RPS (run 3/3)
+## 11:06:20 start longpoll-tgin-3 upstream 5000 RPS (run 3/3)
+== 11:06:24
+tgin-bench-bench-1 2.34% 3.379MiB / 62.79GiB
+== 11:06:33
+tgin-bench-longpull_bot2-1 0.18% 3.289MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 29.91% 4.062MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 30.33% 4.07MiB / 62.79GiB
+tgin-bench-tgin-1 49.27% 6.203MiB / 62.79GiB
+tgin-bench-bench-1 129.39% 10.58MiB / 62.79GiB
+== 11:06:40
+tgin-bench-longpull_bot2-1 35.63% 5.012MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 36.40% 4.637MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 34.87% 4.566MiB / 62.79GiB
+tgin-bench-tgin-1 64.93% 6.094MiB / 62.79GiB
+tgin-bench-bench-1 158.87% 9.52MiB / 62.79GiB
+== 11:06:49
+tgin-bench-longpull_bot2-1 40.57% 5.641MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 40.14% 5.629MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 40.53% 5.199MiB / 62.79GiB
+tgin-bench-tgin-1 74.95% 6.918MiB / 62.79GiB
+tgin-bench-bench-1 163.30% 11.62MiB / 62.79GiB
+== 11:06:57
+tgin-bench-longpull_bot2-1 39.08% 5.473MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 34.50% 5.594MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 39.08% 5.516MiB / 62.79GiB
+tgin-bench-tgin-1 64.70% 7.41MiB / 62.79GiB
+tgin-bench-bench-1 159.09% 15.77MiB / 62.79GiB
+== 11:07:06
+## 11:07:06 end longpoll-tgin-3 upstream 5000 RPS (run 3/3)
+## 11:07:06 start longpoll-tgin-3 v1 5000 RPS (run 3/3)
+tgin-bench-tgin-1 0.04% 6.668MiB / 62.79GiB
+tgin-bench-bench-1 3.24% 12.27MiB / 62.79GiB
+== 11:07:13
+tgin-bench-bench-1 3.52% 3.402MiB / 62.79GiB
+tgin-bench-tgin-1 0.06% 22.34MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 4.51% 3.215MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 3.27% 4.102MiB / 62.79GiB
+== 11:07:25
+tgin-bench-longpull_bot3-1 17.14% 3.941MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 16.62% 4.258MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 19.26% 3.793MiB / 62.79GiB
+tgin-bench-tgin-1 49.51% 27.07MiB / 62.79GiB
+tgin-bench-bench-1 113.43% 7.422MiB / 62.79GiB
+== 11:07:33
+tgin-bench-longpull_bot3-1 35.12% 4.613MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 34.20% 4.273MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 33.02% 5.059MiB / 62.79GiB
+tgin-bench-tgin-1 87.49% 27.07MiB / 62.79GiB
+tgin-bench-bench-1 182.20% 9.566MiB / 62.79GiB
+== 11:07:40
+tgin-bench-longpull_bot3-1 41.85% 5.281MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 36.01% 4.508MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 34.70% 5.637MiB / 62.79GiB
+tgin-bench-tgin-1 105.35% 27.3MiB / 62.79GiB
+tgin-bench-bench-1 197.86% 12.2MiB / 62.79GiB
+== 11:07:49
+tgin-bench-longpull_bot3-1 41.54% 6.867MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 37.08% 5.297MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 35.29% 6.648MiB / 62.79GiB
+tgin-bench-tgin-1 104.04% 29.02MiB / 62.79GiB
+tgin-bench-bench-1 200.13% 17.07MiB / 62.79GiB
+== 11:07:57
+## 11:07:58 end longpoll-tgin-3 v1 5000 RPS (run 3/3)
+## 11:07:58 start webhook-direct-1 upstream 10000 RPS (run 1/3)
+tgin-bench-longpull_bot3-1 0.00% 7.207MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 3.21% 6.012MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 3.00% 7.277MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 28.75MiB / 62.79GiB
+tgin-bench-bench-1 5.91% 14.5MiB / 62.79GiB
+== 11:08:05
+tgin-bench-bench-1 2.34% 3.406MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.137MiB / 62.79GiB
+== 11:08:14
+tgin-bench-webhook_bot1-1 127.81% 7.363MiB / 62.79GiB
+tgin-bench-bench-1 235.06% 13.13MiB / 62.79GiB
+== 11:08:22
+tgin-bench-webhook_bot1-1 138.68% 9.93MiB / 62.79GiB
+tgin-bench-bench-1 223.69% 21.04MiB / 62.79GiB
+== 11:08:30
+tgin-bench-webhook_bot1-1 161.97% 16.62MiB / 62.79GiB
+tgin-bench-bench-1 275.81% 25.33MiB / 62.79GiB
+== 11:08:37
+tgin-bench-webhook_bot1-1 114.88% 17.37MiB / 62.79GiB
+tgin-bench-bench-1 221.78% 32.47MiB / 62.79GiB
+## 11:08:42 end webhook-direct-1 upstream 10000 RPS (run 1/3)
+## 11:08:42 start webhook-tgin-1 upstream 10000 RPS (run 1/3)
+== 11:08:45
+tgin-bench-bench-1 2.54% 3.609MiB / 62.79GiB
+== 11:08:54
+tgin-bench-tgin-1 144.34% 5.816MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 134.60% 5.754MiB / 62.79GiB
+tgin-bench-bench-1 249.45% 11.09MiB / 62.79GiB
+== 11:09:01
+tgin-bench-tgin-1 179.93% 35.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 157.38% 37.38MiB / 62.79GiB
+tgin-bench-bench-1 273.76% 31.54MiB / 62.79GiB
+== 11:09:10
+tgin-bench-tgin-1 171.43% 35.5MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 137.34% 37.86MiB / 62.79GiB
+tgin-bench-bench-1 256.44% 34.86MiB / 62.79GiB
+== 11:09:18
+tgin-bench-tgin-1 157.95% 35.24MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 142.47% 37.87MiB / 62.79GiB
+tgin-bench-bench-1 257.63% 41.61MiB / 62.79GiB
+## 11:09:24 end webhook-tgin-1 upstream 10000 RPS (run 1/3)
+## 11:09:24 start webhook-tgin-1 v1 10000 RPS (run 1/3)
+== 11:09:25
+== 11:09:33
+tgin-bench-tgin-1 0.05% 18.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 3.13% 3.18MiB / 62.79GiB
+tgin-bench-bench-1 3.02% 3.445MiB / 62.79GiB
+== 11:09:40
+tgin-bench-tgin-1 180.04% 52.12MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 172.62% 13.17MiB / 62.79GiB
+tgin-bench-bench-1 290.99% 22.21MiB / 62.79GiB
+== 11:09:48
+tgin-bench-tgin-1 176.86% 53.12MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 156.48% 13.8MiB / 62.79GiB
+tgin-bench-bench-1 271.27% 26.54MiB / 62.79GiB
+== 11:09:56
+tgin-bench-tgin-1 148.13% 57.32MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 159.14% 15.53MiB / 62.79GiB
+tgin-bench-bench-1 246.70% 30.27MiB / 62.79GiB
+== 11:10:05
+tgin-bench-tgin-1 157.04% 58.69MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 147.64% 15.35MiB / 62.79GiB
+tgin-bench-bench-1 260.11% 36.64MiB / 62.79GiB
+## 11:10:08 end webhook-tgin-1 v1 10000 RPS (run 1/3)
+## 11:10:08 start webhook-tgin-3 upstream 10000 RPS (run 1/3)
+== 11:10:13
+tgin-bench-bench-1 2.59% 3.906MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.117MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.883MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.00% 3.129MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.125MiB / 62.79GiB
+== 11:10:21
+tgin-bench-webhook_bot1-1 63.22% 24.11MiB / 62.79GiB
+tgin-bench-tgin-1 176.71% 38.52MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 63.21% 9.074MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 62.95% 20.16MiB / 62.79GiB
+tgin-bench-bench-1 278.33% 31.48MiB / 62.79GiB
+== 11:10:29
+tgin-bench-webhook_bot1-1 56.90% 23.36MiB / 62.79GiB
+tgin-bench-tgin-1 176.70% 37.99MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 57.05% 8.84MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 57.11% 20.12MiB / 62.79GiB
+tgin-bench-bench-1 273.11% 37.4MiB / 62.79GiB
+== 11:10:37
+tgin-bench-webhook_bot1-1 73.75% 24.11MiB / 62.79GiB
+tgin-bench-tgin-1 215.75% 38.6MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 75.91% 9.789MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 77.20% 20.92MiB / 62.79GiB
+tgin-bench-bench-1 299.83% 40.67MiB / 62.79GiB
+== 11:10:44
+tgin-bench-webhook_bot1-1 73.12% 24.74MiB / 62.79GiB
+tgin-bench-tgin-1 218.72% 38.46MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 73.37% 9.613MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 73.89% 20.66MiB / 62.79GiB
+tgin-bench-bench-1 303.39% 48.84MiB / 62.79GiB
+## 11:10:50 end webhook-tgin-3 upstream 10000 RPS (run 1/3)
+## 11:10:50 start webhook-tgin-3 v1 10000 RPS (run 1/3)
+== 11:10:52
+tgin-bench-bench-1 2.14% 3.695MiB / 62.79GiB
+== 11:11:01
+tgin-bench-tgin-1 1.74% 20.27MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 28.54% 4.34MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 30.29% 3.875MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 28.59% 4.438MiB / 62.79GiB
+tgin-bench-bench-1 128.56% 8.883MiB / 62.79GiB
+== 11:11:09
+tgin-bench-tgin-1 165.10% 64.34MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 56.57% 5.32MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 57.04% 5.441MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 57.00% 5.781MiB / 62.79GiB
+tgin-bench-bench-1 265.94% 20.3MiB / 62.79GiB
+== 11:11:16
+tgin-bench-tgin-1 164.59% 70.2MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 59.59% 7.133MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 60.47% 7.059MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 60.61% 7.273MiB / 62.79GiB
+tgin-bench-bench-1 266.86% 29.19MiB / 62.79GiB
+== 11:11:24
+tgin-bench-tgin-1 159.82% 70.36MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 59.17% 7.145MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 56.15% 7.293MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 56.02% 6.82MiB / 62.79GiB
+tgin-bench-bench-1 262.45% 30.29MiB / 62.79GiB
+== 11:11:32
+tgin-bench-tgin-1 163.63% 70.66MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 59.99% 6.402MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 60.92% 7.316MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 60.70% 6.793MiB / 62.79GiB
+tgin-bench-bench-1 267.11% 36MiB / 62.79GiB
+## 11:11:35 end webhook-tgin-3 v1 10000 RPS (run 1/3)
+## 11:11:35 start longpoll-direct-1 upstream 10000 RPS (run 1/3)
+== 11:11:39
+tgin-bench-bench-1 2.61% 3.695MiB / 62.79GiB
+tgin-bench-longpull_bot_direct-1 0.00% 3.199MiB / 62.79GiB
+== 11:11:48
+tgin-bench-longpull_bot_direct-1 147.96% 15.83MiB / 62.79GiB
+tgin-bench-bench-1 220.71% 13.79MiB / 62.79GiB
+== 11:11:55
+tgin-bench-longpull_bot_direct-1 139.10% 17.54MiB / 62.79GiB
+tgin-bench-bench-1 220.12% 18.79MiB / 62.79GiB
+== 11:12:03
+tgin-bench-longpull_bot_direct-1 133.83% 19.27MiB / 62.79GiB
+tgin-bench-bench-1 215.64% 18.93MiB / 62.79GiB
+== 11:12:11
+tgin-bench-longpull_bot_direct-1 149.07% 19.07MiB / 62.79GiB
+tgin-bench-bench-1 232.50% 25.91MiB / 62.79GiB
+## 11:12:16 end longpoll-direct-1 upstream 10000 RPS (run 1/3)
+## 11:12:16 start longpoll-tgin-1 upstream 10000 RPS (run 1/3)
+== 11:12:19
+== 11:12:26
+tgin-bench-longpull_bot1-1 18.54% 7.109MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 4.902MiB / 62.79GiB
+tgin-bench-bench-1 34.72% 7.852MiB / 62.79GiB
+== 11:12:34
+tgin-bench-longpull_bot1-1 100.82% 10.64MiB / 62.79GiB
+tgin-bench-tgin-1 49.74% 7.371MiB / 62.79GiB
+tgin-bench-bench-1 172.57% 11.98MiB / 62.79GiB
+== 11:12:42
+tgin-bench-longpull_bot1-1 94.29% 22.59MiB / 62.79GiB
+tgin-bench-tgin-1 45.00% 9.637MiB / 62.79GiB
+tgin-bench-bench-1 171.89% 19.19MiB / 62.79GiB
+== 11:12:49
+tgin-bench-longpull_bot1-1 128.25% 22.86MiB / 62.79GiB
+tgin-bench-tgin-1 64.34% 9.137MiB / 62.79GiB
+tgin-bench-bench-1 187.41% 21.44MiB / 62.79GiB
+== 11:12:57
+tgin-bench-longpull_bot1-1 116.04% 23.69MiB / 62.79GiB
+tgin-bench-tgin-1 54.08% 9.137MiB / 62.79GiB
+tgin-bench-bench-1 174.59% 27.64MiB / 62.79GiB
+## 11:13:00 end longpoll-tgin-1 upstream 10000 RPS (run 1/3)
+## 11:13:00 start longpoll-tgin-1 v1 10000 RPS (run 1/3)
+== 11:13:05
+tgin-bench-bench-1 2.54% 24.51MiB / 62.79GiB
+== 11:13:13
+tgin-bench-longpull_bot1-1 2.58% 3.215MiB / 62.79GiB
+tgin-bench-tgin-1 0.06% 22.33MiB / 62.79GiB
+tgin-bench-bench-1 2.53% 3.434MiB / 62.79GiB
+== 11:13:21
+tgin-bench-longpull_bot1-1 136.32% 7.195MiB / 62.79GiB
+tgin-bench-tgin-1 101.06% 24.88MiB / 62.79GiB
+tgin-bench-bench-1 232.97% 9.25MiB / 62.79GiB
+== 11:13:28
+tgin-bench-longpull_bot1-1 133.60% 8.879MiB / 62.79GiB
+tgin-bench-tgin-1 93.95% 24.95MiB / 62.79GiB
+tgin-bench-bench-1 220.92% 15.36MiB / 62.79GiB
+== 11:13:36
+tgin-bench-longpull_bot1-1 130.04% 8.883MiB / 62.79GiB
+tgin-bench-tgin-1 91.76% 24.92MiB / 62.79GiB
+tgin-bench-bench-1 207.82% 15.29MiB / 62.79GiB
+== 11:13:44
+tgin-bench-longpull_bot1-1 131.87% 22.58MiB / 62.79GiB
+tgin-bench-tgin-1 100.23% 31.03MiB / 62.79GiB
+tgin-bench-bench-1 226.21% 28.36MiB / 62.79GiB
+## 11:13:51 end longpoll-tgin-1 v1 10000 RPS (run 1/3)
+## 11:13:51 start longpoll-tgin-3 upstream 10000 RPS (run 1/3)
+== 11:13:51
+tgin-bench-tgin-1 0.12% 30.5MiB / 62.79GiB
+tgin-bench-bench-1 3.96% 24.53MiB / 62.79GiB
+== 11:13:59
+tgin-bench-bench-1 2.41% 3.402MiB / 62.79GiB
+tgin-bench-tgin-1 0.22% 4.871MiB / 62.79GiB
+== 11:14:07
+tgin-bench-longpull_bot3-1 48.55% 5.246MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 44.22% 4.965MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 49.37% 5.301MiB / 62.79GiB
+tgin-bench-tgin-1 64.95% 6.652MiB / 62.79GiB
+tgin-bench-bench-1 173.62% 9.809MiB / 62.79GiB
+== 11:14:15
+tgin-bench-longpull_bot3-1 47.88% 6.188MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 48.43% 6.609MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 47.08% 6.609MiB / 62.79GiB
+tgin-bench-tgin-1 65.49% 7.648MiB / 62.79GiB
+tgin-bench-bench-1 176.21% 12.72MiB / 62.79GiB
+== 11:14:23
+tgin-bench-longpull_bot3-1 53.22% 7.375MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 52.75% 7.266MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 53.49% 7.484MiB / 62.79GiB
+tgin-bench-tgin-1 65.32% 8.609MiB / 62.79GiB
+tgin-bench-bench-1 180.72% 17.88MiB / 62.79GiB
+== 11:14:30
+tgin-bench-longpull_bot3-1 48.22% 7.406MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 42.66% 8.082MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 43.09% 7.207MiB / 62.79GiB
+tgin-bench-tgin-1 59.59% 8.371MiB / 62.79GiB
+tgin-bench-bench-1 163.91% 24.81MiB / 62.79GiB
+## 11:14:38 end longpoll-tgin-3 upstream 10000 RPS (run 1/3)
+## 11:14:38 start longpoll-tgin-3 v1 10000 RPS (run 1/3)
+== 11:14:38
+tgin-bench-tgin-1 0.05% 8.105MiB / 62.79GiB
+tgin-bench-bench-1 3.66% 21.53MiB / 62.79GiB
+== 11:14:46
+tgin-bench-bench-1 2.84% 3.426MiB / 62.79GiB
+tgin-bench-tgin-1 0.03% 22.34MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.199MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.191MiB / 62.79GiB
+== 11:14:54
+tgin-bench-longpull_bot3-1 2.71% 3.219MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.88% 3.258MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 2.84% 3.219MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.35MiB / 62.79GiB
+tgin-bench-bench-1 2.30% 3.574MiB / 62.79GiB
+== 11:15:02
+tgin-bench-longpull_bot3-1 54.16% 4.949MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 49.28% 5.246MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 52.09% 4.988MiB / 62.79GiB
+tgin-bench-tgin-1 119.45% 27.43MiB / 62.79GiB
+tgin-bench-bench-1 226.41% 11.69MiB / 62.79GiB
+== 11:15:10
+tgin-bench-longpull_bot3-1 57.32% 7.793MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 63.88% 7.617MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 65.16% 7.301MiB / 62.79GiB
+tgin-bench-tgin-1 118.74% 29.63MiB / 62.79GiB
+tgin-bench-bench-1 238.72% 16.96MiB / 62.79GiB
+== 11:15:17
+tgin-bench-longpull_bot3-1 54.72% 7.871MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 51.44% 8.184MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 52.13% 7.43MiB / 62.79GiB
+tgin-bench-tgin-1 120.36% 28.84MiB / 62.79GiB
+tgin-bench-bench-1 224.71% 17.55MiB / 62.79GiB
+== 11:15:25
+tgin-bench-longpull_bot3-1 65.10% 9.617MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 61.61% 10.12MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 62.90% 8.645MiB / 62.79GiB
+tgin-bench-tgin-1 100.08% 31.02MiB / 62.79GiB
+tgin-bench-bench-1 239.13% 26.26MiB / 62.79GiB
+## 11:15:29 end longpoll-tgin-3 v1 10000 RPS (run 1/3)
+## 11:15:29 start webhook-direct-1 upstream 10000 RPS (run 2/3)
+== 11:15:33
+== 11:15:41
+tgin-bench-webhook_bot1-1 137.84% 4.949MiB / 62.79GiB
+tgin-bench-bench-1 130.12% 8.785MiB / 62.79GiB
+== 11:15:49
+tgin-bench-webhook_bot1-1 144.17% 15.25MiB / 62.79GiB
+tgin-bench-bench-1 258.83% 23.44MiB / 62.79GiB
+== 11:15:57
+tgin-bench-webhook_bot1-1 155.15% 15.86MiB / 62.79GiB
+tgin-bench-bench-1 265.64% 26.95MiB / 62.79GiB
+== 11:16:04
+tgin-bench-webhook_bot1-1 165.22% 16.09MiB / 62.79GiB
+tgin-bench-bench-1 275.78% 33.75MiB / 62.79GiB
+== 11:16:12
+## 11:16:13 end webhook-direct-1 upstream 10000 RPS (run 2/3)
+## 11:16:13 start webhook-tgin-1 upstream 10000 RPS (run 2/3)
+tgin-bench-webhook_bot1-1 0.00% 19.97MiB / 62.79GiB
+tgin-bench-bench-1 3.32% 34.91MiB / 62.79GiB
+== 11:16:20
+tgin-bench-bench-1 2.31% 3.398MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.141MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 3.973MiB / 62.79GiB
+== 11:16:27
+tgin-bench-tgin-1 181.36% 23.07MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 155.05% 17.46MiB / 62.79GiB
+tgin-bench-bench-1 268.50% 20.27MiB / 62.79GiB
+== 11:16:35
+tgin-bench-tgin-1 172.26% 23.67MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 156.67% 18.32MiB / 62.79GiB
+tgin-bench-bench-1 269.06% 24.75MiB / 62.79GiB
+== 11:16:43
+tgin-bench-tgin-1 180.72% 33.74MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 159.04% 81.11MiB / 62.79GiB
+tgin-bench-bench-1 275.85% 54.28MiB / 62.79GiB
+== 11:16:51
+tgin-bench-tgin-1 172.37% 34.2MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 150.13% 82.12MiB / 62.79GiB
+tgin-bench-bench-1 261.83% 64.05MiB / 62.79GiB
+## 11:16:56 end webhook-tgin-1 upstream 10000 RPS (run 2/3)
+## 11:16:56 start webhook-tgin-1 v1 10000 RPS (run 2/3)
+== 11:16:58
+== 11:17:06
+tgin-bench-tgin-1 2.07% 20.29MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.195MiB / 62.79GiB
+tgin-bench-bench-1 2.43% 3.434MiB / 62.79GiB
+== 11:17:14
+tgin-bench-tgin-1 179.24% 69.55MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 174.11% 17.22MiB / 62.79GiB
+tgin-bench-bench-1 289.41% 27.16MiB / 62.79GiB
+== 11:17:22
+tgin-bench-tgin-1 169.64% 69.98MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 161.81% 17.64MiB / 62.79GiB
+tgin-bench-bench-1 262.16% 29.92MiB / 62.79GiB
+== 11:17:29
+tgin-bench-tgin-1 170.13% 69.57MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 161.79% 17.64MiB / 62.79GiB
+tgin-bench-bench-1 277.97% 29.8MiB / 62.79GiB
+== 11:17:37
+tgin-bench-tgin-1 174.02% 76.4MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 175.29% 20.54MiB / 62.79GiB
+tgin-bench-bench-1 280.19% 42.24MiB / 62.79GiB
+## 11:17:41 end webhook-tgin-1 v1 10000 RPS (run 2/3)
+## 11:17:41 start webhook-tgin-3 upstream 10000 RPS (run 2/3)
+== 11:17:45
+tgin-bench-bench-1 0.00% 0B / 0B
+tgin-bench-bench-1 3.08% 3.676MiB / 62.79GiB
+== 11:17:54
+tgin-bench-webhook_bot2-1 98.14% 22.25MiB / 62.79GiB
+tgin-bench-tgin-1 224.12% 34.62MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 76.06% 25.16MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 75.36% 27.79MiB / 62.79GiB
+tgin-bench-bench-1 301.79% 35.71MiB / 62.79GiB
+== 11:18:01
+tgin-bench-webhook_bot2-1 70.20% 26.46MiB / 62.79GiB
+tgin-bench-tgin-1 213.75% 35.71MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 72.27% 26.31MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 70.69% 28.5MiB / 62.79GiB
+tgin-bench-bench-1 303.52% 42.91MiB / 62.79GiB
+== 11:18:09
+tgin-bench-webhook_bot2-1 60.07% 26.2MiB / 62.79GiB
+tgin-bench-tgin-1 197.21% 35.54MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 59.78% 26.54MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 71.42% 29.01MiB / 62.79GiB
+tgin-bench-bench-1 289.37% 48.14MiB / 62.79GiB
+== 11:18:17
+tgin-bench-webhook_bot2-1 67.39% 26.74MiB / 62.79GiB
+tgin-bench-tgin-1 206.11% 36.45MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 72.93% 28MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 68.60% 29.83MiB / 62.79GiB
+tgin-bench-bench-1 293.41% 57.45MiB / 62.79GiB
+== 11:18:25
+## 11:18:25 end webhook-tgin-3 upstream 10000 RPS (run 2/3)
+## 11:18:25 start webhook-tgin-3 v1 10000 RPS (run 2/3)
+tgin-bench-bench-1 8.86% 51.11MiB / 62.79GiB
+== 11:18:33
+tgin-bench-bench-1 2.92% 3.43MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.125MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 0.00% 3.125MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.125MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 18.27MiB / 62.79GiB
+== 11:18:40
+tgin-bench-webhook_bot2-1 60.14% 4.508MiB / 62.79GiB
+tgin-bench-tgin-1 168.33% 40.3MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 64.14% 5.84MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 63.80% 5.703MiB / 62.79GiB
+tgin-bench-bench-1 278.43% 19.18MiB / 62.79GiB
+== 11:18:48
+tgin-bench-webhook_bot2-1 68.52% 7.18MiB / 62.79GiB
+tgin-bench-tgin-1 175.41% 50.69MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 64.05% 5.578MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 63.81% 5.676MiB / 62.79GiB
+tgin-bench-bench-1 282.26% 22.05MiB / 62.79GiB
+== 11:18:56
+tgin-bench-webhook_bot2-1 63.67% 6.352MiB / 62.79GiB
+tgin-bench-tgin-1 175.69% 50.14MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 66.58% 6.355MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 67.09% 5.914MiB / 62.79GiB
+tgin-bench-bench-1 280.25% 24.79MiB / 62.79GiB
+== 11:19:03
+tgin-bench-webhook_bot2-1 62.26% 6.613MiB / 62.79GiB
+tgin-bench-tgin-1 179.15% 50.39MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 63.40% 6.387MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 63.12% 6.012MiB / 62.79GiB
+tgin-bench-bench-1 273.25% 31.92MiB / 62.79GiB
+== 11:19:11
+## 11:19:12 end webhook-tgin-3 v1 10000 RPS (run 2/3)
+## 11:19:12 start longpoll-direct-1 upstream 10000 RPS (run 2/3)
+tgin-bench-bench-1 3.27% 28.52MiB / 62.79GiB
+== 11:19:19
+tgin-bench-longpull_bot_direct-1 0.00% 3.18MiB / 62.79GiB
+tgin-bench-bench-1 2.54% 3.445MiB / 62.79GiB
+== 11:19:27
+tgin-bench-longpull_bot_direct-1 125.48% 6.699MiB / 62.79GiB
+tgin-bench-bench-1 216.44% 11.25MiB / 62.79GiB
+== 11:19:34
+tgin-bench-longpull_bot_direct-1 124.01% 6.566MiB / 62.79GiB
+tgin-bench-bench-1 213.94% 15.52MiB / 62.79GiB
+== 11:19:42
+tgin-bench-longpull_bot_direct-1 126.89% 16.15MiB / 62.79GiB
+tgin-bench-bench-1 211.37% 18.29MiB / 62.79GiB
+== 11:19:50
+tgin-bench-longpull_bot_direct-1 129.33% 17.23MiB / 62.79GiB
+tgin-bench-bench-1 211.48% 25.39MiB / 62.79GiB
+## 11:19:54 end longpoll-direct-1 upstream 10000 RPS (run 2/3)
+## 11:19:54 start longpoll-tgin-1 upstream 10000 RPS (run 2/3)
+== 11:19:57
+tgin-bench-bench-1 2.79% 3.395MiB / 62.79GiB
+tgin-bench-tgin-1 0.16% 4.875MiB / 62.79GiB
+== 11:20:07
+tgin-bench-longpull_bot1-1 77.38% 8.426MiB / 62.79GiB
+tgin-bench-tgin-1 41.07% 7.223MiB / 62.79GiB
+tgin-bench-bench-1 161.22% 9.832MiB / 62.79GiB
+== 11:20:15
+tgin-bench-longpull_bot1-1 80.08% 12.97MiB / 62.79GiB
+tgin-bench-tgin-1 42.37% 6.938MiB / 62.79GiB
+tgin-bench-bench-1 164.91% 13.02MiB / 62.79GiB
+== 11:20:22
+tgin-bench-longpull_bot1-1 80.99% 12.59MiB / 62.79GiB
+tgin-bench-tgin-1 39.94% 7.211MiB / 62.79GiB
+tgin-bench-bench-1 158.74% 17MiB / 62.79GiB
+== 11:20:30
+tgin-bench-longpull_bot1-1 81.28% 13.52MiB / 62.79GiB
+tgin-bench-tgin-1 38.22% 7.543MiB / 62.79GiB
+tgin-bench-bench-1 159.41% 23.39MiB / 62.79GiB
+== 11:20:38
+## 11:20:38 end longpoll-tgin-1 upstream 10000 RPS (run 2/3)
+## 11:20:38 start longpoll-tgin-1 v1 10000 RPS (run 2/3)
+tgin-bench-tgin-1 0.02% 7.051MiB / 62.79GiB
+tgin-bench-bench-1 2.79% 20.21MiB / 62.79GiB
+== 11:20:45
+tgin-bench-bench-1 3.14% 3.434MiB / 62.79GiB
+tgin-bench-tgin-1 0.03% 22.34MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.211MiB / 62.79GiB
+== 11:20:54
+tgin-bench-longpull_bot1-1 135.06% 6.695MiB / 62.79GiB
+tgin-bench-tgin-1 95.27% 26.65MiB / 62.79GiB
+tgin-bench-bench-1 218.50% 9.098MiB / 62.79GiB
+== 11:21:02
+tgin-bench-longpull_bot1-1 125.17% 7.812MiB / 62.79GiB
+tgin-bench-tgin-1 94.61% 26.65MiB / 62.79GiB
+tgin-bench-bench-1 222.97% 12.14MiB / 62.79GiB
+== 11:21:09
+tgin-bench-longpull_bot1-1 134.55% 7.855MiB / 62.79GiB
+tgin-bench-tgin-1 95.73% 26.92MiB / 62.79GiB
+tgin-bench-bench-1 219.57% 15.32MiB / 62.79GiB
+== 11:21:17
+tgin-bench-longpull_bot1-1 122.31% 11.51MiB / 62.79GiB
+tgin-bench-tgin-1 94.67% 28.69MiB / 62.79GiB
+tgin-bench-bench-1 217.26% 22.98MiB / 62.79GiB
+== 11:21:24
+## 11:21:25 end longpoll-tgin-1 v1 10000 RPS (run 2/3)
+## 11:21:25 start longpoll-tgin-3 upstream 10000 RPS (run 2/3)
+tgin-bench-tgin-1 0.05% 28.5MiB / 62.79GiB
+tgin-bench-bench-1 2.72% 19.95MiB / 62.79GiB
+== 11:21:32
+tgin-bench-bench-1 2.89% 3.457MiB / 62.79GiB
+tgin-bench-tgin-1 0.16% 4.871MiB / 62.79GiB
+== 11:21:41
+tgin-bench-longpull_bot1-1 51.25% 5.133MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 51.65% 5.684MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 51.72% 5.273MiB / 62.79GiB
+tgin-bench-tgin-1 65.79% 6.84MiB / 62.79GiB
+tgin-bench-bench-1 181.13% 9.41MiB / 62.79GiB
+== 11:21:48
+tgin-bench-longpull_bot1-1 51.48% 4.957MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 50.28% 5.207MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 48.00% 5.535MiB / 62.79GiB
+tgin-bench-tgin-1 66.23% 6.59MiB / 62.79GiB
+tgin-bench-bench-1 179.25% 15MiB / 62.79GiB
+== 11:21:56
+tgin-bench-longpull_bot1-1 51.50% 5.898MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 49.18% 5.438MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 49.69% 5.715MiB / 62.79GiB
+tgin-bench-tgin-1 66.71% 7.137MiB / 62.79GiB
+tgin-bench-bench-1 176.15% 15.34MiB / 62.79GiB
+== 11:22:04
+tgin-bench-longpull_bot1-1 46.54% 5.961MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 46.96% 5.789MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 41.54% 5.82MiB / 62.79GiB
+tgin-bench-tgin-1 58.81% 7.188MiB / 62.79GiB
+tgin-bench-bench-1 161.26% 22.07MiB / 62.79GiB
+== 11:22:11
+## 11:22:12 end longpoll-tgin-3 upstream 10000 RPS (run 2/3)
+## 11:22:12 start longpoll-tgin-3 v1 10000 RPS (run 2/3)
+tgin-bench-tgin-1 0.05% 6.695MiB / 62.79GiB
+tgin-bench-bench-1 3.03% 19.22MiB / 62.79GiB
+== 11:22:19
+tgin-bench-bench-1 2.76% 3.48MiB / 62.79GiB
+tgin-bench-tgin-1 0.02% 22.34MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.207MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.176MiB / 62.79GiB
+== 11:22:28
+tgin-bench-longpull_bot3-1 3.19% 3.609MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.207MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.51% 3.289MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.35MiB / 62.79GiB
+tgin-bench-bench-1 2.81% 3.453MiB / 62.79GiB
+== 11:22:35
+tgin-bench-longpull_bot3-1 50.79% 5.371MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 52.29% 5.688MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 54.18% 5.238MiB / 62.79GiB
+tgin-bench-tgin-1 120.97% 27.02MiB / 62.79GiB
+tgin-bench-bench-1 226.47% 11.47MiB / 62.79GiB
+== 11:22:43
+tgin-bench-longpull_bot3-1 52.23% 6.18MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 51.95% 6.422MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 56.78% 5.523MiB / 62.79GiB
+tgin-bench-tgin-1 124.12% 27.57MiB / 62.79GiB
+tgin-bench-bench-1 234.00% 15.24MiB / 62.79GiB
+== 11:22:51
+tgin-bench-longpull_bot3-1 51.56% 6.633MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 54.26% 6.68MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 55.86% 5.445MiB / 62.79GiB
+tgin-bench-tgin-1 126.47% 27.11MiB / 62.79GiB
+tgin-bench-bench-1 238.34% 15.58MiB / 62.79GiB
+== 11:22:58
+tgin-bench-longpull_bot3-1 60.52% 7.004MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 59.23% 7.105MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 60.77% 5.457MiB / 62.79GiB
+tgin-bench-tgin-1 126.52% 27.59MiB / 62.79GiB
+tgin-bench-bench-1 235.97% 23.24MiB / 62.79GiB
+## 11:23:03 end longpoll-tgin-3 v1 10000 RPS (run 2/3)
+## 11:23:03 start webhook-direct-1 upstream 10000 RPS (run 3/3)
+== 11:23:06
+== 11:23:14
+tgin-bench-webhook_bot1-1 5.40% 5.336MiB / 62.79GiB
+tgin-bench-bench-1 11.07% 8.875MiB / 62.79GiB
+== 11:23:21
+tgin-bench-webhook_bot1-1 124.52% 7.504MiB / 62.79GiB
+tgin-bench-bench-1 229.87% 16.71MiB / 62.79GiB
+== 11:23:29
+tgin-bench-webhook_bot1-1 117.49% 8.523MiB / 62.79GiB
+tgin-bench-bench-1 230.40% 19.27MiB / 62.79GiB
+== 11:23:37
+tgin-bench-webhook_bot1-1 122.59% 9.422MiB / 62.79GiB
+tgin-bench-bench-1 225.68% 23.61MiB / 62.79GiB
+== 11:23:44
+## 11:23:47 end webhook-direct-1 upstream 10000 RPS (run 3/3)
+tgin-bench-webhook_bot1-1 123.96% 8.434MiB / 62.79GiB
+tgin-bench-bench-1 225.68% 27.35MiB / 62.79GiB
+## 11:23:47 start webhook-tgin-1 upstream 10000 RPS (run 3/3)
+== 11:23:52
+tgin-bench-bench-1 2.28% 3.422MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.121MiB / 62.79GiB
+tgin-bench-tgin-1 0.00% 3.984MiB / 62.79GiB
+== 11:24:00
+tgin-bench-tgin-1 166.63% 29.65MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 173.00% 41.92MiB / 62.79GiB
+tgin-bench-bench-1 254.68% 36.03MiB / 62.79GiB
+== 11:24:08
+tgin-bench-tgin-1 187.73% 31.8MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 177.50% 45.54MiB / 62.79GiB
+tgin-bench-bench-1 279.21% 39.51MiB / 62.79GiB
+== 11:24:16
+tgin-bench-tgin-1 159.03% 32.59MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 141.28% 47MiB / 62.79GiB
+tgin-bench-bench-1 255.87% 40.84MiB / 62.79GiB
+== 11:24:23
+tgin-bench-tgin-1 178.40% 32.56MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 155.12% 46.61MiB / 62.79GiB
+tgin-bench-bench-1 270.02% 48.13MiB / 62.79GiB
+## 11:24:29 end webhook-tgin-1 upstream 10000 RPS (run 3/3)
+## 11:24:29 start webhook-tgin-1 v1 10000 RPS (run 3/3)
+== 11:24:31
+== 11:24:39
+tgin-bench-tgin-1 0.03% 18.25MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.176MiB / 62.79GiB
+tgin-bench-bench-1 2.29% 3.438MiB / 62.79GiB
+== 11:24:46
+tgin-bench-tgin-1 157.87% 29.85MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 156.45% 5.965MiB / 62.79GiB
+tgin-bench-bench-1 272.01% 11.01MiB / 62.79GiB
+== 11:24:54
+tgin-bench-tgin-1 167.70% 35.94MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 167.11% 7.824MiB / 62.79GiB
+tgin-bench-bench-1 279.54% 17.51MiB / 62.79GiB
+== 11:25:02
+tgin-bench-tgin-1 153.47% 38.38MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 158.57% 7.309MiB / 62.79GiB
+tgin-bench-bench-1 257.93% 17.93MiB / 62.79GiB
+== 11:25:10
+tgin-bench-tgin-1 168.61% 66.71MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 146.11% 11.81MiB / 62.79GiB
+tgin-bench-bench-1 257.10% 32.61MiB / 62.79GiB
+## 11:25:15 end webhook-tgin-1 v1 10000 RPS (run 3/3)
+## 11:25:15 start webhook-tgin-3 upstream 10000 RPS (run 3/3)
+== 11:25:17
+== 11:25:25
+tgin-bench-tgin-1 110.69% 9.883MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 0.00% 3.152MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 41.18% 4.125MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 0.00% 3.16MiB / 62.79GiB
+tgin-bench-bench-1 181.25% 8.898MiB / 62.79GiB
+== 11:25:32
+tgin-bench-tgin-1 165.08% 9.434MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 55.27% 4.355MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 61.95% 4.07MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 55.08% 4.395MiB / 62.79GiB
+tgin-bench-bench-1 268.44% 12.85MiB / 62.79GiB
+== 11:25:40
+tgin-bench-tgin-1 156.55% 9.738MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 64.36% 4.777MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 64.26% 4.402MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 64.28% 4.496MiB / 62.79GiB
+tgin-bench-bench-1 279.46% 17.15MiB / 62.79GiB
+== 11:25:48
+tgin-bench-tgin-1 176.72% 23.81MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 62.30% 8.312MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 61.45% 7.922MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 61.33% 8.547MiB / 62.79GiB
+tgin-bench-bench-1 281.71% 27.59MiB / 62.79GiB
+== 11:25:55
+tgin-bench-tgin-1 178.61% 23.44MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 60.71% 8.355MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 60.05% 9.199MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 61.35% 8.641MiB / 62.79GiB
+tgin-bench-bench-1 275.96% 32.99MiB / 62.79GiB
+## 11:25:58 end webhook-tgin-3 upstream 10000 RPS (run 3/3)
+## 11:25:58 start webhook-tgin-3 v1 10000 RPS (run 3/3)
+== 11:26:03
+tgin-bench-bench-1 2.53% 3.961MiB / 62.79GiB
+== 11:26:11
+tgin-bench-tgin-1 2.01% 20.27MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 9.75% 4.809MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 11.46% 4.695MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 12.07% 4.332MiB / 62.79GiB
+tgin-bench-bench-1 41.11% 9.207MiB / 62.79GiB
+== 11:26:18
+tgin-bench-tgin-1 181.58% 55.09MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 62.00% 11.05MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 61.99% 9.195MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 62.30% 11.32MiB / 62.79GiB
+tgin-bench-bench-1 281.09% 30.15MiB / 62.79GiB
+== 11:26:26
+tgin-bench-tgin-1 176.81% 54.88MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 67.01% 10.92MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 64.09% 9.59MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 66.68% 11.57MiB / 62.79GiB
+tgin-bench-bench-1 283.89% 33.54MiB / 62.79GiB
+== 11:26:34
+tgin-bench-tgin-1 174.68% 54.71MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 66.42% 10.75MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 62.03% 9.441MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 61.71% 11.19MiB / 62.79GiB
+tgin-bench-bench-1 280.56% 34.01MiB / 62.79GiB
+== 11:26:42
+tgin-bench-tgin-1 168.27% 55.12MiB / 62.79GiB
+tgin-bench-webhook_bot1-1 60.02% 11.12MiB / 62.79GiB
+tgin-bench-webhook_bot3-1 60.69% 9.746MiB / 62.79GiB
+tgin-bench-webhook_bot2-1 59.81% 11.75MiB / 62.79GiB
+tgin-bench-bench-1 271.04% 40.28MiB / 62.79GiB
+## 11:26:45 end webhook-tgin-3 v1 10000 RPS (run 3/3)
+## 11:26:45 start longpoll-direct-1 upstream 10000 RPS (run 3/3)
+== 11:26:49
+tgin-bench-bench-1 2.78% 3.41MiB / 62.79GiB
+== 11:26:57
+tgin-bench-longpull_bot_direct-1 118.03% 5.816MiB / 62.79GiB
+tgin-bench-bench-1 207.91% 9.242MiB / 62.79GiB
+== 11:27:05
+tgin-bench-longpull_bot_direct-1 125.51% 8.082MiB / 62.79GiB
+tgin-bench-bench-1 213.58% 11.62MiB / 62.79GiB
+== 11:27:12
+tgin-bench-longpull_bot_direct-1 118.25% 7.734MiB / 62.79GiB
+tgin-bench-bench-1 229.30% 15MiB / 62.79GiB
+== 11:27:20
+tgin-bench-longpull_bot_direct-1 129.15% 9.742MiB / 62.79GiB
+tgin-bench-bench-1 214.22% 22.46MiB / 62.79GiB
+## 11:27:27 end longpoll-direct-1 upstream 10000 RPS (run 3/3)
+## 11:27:27 start longpoll-tgin-1 upstream 10000 RPS (run 3/3)
+== 11:27:27
+tgin-bench-bench-1 2.54% 19.52MiB / 62.79GiB
+== 11:27:35
+tgin-bench-tgin-1 0.03% 4.895MiB / 62.79GiB
+tgin-bench-bench-1 3.32% 3.418MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.207MiB / 62.79GiB
+== 11:27:43
+tgin-bench-longpull_bot1-1 79.07% 8.676MiB / 62.79GiB
+tgin-bench-tgin-1 40.70% 7.309MiB / 62.79GiB
+tgin-bench-bench-1 162.40% 10.53MiB / 62.79GiB
+== 11:27:50
+tgin-bench-longpull_bot1-1 76.83% 9.875MiB / 62.79GiB
+tgin-bench-tgin-1 39.06% 6.957MiB / 62.79GiB
+tgin-bench-bench-1 161.30% 15.39MiB / 62.79GiB
+== 11:27:58
+tgin-bench-longpull_bot1-1 79.74% 11.28MiB / 62.79GiB
+tgin-bench-tgin-1 41.78% 8.027MiB / 62.79GiB
+tgin-bench-bench-1 161.06% 15.61MiB / 62.79GiB
+== 11:28:06
+tgin-bench-longpull_bot1-1 82.66% 11.02MiB / 62.79GiB
+tgin-bench-tgin-1 41.62% 7.195MiB / 62.79GiB
+tgin-bench-bench-1 164.73% 22.41MiB / 62.79GiB
+## 11:28:11 end longpoll-tgin-1 upstream 10000 RPS (run 3/3)
+## 11:28:11 start longpoll-tgin-1 v1 10000 RPS (run 3/3)
+== 11:28:13
+tgin-bench-bench-1 3.32% 19.63MiB / 62.79GiB
+== 11:28:21
+tgin-bench-longpull_bot1-1 0.00% 3.199MiB / 62.79GiB
+tgin-bench-tgin-1 0.02% 22.33MiB / 62.79GiB
+tgin-bench-bench-1 2.85% 3.438MiB / 62.79GiB
+== 11:28:29
+tgin-bench-longpull_bot1-1 142.94% 6.465MiB / 62.79GiB
+tgin-bench-tgin-1 95.06% 26.64MiB / 62.79GiB
+tgin-bench-bench-1 224.22% 9.684MiB / 62.79GiB
+== 11:28:36
+tgin-bench-longpull_bot1-1 129.72% 8.031MiB / 62.79GiB
+tgin-bench-tgin-1 95.27% 26.93MiB / 62.79GiB
+tgin-bench-bench-1 215.45% 12.87MiB / 62.79GiB
+== 11:28:44
+tgin-bench-longpull_bot1-1 123.42% 8.777MiB / 62.79GiB
+tgin-bench-tgin-1 93.98% 26.68MiB / 62.79GiB
+tgin-bench-bench-1 212.08% 15.27MiB / 62.79GiB
+== 11:28:52
+tgin-bench-longpull_bot1-1 126.68% 14.9MiB / 62.79GiB
+tgin-bench-tgin-1 94.09% 26.95MiB / 62.79GiB
+tgin-bench-bench-1 212.14% 25.98MiB / 62.79GiB
+## 11:28:59 end longpoll-tgin-1 v1 10000 RPS (run 3/3)
+## 11:28:59 start longpoll-tgin-3 upstream 10000 RPS (run 3/3)
+== 11:28:59
+tgin-bench-bench-1 3.74% 22.07MiB / 62.79GiB
+== 11:29:07
+tgin-bench-tgin-1 0.17% 4.871MiB / 62.79GiB
+tgin-bench-bench-1 2.53% 3.41MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 0.00% 3.199MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 0.00% 3.199MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 0.00% 3.199MiB / 62.79GiB
+== 11:29:16
+tgin-bench-longpull_bot1-1 43.05% 5.836MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 50.15% 5.785MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 50.20% 6.074MiB / 62.79GiB
+tgin-bench-tgin-1 64.08% 7.262MiB / 62.79GiB
+tgin-bench-bench-1 173.59% 10.76MiB / 62.79GiB
+== 11:29:23
+tgin-bench-longpull_bot1-1 46.78% 5.52MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 45.76% 5.906MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 46.87% 5.734MiB / 62.79GiB
+tgin-bench-tgin-1 64.87% 7.539MiB / 62.79GiB
+tgin-bench-bench-1 173.65% 15.62MiB / 62.79GiB
+== 11:29:31
+tgin-bench-longpull_bot1-1 45.68% 5.891MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 45.86% 6.043MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 46.14% 5.867MiB / 62.79GiB
+tgin-bench-tgin-1 62.63% 8.078MiB / 62.79GiB
+tgin-bench-bench-1 172.40% 15.65MiB / 62.79GiB
+== 11:29:39
+tgin-bench-longpull_bot1-1 43.28% 5.703MiB / 62.79GiB
+tgin-bench-longpull_bot3-1 48.22% 6.129MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 43.57% 6.879MiB / 62.79GiB
+tgin-bench-tgin-1 63.61% 7.371MiB / 62.79GiB
+tgin-bench-bench-1 172.82% 22.92MiB / 62.79GiB
+## 11:29:44 end longpoll-tgin-3 upstream 10000 RPS (run 3/3)
+## 11:29:44 start longpoll-tgin-3 v1 10000 RPS (run 3/3)
+== 11:29:46
+tgin-bench-bench-1 2.94% 20MiB / 62.79GiB
+== 11:29:54
+tgin-bench-longpull_bot1-1 2.67% 3.254MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 2.95% 3.199MiB / 62.79GiB
+tgin-bench-tgin-1 0.04% 22.33MiB / 62.79GiB
+tgin-bench-bench-1 2.40% 3.578MiB / 62.79GiB
+== 11:30:02
+tgin-bench-longpull_bot3-1 12.25% 3.789MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 2.77% 3.223MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 11.18% 4.008MiB / 62.79GiB
+tgin-bench-tgin-1 31.01% 26.43MiB / 62.79GiB
+tgin-bench-bench-1 59.07% 10.04MiB / 62.79GiB
+== 11:30:09
+tgin-bench-longpull_bot3-1 47.78% 4.566MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 54.02% 5.887MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 53.47% 4.91MiB / 62.79GiB
+tgin-bench-tgin-1 119.21% 27.23MiB / 62.79GiB
+tgin-bench-bench-1 224.54% 11.37MiB / 62.79GiB
+== 11:30:17
+tgin-bench-longpull_bot3-1 49.87% 5.609MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 48.21% 7.867MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 48.34% 5.098MiB / 62.79GiB
+tgin-bench-tgin-1 119.88% 27.48MiB / 62.79GiB
+tgin-bench-bench-1 221.32% 15.66MiB / 62.79GiB
+== 11:30:24
+tgin-bench-longpull_bot3-1 48.01% 5.465MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 48.13% 7.41MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 53.37% 4.988MiB / 62.79GiB
+tgin-bench-tgin-1 119.68% 26.64MiB / 62.79GiB
+tgin-bench-bench-1 223.45% 16.39MiB / 62.79GiB
+== 11:30:32
+tgin-bench-longpull_bot3-1 54.72% 6.141MiB / 62.79GiB
+tgin-bench-longpull_bot1-1 51.11% 7.238MiB / 62.79GiB
+tgin-bench-longpull_bot2-1 52.60% 5.484MiB / 62.79GiB
+tgin-bench-tgin-1 120.97% 27.36MiB / 62.79GiB
+tgin-bench-bench-1 226.39% 22.81MiB / 62.79GiB
+## 11:30:35 end longpoll-tgin-3 v1 10000 RPS (run 3/3)
+== 11:30:40
