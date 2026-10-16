@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rerun the invalid runs of a matrix until every point has RUNS valid runs
 # per engine. A run is invalid when the generator fell behind its schedule:
-# lag_p99_ms above MAX_LAG_MS (0.5; undisturbed runs show 0.02-0.08).
+# lag_p99_ms above MAX_LAG_MS (0.5; undisturbed runs show mostly 0.025-0.105 ms).
 #
 #   ./rerun-invalid.sh results/<run_id>.csv
 #

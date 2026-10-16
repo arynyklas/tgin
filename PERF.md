@@ -57,7 +57,7 @@ CSV columns (`tests/performance/results/*.csv`):
 | `unreceived` | Sent but not answered by the end of the completion wait. |
 | `duplicate_replies` | Further answers to an already answered update (0 in every run). |
 | `dropped_by_generator` | Webhook sends never issued because 10 000 requests were already in flight. |
-| `lag_p99_ms` | p99 of how late the generator handed updates off. Undisturbed runs are 0.02–0.10 ms. |
+| `lag_p99_ms` | p99 of how late the generator handed updates off. In the gate set, 86 of the 90 valid runs are 0.025–0.105 ms (the other four 0.195–0.498 ms). |
 
 Alongside each CSV, `<run_id>.log` holds every run's counter summary (sent, received, errors, lag, completion wait, `getUpdates` calls) and `<run_id>.stats.log` a `docker stats` sample of the whole stack every 5 s, with the start and end of each run marked.
 
@@ -66,7 +66,7 @@ Alongside each CSV, `<run_id>.log` holds every run's counter summary (sent, rece
 - **Throughput.** 1.0's `delivered_rps` ≥ 0.2's — except that the requirement is met outright when, in every run of both engines, `unreceived` and `dropped_by_generator` are 0: both engines then delivered every update, and `delivered_rps` differs only by the jitter of the last answer. That is the case at every point below.
 - **Latency.** 1.0's `p99_ms` ≤ 1.2 × 0.2's.
 
-**Valid runs.** A run whose generator fell behind its schedule (`lag_p99_ms` above 0.5 ms; undisturbed runs are 0.02–0.10 ms) measures the host, not the engine. Such runs are kept in the CSVs, listed below, and rerun (`./rerun-invalid.sh <csv>`) until each point has 3 valid runs per engine.
+**Valid runs.** A run whose generator fell behind its schedule (`lag_p99_ms` above 0.5 ms; undisturbed runs are mostly 0.025–0.105 ms) measures the host, not the engine. Such runs are kept in the CSVs, listed below, and rerun (`./rerun-invalid.sh <csv>`) until each point has 3 valid runs per engine.
 
 ## Machine
 
@@ -142,7 +142,7 @@ Medians of 3 valid runs of the same set; the bot answers the generator directly.
 | 50 000 | 49 999.57 / 0.13 / 39.68 ms | 49 999.41 / 0.23 / 0.79 ms |
 | 80 000 | 79 998.71 / 0.14 / 60.38 ms | 79 997.98 / 0.28 / 19.63 ms |
 
-One bot process answers every update up to 80 000 per second, eight times the highest rate in the matrix, so the bots never set the numbers above. (Beyond 20 000 RPS the tail grows because the generator and the bot together saturate the host, not because updates are lost: nothing is unreceived.)
+One bot process answers every update up to 80 000 per second, eight times the highest rate in the matrix, so the bots never set the numbers above. Beyond 20 000 RPS the webhook and long-poll tails grow while nothing is lost (`unreceived` 0); the cause is not established — no `docker stats` were taken in these runs, and the webhook tail also fits the generator's 100-connection cap.
 
 ## Charts
 
@@ -196,11 +196,11 @@ Two defects showed up once the bots stopped being the bottleneck.
 
 **1. Nagle's algorithm on tgin's data plane (engine fix).** A pull response is written as one chunk per update, so a batch leaves tgin as several writes. With Nagle's algorithm on, every write after the first waits for the client's delayed ACK, up to 40 ms on Linux. `longpoll-tgin-1` at 10 000 RPS had p99 74–472 ms against 0.6 ms for 0.2 ([`20261015T2215Z-lp1-diag-v1`](tests/performance/results/20261015T2215Z-lp1-diag-v1.csv)). An instrumented build showed nothing slow inside tgin — not the `getUpdates` poll, the admission, the lease, or the handler ([`…-instrumented`](tests/performance/results/20261015T2225Z-lp1-diag-instrumented-v1.csv)) — while a packet capture showed the delay sitting between two segments of one response. tgin now sets `TCP_NODELAY` on every accepted connection, as 0.2's `axum_server` default acceptor did; with that, the same point is p99 0.65 ms.
 
-**2. Unbounded webhook connections in the generator (harness fix).** Telegram opens at most `max_connections` (≤ 100) connections to a webhook; the generator opened one per in-flight send, up to 10 000. In the runs whose p99 jumped to 30–470 ms — on **both** engines — the kernel counters show the cause: the generator opened thousands of connections at once (`TcpActiveOpens` 2 627 and 3 583 against 60–150 in the clean runs), tgin's listen backlog overflowed (`TcpExtListenOverflows` 2 048 for 0.2 and 3 004 for 1.0, `TcpExtTCPSynRetrans` 1 543 and 2 393), and the sends waited out a SYN retransmit. Clean runs show zeros throughout. The generator now keeps at most 100 requests on the wire; the rest of the in-flight budget waits for a connection, and the wait counts in latency.
+**2. Unbounded webhook connections in the generator (harness fix).** Telegram opens at most `max_connections` (≤ 100) connections to a webhook; the generator opened one per in-flight send, up to 10 000. In the pre-cap sets ([`20261015T2107Z-rust`](tests/performance/results/20261015T2107Z-rust.csv), [`20261015T2245Z-rust-nodelay`](tests/performance/results/20261015T2245Z-rust-nodelay.csv)) the webhook outliers had p99 of about 30–93 ms at the tgin points (161 ms at `webhook-direct-1`), on **both** engines. Kernel counters read from each container's network namespace (`/proc/net/snmp` and `/proc/net/netstat`) after six runs of `webhook-tgin-1` at 10 000 RPS show the cause. In the two outlier runs (p99 33.85 ms for 0.2, 98.43 ms for 1.0), the **generator's** namespace had `TcpActiveOpens` 2 627 and 3 583 (59–149 in the four clean runs) and `TcpExtTCPSynRetrans` 1 543 and 2 393; **tgin's** namespace had `TcpExtListenOverflows` 2 048 and 3 004 and `TcpExtTCPSynRetrans` 127 and 130 (SYN-ACK retransmits). The clean runs had zero overflows and zero retransmits in every namespace. So the generator opened thousands of connections at once, tgin's listen backlog overflowed, and the sends waited out a SYN retransmit. These snapshots are **unsaved diagnostics**: they were read during the investigation and are not committed. The generator now keeps at most 100 requests on the wire; the rest of the in-flight budget waits for a connection, and the wait counts in latency.
 
 ## `max_in_flight`
 
-A push consumer's `max_in_flight` (requests in flight over all its endpoints) stays at its default, **32**, in the scenario configs. With the Rust bots the default passes the gate at the webhook points ([`20261016T0131Z-rust-mif32`](tests/performance/results/20261016T0131Z-rust-mif32.csv), medians of 3):
+A push consumer's `max_in_flight` (requests in flight over all its endpoints) stays at its default, **32**, in the scenario configs. With the Rust bots, the default passed three of the four webhook points in a dedicated set ([`20261016T0131Z-rust-mif32`](tests/performance/results/20261016T0131Z-rust-mif32.csv), medians of 3). `webhook-tgin-3` at 5 000 RPS failed p99 there: 0.65 ms against 0.47 ms (1.38×; 1.0's runs 0.65, 0.51 and 44.48 ms, 0.2's 0.52, 0.47 and 0.46 ms, all valid). The same point with the same default passes in the gate set (0.49 against 0.47 ms), and the gate set's four webhook points all pass.
 
 | Point | RPS | 0.2 delivered / p99 | 1.0 delivered / p99 (`max_in_flight` 32) |
 |---|---:|---|---|
@@ -209,7 +209,7 @@ A push consumer's `max_in_flight` (requests in flight over all its endpoints) st
 | webhook-tgin-3 | 5 000 | 4 999.99 / 0.47 ms | 4 999.99 / 0.65 ms |
 | webhook-tgin-3 | 10 000 | 9 999.96 / 0.59 ms | 9 999.92 / 0.62 ms |
 
-With a **single-process** downstream (one aiogram bot), the value mattered a great deal: at 5 000 RPS one bot delivered 1 651 RPS with 256, 1 809 with the default 32, and 2 268 with 8 ([`20261015T1945Z-py-mif256-v1`](tests/performance/results/20261015T1945Z-py-mif256-v1.csv), [`…mif64`](tests/performance/results/20261015T1955Z-py-mif64-v1.csv), [`…mif8`](tests/performance/results/20261015T1955Z-py-mif8-v1.csv)). A bot that handles one request at a time is fastest with few requests in flight; tune `max_in_flight` to what the downstream can actually overlap.
+With a **single-process** downstream (one aiogram bot) at 5 000 RPS, the value mattered a great deal. Medians of 1.0's `delivered_rps`: 1 651 with 256 ([`20261015T1945Z-py-mif256-v1`](tests/performance/results/20261015T1945Z-py-mif256-v1.csv), 3 runs), 1 781 with 64 ([`20261015T1955Z-py-mif64-v1`](tests/performance/results/20261015T1955Z-py-mif64-v1.csv), 2 runs), 1 809 with the default 32 ([`20261015T1752Z-v1`](tests/performance/results/20261015T1752Z-v1.csv), 3 runs), and with 8, 2 280 ([`20261015T1955Z-py-mif8-v1`](tests/performance/results/20261015T1955Z-py-mif8-v1.csv), 2 runs) and 2 268 ([`20261015T2005Z-webhook-mif-v1`](tests/performance/results/20261015T2005Z-webhook-mif-v1.csv), 3 runs). A bot that handles one request at a time is fastest with few requests in flight; tune `max_in_flight` to what the downstream can actually overlap.
 
 ## Python bots
 
@@ -221,7 +221,7 @@ With a **single-process** downstream (one aiogram bot), the value mattered a gre
 
 What those runs showed, with the evidence they rest on:
 
-- **With one aiogram bot at 5 000 and 10 000 RPS, both engines are far past the bot's capacity** (the bot container at 110–118 % CPU, tgin at 29–74 %). There 1.0 answered updates that 0.2 dropped: 116 661 against 70 158 of 150 000 with one bot at 5 000 RPS, 275 141 against 200 873 of 300 000 with three bots at 10 000 RPS. Those extra answers are updates that waited in the queue, which raises 1.0's p50 and p99 (36.1 s against 14.5 s at one bot, 5 000 RPS).
+- **With one aiogram bot at 5 000 and 10 000 RPS, both engines are far past the bot's capacity** (the bot container at 110–118 % CPU). tgin's container, in `20261015T1752Z.stats.log`: 1.0 at 0–30 % on long poll (mostly 1–3 %: its pull queue was full and it stopped fetching) and 0–82 % on webhook; 0.2 at 0–75 % on long poll and 0–84 % on webhook. There 1.0 answered updates that 0.2 dropped: 116 661 against 70 158 of 150 000 with one bot at 5 000 RPS, 275 141 against 200 873 of 300 000 with three bots at 10 000 RPS. Those extra answers are updates that waited in the queue, which raises 1.0's p50 and p99 (36.1 s against 14.5 s at one bot, 5 000 RPS).
 - **`longpoll-tgin-3` at 10 000 RPS**: 1.0 answered 4 587 per second against 0.2's 5 230, with the bots at 106–118 % CPU in both cases, i.e. about 12 % fewer answers per second from equally busy bots. The cause was never established; with the Rust bots the same point passes.
 - **`longpoll-tgin-3` at 5 000 RPS**: both engines delivered every update with p50 0.85 ms (0.2) against 0.87 ms (1.0), but the tails differed run to run (0.2: 3.21, 4.15, 197.50 ms; 1.0: 55.68, 83.52, 117.44 ms). Three runs per engine could not separate them. With the Rust bots the point is 0.50 ms on both engines.
 - **`webhook-tgin-1` at 1 000 RPS** failed on p99 in one set (8.24 ms against 1.46) and passed in a rerun of three runs each (1.47 against 2.33 ms). The bot ran at 45–84 % CPU — not saturated — and the generator did not stall in the failing run (`lag_p99_ms` 0.040). No component was identified as the cause; the point was simply noisy on both engines.
@@ -230,7 +230,7 @@ Those sets predate rulings R43 (the throughput rule above) and R45 (invalid runs
 
 ## Known limits of the harness
 
-- **Generator CPU.** The send loop spins one core from about 500 RPS up, and the generator container used 1.2–2.4 cores at 5 000–10 000 RPS. It shares the host with tgin and the bots, so a host stall shows up as generator lag; runs above 0.5 ms of `lag_p99_ms` are invalid and are rerun.
+- **Generator CPU.** The send loop spins one core from about 500 RPS up, and the generator container used about 1.7–3 cores at 5 000–10 000 RPS in the gate set (`20261016T0155Z-final.stats.log`; one invalid run peaked at 4.9 cores). It shares the host with tgin and the bots, so a host stall shows up as generator lag; runs above 0.5 ms of `lag_p99_ms` are invalid and are rerun.
 - **Long-poll `achieved_rps`** is always the target: a long-poll send only appends to the fake API's queue.
 - **`delivered_rps` under overload** is computed up to the last answer, which may come during the 30 s completion wait, so an engine that keeps and later delivers a backlog can report a lower rate than one that loses it. Read it together with `unreceived`.
 - **Webhook connections are capped at 100** (see above). A target that answers more slowly than 100 concurrent requests allow will show the wait in its latency rather than in `dropped_by_generator`.

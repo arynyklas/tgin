@@ -21,7 +21,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Admits a connection only while a permit is free; otherwise the connection
 /// is closed as soon as it is accepted. Admitted connections have
-/// `TCP_NODELAY` set.
+/// `TCP_NODELAY` set; if setting it fails, the connection is refused, as
+/// `axum_server`'s own acceptors do (on Linux it cannot fail on a live TCP
+/// socket).
 #[derive(Clone)]
 pub(crate) struct ConnLimit {
     permits: Arc<Semaphore>,
