@@ -442,14 +442,14 @@ async fn pull_alias_path_serves_queue() {
         &telegram,
         QUICK,
         "[{ to: [workers] }]",
-        r#"  workers: { pull: { aliases: ["/legacy/getUpdates", "/other/poll"] } }"#,
+        r#"  workers: { pull: { aliases: ["/bot1/getUpdates", "/other/poll"] } }"#,
     ))
     .await;
     app.deliver(&[(1, "one"), (2, "two")]).await;
 
     let first = app
         .http
-        .post(app.url("/legacy/getUpdates"))
+        .post(app.url("/bot1/getUpdates"))
         .json(&json!({ "limit": 1, "timeout": 0 }))
         .send()
         .await
@@ -1190,27 +1190,14 @@ fn scratch(test: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn legacy_file_flag_hint_exits_1() {
-    for args in [["-f", "tgin.ron"].as_slice(), &["--file=tgin.ron"]] {
-        let out = output(&mut tgin(args));
-        assert_eq!(out.code, Some(1), "{args:?}: {}", out.stderr);
-        assert!(
-            out.stderr.contains(
-                "tgin 1.0 reads YAML; convert with: tgin config migrate tgin.ron -o tgin.yaml"
-            ),
-            "{}",
-            out.stderr
-        );
-    }
-}
-
-#[test]
 fn usage_error_exits_64() {
     for args in [
         ["--bogus"].as_slice(),
         &["frobnicate"],
         &["config"],
         &["-c", "a.yaml", "config", "schema"],
+        &["-f", "x"],
+        &["--file=x"],
     ] {
         let out = output(&mut tgin(args));
         assert_eq!(out.code, Some(64), "{args:?}: {}", out.stderr);

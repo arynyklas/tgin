@@ -1,9 +1,8 @@
 # yaml-language-server: $schema=../../../schema/tgin.v1.schema.json
 #
 # One bot, three downstream instances: two poll tgin (pull), one receives
-# webhooks (push). Updates are shared round robin. From examples/simple:
-# made with `tgin config migrate tgin.ron -o config/tgin.yaml` from the 0.2
-# example; check it with `TOKEN=… TGIN_ADMIN_TOKEN=…
+# webhooks (push). Updates are shared round robin. From examples/simple,
+# check it with `TOKEN=… TGIN_ADMIN_TOKEN=…
 # TELEGRAM_API_URL=https://api.telegram.org tgin config validate
 # config/tgin.yaml` (every `${env:…}` must be set). docker-compose.yml
 # mounts this directory as /etc/tgin.
@@ -40,8 +39,8 @@ consumers:
   # Telegram's getUpdates.
   bot1:
     pull:
-      # Kept from migrate on purpose: when a bot is stopped its queue drops
-      # its oldest updates instead of pausing the source for every bot.
+      # When a bot is stopped, its queue drops its oldest updates instead of
+      # pausing the source for every bot.
       on_full: drop_oldest
   bot2:
     pull:
@@ -52,9 +51,7 @@ consumers:
     push:
       endpoints:
         - url: http://bot3:3001/bot
-      # Kept from migrate on purpose (as tgin 0.2 behaved): a full queue drops
-      # its oldest updates, so a stopped bot3 never stalls bot1 and bot2.
-      # Migrate's `retry: {max_attempts: 1}` is not kept: bot3 starts after
-      # tgin, and the default retries (backoff from 1 s) deliver the updates
-      # that arrive before it listens.
+      # A full queue drops its oldest updates, so a stopped bot3 never stalls
+      # bot1 and bot2. bot3 starts after tgin; the default retries (backoff
+      # from 1 s) deliver the updates that arrive before it listens.
       on_full: drop_oldest

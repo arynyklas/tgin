@@ -21,9 +21,6 @@ http-body.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-# Only for reading 0.2 configs (`migrate`): RON and 0.2's `${VAR}` placeholders.
-ron.workspace = true
-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tgin-botapi.workspace = true
@@ -41,7 +38,6 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
-serde-saphyr.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true
 wiremock.workspace = true

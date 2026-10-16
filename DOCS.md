@@ -1,6 +1,6 @@
 # tgin documentation
 
-This is the manual of tgin 1.0. The key-by-key reference of the config file is [docs/config-reference.md](docs/config-reference.md), generated from the config model. Moving from tgin 0.2: [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md).
+This is the manual of tgin 1.0. The key-by-key reference of the config file is [docs/config-reference.md](docs/config-reference.md), generated from the config model.
 
 ## Contents
 
@@ -94,7 +94,7 @@ Names of bots and consumers are 1 to 63 lowercase letters, digits and `-`, start
 
 **Push consumer** (`push`): `endpoints` (at least one: `url`, `secret_token`, `timeout` `10s`), `balance` (`round_robin`, `hash_chat` or `least_in_flight`), `max_in_flight` (`32`), `ordering` (`none`), `capacity` (`10000`), `capacity_bytes` (`64MiB`), `on_full` (`backpressure`), `retry` (`initial` `1s`, `max` `1m`, `max_attempts` `10`, `max_age` `1h`), `breaker` (`failure_threshold` `5`, `open_for` `30s`). An endpoint `timeout`, `retry.initial`, `retry.max`, `retry.max_age`, `breaker.open_for` and `server.header_read_timeout` of 0 would disable or break what they configure, and are config errors; `runtime.lame_duck`, `runtime.shutdown_grace` and `reload.drain_timeout` may be 0 (no lame duck, no drain).
 
-`max_in_flight` counts deliveries in progress over all of a consumer's endpoints, retries waiting included. With downstreams that handle requests concurrently, the default, 32, passed every webhook point of the benchmark gate. A downstream that handles one request at a time (a single bot process) can deliver more with a lower value: in the benchmarks, one aiogram process offered 5 000 updates/s took 1 809 updates/s with 32 and 2 268–2 280 with 8 ([PERF.md → `max_in_flight`](PERF.md#max_in_flight), which also lists the one point where 32 fell short in a separate set).
+`max_in_flight` counts deliveries in progress over all of a consumer's endpoints, retries waiting included. With downstreams that handle requests concurrently, the default, 32, delivered every update at every webhook point of the benchmarks. A downstream that handles one request at a time (a single bot process) can deliver more with a lower value: in benchmarks from an earlier session, before the load generator's 100-connection cap, one aiogram process offered 5 000 updates/s took 1 809 updates/s with 32 and 2 268–2 280 with 8 ([PERF.md → `max_in_flight`](PERF.md#max_in_flight)).
 
 ### Example
 
@@ -552,18 +552,14 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 | `tgin config validate <path>` | Check a config file; list every error and warning. |
 | `tgin config print <path>` | Print the config as JSON, defaults filled in (except a webhook's omitted `path`), secrets redacted. |
 | `tgin config schema` | Print the JSON Schema. |
-| `tgin config migrate <path> [-o PATH]` | Convert a tgin 0.2 RON config to YAML ([migration guide](docs/migrating-to-1.0.md)). |
 | `tgin admin …` | Call a running tgin's admin API ([`tgin admin`](#tgin-admin)). |
 | `tgin version` / `tgin --version` | Print the version (`tgin version` adds the commit when the build recorded one). |
-
-The 0.2 flag `-f/--file` is refused with a hint to run `tgin config migrate`.
 
 | Code | Meaning |
 |---|---|
 | 0 | Clean shutdown after a signal (also a signal during start-up), or a command that succeeded. |
-| 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), the 0.2 `-f` flag, or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
+| 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
 | 2 | Every source failed for good: Telegram rejected each long-poll bot's token and no webhook bot exists. |
-| 3 | `tgin config migrate` only: converted, with warnings to review (on stderr and at the top of the YAML). |
 | 64 | Malformed command line (unknown command or option, missing argument). |
 | 130 | A second shutdown signal cut the drain short. |
 
@@ -572,8 +568,7 @@ Updates lost at the end of a shutdown do not change the exit code; see `tgin_shu
 ## Further reading
 
 - [docs/config-reference.md](docs/config-reference.md) — every config key, type and default.
-- [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) — from tgin 0.2.
-- [PERF.md](PERF.md) — benchmarks against 0.2 and their method.
+- [PERF.md](PERF.md) — benchmarks against the original engine, and their method.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release.
 - [SECURITY.md](SECURITY.md) — reporting vulnerabilities, verifying releases.
 - [examples/simple](examples/simple) — a Compose stack with pull and push consumers.

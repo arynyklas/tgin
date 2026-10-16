@@ -87,7 +87,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       # `latest` goes only to the highest stable vX.Y.Z tag, so a patch for an
-      # older minor (0.2.x after 0.3.0) does not move it back. Prereleases such
+      # older minor (1.2.x after 1.3.0) does not move it back. Prereleases such
       # as v1.0.0-rc.1 never get it; `{{major}}.{{minor}}` skips them too.
       - name: Is this the newest stable release
         id: latest
