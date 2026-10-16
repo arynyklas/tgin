@@ -652,7 +652,7 @@ fn url_problem(path: &str) -> Option<&'static str> {
 /// What the Bot API gateway would serve at `path`, if anything: a first
 /// segment `bot<id>:<secret>` (a method path) or `/file/bot<id>:` (a file
 /// path). The gateway serves only token-shaped segments, so other `/bot…`
-/// paths, such as 0.2's `/bot1/getUpdates`, stay free.
+/// paths, such as `/bot1/getUpdates`, stay free.
 fn gateway_path(path: &str) -> Option<&'static str> {
     let rest = path.strip_prefix('/')?;
     let (rest, kind) = match rest.strip_prefix("file/") {
@@ -677,8 +677,8 @@ mod tests {
             "/a:b",
             "/vone/x",
             "/v1x",
-            // 0.2 long-poll paths; the gateway serves only token-shaped
-            // `bot<id>:<secret>` segments.
+            // Paths such as `/bot1/getUpdates`; the gateway serves only
+            // token-shaped `bot<id>:<secret>` segments.
             "/bot1/getUpdates",
             "/bot",
             "/bot/x",
