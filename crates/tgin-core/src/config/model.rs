@@ -120,7 +120,7 @@ pub struct Server {
     /// Most open connections.
     #[schemars(range(min = 1))]
     pub max_connections: At<usize>,
-    /// How long a client may take to send the request headers.
+    /// How long a client may take to send the request headers; above 0.
     pub header_read_timeout: At<HumanDuration>,
 }
 
@@ -169,7 +169,7 @@ pub struct Reload {
 pub struct Bot {
     /// Unique bot name, used in metrics and logs.
     pub name: At<Name>,
-    /// The bot token.
+    /// The bot token: only ASCII letters, digits, `:`, `_` and `-`.
     pub token: SecretText,
     /// Bot API base URL. Supports `${env:…}` and `${file:…}`.
     #[serde(default = "defaults::api_url")]
@@ -204,7 +204,10 @@ pub struct LongPoll {
     /// Updates per `getUpdates` call, 1 to 100.
     #[schemars(range(min = 1, max = 100))]
     pub limit: At<u32>,
-    /// Update types to receive. Omitted, Telegram's default applies.
+    /// Update types to receive, sent with every `getUpdates`, so the config
+    /// decides what arrives. Omitted, tgin sends `[]`: Telegram's default,
+    /// every type except `chat_member`, `message_reaction` and
+    /// `message_reaction_count`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<Vec<String>>,
     /// Call `deleteWebhook` (keeping pending updates) before polling, and
@@ -217,7 +220,9 @@ pub struct LongPoll {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Webhook {
-    /// HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.
+    /// HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. It
+    /// is matched as written, so it must be what a URL sends: no `?`, `#`,
+    /// spaces, control or non-ASCII characters, `.`/`..` segments or `\`.
     /// Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Template>,
@@ -228,9 +233,11 @@ pub struct Webhook {
     /// Call `setWebhook` at start; needs `public_url`.
     pub register: At<bool>,
     /// `auto` (derived from the bot token), `none`, or the secret Telegram
-    /// must send.
+    /// must send: 1 to 256 ASCII letters, digits, `_` or `-`.
     pub secret_token: WebhookSecret,
-    /// Update types to receive. Omitted, Telegram's default applies.
+    /// Update types to receive, sent with `setWebhook`, so the config decides
+    /// what arrives. Omitted, tgin sends `[]`: Telegram's default, every type
+    /// except `chat_member`, `message_reaction` and `message_reaction_count`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<Vec<String>>,
     /// Telegram's `max_connections`, 1 to 100.
@@ -382,14 +389,15 @@ pub struct Pull {
     pub capacity_bytes: At<ByteSize>,
     pub on_full: OnFull,
     /// How long a fetched update waits for its acknowledgement before
-    /// another poll may receive it.
+    /// another poll may receive it; at least 1s.
     pub lease_timeout: At<HumanDuration>,
     pub ordering: Ordering,
     /// Bearer token pollers must send.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<SecretText>,
-    /// Extra HTTP paths serving this consumer. Each supports `${env:…}`
-    /// and `${file:…}`.
+    /// Extra HTTP paths serving this consumer, matched as written, with the
+    /// same rules as a webhook `path`. Each supports `${env:…}` and
+    /// `${file:…}`.
     pub aliases: Vec<Template>,
 }
 
@@ -433,7 +441,7 @@ pub struct Endpoint {
     /// Sent as `X-Telegram-Bot-Api-Secret-Token`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_token: Option<SecretText>,
-    /// Per-request timeout.
+    /// Per-request timeout; above 0.
     #[serde(default = "defaults::endpoint_timeout")]
     pub timeout: At<HumanDuration>,
 }
@@ -476,14 +484,15 @@ pub enum Ordering {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Retry {
-    /// First backoff.
+    /// First backoff; above 0.
     pub initial: At<HumanDuration>,
-    /// Longest backoff.
+    /// Longest backoff; above 0.
     pub max: At<HumanDuration>,
     /// Attempts before the update is dead-lettered; at least 1.
     #[schemars(range(min = 1))]
     pub max_attempts: At<u32>,
-    /// Age after which the update is dead-lettered.
+    /// Age after which the update is dead-lettered, counted from when it
+    /// was queued; above 0.
     pub max_age: At<HumanDuration>,
 }
 
@@ -495,7 +504,7 @@ pub struct Breaker {
     /// errors) that open the breaker; at least 1.
     #[schemars(range(min = 1))]
     pub failure_threshold: At<u32>,
-    /// How long the breaker stays open.
+    /// How long the breaker stays open; above 0.
     pub open_for: At<HumanDuration>,
 }
 
@@ -844,7 +853,7 @@ impl Serialize for WorkerThreads {
 /// A webhook's `secret_token`: `auto`, `none` or the secret itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum WebhookSecret {
-    /// Generated at start.
+    /// Derived from the bot token.
     #[default]
     Auto,
     /// Telegram sends no secret and none is checked.

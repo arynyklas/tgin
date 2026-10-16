@@ -21,6 +21,16 @@ pub use self::resolve::{
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
 
+/// Whether `token` can be sent as a bot token: non-empty, and only
+/// `[A-Za-z0-9:_-]`. The loader rejects any other token, and the Bot API
+/// client refuses it, by this one rule.
+pub fn valid_bot_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
 /// Parses, validates and resolves a config file. `origin` names the file in
 /// messages, and relative `${file:…}` references resolve against its
 /// directory.

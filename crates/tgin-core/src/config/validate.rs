@@ -6,17 +6,22 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use serde_saphyr::Location;
 use tgin_runtime::config::{ConfigError, Located};
+use url::Url;
 
 use super::model::{
     At, Consumer, HumanDuration, Ingress, Name, Push, RawConfig, Split, SplitStrategy, Target,
 };
 
-/// Paths that tgin itself serves; configured paths must not start with them.
-/// The Bot API gateway's paths are reserved by [`gateway_path`] instead.
-const RESERVED_PREFIXES: [&str; 6] = ["/c/", "/mtproto/", "/v1/", "/livez", "/readyz", "/metrics"];
+/// Paths that tgin itself serves or will serve: a configured path must not
+/// be one of them or lie below one. The Bot API gateway's paths are reserved
+/// by [`gateway_path`] instead.
+const RESERVED: [&str; 6] = ["/c", "/mtproto", "/v1", "/livez", "/readyz", "/metrics"];
 
 /// The shortest `reload.debounce`.
 const MIN_DEBOUNCE: Duration = Duration::from_millis(10);
+/// The shortest pull `lease_timeout`: leases are expired by a check that
+/// runs once a second.
+const MIN_LEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Errors and warnings found so far.
 #[derive(Debug, Default)]
@@ -87,6 +92,12 @@ pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) {
             "server.header_read_timeout",
             &server.header_read_timeout,
         );
+        positive(
+            diag,
+            "server.header_read_timeout",
+            &server.header_read_timeout,
+            "0 would close every connection before its headers arrive; 10s is the default",
+        );
     }
     if raw.admin.token.is_none() {
         for (i, listen) in raw.admin.listen.iter().enumerate() {
@@ -136,6 +147,19 @@ fn consumers(raw: &RawConfig, diag: &mut Diagnostics) {
                 at_least_one(diag, format!("{path}.capacity"), &pull.capacity);
                 capacity_bytes(diag, format!("{path}.capacity_bytes"), &pull.capacity_bytes);
                 duration(diag, format!("{path}.lease_timeout"), &pull.lease_timeout);
+                if pull.lease_timeout.value.get() < MIN_LEASE_TIMEOUT {
+                    diag.errors.push(
+                        ConfigError::new(format!(
+                            "`{}` is shorter than the minimum of 1s",
+                            pull.lease_timeout.value.as_str()
+                        ))
+                        .at(located(
+                            format!("{path}.lease_timeout"),
+                            known(pull.lease_timeout.location, consumer.location),
+                        ))
+                        .hint("leases are expired by a check that runs once a second, so a shorter lease ends at the next check; 2m is the default"),
+                    );
+                }
             }
             Consumer::Push(push) => {
                 self::push(diag, &format!("{path}.push"), consumer.location, push)
@@ -153,23 +177,45 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
         );
     }
     for (k, endpoint) in push.endpoints.value.iter().enumerate() {
-        duration(
+        let path = format!("{path}.endpoints[{k}].timeout");
+        duration(diag, path.clone(), &endpoint.timeout);
+        positive(
             diag,
-            format!("{path}.endpoints[{k}].timeout"),
+            path,
             &endpoint.timeout,
+            "0 times out every request at once; give the longest a delivery may take (10s is the default)",
         );
     }
     at_least_one(diag, format!("{path}.max_in_flight"), &push.max_in_flight);
     at_least_one(diag, format!("{path}.capacity"), &push.capacity);
     capacity_bytes(diag, format!("{path}.capacity_bytes"), &push.capacity_bytes);
+    let retry_wait = "0 would retry a failed delivery without waiting; the defaults are 1s (`initial`) and 1m (`max`)";
     duration(diag, format!("{path}.retry.initial"), &push.retry.initial);
+    positive(
+        diag,
+        format!("{path}.retry.initial"),
+        &push.retry.initial,
+        retry_wait,
+    );
     duration(diag, format!("{path}.retry.max"), &push.retry.max);
+    positive(
+        diag,
+        format!("{path}.retry.max"),
+        &push.retry.max,
+        retry_wait,
+    );
     at_least_one(
         diag,
         format!("{path}.retry.max_attempts"),
         &push.retry.max_attempts,
     );
     duration(diag, format!("{path}.retry.max_age"), &push.retry.max_age);
+    positive(
+        diag,
+        format!("{path}.retry.max_age"),
+        &push.retry.max_age,
+        "0 dead-letters every update before its first attempt; 1h is the default",
+    );
     at_least_one(
         diag,
         format!("{path}.breaker.failure_threshold"),
@@ -179,6 +225,12 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
         diag,
         format!("{path}.breaker.open_for"),
         &push.breaker.open_for,
+    );
+    positive(
+        diag,
+        format!("{path}.breaker.open_for"),
+        &push.breaker.open_for,
+        "0 would let requests through as soon as the breaker opens; 30s is the default",
     );
 }
 
@@ -458,6 +510,23 @@ fn duration(diag: &mut Diagnostics, path: impl Into<String>, value: &At<HumanDur
     }
 }
 
+/// Rejects a zero duration, which would disable what it configures or make
+/// it misbehave; `hint` says what 0 would do.
+fn positive(
+    diag: &mut Diagnostics,
+    path: impl Into<String>,
+    value: &At<HumanDuration>,
+    hint: &str,
+) {
+    if value.value.get().is_zero() {
+        diag.errors.push(
+            ConfigError::new(format!("`{}` must be longer than 0", value.value.as_str()))
+                .at(located(path, value.location))
+                .hint(hint),
+        );
+    }
+}
+
 fn at_least_one<T: PartialEq + Default>(diag: &mut Diagnostics, path: String, value: &At<T>) {
     if value.value == T::default() {
         diag.error(path, value.location, "must be at least 1");
@@ -518,7 +587,8 @@ impl HttpPaths {
     }
 }
 
-/// What is wrong with a configured HTTP path, if anything.
+/// What is wrong with a configured HTTP path, if anything. Messages never
+/// quote the path, which may hold a secret.
 fn path_problem(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return Some("must start with `/`".to_owned());
@@ -532,15 +602,51 @@ fn path_problem(path: &str) -> Option<String> {
     {
         return Some("has a segment starting with `:` or `*`; paths are literal".to_owned());
     }
+    if let Some(problem) = url_problem(path) {
+        return Some(problem.to_owned());
+    }
     if let Some(kind) = gateway_path(path) {
         return Some(format!(
             "starts with a bot-token {kind}, which tgin reserves for its Bot API gateway"
         ));
     }
-    RESERVED_PREFIXES
+    RESERVED
         .iter()
-        .find(|prefix| path.starts_with(*prefix) || path == prefix.trim_end_matches('/'))
-        .map(|prefix| format!("starts with `{prefix}`, which tgin reserves"))
+        .find(|reserved| {
+            path.strip_prefix(**reserved)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .map(|reserved| format!("is `{reserved}` or below it, which tgin reserves"))
+}
+
+/// Why `path`, joined to a base URL (as `setWebhook` registers it, and as
+/// clients request it), would not reach the router as written: the router
+/// matches the request path byte for byte.
+fn url_problem(path: &str) -> Option<&'static str> {
+    if path.contains('?') {
+        return Some("contains `?`; a URL would carry what follows as its query");
+    }
+    if path.contains('#') {
+        return Some("contains `#`; a URL would drop what follows as its fragment");
+    }
+    if path.bytes().any(|b| b.is_ascii_control()) {
+        return Some("contains a control character, which a URL encodes");
+    }
+    if path.contains(' ') {
+        return Some("contains whitespace, which a URL encodes; write it percent-encoded");
+    }
+    if !path.is_ascii() {
+        return Some(
+            "contains a non-ASCII character, which a URL encodes; write it percent-encoded",
+        );
+    }
+    let joined = Url::parse(&format!("http://tgin.invalid{path}"));
+    if !joined.is_ok_and(|url| url.path() == path) {
+        return Some(
+            "changes when it is part of a URL (`.` or `..` segments, `\\`, or characters a URL encodes); write it as the path is sent",
+        );
+    }
+    None
 }
 
 /// What the Bot API gateway would serve at `path`, if anything: a first
@@ -583,6 +689,18 @@ mod tests {
             "/file/x",
             "/file/bot123",
             "/files/bot123:abc",
+            // Reservations cover whole segments only.
+            "/metricsbot/hook",
+            "/livezone/getUpdates",
+            "/readyzz",
+            "/cx/y",
+            "/mtprotocol",
+            // What a URL carries unchanged.
+            "/hook%20x",
+            "/a|b",
+            "/a;b=c,d",
+            "/~user/x.y",
+            "/a/.b",
         ] {
             assert_eq!(path_problem(ok), None, "{ok}");
         }
@@ -605,6 +723,22 @@ mod tests {
             "/readyz/x",
             "/metrics",
             "/c",
+            "/livez/",
+            "/metrics/x",
+            "/mtproto",
+            "/hook?bot=shop",
+            "/hook#frag",
+            "/hook x",
+            "/hook\tx",
+            "/hook\u{7f}",
+            "/hook/\u{e9}",
+            "/a/../b",
+            "/a/./b",
+            "/a/..",
+            "/a\\b",
+            "/a\"b",
+            "/a<b>",
+            "/a`b",
         ] {
             assert!(path_problem(bad).is_some(), "{bad} accepted");
         }

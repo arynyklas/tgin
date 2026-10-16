@@ -19,7 +19,10 @@ pub struct Envelope {
     pub key: Option<u64>,
     /// The raw update JSON, forwarded verbatim.
     pub payload: Bytes,
-    /// When the update was received.
+    /// When admission queued the update (not when the source received it:
+    /// time spent held back by backpressure, or in Telegram's retries, is
+    /// not counted). `retry.max_age` and `tgin_delivery_latency_seconds`
+    /// count from here.
     pub received_at: Instant,
 }
 

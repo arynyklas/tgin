@@ -605,6 +605,32 @@ fn bot_paths_without_a_token_are_not_reserved() {
     assert_eq!(aliases, ["/bot1/getUpdates", "/bot/x", "/file/x"]);
 }
 
+/// Reservations cover whole segments: the reserved path itself and what lies
+/// below it, never a longer name that merely starts the same way.
+#[test]
+fn reserved_paths_match_whole_segments() {
+    let yaml = "version: 1\nserver: {}\nbots:\n  - name: a\n    token: t\n    ingress: { webhook: { path: /metricsbot/hook } }\nconsumers:\n  q: { pull: { aliases: [/livezone/getUpdates, /readyzz, /v1x/y, /cx, /mtprotocol] } }\n";
+    let cfg = loads(yaml);
+    let q = pull(&cfg, "q");
+    let aliases: Vec<&str> = q.aliases.iter().map(|a| a.expose().as_str()).collect();
+    assert_eq!(
+        aliases,
+        [
+            "/livezone/getUpdates",
+            "/readyzz",
+            "/v1x/y",
+            "/cx",
+            "/mtprotocol"
+        ]
+    );
+    for reserved in ["/livez/x", "/metrics/", "/v1", "/c", "/mtproto"] {
+        let yaml = format!(
+            "version: 1\nserver: {{}}\nconsumers:\n  q: {{ pull: {{ aliases: [\"{reserved}\"] }} }}\n"
+        );
+        assert_message(&single_error(&yaml), "which tgin reserves");
+    }
+}
+
 #[test]
 fn rule_paths_unique() {
     let yaml = r#"version: 1
@@ -1819,4 +1845,199 @@ fn rule_long_poll_timeout_at_least_one_second() {
     loads(
         "version: 1\nbots:\n  - name: a\n    token: t\n    ingress: { long_poll: { timeout: 1s } }\n",
     );
+}
+
+/// Durations that would disable what they configure, or make it misbehave,
+/// are rejected where they are written.
+#[test]
+fn rule_degenerate_durations_rejected() {
+    let push_yaml = |field: &str| {
+        format!(
+            "version: 1\nconsumers:\n  p:\n    push:\n      endpoints: [{{ url: \"http://p/\"{field} }}]\n"
+        )
+    };
+    let pull_yaml = |lease: &str| {
+        format!(
+            "version: 1\nserver: {{}}\nconsumers:\n  q: {{ pull: {{ lease_timeout: {lease} }} }}\n"
+        )
+    };
+    let cases = [
+        (
+            "version: 1\nserver: { header_read_timeout: 0 }\n".to_owned(),
+            "server.header_read_timeout",
+            "header_read_timeout: 0",
+            "must be longer than 0",
+        ),
+        (
+            push_yaml(", timeout: 0"),
+            "consumers.p.push.endpoints[0].timeout",
+            "timeout: 0",
+            "must be longer than 0",
+        ),
+        (
+            format!("{}      retry: {{ initial: 0 }}\n", push_yaml("")),
+            "consumers.p.push.retry.initial",
+            "initial: 0",
+            "must be longer than 0",
+        ),
+        (
+            format!("{}      retry: {{ max: 0s }}\n", push_yaml("")),
+            "consumers.p.push.retry.max",
+            "max: 0s",
+            "must be longer than 0",
+        ),
+        (
+            format!("{}      retry: {{ max_age: 0 }}\n", push_yaml("")),
+            "consumers.p.push.retry.max_age",
+            "max_age: 0",
+            "must be longer than 0",
+        ),
+        (
+            format!("{}      breaker: {{ open_for: 0 }}\n", push_yaml("")),
+            "consumers.p.push.breaker.open_for",
+            "open_for: 0",
+            "must be longer than 0",
+        ),
+        (
+            pull_yaml("0"),
+            "consumers.q.pull.lease_timeout",
+            "lease_timeout: 0",
+            "shorter than the minimum of 1s",
+        ),
+        (
+            pull_yaml("999ms"),
+            "consumers.q.pull.lease_timeout",
+            "lease_timeout: 999ms",
+            "shorter than the minimum of 1s",
+        ),
+    ];
+    for (yaml, path, needle, message) in cases {
+        let err = single_error(&yaml);
+        let (line, column) = pos(&yaml, needle);
+        let value_column = column + u32::try_from(needle.find(": ").unwrap() + 2).unwrap();
+        assert_at(&err, path, (line, value_column));
+        assert_message(&err, message);
+        assert!(err.hint.is_some(), "{err}");
+    }
+
+    // Zero is meaningful here: no lame duck, no drain, no drain on reload.
+    let cfg = loads(
+        "version: 1\nruntime: { lame_duck: 0, shutdown_grace: 0 }\nreload: { drain_timeout: 0 }\nserver: {}\nconsumers:\n  q: { pull: { lease_timeout: 1s } }\n",
+    );
+    assert_eq!(cfg.runtime.lame_duck, Duration::ZERO);
+    assert_eq!(cfg.runtime.shutdown_grace, Duration::ZERO);
+    assert_eq!(cfg.reload.drain_timeout, Duration::ZERO);
+    assert_eq!(pull(&cfg, "q").queue.lease_timeout, secs(1));
+}
+
+/// A bot token is checked at load with the Bot API client's rule, so
+/// `config validate`, start and reload all refuse what the client would.
+#[test]
+fn rule_bot_token_charset() {
+    let env = env(&[("SPACED", "123456:abc def"), ("NEWLINE", "123456:abc\n")]);
+    for (k, token) in [
+        (0, "\"123456:abc def\""),
+        (1, "\"123456:a+b/c=\""),
+        (2, "\"${env:SPACED}\""),
+        (3, "\"${env:NEWLINE}\""),
+    ] {
+        let yaml = format!("version: 1\nbots:\n  - name: b{k}\n    token: {token}\n");
+        let errors = config::load(&yaml, Path::new("tgin.yaml"), &env).unwrap_err();
+        assert_eq!(errors.len(), 1, "{}", render(&errors));
+        let err = &errors[0];
+        assert_at(err, "bots[0].token", pos(&yaml, token));
+        assert_message(err, "bot token");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("[A-Za-z0-9:_-]")),
+            "{err}"
+        );
+        for part in ["abc", "a+b", "def"] {
+            assert!(!err.to_string().contains(part), "{err}");
+        }
+    }
+    assert!(config::valid_bot_token("123456:AA-bb_CC"));
+    assert!(!config::valid_bot_token(""));
+    assert!(!config::valid_bot_token("123456:abc "));
+    loads("version: 1\nbots:\n  - name: b\n    token: \"123456:AA-bb_CC\"\n");
+}
+
+/// Telegram accepts a webhook secret of 1 to 256 of `[A-Za-z0-9_-]` only.
+#[test]
+fn rule_webhook_secret_token_charset() {
+    let long = "a".repeat(257);
+    for secret in [
+        "\"has space+plus\"",
+        "\"c2VjcmV0Lw==\"",
+        &format!("\"{long}\""),
+    ] {
+        let yaml = format!(
+            "version: 1\nserver: {{}}\nbots:\n  - name: a\n    token: t\n    ingress: {{ webhook: {{ secret_token: {secret} }} }}\n"
+        );
+        let err = single_error(&yaml);
+        assert_at(
+            &err,
+            "bots[0].ingress.webhook.secret_token",
+            pos(&yaml, secret),
+        );
+        assert_message(&err, "secret_token");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("1 to 256 ASCII letters, digits, `_` or `-`")),
+            "{err}"
+        );
+        for part in ["space", "c2Vj", "aaaa"] {
+            assert!(!err.to_string().contains(part), "{err}");
+        }
+    }
+    let max = "Z_-9".repeat(64);
+    let cfg = loads(&format!(
+        "version: 1\nserver: {{}}\nbots:\n  - name: a\n    token: t\n    ingress: {{ webhook: {{ secret_token: \"{max}\" }} }}\n"
+    ));
+    let Some(Ingress::Webhook(hook)) = &cfg.bots[0].ingress else {
+        panic!("{:?}", cfg.bots[0].ingress);
+    };
+    assert!(matches!(&hook.secret_token, WebhookSecret::Token(s) if *s.expose() == max));
+}
+
+/// A webhook path or alias reaches the router byte for byte only if a URL
+/// carries it unchanged; anything a URL moves, drops or encodes is refused.
+#[test]
+fn rule_paths_survive_url_encoding() {
+    for (path, message) in [
+        ("/hook?bot=shop", "`?`"),
+        ("/hook#frag", "`#`"),
+        ("/hook x", "whitespace"),
+        ("/hook\\tx", "control"),
+        ("/hook/\u{e9}", "non-ASCII"),
+        ("/a/../b", "changes"),
+        ("/a/./b", "changes"),
+        ("/a\\\\b", "changes"),
+    ] {
+        for yaml in [
+            format!(
+                "version: 1\nserver: {{}}\nbots:\n  - name: a\n    token: t\n    ingress: {{ webhook: {{ path: \"{path}\" }} }}\n"
+            ),
+            format!(
+                "version: 1\nserver: {{}}\nconsumers:\n  q: {{ pull: {{ aliases: [\"{path}\"] }} }}\n"
+            ),
+        ] {
+            let err = single_error(&yaml);
+            assert_message(&err, message);
+            for part in ["bot=shop", "#frag", "hook x", "/b"] {
+                assert!(!err.to_string().contains(part), "{err}");
+            }
+        }
+    }
+    let cfg = loads(
+        "version: 1\nserver: {}\nconsumers:\n  q: { pull: { aliases: [\"/hook%20x\", \"/a|b\", \"/a;b=c\", \"/~u/x.y\"] } }\n",
+    );
+    let aliases: Vec<String> = pull(&cfg, "q")
+        .aliases
+        .iter()
+        .map(|a| a.expose().clone())
+        .collect();
+    assert_eq!(aliases, ["/hook%20x", "/a|b", "/a;b=c", "/~u/x.y"]);
 }

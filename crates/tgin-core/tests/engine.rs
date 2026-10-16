@@ -17,6 +17,7 @@ use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
 use tgin_core::sink::{Admit, Sink};
+use tgin_runtime::breaker::BreakerState;
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::queue::{HolderId, QueueStats};
 use tgin_runtime::supervisor::{Supervisor, TaskState};
@@ -706,6 +707,81 @@ async fn reload_changes_params_live() {
     })
     .await
     .expect("delivered to the new endpoint");
+}
+
+/// A reload that only adds a bot keeps every push consumer's endpoints, with
+/// their breakers and in-flight counts; only the source names it reports in
+/// `X-Tgin-Source` change.
+#[tokio::test]
+async fn adding_a_bot_keeps_push_breakers() {
+    let down = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&down)
+        .await;
+    let up = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&up)
+        .await;
+    let base = format!(
+        r#"version: 1
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{{ to: [down, up] }}]
+consumers:
+  down:
+    push:
+      endpoints: [{{ url: "{}/hook" }}]
+      retry: {{ max_attempts: 1 }}
+      breaker: {{ failure_threshold: 1, open_for: 1h }}
+  up: {{ push: {{ endpoints: [{{ url: "{}/hook" }}] }} }}
+"#,
+        down.uri(),
+        up.uri()
+    );
+    let h = Harness::new(&base);
+    let Some(Consumer::Push(dead)) = h.engine.consumer("down") else {
+        panic!("down is a push consumer");
+    };
+    assert_eq!(h.admit("message", 1), Admit::Admitted);
+    eventually("the breaker opens", || {
+        dead.endpoints()[0].1 == BreakerState::Open
+    })
+    .await;
+
+    let with_b = base.replace(
+        "consumers:\n",
+        "  - name: b\n    token: \"2:bbb\"\n    routes: [{ to: [down, up] }]\nconsumers:\n",
+    );
+    let report = h.engine.apply(&load(&with_b)).expect("apply");
+    assert_eq!(report.sources_added, ["b"]);
+    assert!(report.changed.is_empty(), "{report:?}");
+    assert_eq!(dead.endpoints()[0].1, BreakerState::Open);
+
+    let b = h.engine.source_id("b").expect("b has a source");
+    assert_eq!(admit_to(&h.engine, b, "message", 2), Admit::Admitted);
+    timeout(WAIT, async {
+        loop {
+            let got = up.received_requests().await.expect("recording");
+            if let Some(req) = got
+                .iter()
+                .find(|r| r.body.starts_with(br#"{"update_id":2,"#))
+            {
+                assert_eq!(
+                    req.headers.get("x-tgin-source").map(|v| v.as_bytes()),
+                    Some(&b"b"[..])
+                );
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("b's update delivered with its name");
+    assert_eq!(dead.endpoints()[0].1, BreakerState::Open);
+    assert_eq!(down.received_requests().await.expect("recording").len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

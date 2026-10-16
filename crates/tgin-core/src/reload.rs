@@ -129,6 +129,8 @@ struct Live {
     slot: Arc<Slot>,
     queue: Option<QueueConfig>,
     endpoints: Option<(Vec<Endpoint>, PushOptions)>,
+    /// New source names for a push consumer that keeps its endpoints.
+    source_names: Option<Arc<[Arc<str>]>>,
 }
 
 /// A bot of the new generation before its metrics are resolved.
@@ -253,6 +255,7 @@ impl Plan {
                                     }
                                     ConsumerKind::Pull(_) => None,
                                 },
+                                source_names: None,
                             });
                             revived.push(Arc::clone(slot));
                             Arc::clone(slot)
@@ -355,6 +358,8 @@ pub(crate) fn commit(
         }
         if let (Consumer::Push(push), Some((endpoints, opts))) = (consumer, change.endpoints) {
             push.set_endpoints(endpoints, opts);
+        } else if let (Consumer::Push(push), Some(names)) = (consumer, change.source_names) {
+            push.set_source_names(names);
         }
     }
     for slot in &changes.revived {
@@ -503,7 +508,8 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 
 /// The live changes from `old` to `new` of the same mode, if any. A push
 /// consumer gets new endpoints (and breakers) when its delivery settings
-/// change or new bots appear, whose names it reports.
+/// change; when only new bots appear, it keeps them and learns the bots'
+/// names.
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
@@ -511,9 +517,9 @@ fn live_change(
     names_grew: bool,
     source_names: &Arc<[Arc<str>]>,
 ) -> Option<Live> {
-    let (queue, endpoints) = match (old, new) {
+    let (queue, endpoints, names) = match (old, new) {
         (ConsumerKind::Pull(old), ConsumerKind::Pull(new)) => {
-            ((old.queue != new.queue).then_some(new.queue), None)
+            ((old.queue != new.queue).then_some(new.queue), None, None)
         }
         (ConsumerKind::Push(old), ConsumerKind::Push(new)) => {
             let delivery = old.endpoints != new.endpoints
@@ -523,15 +529,17 @@ fn live_change(
                 || old.breaker != new.breaker;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
-                (delivery || names_grew).then(|| (endpoints(new), options(new, source_names))),
+                delivery.then(|| (endpoints(new), options(new, source_names))),
+                (!delivery && names_grew).then(|| Arc::clone(source_names)),
             )
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
-    (queue.is_some() || endpoints.is_some()).then(|| Live {
+    (queue.is_some() || endpoints.is_some() || names.is_some()).then(|| Live {
         slot: Arc::clone(slot),
         queue,
         endpoints,
+        source_names: names,
     })
 }
 

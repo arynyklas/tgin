@@ -1,5 +1,5 @@
-//! The resolved config: secrets expanded, URLs parsed, names replaced by
-//! dense ids and rules compile-checked.
+//! The resolved config: secrets expanded, URLs parsed, consumer names
+//! replaced by dense ids and rules compile-checked.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -37,7 +37,10 @@ pub struct Config {
     pub server: Option<Server>,
     pub admin: Admin,
     pub reload: Reload,
-    /// Indexed by [`SourceId`].
+    /// In file order. The engine gives each bot a [`SourceId`] of its own,
+    /// stable by name across reloads: look it up with
+    /// [`Engine::source_id`](crate::engine::Engine::source_id), never by
+    /// position here.
     pub bots: Vec<Bot>,
     /// Indexed by [`ConsumerId`].
     pub consumers: Vec<Consumer>,
@@ -111,7 +114,6 @@ pub struct Reload {
 
 #[derive(Clone, Debug)]
 pub struct Bot {
-    pub id: SourceId,
     pub name: String,
     pub token: Secret<String>,
     pub api_url: SensitiveUrl,
@@ -155,7 +157,7 @@ pub struct Webhook {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebhookSecret {
-    /// Generate one at start.
+    /// Derived from the bot token.
     Auto,
     None,
     Token(Secret<String>),
@@ -377,6 +379,41 @@ impl Resolver<'_> {
         );
     }
 
+    /// A `secret_token` sent as `X-Telegram-Bot-Api-Secret-Token`, which
+    /// Telegram allows only as 1 to 256 of `[A-Za-z0-9_-]`.
+    fn header_secret(&mut self, path: String, text: &SecretText) -> Option<Secret<String>> {
+        let secret = self.secret(path.clone(), text)?;
+        if header_safe_secret(secret.expose()) {
+            return Some(secret);
+        }
+        // Never quotes the value: it is the secret.
+        self.diag.errors.push(
+            ConfigError::new("the secret_token is not a valid secret header value")
+                .at(located(path, text.0.location))
+                .hint(
+                    "it is sent as `X-Telegram-Bot-Api-Secret-Token`: use 1 to 256 ASCII letters, digits, `_` or `-`",
+                ),
+        );
+        None
+    }
+
+    /// A bot token, checked with the rule the Bot API client applies.
+    fn bot_token(&mut self, path: String, text: &SecretText) -> Option<Secret<String>> {
+        let token = self.secret(path.clone(), text)?;
+        if super::valid_bot_token(token.expose()) {
+            return Some(token);
+        }
+        // Never quotes the value: it is the token.
+        self.diag.errors.push(
+            ConfigError::new("this is not a valid bot token")
+                .at(located(path, text.0.location))
+                .hint(
+                    "a bot token uses only [A-Za-z0-9:_-]; look for a space, quotes or an extra newline in the value or its file",
+                ),
+        );
+        None
+    }
+
     fn template(&mut self, path: &str, text: &Template) -> Option<String> {
         match interpolate(&text.0.value, self.env, self.base_dir) {
             Ok(value) => Some(value),
@@ -519,22 +556,10 @@ impl Resolver<'_> {
         for (k, endpoint) in push.endpoints.value.iter().enumerate() {
             let path = format!("{path}.push.endpoints[{k}]");
             let url = self.url(&format!("{path}.url"), &endpoint.url, false);
-            let secret_token = endpoint.secret_token.as_ref().and_then(|t| {
-                let path = format!("{path}.secret_token");
-                let secret = self.secret(path.clone(), t)?;
-                if !header_safe_secret(secret.expose()) {
-                    // Never quotes the value: it is the secret.
-                    self.diag.errors.push(
-                        ConfigError::new("the secret_token is not a valid secret header value")
-                            .at(located(path, t.0.location))
-                            .hint(
-                                "it is sent as `X-Telegram-Bot-Api-Secret-Token`: use 1 to 256 ASCII letters, digits, `_` or `-`",
-                            ),
-                    );
-                    return None;
-                }
-                Some(secret)
-            });
+            let secret_token = endpoint
+                .secret_token
+                .as_ref()
+                .and_then(|t| self.header_secret(format!("{path}.secret_token"), t));
             if let Some(url) = url {
                 endpoints.push(Endpoint {
                     url,
@@ -568,10 +593,10 @@ impl Resolver<'_> {
         let mut out = Vec::with_capacity(raw.bots.len());
         for (index, bot) in raw.bots.iter().enumerate() {
             let path = format!("bots[{index}]");
-            let Some(id) = self.id(index, &path, bot.name.location, "bots") else {
+            if self.id(index, &path, bot.name.location, "bots").is_none() {
                 break;
-            };
-            let token = self.secret(format!("{path}.token"), &bot.token);
+            }
+            let token = self.bot_token(format!("{path}.token"), &bot.token);
             let api_url = self.url(&format!("{path}.api_url"), &bot.api_url, false);
             let ingress = bot
                 .ingress
@@ -585,7 +610,6 @@ impl Resolver<'_> {
             }
             if let (Some(token), Some(api_url)) = (token, api_url) {
                 out.push(Bot {
-                    id: SourceId(id),
                     name: bot.name.value.as_str().to_owned(),
                     token,
                     api_url,
@@ -628,7 +652,7 @@ impl Resolver<'_> {
                         raw::WebhookSecret::Auto => WebhookSecret::Auto,
                         raw::WebhookSecret::None => WebhookSecret::None,
                         raw::WebhookSecret::Secret(secret) => self
-                            .secret(format!("{path}.secret_token"), secret)
+                            .header_secret(format!("{path}.secret_token"), secret)
                             .map_or(WebhookSecret::None, WebhookSecret::Token),
                     },
                     allowed_updates: hook.allowed_updates.clone(),
@@ -651,7 +675,7 @@ impl Resolver<'_> {
         }
     }
 
-    /// A dense id for the `index`th bot or consumer.
+    /// A dense id for the `index`th bot or consumer, if one is left.
     fn id(&mut self, index: usize, path: &str, location: Location, what: &str) -> Option<u16> {
         let id = u16::try_from(index).ok();
         if id.is_none() {
@@ -672,10 +696,17 @@ impl Resolver<'_> {
         }
     }
 
-    /// Compiles every bot's rules together, as the engine will.
+    /// Compiles every bot's rules together, as the engine will. The bots
+    /// take their positions in the file as ids here, so that an error names
+    /// the bot it comes from; the engine gives them its own ids.
     fn compile_all(&mut self, raw: &RawConfig, bots: &[Bot]) {
-        let rules: Vec<(SourceId, Vec<RuleSpec>)> =
-            bots.iter().map(|b| (b.id, b.rules.clone())).collect();
+        let rules: Vec<(SourceId, Vec<RuleSpec>)> = bots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bot)| {
+                Some((SourceId(u16::try_from(index).ok()?), bot.rules.clone()))
+            })
+            .collect();
         let Err(err) = RouteTable::compile(&rules, &[]) else {
             return;
         };

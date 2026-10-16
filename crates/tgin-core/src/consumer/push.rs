@@ -156,6 +156,21 @@ impl PushConsumer {
         self.changed.notify_waiters();
     }
 
+    /// Replaces the source names reported in `X-Tgin-Source` and logs,
+    /// keeping the endpoints with their breakers and in-flight counts.
+    pub fn set_source_names(&self, source_names: Arc<[Arc<str>]>) {
+        let current = self.targets.load();
+        let opts = PushOptions {
+            source_names,
+            ..current.opts.clone()
+        };
+        self.targets.store(Arc::new(Targets {
+            slots: Arc::clone(&current.slots),
+            source_headers: source_headers(&opts.source_names),
+            opts,
+        }));
+    }
+
     /// Deliveries in flight, counting those waiting to retry.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
@@ -542,7 +557,8 @@ impl PushConsumer {
 
 /// One endpoint set with the options it was given with.
 struct Targets {
-    slots: Box<[Slot]>,
+    /// Shared by the sets that differ only in their source names.
+    slots: Arc<[Slot]>,
     opts: PushOptions,
     /// `X-Tgin-Source` values by source; `None` for a name that is no valid
     /// header value.
@@ -589,17 +605,19 @@ impl Targets {
                 }
             })
             .collect();
-        let source_headers = opts
-            .source_names
-            .iter()
-            .map(|name| HeaderValue::from_str(name).ok())
-            .collect();
         Self {
             slots,
+            source_headers: source_headers(&opts.source_names),
             opts,
-            source_headers,
         }
     }
+}
+
+fn source_headers(names: &[Arc<str>]) -> Box<[Option<HeaderValue>]> {
+    names
+        .iter()
+        .map(|name| HeaderValue::from_str(name).ok())
+        .collect()
 }
 
 struct Slot {

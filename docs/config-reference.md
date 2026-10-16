@@ -45,7 +45,7 @@ One Telegram bot.
 | `ingress` | [Ingress](#ingress) |  | How updates arrive; at most one. Omitted, the bot receives none. |
 | `name` | string (matching `^[a-z0-9][a-z0-9-]{0,62}$`) | **required** | Unique bot name, used in metrics and logs. |
 | `routes` | list of [Route](#route) | `[]` | Rules in order; the first match wins. |
-| `token` | [Secret](#secret) | **required** | The bot token. |
+| `token` | [Secret](#secret) | **required** | The bot token: only ASCII letters, digits, `:`, `_` and `-`. |
 
 ## `Ingress`
 
@@ -60,7 +60,7 @@ Long polling: tgin calls `getUpdates` on the Bot API.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `allowed_updates` | list of string |  | Update types to receive. Omitted, Telegram's default applies. |
+| `allowed_updates` | list of string |  | Update types to receive, sent with every `getUpdates`, so the config decides what arrives. Omitted, tgin sends `[]`: Telegram's default, every type except `chat_member`, `message_reaction` and `message_reaction_count`. |
 | `delete_webhook_on_start` | boolean | `true` | Call `deleteWebhook` (keeping pending updates) before polling, and again when a poll finds a webhook set. Off, an active webhook stops the polling until something else deletes it. |
 | `limit` | integer (at least 1, at most 100) | `100` | Updates per `getUpdates` call, 1 to 100. |
 | `timeout` | [Duration](#duration) | `30s` | `getUpdates` long-poll timeout; at least 1 s. |
@@ -82,16 +82,16 @@ Telegram posts updates to the data plane.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `allowed_updates` | list of string |  | Update types to receive. Omitted, Telegram's default applies. |
+| `allowed_updates` | list of string |  | Update types to receive, sent with `setWebhook`, so the config decides what arrives. Omitted, tgin sends `[]`: Telegram's default, every type except `chat_member`, `message_reaction` and `message_reaction_count`. |
 | `certificate_file` | string (not empty) |  | Self-signed certificate to upload with `setWebhook`; needs `register: true`. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
 | `drop_pending_updates` | boolean | `false` | Telegram's `drop_pending_updates` for `setWebhook`. |
 | `ip_address` | IP address |  | Telegram's `ip_address` for `setWebhook`. |
 | `ip_allowlist` | [IpAllowlist](#ipallowlist) | `none` | Who may post updates: `none` (anyone), `telegram` (Telegram's published networks) or a list of networks. |
 | `max_connections` | integer (at least 1, at most 100) |  | Telegram's `max_connections`, 1 to 100. |
-| `path` | string (not empty) |  | HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. Supports `${env:…}` and `${file:…}`. |
+| `path` | string (not empty) |  | HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. It is matched as written, so it must be what a URL sends: no `?`, `#`, spaces, control or non-ASCII characters, `.`/`..` segments or `\`. Supports `${env:…}` and `${file:…}`. |
 | `public_url` | string (not empty) |  | The public HTTPS base URL Telegram reaches tgin at; `setWebhook` registers it followed by `path`. Supports `${env:…}` and `${file:…}`. |
 | `register` | boolean | `false` | Call `setWebhook` at start; needs `public_url`. |
-| `secret_token` | [WebhookSecret](#webhooksecret) | `auto` | `auto` (derived from the bot token), `none`, or the secret Telegram must send. |
+| `secret_token` | [WebhookSecret](#webhooksecret) | `auto` | `auto` (derived from the bot token), `none`, or the secret Telegram must send: 1 to 256 ASCII letters, digits, `_` or `-`. |
 
 ## `IpAllowlist`
 
@@ -202,11 +202,11 @@ Bots fetch updates from tgin with `getUpdates` on `/c/<consumer>/getUpdates` and
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `aliases` | list of string (not empty) | `[]` | Extra HTTP paths serving this consumer. Each supports `${env:…}` and `${file:…}`. |
+| `aliases` | list of string (not empty) | `[]` | Extra HTTP paths serving this consumer, matched as written, with the same rules as a webhook `path`. Each supports `${env:…}` and `${file:…}`. |
 | `auth_token` | [Secret](#secret) |  | Bearer token pollers must send. |
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |
 | `capacity_bytes` | [ByteSize](#bytesize) | `64MiB` | Most queued bytes. |
-| `lease_timeout` | [Duration](#duration) | `2m` | How long a fetched update waits for its acknowledgement before another poll may receive it. |
+| `lease_timeout` | [Duration](#duration) | `2m` | How long a fetched update waits for its acknowledgement before another poll may receive it; at least 1s. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |
 
@@ -272,7 +272,7 @@ Per-endpoint circuit breaker.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `failure_threshold` | integer (at least 1) | `5` | Consecutive transient failures (408, 429, 5xx, timeouts, network errors) that open the breaker; at least 1. |
-| `open_for` | [Duration](#duration) | `30s` | How long the breaker stays open. |
+| `open_for` | [Duration](#duration) | `30s` | How long the breaker stays open; above 0. |
 
 ## `Endpoint`
 
@@ -281,7 +281,7 @@ One downstream URL.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `secret_token` | [Secret](#secret) |  | Sent as `X-Telegram-Bot-Api-Secret-Token`. |
-| `timeout` | [Duration](#duration) | `10s` | Per-request timeout. |
+| `timeout` | [Duration](#duration) | `10s` | Per-request timeout; above 0. |
 | `url` | string (not empty) | **required** | `http` or `https` URL. Supports `${env:…}` and `${file:…}`. |
 
 ## `Retry`
@@ -290,9 +290,9 @@ Retries of failed deliveries.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `initial` | [Duration](#duration) | `1s` | First backoff. |
-| `max` | [Duration](#duration) | `1m` | Longest backoff. |
-| `max_age` | [Duration](#duration) | `1h` | Age after which the update is dead-lettered. |
+| `initial` | [Duration](#duration) | `1s` | First backoff; above 0. |
+| `max` | [Duration](#duration) | `1m` | Longest backoff; above 0. |
+| `max_age` | [Duration](#duration) | `1h` | Age after which the update is dead-lettered, counted from when it was queued; above 0. |
 | `max_attempts` | integer (at least 1) | `10` | Attempts before the update is dead-lettered; at least 1. |
 
 ## `Log`
@@ -354,7 +354,7 @@ The data-plane HTTP server.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `header_read_timeout` | [Duration](#duration) | `10s` | How long a client may take to send the request headers. |
+| `header_read_timeout` | [Duration](#duration) | `10s` | How long a client may take to send the request headers; above 0. |
 | `listen` | list of string | `["0.0.0.0:8080"]` | Addresses to listen on, as `ip:port`. |
 | `max_connections` | integer (at least 1) | `10000` | Most open connections. |
 | `tls` | [Tls](#tls) |  | Serve HTTPS with these files. Turning TLS on or off takes effect after a restart. |

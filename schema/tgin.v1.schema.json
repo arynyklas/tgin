@@ -89,7 +89,7 @@
         },
         "token": {
           "$ref": "#/$defs/Secret",
-          "description": "The bot token."
+          "description": "The bot token: only ASCII letters, digits, `:`, `_` and `-`."
         }
       },
       "required": [
@@ -112,7 +112,7 @@
         "open_for": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
-          "description": "How long the breaker stays open."
+          "description": "How long the breaker stays open; above 0."
         }
       },
       "type": "object"
@@ -218,7 +218,7 @@
         "timeout": {
           "$ref": "#/$defs/Duration",
           "default": "10s",
-          "description": "Per-request timeout."
+          "description": "Per-request timeout; above 0."
         },
         "url": {
           "description": "`http` or `https` URL. Supports `${env:…}` and `${file:…}`.",
@@ -318,7 +318,7 @@
       "description": "Long polling: tgin calls `getUpdates` on the Bot API.",
       "properties": {
         "allowed_updates": {
-          "description": "Update types to receive. Omitted, Telegram's default applies.",
+          "description": "Update types to receive, sent with every `getUpdates`, so the config\ndecides what arrives. Omitted, tgin sends `[]`: Telegram's default,\nevery type except `chat_member`, `message_reaction` and\n`message_reaction_count`.",
           "items": {
             "type": "string"
           },
@@ -456,7 +456,7 @@
       "properties": {
         "aliases": {
           "default": [],
-          "description": "Extra HTTP paths serving this consumer. Each supports `${env:…}`\nand `${file:…}`.",
+          "description": "Extra HTTP paths serving this consumer, matched as written, with the\nsame rules as a webhook `path`. Each supports `${env:…}` and\n`${file:…}`.",
           "items": {
             "minLength": 1,
             "type": "string"
@@ -489,7 +489,7 @@
         "lease_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "2m",
-          "description": "How long a fetched update waits for its acknowledgement before\nanother poll may receive it."
+          "description": "How long a fetched update waits for its acknowledgement before\nanother poll may receive it; at least 1s."
         },
         "on_full": {
           "$ref": "#/$defs/OnFull",
@@ -595,17 +595,17 @@
         "initial": {
           "$ref": "#/$defs/Duration",
           "default": "1s",
-          "description": "First backoff."
+          "description": "First backoff; above 0."
         },
         "max": {
           "$ref": "#/$defs/Duration",
           "default": "1m",
-          "description": "Longest backoff."
+          "description": "Longest backoff; above 0."
         },
         "max_age": {
           "$ref": "#/$defs/Duration",
           "default": "1h",
-          "description": "Age after which the update is dead-lettered."
+          "description": "Age after which the update is dead-lettered, counted from when it\nwas queued; above 0."
         },
         "max_attempts": {
           "default": 10,
@@ -680,7 +680,7 @@
         "header_read_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "10s",
-          "description": "How long a client may take to send the request headers."
+          "description": "How long a client may take to send the request headers; above 0."
         },
         "listen": {
           "default": [
@@ -889,7 +889,7 @@
       "description": "Telegram posts updates to the data plane.",
       "properties": {
         "allowed_updates": {
-          "description": "Update types to receive. Omitted, Telegram's default applies.",
+          "description": "Update types to receive, sent with `setWebhook`, so the config decides\nwhat arrives. Omitted, tgin sends `[]`: Telegram's default, every type\nexcept `chat_member`, `message_reaction` and `message_reaction_count`.",
           "items": {
             "type": "string"
           },
@@ -935,7 +935,7 @@
           ]
         },
         "path": {
-          "description": "HTTP path updates are posted to. Omitted, `/webhook/<bot name>`.\nSupports `${env:…}` and `${file:…}`.",
+          "description": "HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. It\nis matched as written, so it must be what a URL sends: no `?`, `#`,\nspaces, control or non-ASCII characters, `.`/`..` segments or `\\`.\nSupports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",
@@ -958,7 +958,7 @@
         "secret_token": {
           "$ref": "#/$defs/WebhookSecret",
           "default": "auto",
-          "description": "`auto` (derived from the bot token), `none`, or the secret Telegram\nmust send."
+          "description": "`auto` (derived from the bot token), `none`, or the secret Telegram\nmust send: 1 to 256 ASCII letters, digits, `_` or `-`."
         }
       },
       "type": "object"

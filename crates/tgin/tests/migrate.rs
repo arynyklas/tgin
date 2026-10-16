@@ -340,10 +340,11 @@ fn webhook_registration_supplies_token_url_and_secret() {
 /// Placeholders become `${env:…}`; literal `${` text stays literal.
 #[test]
 fn placeholders_become_env_references() {
+    // The literal goes into the admin token: a bot token cannot hold `$`.
     let ron = r#"(
-        auth_token: Some("${ADMIN}"),
+        auth_token: Some("a${not-a-placeholder}"),
         server_port: Some(3000),
-        updates: [LongPollUpdate(token: "1:a${not-a-placeholder}")],
+        updates: [LongPollUpdate(token: "${TOKEN}")],
         route: LongPollRoute(path: "/poll/${TOKEN}"),
     )"#;
     let out = migrated(ron);
@@ -353,9 +354,9 @@ fn placeholders_become_env_references() {
             .token
             .as_ref()
             .map(|token| token.expose().as_str()),
-        Some("admin-token-value")
+        Some("a${not-a-placeholder}")
     );
-    assert_eq!(cfg.bots[0].token.expose(), "1:a${not-a-placeholder}");
+    assert_eq!(cfg.bots[0].token.expose(), TOKEN);
     let ConsumerKind::Pull(pull) = &cfg.consumers[0].kind else {
         panic!("{:?}", cfg.consumers[0].kind);
     };
