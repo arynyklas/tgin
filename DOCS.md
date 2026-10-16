@@ -60,7 +60,7 @@ error: bots[0].routes[0].to[0] (line 9, column 14): unknown consumer `bot`
 tgin: tgin.yaml has 1 error
 ```
 
-`tgin config validate` lists the errors (all validation errors at once; a YAML syntax or shape error alone) and warnings, and exits 1 on errors; `tgin config print` prints the config as JSON with defaults filled in and secrets redacted; `tgin config schema` prints the JSON Schema ([schema/tgin.v1.schema.json](schema/tgin.v1.schema.json)), which YAML editors can use (`# yaml-language-server: $schema=…`). Every `${env:…}` the file references must be set for these commands too.
+`tgin config validate` lists the errors (all validation errors at once; a YAML syntax or shape error alone) and warnings, and exits 1 on errors; `tgin config print` prints the config as JSON with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`) and secrets redacted; `tgin config schema` prints the JSON Schema ([schema/tgin.v1.schema.json](schema/tgin.v1.schema.json)), which YAML editors can use (`# yaml-language-server: $schema=…`). Every `${env:…}` the file references must be set for these commands too.
 
 **References.** Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`) and fields holding URLs or file paths (including webhook `path` and pull `aliases`) expand references; every other value is literal.
 
@@ -315,7 +315,8 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
      "endpoints": [{"url_redacted": "https://audit.internal", "breaker": "closed"}]}
   ],
   "tasks": [
-    {"name": "source:shop", "state": "running"}
+    {"name": "source:shop", "state": "running"},
+    {"name": "push:audit", "state": "running"}
   ]
 }
 ```
@@ -325,7 +326,7 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 - `consumers[]`: `depth` (waiting to be leased), `leased`, `in_flight` (push deliveries in progress, retries waiting included), `paused`, and for push consumers each endpoint's origin (`scheme://host[:port]`; path, query and credentials are never shown) and breaker (`closed`, `open` or `half_open`).
 - `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls) with its state and, when it backs off or failed, its last error, secrets masked.
 
-`GET /v1/config` shows the config as written, with defaults filled in: every secret is `"[redacted]"`, URL fields (`api_url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
+`GET /v1/config` shows the config as written, with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`): every secret is `"[redacted]"`, URL fields (`api_url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
 
 ## `tgin admin`
 
@@ -349,13 +350,13 @@ $ tgin admin health
 
 `status` prints the version, generation and phase, then a table of sources and one of consumers; `consumers` prints the consumer table; `reload` prints the new generation and what changed, including settings that need a restart; `purge` prints how many updates it dropped. A request waits at most 60 s (a reload may wait on Telegram).
 
-`health` asks `GET /readyz`, needs no token (it does not read the token file), waits at most 2 s, prints `ready` or `not ready (…)`, and exits 0 when ready, else 1. The container image's `HEALTHCHECK` runs it.
+`health` asks `GET /readyz`, needs no token (it does not read the token file), waits at most 2 s, prints `ready` or `not ready (…)`, and exits 0 when ready, else 1; when the admin API cannot be reached or does not answer in time, it prints the error on stderr and exits 1. The container image's `HEALTHCHECK` runs it.
 
 Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot be reached or does not answer in time, it answers with an error (printed with the server's `error` or its list of config errors), or `health` finds tgin not ready; 64 for a malformed command line.
 
 ## Metrics
 
-`GET /metrics` on the admin plane serves the OpenMetrics text format (`application/openmetrics-text; version=1.0.0`). Every name carries the `tgin_` prefix; counters end in `_total`.
+`GET /metrics` on the admin plane serves the OpenMetrics text format (`application/openmetrics-text; version=1.0.0; charset=utf-8`). Every name carries the `tgin_` prefix; counters end in `_total`.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -545,7 +546,7 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 |---|---|
 | `tgin` / `tgin run [-c PATH]` | Run with the config file (`-c/--config`, `TGIN_CONFIG`, default `tgin.yaml`). |
 | `tgin config validate <path>` | Check a config file; list every error and warning. |
-| `tgin config print <path>` | Print the config as JSON, defaults filled in, secrets redacted. |
+| `tgin config print <path>` | Print the config as JSON, defaults filled in (except a webhook's omitted `path`), secrets redacted. |
 | `tgin config schema` | Print the JSON Schema. |
 | `tgin config migrate <path> [-o PATH]` | Convert a tgin 0.2 RON config to YAML ([migration guide](docs/migrating-to-1.0.md)). |
 | `tgin admin …` | Call a running tgin's admin API ([`tgin admin`](#tgin-admin)). |

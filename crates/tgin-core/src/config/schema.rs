@@ -155,7 +155,7 @@ impl JsonSchema for WebhookSecret {
         let secret = generator.subschema_for::<SecretText>();
         json_schema!({
             "anyOf": [
-                { "const": "auto", "description": "Generate a secret at start." },
+                { "const": "auto", "description": "Derived from the bot token (HMAC-SHA256); the same on every restart and replica." },
                 { "const": "none", "description": "Send and check no secret." },
                 secret
             ]

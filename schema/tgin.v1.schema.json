@@ -104,7 +104,7 @@
       "properties": {
         "failure_threshold": {
           "default": 5,
-          "description": "Consecutive failures that open the breaker; at least 1.",
+          "description": "Consecutive transient failures (408, 429, 5xx, timeouts, network\nerrors) that open the breaker; at least 1.",
           "format": "uint32",
           "minimum": 1,
           "type": "integer"
@@ -958,7 +958,7 @@
         "secret_token": {
           "$ref": "#/$defs/WebhookSecret",
           "default": "auto",
-          "description": "`auto` (generated), `none`, or the secret Telegram must send."
+          "description": "`auto` (derived from the bot token), `none`, or the secret Telegram\nmust send."
         }
       },
       "type": "object"
@@ -967,7 +967,7 @@
       "anyOf": [
         {
           "const": "auto",
-          "description": "Generate a secret at start."
+          "description": "Derived from the bot token (HMAC-SHA256); the same on every restart and replica."
         },
         {
           "const": "none",

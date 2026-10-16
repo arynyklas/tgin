@@ -91,7 +91,7 @@ Telegram posts updates to the data plane.
 | `path` | string (not empty) |  | HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. Supports `${env:…}` and `${file:…}`. |
 | `public_url` | string (not empty) |  | The public HTTPS base URL Telegram reaches tgin at; `setWebhook` registers it followed by `path`. Supports `${env:…}` and `${file:…}`. |
 | `register` | boolean | `false` | Call `setWebhook` at start; needs `public_url`. |
-| `secret_token` | [WebhookSecret](#webhooksecret) | `auto` | `auto` (generated), `none`, or the secret Telegram must send. |
+| `secret_token` | [WebhookSecret](#webhooksecret) | `auto` | `auto` (derived from the bot token), `none`, or the secret Telegram must send. |
 
 ## `IpAllowlist`
 
@@ -113,7 +113,7 @@ Examples: `10.0.0.0/8`, `2001:db8::/32`.
 
 One of:
 
-- `auto` — Generate a secret at start.
+- `auto` — Derived from the bot token (HMAC-SHA256); the same on every restart and replica.
 - `none` — Send and check no secret.
 - [Secret](#secret)
 
@@ -271,7 +271,7 @@ Per-endpoint circuit breaker.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `failure_threshold` | integer (at least 1) | `5` | Consecutive failures that open the breaker; at least 1. |
+| `failure_threshold` | integer (at least 1) | `5` | Consecutive transient failures (408, 429, 5xx, timeouts, network errors) that open the breaker; at least 1. |
 | `open_for` | [Duration](#duration) | `30s` | How long the breaker stays open. |
 
 ## `Endpoint`

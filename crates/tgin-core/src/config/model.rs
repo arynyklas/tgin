@@ -227,7 +227,8 @@ pub struct Webhook {
     pub public_url: Option<Template>,
     /// Call `setWebhook` at start; needs `public_url`.
     pub register: At<bool>,
-    /// `auto` (generated), `none`, or the secret Telegram must send.
+    /// `auto` (derived from the bot token), `none`, or the secret Telegram
+    /// must send.
     pub secret_token: WebhookSecret,
     /// Update types to receive. Omitted, Telegram's default applies.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,7 +491,8 @@ pub struct Retry {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Breaker {
-    /// Consecutive failures that open the breaker; at least 1.
+    /// Consecutive transient failures (408, 429, 5xx, timeouts, network
+    /// errors) that open the breaker; at least 1.
     #[schemars(range(min = 1))]
     pub failure_threshold: At<u32>,
     /// How long the breaker stays open.

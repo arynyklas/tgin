@@ -24,7 +24,7 @@
 tgin receives your Telegram bots' updates — by long polling the Bot API or as webhooks — and routes each one, by rules you write, to the processes that handle it: bot instances that poll tgin the way they would poll Telegram, or HTTP services tgin posts to.
 
 > [!IMPORTANT]
-> This is tgin 1.0 in development (`1.0.0-dev`): a rewrite with a new YAML config, new ports and new metrics. No 1.0 release exists yet; the latest release is 0.2. Coming from 0.2? Read [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md); `tgin config migrate` converts your config.
+> This is tgin 1.0 in development (`1.0.0-dev`): a rewrite with a new YAML config, new ports and new metrics. There is no stable release yet: the last published artifacts are the 0.2.0 release candidates (`v0.2.0-rc.1`, `v0.2.0-rc.2`), and 1.0 will be the first stable release. Coming from 0.2? Read [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md); `tgin config migrate` converts your config.
 
 ## Contents
 
