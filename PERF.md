@@ -83,6 +83,8 @@ No builds or other benchmarks ran during the measurements. Unrelated, idle conta
 
 Medians of 3 valid runs, run set [`20261016T0155Z-final`](tests/performance/results/20261016T0155Z-final.csv) (+ [reruns](tests/performance/results/20261016T0155Z-final-rerun.csv)). Both engines answered every update in every run (`unreceived` = 0, `dropped_by_generator` = 0), so the throughput half of the gate is met everywhere; the `delivered` columns are shown for completeness.
 
+**Recheck after the M1 final fixes** (copied ingress bodies, `allowed_updates` always sent), the four 10 000 RPS tgin points, 3 runs per engine, all valid, every update answered: set [`20261016T-finalfix`](tests/performance/results/20261016T-finalfix.csv) gives 1.0 / 0.2 p99 medians of 0.99 (long poll, 1 bot), 1.08 (long poll, 3 bots), 1.04 (webhook, 3 bots) and **1.22 (webhook, 1 bot: 0.72 vs 0.59 ms, over the 1.2 limit)**; a confirmation set of that point, [`20261016T-finalfix-wh1-confirm`](tests/performance/results/20261016T-finalfix-wh1-confirm.csv), gives 0.99 (0.84 vs 0.85 ms) with a noisy host (one 1.0 run at 1.52 ms, 0.2 runs 0.61–0.85 ms).
+
 | Point | RPS | 0.2 delivered | 1.0 delivered | 0.2 p99 ms | 1.0 p99 ms | 1.0 / 0.2 p99 | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
 | webhook-tgin-1 | 1 000 | 1 000.02 | 1 000.02 | 0.62 | 0.64 | 1.03 | pass |
