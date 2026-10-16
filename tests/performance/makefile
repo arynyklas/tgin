@@ -22,7 +22,9 @@
 # BOT_IMPL selects the downstream bots:
 #   rust  `tgin-bench bot` (default): answers far faster than any target rate,
 #         so a scenario measures the engine, not the bots.
-#   py    aiogram 3 bots (bot/); one process answers about 2 000 updates/s.
+#   py    aiogram 3 bots (bot/); one process answered about 600–2 400
+#         updates/s in the benchmarks, depending on the engine in front of it
+#         and on max_in_flight.
 
 BOT_IMPL ?= rust
 ifeq ($(BOT_IMPL),rust)

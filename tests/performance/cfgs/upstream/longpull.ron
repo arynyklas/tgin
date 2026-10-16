@@ -8,7 +8,7 @@
 //
 // default_timeout_sleep: upstream sleeps this many milliseconds after every
 // getUpdates answer (default 100), which caps one source at 1 000 updates/s
-// with batches of 100. 0 polls again at once, as v0 and v1 do.
+// with batches of 100. 0 is the shortest pause it accepts.
 (
     dark_threads: 6,
 

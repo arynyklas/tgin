@@ -3,9 +3,9 @@
 tgin began as a fork of [chesnokpeter/tgin](https://github.com/chesnokpeter/tgin). This page compares tgin 1.0 with that original engine at commit `4f0971a`, the last upstream commit this project contains. Both were measured on one machine in one session on 2026-10-16. The short version:
 
 - **Long poll → pull: tgin 1.0 is about 3–5× faster.** Median end-to-end latency through tgin 1.0 is 0.26–0.38 ms; through the original engine it is 0.81–1.53 ms. Median p99 is 0.60–1.79 ms for 1.0 and 2.25–3.28 ms for the original. Both engines answered every update at every rate.
-- **Webhook → push: both engines are close.** p50 is 0.30–0.36 ms for 1.0 and 0.28–0.36 ms for the original. At 5 000 and 10 000 RPS, single slow runs dominate the p99 medians of both engines (0.57–5.44 ms), so this host cannot separate them on p99.
-- **Overload** (one aiogram bot that answers about 1 000–1 600 updates per second, offered 5 000 per second): tgin 1.0 keeps memory flat (about 50 MiB) and pushes back on its source. On the webhook it refuses what its queue cannot hold with `503`, which Telegram retries. The original engine buffers without bound and answers `200` once an update is queued in memory. It reached 590–599 MiB and up to 6.4 cores on the webhook, and its webhook ingress slowed until the generator could send only about half the load. From the same bot, 1.0 got 1 170–1 560 answers per second and the original 600–1 010.
-- **CPU:** 1.0 uses more CPU on the long-poll path, because it polls the Bot API as soon as updates arrive (1.0 polls up to 7 500 times per second, the original about 800). On the webhook path both use about the same.
+- **Webhook → push: both engines are close.** p50 is 0.30–0.36 ms for 1.0 and 0.28–0.36 ms for the original. At 5 000 and 10 000 RPS the p99s of both engines vary widely from run to run (medians 0.57–5.44 ms), so this host cannot separate them on p99.
+- **Overload** (one aiogram bot, offered 5 000 updates per second; one such process answered about 600–2 400 per second in these benchmarks, depending on the engine in front of it and on `max_in_flight`): tgin 1.0 keeps memory flat (about 50 MiB) and pushes back on its source. On the webhook it refuses what its queue cannot hold with `503`, which Telegram retries. The original engine buffers without bound and answers `200` once an update is queued in memory. It reached 590–599 MiB and up to 6.4 cores on the webhook, and its webhook ingress slowed until the generator could send only about half the load. From the same bot, 1.0 got 1 170–1 560 answers per second and the original 600–1 010.
+- **CPU:** 1.0 uses more CPU on the long-poll path, and polls the Bot API far more often (1.0 polls up to 7 500 times per second, the original about 800). On the webhook path both use about the same.
 - [What changed for performance](#what-changed-for-performance) lists, with file references in both codebases, where the differences come from.
 
 ## Contents
@@ -70,7 +70,7 @@ CSV columns (`tests/performance/results/*.csv`):
 | `dropped_by_generator` | Webhook sends never issued because 10 000 requests were already in flight. |
 | `lag_p99_ms` | p99 of how late the generator handed updates off. In the matrix, 71 of the 90 valid runs are 0.025–0.105 ms, and the rest at most 0.435 ms. |
 
-Alongside each CSV, `<run_id>.log` holds every run's counter summary (sent, received, errors, lag, completion wait, `getUpdates` calls to the fake Bot API) and `<run_id>.stats.log` a `docker stats` sample of the whole stack every 5 s, with the start and end of each run marked.
+Next to each CSV, `benchmark.sh` writes `<run_id>.log`, every run's counter summary (sent, received, errors, lag, completion wait, `getUpdates` calls to the fake Bot API), and `<run_id>.stats.log`, a `docker stats` sample of the whole stack every 5 s with the start and end of each run marked. In `tests/performance/results/` the logs are kept only for the `20261016T-upstream*` sets and the bot-capacity run.
 
 **Valid runs.** A run whose generator fell behind its schedule (`lag_p99_ms` above 0.5 ms) measured the host, not the engine. Such runs are kept in the CSVs, listed below, and rerun (`./rerun-invalid.sh <csv>`) until each point has 3 valid runs per engine.
 
@@ -158,7 +158,7 @@ Medians of 3 valid runs of the same set; the bot answers the generator directly.
 | longpoll-direct-1 | 5 000 | 5 000.00 | 0.18 | 0.57 |
 | longpoll-direct-1 | 10 000 | 9 999.95 | 0.26 | 0.79 |
 
-**The Rust bot's capacity** ([`20261016T0330Z-rust-bot-capacity`](tests/performance/results/20261016T0330Z-rust-bot-capacity.csv), [log](tests/performance/results/20261016T0330Z-rust-bot-capacity.log), 10 s runs, one bot, no tgin):
+**The Rust bot's capacity** ([`20261016T0330Z-rust-bot-capacity`](tests/performance/results/20261016T0330Z-rust-bot-capacity.csv), [log](tests/performance/results/20261016T0330Z-rust-bot-capacity.log), 10 s runs, one bot, no tgin; the direct runs are labelled `v1`):
 
 | RPS | webhook delivered / p50 / p99 | long poll delivered / p50 / p99 |
 |---:|---|---|
@@ -237,14 +237,14 @@ Each item was checked in both codebases. Paths starting with `src/` are files of
    [Overload](#overload) shows the effect.
 6. **The long-poll source polls again at once.** The original engine sleeps `default_timeout_sleep` after every answer (`src/update/longpull.rs:74`; 100 ms by default, 0 in the benchmark configs). tgin 1.0's source polls again immediately and sleeps only after an error or while its sink is full (`crates/tgin-botapi/src/longpoll.rs:287, 326`). In the matrix, the original engine made about 700–880 calls per second and tgin 1.0 up to 7 500.
 7. **`TCP_NODELAY`.** The original engine serves with `axum::serve` and does not set `TCP_NODELAY` (`src/tgin.rs:123-124`; axum 0.7.9 leaves it unset unless asked), so Nagle's algorithm stays on. Each of its responses is one body. tgin 1.0 writes a pull response as one chunk per update and sets `TCP_NODELAY` on every accepted connection (`crates/tgin-runtime/src/http/accept.rs:47`); see [below](#two-problems-found-while-measuring-tgin-10) for why.
-8. **mimalloc on musl.** The original image is a glibc Debian build with the system allocator (its `Dockerfile`). tgin 1.0's static musl builds, including the container image, use mimalloc as the global allocator (`crates/tgin/src/main.rs:5-7`, `crates/tgin/Cargo.toml:39-40`).
+8. **mimalloc on musl.** The original image is a glibc Debian build with the system allocator (its `Dockerfile`). tgin 1.0's static musl builds, including the container image, use mimalloc as the global allocator (`crates/tgin/src/main.rs:5-7`, `crates/tgin/Cargo.toml:36-37`).
 9. **Connection cap and timeouts.** The original engine sets no connection limit and no header timeout on its listener (`src/tgin.rs:123-124`). Its HTTP clients are `reqwest::Client::new()` with no timeouts (`src/route/webhook.rs:14`, `src/update/longpull.rs:24`). tgin 1.0 caps a listener at `server.max_connections` (10 000) and gives clients `server.header_read_timeout` (10 s) to send a request head (`crates/tgin-runtime/src/http/server.rs:43-54, 215-223`). It bounds a webhook request to 30 s (`crates/tgin/src/data_server.rs:41, 250-258`), and its outgoing requests to 5 s to connect and 10 s in total (`crates/tgin-runtime/src/http/client.rs:33-34`; push endpoints `timeout` 10 s, `crates/tgin-core/src/config/defaults.rs:55-56`).
 
 ## Two problems found while measuring tgin 1.0
 
 **1. Nagle's algorithm on tgin's data plane (engine fix).** A pull response is written as one chunk per update, so a batch leaves tgin as several writes. With Nagle's algorithm on, every write after the first waits for the client's delayed ACK, up to 40 ms on Linux. Before the fix, `longpoll-tgin-1` at 10 000 RPS had p99 77.50, 472.06 and 88.06 ms ([`20261015T2215Z-lp1-diag-v1`](tests/performance/results/20261015T2215Z-lp1-diag-v1.csv)). An instrumented build showed nothing slow inside tgin: not the `getUpdates` poll, the admission, the lease or the handler ([`…-instrumented`](tests/performance/results/20261015T2225Z-lp1-diag-instrumented-v1.csv), p99 52.51 ms). A packet capture showed the delay sitting between two segments of one response. tgin now sets `TCP_NODELAY` on every accepted connection. The same instrumented build then measured p99 0.69, 0.72 and 0.84 ms at that point ([`…-nodelay-instrumented`](tests/performance/results/20261015T2235Z-lp1-diag-nodelay-instrumented-v1.csv)), and the release image 0.86 ms in [Results](#results).
 
-**2. Unbounded webhook connections in the generator (harness fix).** Telegram opens at most `max_connections` (≤ 100) connections to a webhook; the generator opened one per in-flight send, up to 10 000. In the sets taken before the cap ([`20261015T2107Z-rust`](tests/performance/results/20261015T2107Z-rust.csv), [`20261015T2245Z-rust-nodelay`](tests/performance/results/20261015T2245Z-rust-nodelay.csv)), tgin 1.0's webhook points had valid runs with p99 of 41.53, 48.26, 49.79 and 93.31 ms, and `webhook-direct-1`, with no tgin, one of 161.15 ms. Kernel counters read from each container's network namespace (`/proc/net/snmp` and `/proc/net/netstat`) after runs of `webhook-tgin-1` at 10 000 RPS show the cause. In tgin 1.0's outlier run (p99 98.43 ms):
+**2. Unbounded webhook connections in the generator (harness fix).** Telegram opens at most `max_connections` (≤ 100) connections to a webhook; the generator opened one per in-flight send, up to 10 000. In the sets taken before the cap ([`20261015T2107Z-rust`](tests/performance/results/20261015T2107Z-rust.csv), [`20261015T2245Z-rust-nodelay`](tests/performance/results/20261015T2245Z-rust-nodelay.csv)), tgin 1.0's webhook points had valid runs with p99 of 41.53, 48.26, 49.79 and 93.31 ms, and `webhook-direct-1`, with no tgin, one of 161.15 ms. Older sets keep only the 1.0 and direct rows used here; their direct rows carry the label `v1`, which names no engine, as no tgin is in their path. Kernel counters read from each container's network namespace (`/proc/net/snmp` and `/proc/net/netstat`) after runs of `webhook-tgin-1` at 10 000 RPS show the cause. In tgin 1.0's outlier run (p99 98.43 ms):
 - the **generator's** namespace had `TcpActiveOpens` 3 583 and `TcpExtTCPSynRetrans` 2 393;
 - **tgin's** namespace had `TcpExtListenOverflows` 3 004 and `TcpExtTCPSynRetrans` 130 (SYN-ACK retransmits).
 
@@ -252,7 +252,7 @@ Runs without outliers had no overflows and no retransmits in any namespace. So t
 
 ## `max_in_flight`
 
-A push consumer's `max_in_flight` (requests in flight over all its endpoints) stays at its default, **32**, in the scenario configs. With the Rust bots and the default, tgin 1.0's webhook points in a dedicated set ([`20261016T0131Z-rust-mif32`](tests/performance/results/20261016T0131Z-rust-mif32.csv), 3 runs each, all valid) had these p99s:
+A push consumer's `max_in_flight` (requests in flight over all its endpoints) stays at its default, **32**, in the scenario configs. With the Rust bots and the default, tgin 1.0's webhook points in a dedicated set ([`20261016T0131Z-rust-mif32`](tests/performance/results/20261016T0131Z-rust-mif32.csv), which keeps only its 1.0 rows; 3 runs each, all valid) had these p99s:
 
 | Point | RPS | 1.0 p99 of each run | median |
 |---|---:|---|---:|
@@ -263,7 +263,7 @@ A push consumer's `max_in_flight` (requests in flight over all its endpoints) st
 
 Every update was delivered in every run.
 
-With a **single-process** downstream (one aiogram bot) at 5 000 RPS, the value mattered a great deal. Medians of tgin 1.0's `delivered_rps`:
+With a **single-process** downstream (one aiogram bot) at 5 000 RPS, the value mattered a great deal. These sets come from an earlier session, before the generator's 100-connection cap, so they are not comparable with the 1 474–1 561 per second of the [overload](#overload) set. Medians of tgin 1.0's `delivered_rps`:
 - 256: 1 651 ([`20261015T1945Z-py-mif256-v1`](tests/performance/results/20261015T1945Z-py-mif256-v1.csv), 3 runs);
 - 64: 1 781 ([`20261015T1955Z-py-mif64-v1`](tests/performance/results/20261015T1955Z-py-mif64-v1.csv), 2 runs);
 - 32 (the default): 1 809 ([`20261015T1752Z-v1`](tests/performance/results/20261015T1752Z-v1.csv), 3 runs);
