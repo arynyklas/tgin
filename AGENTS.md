@@ -58,7 +58,7 @@ All async trait methods use `#[async_trait]`.
 | `crates/tgin/src/utils/auth.rs` | `secret_eq` (the single constant-time compare, used by the webhook secret check and the bearer gate) and `guard` (optional `Bearer` middleware). |
 | `crates/tgin/src/observe.rs` | tracing subscriber init, `dispatch_span`, `UpdaterMetrics`, process-global metrics registry, `/status` + `/metrics` handlers. |
 | `crates/tgin/src/mock/routes.rs` | `MockCallsRoute` test double, gated by `#[cfg(test)]` on `mod mock` in `main.rs`. |
-| `tests/performance/` | Docker-compose load-test harness: Rust `tgin-bench` load generator, Python aiogram bots, Python (matplotlib) plotter in `diagram/`. |
+| `tests/performance/` | Docker-compose load-test harness: Rust `tgin-bench` (load generator, fake Bot API and the `bot` downstream), Python aiogram bots (`BOT_IMPL=py`), Python (matplotlib) plotter in `diagram/`. |
 | `examples/simple/` | docker-compose example with two long-poll bots and one webhook bot. |
 | `integrations/pytgin/` | Python `aiogram` shim that reroutes `getUpdates` through tgin. |
 
@@ -105,11 +105,13 @@ docker run --rm -v "$PWD/tgin.ron:/etc/tgin/config.ron:ro" \
 # Example stack (long-poll + webhook bots)
 cd examples/simple && TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
 
-# Performance harness (ENGINE=v1 default, or v0 = tgin 0.2 built from 1af6aaa)
+# Performance harness (ENGINE=v1 default or v0 = tgin 0.2 from 1af6aaa;
+# BOT_IMPL=rust default, py = the aiogram bots)
 cd tests/performance
 make build && make image ENGINE=v1
-make webhook-tgin-3 ENGINE=v1 RPS=1000 DURATION=10   # one scenario
-ENGINE=v1 ./benchmark.sh                 # 6 scenarios × 3 rates × 3 runs → results/<run_id>.csv (~45 min)
+make webhook-tgin-3 RPS=10000 DURATION=30            # one scenario
+ENGINE="v0 v1" ./benchmark.sh      # both engines, 6 scenarios × 3 rates × 3 runs (~70 min)
+./rerun-invalid.sh results/<run_id>.csv              # rerun runs with lag_p99_ms > 0.5
 ```
 
 There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses stock `rustfmt` and `clippy` on stable, with clippy warnings as errors.
@@ -157,7 +159,7 @@ Variants must match `RouteConfig` / `UpdateConfig` exactly; every config type is
 - **Test doubles** live in `crates/tgin/src/mock/routes.rs` (`MockCallsRoute` records every received update as `Bytes` in `Arc<tokio::sync::Mutex<Vec<Bytes>>>`; `get_calls` parses them). The `mod mock` declaration in `crates/tgin/src/main.rs` is `#[cfg(test)]`-gated, so production builds don't see it.
 - **HTTP mocking**: `wiremock` for outbound assertions (see `crates/tgin/src/route/webhook.rs::tests::test_process_sends_correct_post_request`). `tower::ServiceExt` and `http_body_util` are available via dev-deps for in-process axum requests.
 - **Dependencies must not be mocked at the boundary** the system actually crosses — prefer real `wiremock` HTTP servers and real `tokio::sync::mpsc` channels over hand-rolled fakes.
-- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE=v1|v0` selects tgin 1.x (`cfgs/v1/*.yaml`) or 0.2 (`cfgs/*.ron`, image built from `1af6aaa`). One engine's sweep is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 45 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) and are plotted by `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`). Without arguments it plots the `results/*.csv` whose run id sorts last; pass several CSVs to compare engines. The plotter deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the v0/v1 gate and the harness's known limits.
+- **Performance / load tests** are not run by `cargo test`. They live under `tests/performance/` and require Docker, `make`, `curl` and `git` — see `tests/performance/makefile` and `benchmark.sh`. `ENGINE` selects the engine (`v1` default, `v0` = 0.2 built from `1af6aaa`, or both: `ENGINE="v0 v1"` alternates them run by run); `BOT_IMPL` selects the downstream (`rust` default = `tgin-bench bot`, 50 000+ updates/s; `py` = the aiogram bots, ~2 000/s, which saturate before tgin does). A full pass over both engines is 6 scenarios × 3 RPS values (1 000, 5 000, 10 000) × 3 runs of 30 s plus container start-up, about 70 min; the generator is open loop and measures latency from each update's scheduled time. Results land in `tests/performance/results/<run_id>.csv` (13 columns, see PERF.md) next to `<run_id>.log` (per-run counters) and `<run_id>.stats.log` (`docker stats`). A run with `lag_p99_ms` above 0.5 measured the host, not the engine: `./rerun-invalid.sh results/<run_id>.csv` reruns those. Charts come from `tests/performance/diagram/main.py` (`uv run main.py [CSV ...]`); without arguments it plots the `results/*.csv` whose run id sorts last, and it deletes every PNG in `diagram/generated/` before rendering. Run the matrix on an otherwise idle machine (no cargo builds); PERF.md lists the machine, the v0/v1 gate and the harness's known limits.
 - Always exercise the actual change before claiming it passes: run the specific `cargo test -p tgin <name>` for the touched module, and for HTTP-affecting changes spin up `examples/simple` or a perf scenario.
 
 ## Runtime / Tooling

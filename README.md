@@ -124,7 +124,7 @@ The image runs as uid/gid `65532` and contains no shell: a mounted config file (
 
 ## Performance
 
-tgin 1.0 against 0.2 at 1 000, 5 000 and 10 000 updates per second, with one and three aiogram bots behind it; methodology, the full table, the raw CSVs and the harness's limits are in [PERF.md](PERF.md). Below the bots' capacity tgin adds well under a millisecond (median 0.6–1.0 ms end to end at 1 000 RPS). Beyond it, one aiogram process tops out near 2 000 updates per second and the numbers measure queueing in front of the bots; there tgin 1.0 keeps updates that 0.2 loses, at the cost of a longer tail.
+tgin 1.0 against 0.2 at 1 000, 5 000 and 10 000 updates per second, with one and three downstream bots, webhook and long poll; methodology, the full table, the raw CSVs and the harness's limits are in [PERF.md](PERF.md). Routing an update costs a fraction of a millisecond: at 10 000 RPS the median end-to-end latency through tgin is 0.24–0.28 ms and p99 0.52–0.65 ms, against 0.13–0.15 ms and 0.33–0.46 ms straight to the bot. tgin 1.0 matches 0.2 at every point (p99 between 0.88× and 1.11×, every update delivered) and uses less CPU on the long-poll path.
 
 <table>
   <tr>

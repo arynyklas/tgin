@@ -20,9 +20,5 @@ bots:
 consumers:
   bots:
     push:
-      # 8 requests in flight per bot: one aiogram process answers fastest at
-      # low concurrency (the default 32 gave ~1 800 delivered RPS at 5k, 8 gave
-      # ~2 300; see PERF.md).
-      max_in_flight: 8
       endpoints:
         - url: http://10.5.0.11:8080/webhook

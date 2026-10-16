@@ -1,0 +1,4 @@
+scenario,engine,target_rps,achieved_rps,delivered_rps,p50_ms,p95_ms,p99_ms,max_ms,unreceived,duplicate_replies,dropped_by_generator,lag_p99_ms
+longpoll-tgin-1,v1,10000,10000.00,9999.93,0.26,0.57,77.50,204.93,0,0,0,0.028
+longpoll-tgin-1,v1,10000,10000.00,9999.97,0.32,43.10,472.06,665.60,0,0,0,0.028
+longpoll-tgin-1,v1,10000,10000.00,9999.91,0.26,0.72,88.06,240.25,0,0,0,0.034

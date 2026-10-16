@@ -1,0 +1,172 @@
+docker compose down --remove-orphans
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench webhook_bot1
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-webhook_bot1-1 Creating 
+ Container tgin-bench-webhook_bot1-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Starting 
+ Container tgin-bench-webhook_bot1-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-webhook_bot1-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Healthy 
+docker compose exec -T bench tgin-bench run --target http://10.5.0.11:8080/webhook --rps "20000" --duration "10" --scenario "webhook-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+webhook-direct-1 (v0) at 20000 RPS: achieved 20000.00 RPS, delivered 19999.89 RPS, sent 200000, received 200000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.002 ms p99 0.027 ms max 0.386 ms, completion wait 0.00 s, getUpdates calls 0
+docker compose down --remove-orphans
+ Container tgin-bench-webhook_bot1-1 Stopping 
+ Container tgin-bench-webhook_bot1-1 Stopped 
+ Container tgin-bench-webhook_bot1-1 Removing 
+ Container tgin-bench-webhook_bot1-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench longpull_bot_direct
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-longpull_bot_direct-1 Creating 
+ Container tgin-bench-longpull_bot_direct-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Starting 
+ Container tgin-bench-longpull_bot_direct-1 Started 
+ Container tgin-bench-longpull_bot_direct-1 Waiting 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Healthy 
+docker compose exec -T bench tgin-bench run --mode longpoll --rps "20000" --duration "10" --scenario "longpoll-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+longpoll-direct-1 (v0) at 20000 RPS: achieved 20000.00 RPS, delivered 19999.59 RPS, sent 200000, received 200000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.001 ms p99 0.024 ms max 0.814 ms, completion wait 0.00 s, getUpdates calls 81497
+docker compose down --remove-orphans
+ Container tgin-bench-longpull_bot_direct-1 Stopping 
+ Container tgin-bench-longpull_bot_direct-1 Stopped 
+ Container tgin-bench-longpull_bot_direct-1 Removing 
+ Container tgin-bench-longpull_bot_direct-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench webhook_bot1
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-webhook_bot1-1 Creating 
+ Container tgin-bench-webhook_bot1-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Starting 
+ Container tgin-bench-webhook_bot1-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-webhook_bot1-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Healthy 
+docker compose exec -T bench tgin-bench run --target http://10.5.0.11:8080/webhook --rps "50000" --duration "10" --scenario "webhook-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+webhook-direct-1 (v0) at 50000 RPS: achieved 50000.00 RPS, delivered 49999.57 RPS, sent 500000, received 500000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.001 ms p99 0.065 ms max 9.069 ms, completion wait 0.00 s, getUpdates calls 0
+docker compose down --remove-orphans
+ Container tgin-bench-webhook_bot1-1 Stopping 
+ Container tgin-bench-webhook_bot1-1 Stopped 
+ Container tgin-bench-webhook_bot1-1 Removing 
+ Container tgin-bench-webhook_bot1-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench longpull_bot_direct
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-longpull_bot_direct-1 Creating 
+ Container tgin-bench-longpull_bot_direct-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Starting 
+ Container tgin-bench-longpull_bot_direct-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-longpull_bot_direct-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Healthy 
+docker compose exec -T bench tgin-bench run --mode longpoll --rps "50000" --duration "10" --scenario "longpoll-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+longpoll-direct-1 (v0) at 50000 RPS: achieved 50000.00 RPS, delivered 49999.41 RPS, sent 500000, received 500000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.001 ms p99 0.029 ms max 1.564 ms, completion wait 0.00 s, getUpdates calls 69682
+docker compose down --remove-orphans
+ Container tgin-bench-longpull_bot_direct-1 Stopping 
+ Container tgin-bench-longpull_bot_direct-1 Stopped 
+ Container tgin-bench-longpull_bot_direct-1 Removing 
+ Container tgin-bench-longpull_bot_direct-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench webhook_bot1
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-webhook_bot1-1 Creating 
+ Container tgin-bench-webhook_bot1-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Starting 
+ Container tgin-bench-webhook_bot1-1 Started 
+ Container tgin-bench-webhook_bot1-1 Waiting 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-webhook_bot1-1 Healthy 
+docker compose exec -T bench tgin-bench run --target http://10.5.0.11:8080/webhook --rps "80000" --duration "10" --scenario "webhook-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+webhook-direct-1 (v0) at 80000 RPS: achieved 80000.00 RPS, delivered 79998.71 RPS, sent 800000, received 800000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.001 ms p99 0.047 ms max 1.183 ms, completion wait 0.00 s, getUpdates calls 0
+docker compose down --remove-orphans
+ Container tgin-bench-webhook_bot1-1 Stopping 
+ Container tgin-bench-webhook_bot1-1 Stopped 
+ Container tgin-bench-webhook_bot1-1 Removing 
+ Container tgin-bench-webhook_bot1-1 Removed 
+ Container tgin-bench-bench-1 Stopping 
+ Container tgin-bench-bench-1 Stopped 
+ Container tgin-bench-bench-1 Removing 
+ Container tgin-bench-bench-1 Removed 
+ Network tgin-bench_testing_net Removing 
+ Network tgin-bench_testing_net Removed 
+docker compose up -d --wait --wait-timeout 90 bench longpull_bot_direct
+ Network tgin-bench_testing_net Creating 
+ Network tgin-bench_testing_net Created 
+ Container tgin-bench-bench-1 Creating 
+ Container tgin-bench-bench-1 Created 
+ Container tgin-bench-longpull_bot_direct-1 Creating 
+ Container tgin-bench-longpull_bot_direct-1 Created 
+ Container tgin-bench-bench-1 Starting 
+ Container tgin-bench-bench-1 Started 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Starting 
+ Container tgin-bench-longpull_bot_direct-1 Started 
+ Container tgin-bench-longpull_bot_direct-1 Waiting 
+ Container tgin-bench-bench-1 Waiting 
+ Container tgin-bench-bench-1 Healthy 
+ Container tgin-bench-longpull_bot_direct-1 Healthy 
+docker compose exec -T bench tgin-bench run --mode longpoll --rps "80000" --duration "10" --scenario "longpoll-direct-1" --engine "v0" --completion-timeout "30" --format "csv-row" >> "results/20261016T0330Z-rust-bot-capacity.csv"
+longpoll-direct-1 (v0) at 80000 RPS: achieved 80000.00 RPS, delivered 79997.98 RPS, sent 800000, received 800000, unreceived 0, duplicate replies 0, dropped by generator 0, send errors 0, HTTP errors 0, unmatched replies 0, send lag p50 0.001 ms p99 0.039 ms max 1.566 ms, completion wait 0.01 s, getUpdates calls 62630
