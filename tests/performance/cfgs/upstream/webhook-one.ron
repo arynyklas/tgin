@@ -1,8 +1,8 @@
+// ENGINE=upstream, scenario webhook-tgin-1.
 (
     dark_threads: 6,
 
     api : Some(ApiConfig(base_path: "/api")),
-    auth_token: Some("bench"),
 
     server_port: Some(3000),
 
@@ -13,7 +13,6 @@
     route: RoundRobinLB(
         routes: [
             WebhookRoute(url: "http://10.5.0.11:8080/webhook"),
-            WebhookRoute(url: "http://10.5.0.12:8080/webhook"),
         ]
     )
 )

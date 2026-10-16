@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run the scenario matrix and write results/<run_id>.csv.
 #
-#   ENGINE       v1 (default), v0, or a list such as "v0 v1": the engines
-#                take turns run by run, so they share the machine's state
+#   ENGINE       v1 (default), upstream, or both: "upstream v1" makes the
+#                engines take turns run by run, so they share the machine's
+#                state; see the makefile
 #   BOT_IMPL     rust (default) or py; see the makefile
 #   RPS_VALUES   target rates, default "1000 5000 10000"
 #   SCENARIOS    default: every scenario in the makefile; the direct
@@ -32,9 +33,9 @@ stats_path="${result_dir}/${run_id}.stats.log"
 
 for engine in "${engines[@]}"; do
     case "${engine}" in
-        v0|v1) ;;
+        v1|upstream) ;;
         *)
-            echo "ENGINE must be v0, v1 or a list of them" >&2
+            echo "ENGINE must be v1, upstream or a list of them" >&2
             exit 1
             ;;
     esac

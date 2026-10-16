@@ -280,8 +280,8 @@ mod tests {
 
     #[test]
     fn the_offset_never_goes_back() {
-        // A re-served older update (v0 does not honour offsets) must not
-        // un-confirm newer ones.
+        // A re-served older update (an engine that ignores offsets may send
+        // one) must not un-confirm newer ones.
         assert_eq!(next_offset(20, &updates(&[3, 4])), 20);
     }
 

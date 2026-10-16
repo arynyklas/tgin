@@ -10,7 +10,7 @@ whatever engine the run was for.
 
 Without arguments the newest ../results/<run_id>.csv is plotted, newest by
 `run_id` (the file name), not by modification time. Pass CSV paths to plot
-specific runs, for example a v0 and a v1 run side by side.
+specific runs, for example a run set and its reruns.
 
 Run from this directory:
     uv run main.py [../results/<run_id>.csv ...]
@@ -61,7 +61,7 @@ COLORS: list[tuple[float, float, float]] = [
 ]
 
 # Each engine gets its own line style, so engines stay apart in print.
-ENGINE_STYLES: dict[str, str] = {DIRECT_ENGINE: ":", "v0": "--", "v1": "-"}
+ENGINE_STYLES: dict[str, str] = {DIRECT_ENGINE: ":", "upstream": "--", "v1": "-"}
 
 
 @dataclass(frozen=True, order=True)

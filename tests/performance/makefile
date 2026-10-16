@@ -6,10 +6,18 @@
 #   make webhook-tgin-3 RPS=5000 DURATION=30
 #
 # ENGINE selects the engine under test:
-#   v1  tgin 1.x: image tgin-bench:v1 built from this tree, YAML configs in
-#       cfgs/v1/, data plane on 8080, admin plane on 9090 (/readyz).
-#   v0  tgin 0.2: image tgin-bench:v0 built from V0_REF, RON configs in cfgs/,
-#       management API on 3000 (webhook) or 3030 (long poll).
+#   v1        tgin 1.x: image built from this tree, YAML configs in cfgs/v1/,
+#             data plane on 8080, admin plane on 9090 (/readyz).
+#   upstream  the original tgin (github.com/chesnokpeter/tgin) at
+#             UPSTREAM_REF, built with its own Dockerfile; the original
+#             engine's configs in cfgs/upstream/; management API (no auth)
+#             on 3000 (webhook scenarios) or 3030 (long-poll scenarios).
+#             Readiness is `GET /api/routes`; downstreams beyond the configs
+#             are added with `POST /api/route`. Its configured long-poll
+#             routes accept only form-encoded polls, so every long-poll route
+#             is added through the management API, whose fallback handler
+#             also accepts JSON.
+# V1_IMAGE and UPSTREAM_IMAGE name the image of each engine.
 #
 # BOT_IMPL selects the downstream bots:
 #   rust  `tgin-bench bot` (default): answers far faster than any target rate,
@@ -35,13 +43,16 @@ BOT_SLEEP_MS ?= 0
 # How long a run waits for outstanding replies after the send phase, seconds.
 COMPLETION_TIMEOUT ?= 30
 COMPOSE_WAIT_TIMEOUT ?= 90
-# The last 0.2 commit, which `make image ENGINE=v0` builds.
-V0_REF ?= 1af6aaa
-TGIN_IMAGE ?= tgin-bench:$(ENGINE)
+# The last upstream commit this project contains, which
+# `make image ENGINE=upstream` builds.
+UPSTREAM_REF ?= 4f0971a
+V1_IMAGE ?= tgin-bench:v1
+UPSTREAM_IMAGE ?= tgin-bench:upstream
 
 TGIN_IP := 10.5.0.2
 
 ifeq ($(ENGINE),v1)
+TGIN_IMAGE := $(V1_IMAGE)
 TGIN_CONFIG_TARGET := /etc/tgin/tgin.yaml
 TGIN_PROBE_PORT := 9090
 READY_URL := http://localhost:9090/readyz
@@ -56,38 +67,43 @@ CFG_LONGPOLL_3 := ./cfgs/v1/longpoll-3.yaml
 PULL_URL_1 := http://$(TGIN_IP):8080/c/bots/getUpdates
 PULL_URL_2 := $(PULL_URL_1)
 PULL_URL_3 := $(PULL_URL_1)
-else ifeq ($(ENGINE),v0)
+else ifeq ($(ENGINE),upstream)
+TGIN_IMAGE := $(UPSTREAM_IMAGE)
+# The path the upstream image's CMD (`tgin -f /etc/tgin/config.ron`) reads.
 TGIN_CONFIG_TARGET := /etc/tgin/config.ron
-# The RON configs serve webhooks on 3000 and long-poll routes on 3030; the
+# The configs serve webhooks on 3000 and long-poll routes on 3030; the
 # scenario targets below pick the port.
-TGIN_PROBE_PORT = $(V0_PORT)
-READY_URL = http://localhost:$(V0_PORT)/api/routes
+TGIN_PROBE_PORT = $(UPSTREAM_PORT)
+READY_URL = http://localhost:$(UPSTREAM_PORT)/api/routes
 WEBHOOK_URL := http://$(TGIN_IP):3000/webhook
-CFG_WEBHOOK_1 := ./cfgs/webhook-one.ron
+CFG_WEBHOOK_1 := ./cfgs/upstream/webhook-one.ron
 # Two routes; the third is added through the management API.
-CFG_WEBHOOK_3 := ./cfgs/webhook.ron
-CFG_LONGPOLL_1 := ./cfgs/longpull-one.ron
-# Two routes; the third is added through the management API.
-CFG_LONGPOLL_3 := ./cfgs/longpull.ron
+CFG_WEBHOOK_3 := ./cfgs/upstream/webhook.ron
+# No routes: all of them are added through the management API.
+CFG_LONGPOLL_1 := ./cfgs/upstream/longpull.ron
+CFG_LONGPOLL_3 := ./cfgs/upstream/longpull.ron
 PULL_URL_1 := http://$(TGIN_IP):3030/bot1/getUpdates
 PULL_URL_2 := http://$(TGIN_IP):3030/bot2/getUpdates
 PULL_URL_3 := http://$(TGIN_IP):3030/bot3/getUpdates
 else
-$(error ENGINE must be v0 or v1, got '$(ENGINE)')
+$(error ENGINE must be v1 or upstream, got '$(ENGINE)')
 endif
 
-webhook-%: V0_PORT := 3000
-longpoll-%: V0_PORT := 3030
+webhook-%: UPSTREAM_PORT := 3000
+longpoll-%: UPSTREAM_PORT := 3030
 
 # Read by docker-compose.yml.
 export TGIN_IMAGE TGIN_CONFIG_FILE TGIN_CONFIG_TARGET TGIN_PROBE_PORT BOT_SLEEP_MS \
 	PULL_URL_1 PULL_URL_2 PULL_URL_3
 
-# Must match `auth_token` in cfgs/*.ron (v0) and `admin.token` in cfgs/v1/*.yaml.
+# Must match `admin.token` in cfgs/v1/*.yaml; upstream's management API has
+# no auth and ignores it.
 AUTH_HEADER := Authorization: Bearer bench
-# The third downstream of the v0 "-3" scenarios, as 0.2 management API routes.
-V0_WEBHOOK_ROUTE_3 := {"type": "Webhook", "url": "http://10.5.0.13:8080/webhook"}
-V0_LONGPOLL_ROUTE_3 := {"type": "Longpull", "path": "/bot3/getUpdates"}
+# Downstreams the upstream scenarios add through the management API.
+UPSTREAM_WEBHOOK_ROUTE_3 := {"type": "Webhook", "url": "http://10.5.0.13:8080/webhook"}
+UPSTREAM_LONGPOLL_ROUTE_1 := {"type": "Longpull", "path": "/bot1/getUpdates"}
+UPSTREAM_LONGPOLL_ROUTE_2 := {"type": "Longpull", "path": "/bot2/getUpdates"}
+UPSTREAM_LONGPOLL_ROUTE_3 := {"type": "Longpull", "path": "/bot3/getUpdates"}
 
 SCENARIOS := webhook-direct-1 webhook-tgin-1 webhook-tgin-3 \
 	longpoll-direct-1 longpoll-tgin-1 longpoll-tgin-3
@@ -120,9 +136,11 @@ curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --header "$(A
 exit 1
 endef
 
-# v0 only: add a route through the 0.2 management API.
-define ADD_V0_ROUTE
-@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST "http://localhost:$(V0_PORT)/api/route" --data '$(1)' --header "Content-Type: application/json" --header "$(AUTH_HEADER)" >/dev/null
+# Upstream only: add a route through the management API. Upstream queues the
+# change and answers at once; it applies its management messages in order,
+# so the readiness GET after the last add returns once every add is applied.
+define ADD_ROUTE
+@curl --fail --silent --show-error --connect-timeout 2 --max-time 10 --request POST "http://localhost:$(UPSTREAM_PORT)/api/route" --data '$(1)' --header "Content-Type: application/json" >/dev/null
 endef
 
 clean:
@@ -135,7 +153,7 @@ image:
 ifeq ($(ENGINE),v1)
 	docker build -t "$(TGIN_IMAGE)" ../..
 else
-	git -C ../.. archive --format=tar "$(V0_REF)" | docker build -t "$(TGIN_IMAGE)" -
+	git -C ../.. archive --format=tar "$(UPSTREAM_REF)" | docker build -t "$(TGIN_IMAGE)" -
 endif
 
 webhook-direct-1: clean
@@ -152,8 +170,9 @@ webhook-tgin-3: TGIN_CONFIG_FILE := $(CFG_WEBHOOK_3)
 webhook-tgin-3: clean
 	$(call COMPOSE_UP_WAIT,bench webhook_bot1 webhook_bot2 webhook_bot3 tgin)
 	$(call WAIT_HTTP,$(READY_URL))
-ifeq ($(ENGINE),v0)
-	$(call ADD_V0_ROUTE,$(V0_WEBHOOK_ROUTE_3))
+ifeq ($(ENGINE),upstream)
+	$(call ADD_ROUTE,$(UPSTREAM_WEBHOOK_ROUTE_3))
+	$(call WAIT_HTTP,$(READY_URL))
 endif
 	$(call RUN_BENCH,--target $(WEBHOOK_URL))
 
@@ -163,16 +182,31 @@ longpoll-direct-1: clean
 
 longpoll-tgin-1: TGIN_CONFIG_FILE := $(CFG_LONGPOLL_1)
 longpoll-tgin-1: clean
+ifeq ($(ENGINE),upstream)
+	$(call COMPOSE_UP_WAIT,bench tgin)
+	$(call WAIT_HTTP,$(READY_URL))
+	$(call ADD_ROUTE,$(UPSTREAM_LONGPOLL_ROUTE_1))
+	$(call WAIT_HTTP,$(READY_URL))
+	$(call COMPOSE_UP_WAIT,longpull_bot1)
+else
 	$(call COMPOSE_UP_WAIT,bench tgin longpull_bot1)
 	$(call WAIT_HTTP,$(READY_URL))
+endif
 	$(call RUN_BENCH,--mode longpoll)
 
 longpoll-tgin-3: TGIN_CONFIG_FILE := $(CFG_LONGPOLL_3)
 longpoll-tgin-3: clean
+ifeq ($(ENGINE),upstream)
+	$(call COMPOSE_UP_WAIT,bench tgin)
+	$(call WAIT_HTTP,$(READY_URL))
+	$(call ADD_ROUTE,$(UPSTREAM_LONGPOLL_ROUTE_1))
+	$(call ADD_ROUTE,$(UPSTREAM_LONGPOLL_ROUTE_2))
+	$(call ADD_ROUTE,$(UPSTREAM_LONGPOLL_ROUTE_3))
+	$(call WAIT_HTTP,$(READY_URL))
+	$(call COMPOSE_UP_WAIT,longpull_bot1 longpull_bot2 longpull_bot3)
+else
 	$(call COMPOSE_UP_WAIT,bench tgin longpull_bot1 longpull_bot2)
 	$(call WAIT_HTTP,$(READY_URL))
-ifeq ($(ENGINE),v0)
-	$(call ADD_V0_ROUTE,$(V0_LONGPOLL_ROUTE_3))
-endif
 	$(call COMPOSE_UP_WAIT,longpull_bot3)
+endif
 	$(call RUN_BENCH,--mode longpoll)
