@@ -1,0 +1,28 @@
+// ENGINE=upstream, scenarios longpoll-tgin-1 and longpoll-tgin-3.
+//
+// No routes here: the makefile adds /bot1, /bot2 and /bot3 through the
+// management API. A route configured in this file serves getUpdates through
+// axum's Form extractor, which answers 415 to the JSON polls of the Rust
+// bots; routes added through the API are served by the fallback handler,
+// which reads JSON and form bodies alike.
+//
+// default_timeout_sleep: upstream sleeps this many milliseconds after every
+// getUpdates answer (default 100), which caps one source at 1 000 updates/s
+// with batches of 100. 0 is the shortest pause it accepts.
+(
+    dark_threads: 6,
+
+    api: Some(ApiConfig(base_path: "/api")),
+
+    server_port: Some(3030),
+
+    updates: [
+        LongPollUpdate(
+            token: "123:test",
+            url: Some("http://10.5.0.3:8090/bot123:test/getUpdates"),
+            default_timeout_sleep: 0,
+        )
+    ],
+
+    route: RoundRobinLB(routes: [])
+)

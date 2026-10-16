@@ -592,7 +592,7 @@ fn rule_paths_not_reserved() {
 }
 
 /// Only token-shaped `bot<id>:<secret>` segments belong to the Bot API
-/// gateway, so 0.2-style long-poll paths remain usable aliases.
+/// gateway, so paths such as `/bot1/getUpdates` remain usable aliases.
 #[test]
 fn bot_paths_without_a_token_are_not_reserved() {
     let yaml = "version: 1\nserver: {}\nconsumers:\n  q: { pull: { aliases: [/bot1/getUpdates, /bot/x, /file/x] } }\n";

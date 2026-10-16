@@ -13,8 +13,8 @@ x-bot: &bot
     retries: 30
 
 services:
-  # The engine under test: tgin 0.2 (ENGINE=v0, RON config) or tgin 1.x
-  # (ENGINE=v1, YAML config, data plane 8080, admin plane 9090).
+  # The engine under test: tgin 1.x (ENGINE=v1, YAML config, data plane
+  # 8080, admin plane 9090) or the original upstream tgin (ENGINE=upstream).
   tgin:
     image: ${TGIN_IMAGE:-tgin-bench:v1}
     pull_policy: never
@@ -23,7 +23,7 @@ services:
     volumes:
       - ${TGIN_CONFIG_FILE:-./cfgs/v1/webhook-1.yaml}:${TGIN_CONFIG_TARGET:-/etc/tgin/tgin.yaml}:ro
     ports:
-      # Readiness probe (v1 admin plane) or management API (v0) for the host.
+      # Readiness probe (v1 admin plane) or management API (upstream) for the host.
       - "${TGIN_PROBE_PORT:-9090}:${TGIN_PROBE_PORT:-9090}"
     depends_on:
       bench:

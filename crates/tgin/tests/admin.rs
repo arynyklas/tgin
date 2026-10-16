@@ -1418,8 +1418,8 @@ fn pull_only(telegram: &MockServer, name: &str, extra: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_pull_aliases_drain_until_reused() {
     const OLD_SECRET: &str = "old-alias-secret-value";
-    // As a migrated 0.2 client polls it (`/bot…` is reserved in v1).
-    const ALIAS: &str = "/legacy/one/getUpdates";
+    // An alias path a client can poll (`/bot<token>` paths are reserved).
+    const ALIAS: &str = "/pollers/one/getUpdates";
     let telegram = telegram().await;
     let tgin = start(
         "retired_pull_aliases_drain_until_reused",

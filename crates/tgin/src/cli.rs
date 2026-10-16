@@ -1,4 +1,4 @@
-//! The command line: `tgin [run]`, `tgin config validate|schema|print|migrate`,
+//! The command line: `tgin [run]`, `tgin config validate|schema|print`,
 //! `tgin admin …` and `tgin version`.
 
 use std::borrow::Cow;
@@ -41,9 +41,6 @@ const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// The 0.2 config flag; tgin 1.0 explains how to migrate instead.
-    #[arg(short = 'f', long = "file", hide = true, value_name = "PATH")]
-    legacy_file: Option<PathBuf>,
     #[command(flatten)]
     run: RunArgs,
     #[command(subcommand)]
@@ -126,13 +123,6 @@ enum ConfigCommand {
     Schema,
     /// Print a config file with defaults filled in and secrets redacted.
     Print { path: PathBuf },
-    /// Convert a tgin 0.2 RON config to YAML.
-    Migrate {
-        path: PathBuf,
-        /// Write the YAML here instead of stdout.
-        #[arg(short = 'o', long = "out", value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
 }
 
 /// What the command line asks for.
@@ -142,14 +132,8 @@ pub enum Invocation {
     Validate(PathBuf),
     Schema,
     Print(PathBuf),
-    Migrate {
-        path: PathBuf,
-        out: Option<PathBuf>,
-    },
     Version,
     Admin(client::Command),
-    /// The 0.2 `-f/--file` flag with its value.
-    LegacyFile(PathBuf),
 }
 
 /// Parses the command line; `args` starts with the program name.
@@ -163,18 +147,12 @@ where
     T: Into<OsString> + Clone,
 {
     let cli = Cli::try_parse_from(args)?;
-    if let Some(file) = cli.legacy_file {
-        return Ok(Invocation::LegacyFile(file));
-    }
     Ok(match cli.command {
         None => Invocation::Run(cli.run.config),
         Some(Command::Run(run)) => Invocation::Run(run.config),
         Some(Command::Config(ConfigCommand::Validate { path })) => Invocation::Validate(path),
         Some(Command::Config(ConfigCommand::Schema)) => Invocation::Schema,
         Some(Command::Config(ConfigCommand::Print { path })) => Invocation::Print(path),
-        Some(Command::Config(ConfigCommand::Migrate { path, out })) => {
-            Invocation::Migrate { path, out }
-        }
         Some(Command::Version) => Invocation::Version,
         Some(Command::Admin(admin)) => Invocation::Admin(client::Command {
             url: admin.url,
@@ -221,19 +199,11 @@ where
             exit::OK
         }
         Invocation::Print(path) => print(&path),
-        Invocation::Migrate { path, out } => crate::migrate::run(&path, out.as_deref()),
         Invocation::Version => {
             println!("{}", version());
             exit::OK
         }
         Invocation::Admin(command) => client::run(&command),
-        Invocation::LegacyFile(file) => {
-            eprintln!(
-                "tgin 1.0 reads YAML; convert with: tgin config migrate {} -o tgin.yaml",
-                file.display()
-            );
-            exit::FAILURE
-        }
     }
 }
 
@@ -490,20 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_flag_is_recognized() {
-        assert_eq!(
-            parsed(&["-f", "tgin.ron"]),
-            Invocation::LegacyFile("tgin.ron".into())
-        );
-        assert_eq!(
-            parsed(&["--file=old.ron"]),
-            Invocation::LegacyFile("old.ron".into())
-        );
-    }
-
-    #[test]
     fn malformed_command_lines_are_errors() {
         assert_eq!(error(&["--bogus"]), ErrorKind::UnknownArgument);
+        assert_eq!(error(&["-f", "x"]), ErrorKind::UnknownArgument);
+        assert_eq!(error(&["--file=x"]), ErrorKind::UnknownArgument);
         assert_eq!(error(&["frobnicate"]), ErrorKind::InvalidSubcommand);
         assert_eq!(
             error(&["-c", "x.yaml", "config", "schema"]),

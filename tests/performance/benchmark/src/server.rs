@@ -71,7 +71,7 @@ pub struct RunOptions {
     /// Scenario name for the report.
     #[arg(long, default_value = "manual")]
     pub scenario: String,
-    /// Engine under test for the report, such as `v0` or `v1`.
+    /// Engine under test for the report, such as `upstream` or `v1`.
     #[arg(long, default_value = "unknown")]
     pub engine: String,
     /// Most webhook sends in flight. A send that finds them all taken is not
