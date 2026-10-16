@@ -1254,6 +1254,43 @@ async fn status_redacts_task_errors() {
     tgin.stop().await;
 }
 
+/// Rotating a running bot to a token the Bot API client refuses (here a
+/// space in its token file) is rejected like any invalid config: the bot
+/// keeps polling with its old token and tgin stays ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_refuses_an_unusable_token() {
+    const TEST: &str = "reload_refuses_an_unusable_token";
+    let telegram = MockServer::start().await;
+    let mut polls = mount_bot(&telegram, TOKEN, me("tgin_bot"), Duration::from_secs(3600)).await;
+    let token_file = scratch(TEST).join("token");
+    std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
+    // The real file system: the reload reads the token file again.
+    let file = write_config(
+        TEST,
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            poll_bot(&telegram, "main", "${file:token}", "workers")
+        )),
+    );
+    let boot = Boot::load(&file, Arc::new(tgin_runtime::config::OsEnv)).expect("valid config");
+    let tgin = running(App::start(boot).await.expect("tgin starts"), file);
+    next(&mut polls).await;
+
+    std::fs::write(&token_file, "123456:abc def\n").unwrap();
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 422, "{}", reload.body);
+    assert!(reload.body.contains("bots[0].token"), "{}", reload.body);
+    assert!(!reload.body.contains("abc def"), "{}", reload.body);
+
+    let ready = tgin.admin_get("/readyz", None).await;
+    assert_eq!(ready.status, 200, "{}", ready.body);
+    let answer = tgin.admin_get("/v1/status", Some(ADMIN_TOKEN)).await;
+    let status: Status = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(status.generation, 1);
+    assert_eq!(status.sources[0].state, "running", "{}", answer.body);
+    tgin.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redactor_keeps_retired_secrets() {
     // Not shaped like Telegram tokens, so only the configured secrets mask

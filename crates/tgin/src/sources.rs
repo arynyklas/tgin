@@ -153,12 +153,17 @@ impl Sources {
         prepared
     }
 
-    /// Records `bot`, whose source cannot be prepared, as a long poll that
-    /// failed for good with `err`: `failed` with the error in the status,
-    /// counted by [`Sources::all_failed`], and no longer starting. A source
-    /// that later fails does not make tgin unready, so its readiness
-    /// component is ready.
+    /// Records `bot`, whose source cannot be prepared, as failed for good
+    /// with `err`, keeping its kind: `failed` with the error in the status,
+    /// no longer starting, and for a long poll counted by
+    /// [`Sources::all_failed`] (a webhook bot's route is still served, so
+    /// it never counts). A source that later fails does not make tgin
+    /// unready, so its readiness component is ready.
     fn fail(&self, bot: &Bot, err: &StartError) {
+        let kind = match bot.ingress {
+            Some(Ingress::Webhook(_)) => Kind::Webhook,
+            _ => Kind::LongPoll,
+        };
         let reason = err.to_string();
         let metrics = self.engine.source_id(&bot.name).and_then(|id| {
             let state = self.engine.state();
@@ -182,7 +187,7 @@ impl Sources {
         registry.started.insert(
             bot.name.clone(),
             Started {
-                kind: Kind::LongPoll,
+                kind,
                 stop: self.ingest.child_token(),
                 metrics,
                 long_poll: None,
@@ -373,9 +378,9 @@ impl Sources {
         // An ended background `getMe` is of no use, also for a bot that
         // starts again.
         self.reap(identity_task(name), None);
-        if started.kind == Kind::LongPoll {
-            self.reap(source_task(name), Some(name.to_owned()));
-        }
+        // A long poll's task, or the failed record of a source that could
+        // not be prepared (webhook bots have no other `source:` task).
+        self.reap(source_task(name), Some(name.to_owned()));
     }
 
     /// Forgets the supervised task `task` once its current instance has
@@ -597,5 +602,112 @@ async fn register(bot: &Prepared, hook: &Webhook) {
         Err(err) => {
             tracing::error!(source = %name, error = %err, "setWebhook failed; Telegram may not deliver updates")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tgin_core::config::{self, Config};
+    use tgin_core::engine::EngineRuntime;
+    use tgin_core::metrics::CoreMetrics;
+    use tgin_runtime::config::MapEnv;
+    use tgin_runtime::obs::MetricsRegistry;
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn load(yaml: &str) -> Config {
+        config::load(yaml, Path::new("tgin.yaml"), &MapEnv::default()).expect("valid config")
+    }
+
+    /// Sources over an engine that knows no bot, so every bot fails to be
+    /// prepared.
+    fn sources() -> (Sources, Arc<Supervisor>, Arc<Health>) {
+        let mut registry = MetricsRegistry::new("test", "test");
+        let core = CoreMetrics::register(registry.registry_mut());
+        let supervisor = Arc::new(Supervisor::new());
+        let force = CancellationToken::new();
+        let engine = Engine::new(
+            &load("version: 1\n"),
+            core,
+            reqwest::Client::new(),
+            EngineRuntime {
+                supervisor: Arc::clone(&supervisor),
+                stop: CancellationToken::new(),
+                force: force.clone(),
+            },
+        )
+        .expect("engine");
+        let health = Arc::new(Health::default());
+        let sources = Sources::new(
+            Arc::new(engine),
+            Arc::clone(&supervisor),
+            Arc::clone(&health),
+            reqwest::Client::new(),
+            CancellationToken::new(),
+            force,
+        );
+        (sources, supervisor, health)
+    }
+
+    async fn failed(supervisor: &Supervisor, task: &str) -> String {
+        let mut state = supervisor.subscribe(task).expect("the task is supervised");
+        let state = tokio::time::timeout(
+            WAIT,
+            state.wait_for(|s| matches!(s, TaskState::Failed { .. })),
+        )
+        .await
+        .expect("the task fails in time")
+        .expect("the task is alive");
+        match &*state {
+            TaskState::Failed { reason } => reason.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A source that cannot be prepared is failed with its error and its
+    /// own kind, ready rather than starting; only long polls count towards
+    /// every source having failed.
+    #[tokio::test]
+    async fn unpreparable_sources_fail_with_their_kind() {
+        let cfg = load(
+            "version: 1\nserver: {}\nbots:\n  - { name: poll, token: \"1:a\", ingress: { long_poll: {} } }\n  - { name: hook, token: \"2:b\", ingress: { webhook: {} } }\n",
+        );
+        let ready = |health: &Health, task: &str| {
+            health
+                .ready()
+                .1
+                .into_iter()
+                .any(|(name, r)| name == task && r == Readiness::Ready)
+        };
+
+        let (alone, supervisor, health) = sources();
+        assert!(alone.prepare(&cfg.bots[0]).is_err());
+        assert!(!alone.is_starting("poll"));
+        assert_eq!(alone.kind("poll"), Some(Kind::LongPoll));
+        assert!(
+            failed(&supervisor, "source:poll")
+                .await
+                .contains("no source")
+        );
+        assert!(ready(&health, "source:poll"));
+        assert!(alone.all_failed());
+
+        let (both, supervisor, health) = sources();
+        assert!(both.prepare(&cfg.bots[0]).is_err());
+        assert!(both.prepare(&cfg.bots[1]).is_err());
+        assert_eq!(both.kind("hook"), Some(Kind::Webhook));
+        assert!(
+            failed(&supervisor, "source:hook")
+                .await
+                .contains("no source")
+        );
+        failed(&supervisor, "source:poll").await;
+        assert!(ready(&health, "source:hook"));
+        // A webhook bot's route is still served: never all failed.
+        assert!(!both.all_failed());
     }
 }
