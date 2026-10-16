@@ -1450,3 +1450,42 @@ async fn os_sigterm_then_sigint_exits_130() {
     kill(&child, "-INT");
     assert_eq!(exit_code(child).await, Some(130));
 }
+
+/// A long poll that waits out an unreachable Bot API stops with ingest: the
+/// shutdown aborts no task at its deadline.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_unreachable_api_aborts_nothing() {
+    let test = "shutdown_with_unreachable_api_aborts_nothing";
+    let file = scratch(test).join("tgin.yaml");
+    std::fs::write(
+        &file,
+        format!(
+            r#"version: 1
+{QUICK}
+admin: {{ listen: ["127.0.0.1:0"] }}
+bots:
+  - name: lost
+    token: "{TOKEN}"
+    api_url: http://127.0.0.1:1
+    ingress: {{ long_poll: {{}} }}
+"#
+        ),
+    )
+    .unwrap();
+    let log = file.with_file_name("tgin.log");
+    let (child, _admin) =
+        support::spawn_listening(&mut tgin(&["-c", file.to_str().unwrap()]), &log, PATIENCE).await;
+    let started = Instant::now();
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("getMe failed")
+    {
+        assert!(started.elapsed() < PATIENCE, "getMe never failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    kill(&child, "-TERM");
+    assert_eq!(exit_code(child).await, Some(0));
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(!logged.contains("were aborted"), "{logged}");
+}

@@ -69,9 +69,10 @@ cargo test -p tgin-runtime queue::       # one module's unit tests
 # Generated files
 cargo xtask schema && cargo xtask config-docs
 
-# Docker (the config must be readable by uid 65532)
+# Docker (mount the config's directory, readable by uid 65532; a single-file
+# mount would never see an edit saved by rename)
 docker build -t tgin .
-docker run --rm -v "$PWD/tgin.yaml:/etc/tgin/tgin.yaml:ro" -e TOKEN=... -p 8080:8080 tgin
+docker run --rm -v "$PWD/config:/etc/tgin:ro" -e TOKEN=... -p 8080:8080 tgin
 
 # Example stack
 cd examples/simple && TOKEN=... TGIN_ADMIN_TOKEN=$(openssl rand -hex 32) docker compose up --build
@@ -91,9 +92,9 @@ There is no `rustfmt.toml`, `clippy.toml` or `rust-toolchain*` file: CI uses sto
 
 ### Hot path
 
-The path from a source through `Engine::admit` to a queue, and from a queue to a poll response or a push request, is measured by `alloc_budget.rs` (≤ 2 allocations per update) and `bench-gate` (instruction counts). On it:
+The ingest path (getUpdates body → `split_updates` → `extract` → `Engine::admit` → queue commit) is gated by `alloc_budget.rs` (≤ 2 allocations per update on the fixture) and, with queue commit, lease and ack, by `bench-gate` (instruction counts). Egress (`data_server.rs::batch_response`, push delivery) is not gated. Along these paths:
 
-- **Payloads stay `Bytes`.** An update is its raw JSON from ingress to egress, never re-serialized; a pull response is assembled from the payloads as body chunks without copying (`data_server.rs::batch_response`). Facts are extracted once, borrowing from the payload.
+- **Payloads stay `Bytes`.** An update is its raw JSON from ingress to egress, never re-serialized; a pull response is assembled from the payloads as body chunks without copying (`data_server.rs::batch_response`). Facts are extracted once, borrowing from the payload. Ingress copies each `getUpdates` body and each single-frame webhook body once, to its exact size, so queued updates never keep hyper's read buffers alive; the updates of one `getUpdates` body share it.
 - **Metrics handles are pre-resolved.** `CoreMetrics::source(name)` / `::consumer(name)` resolve every label combination once; the hot path increments handles and never hashes labels. A metric has one owner (e.g. only `Engine::admit` counts `tgin_routes_unmatched_total`).
 - **No awaits and one lock at a time in admission.** Reserve, then commit; cancel reservations on refusal.
 - **Rules are compiled.** `RouteTable::compile` does the work at load time; `route` writes into reusable scratch and does not allocate.

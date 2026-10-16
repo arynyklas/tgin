@@ -103,8 +103,9 @@ curl -s http://127.0.0.1:9090/readyz
 
 ```bash
 docker build -t tgin .
+# tgin.yaml lives in ./config: mount the directory, so edits reach the container
 docker run -d --name tgin -p 8080:8080 \
-  -v "$PWD/tgin.yaml:/etc/tgin/tgin.yaml:ro" \
+  -v "$PWD/config:/etc/tgin:ro" \
   -e TOKEN=123456:ABC --stop-timeout 30 tgin
 docker exec tgin tgin admin status
 ```

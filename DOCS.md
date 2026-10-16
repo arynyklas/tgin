@@ -84,13 +84,15 @@ File-path fields (`server.tls.cert_file`, `server.tls.key_file`, a webhook's `ce
 
 Names of bots and consumers are 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit.
 
-**Long poll** (`ingress.long_poll`): `timeout` (`30s`, at least `1s`, at most 50 s is sent), `limit` (`100`, 1 to 100), `allowed_updates`, `delete_webhook_on_start` (`true`).
+**Long poll** (`ingress.long_poll`): `timeout` (`30s`, at least `1s`, at most 50 s is sent), `limit` (`100`, 1 to 100), `allowed_updates`, `delete_webhook_on_start` (`true`). tgin sends `allowed_updates` with every `getUpdates`: the configured list, or `[]` when it is omitted, which is Telegram's default (every update type except `chat_member`, `message_reaction` and `message_reaction_count`). A list Telegram stored for the token from an earlier client never decides what arrives; list those three types to receive them.
 
-**Webhook** (`ingress.webhook`): `path` (default `/webhook/<bot name>`), `public_url` (the public `https` base URL; `setWebhook` registers `public_url` followed by `path`), `register` (`false`; `true` calls `setWebhook` when the bot's source starts and needs `public_url`), `secret_token` (`auto`), `ip_allowlist` (`none`), and Telegram's `allowed_updates`, `max_connections`, `drop_pending_updates`, `ip_address` and `certificate_file` for `setWebhook`.
+**Webhook** (`ingress.webhook`): `path` (default `/webhook/<bot name>`), `public_url` (the public `https` base URL; `setWebhook` registers `public_url` followed by `path`), `register` (`false`; `true` calls `setWebhook` when the bot's source starts and needs `public_url`), `secret_token` (`auto`; a configured secret is 1 to 256 ASCII letters, digits, `_` or `-`, as Telegram requires), `ip_allowlist` (`none`), and Telegram's `allowed_updates` (sent with every `setWebhook`, `[]` when omitted, as for long polls), `max_connections`, `drop_pending_updates`, `ip_address` and `certificate_file` for `setWebhook`.
 
-**Pull consumer** (`pull`): `capacity` (`10000`), `capacity_bytes` (`64MiB`, at least `1MiB`), `on_full` (`backpressure`), `lease_timeout` (`2m`), `ordering` (`none`), `auth_token`, `aliases`.
+**Tokens and paths.** A bot token may use only ASCII letters, digits, `:`, `_` and `-`; a token with anything else (a space, quotes, a second trailing newline in a token file) is a config error, at start and on reload alike. Webhook paths and pull aliases are matched byte for byte, so they must reach tgin unchanged inside a URL: no `?`, `#`, spaces, control or non-ASCII characters (write them percent-encoded), no `.` or `..` segments and no `\`.
 
-**Push consumer** (`push`): `endpoints` (at least one: `url`, `secret_token`, `timeout` `10s`), `balance` (`round_robin`, `hash_chat` or `least_in_flight`), `max_in_flight` (`32`), `ordering` (`none`), `capacity` (`10000`), `capacity_bytes` (`64MiB`), `on_full` (`backpressure`), `retry` (`initial` `1s`, `max` `1m`, `max_attempts` `10`, `max_age` `1h`), `breaker` (`failure_threshold` `5`, `open_for` `30s`).
+**Pull consumer** (`pull`): `capacity` (`10000`), `capacity_bytes` (`64MiB`, at least `1MiB`), `on_full` (`backpressure`), `lease_timeout` (`2m`, at least `1s`: leases are expired by a check that runs once a second), `ordering` (`none`), `auth_token`, `aliases`.
+
+**Push consumer** (`push`): `endpoints` (at least one: `url`, `secret_token`, `timeout` `10s`), `balance` (`round_robin`, `hash_chat` or `least_in_flight`), `max_in_flight` (`32`), `ordering` (`none`), `capacity` (`10000`), `capacity_bytes` (`64MiB`), `on_full` (`backpressure`), `retry` (`initial` `1s`, `max` `1m`, `max_attempts` `10`, `max_age` `1h`), `breaker` (`failure_threshold` `5`, `open_for` `30s`). An endpoint `timeout`, `retry.initial`, `retry.max`, `retry.max_age`, `breaker.open_for` and `server.header_read_timeout` of 0 would disable or break what they configure, and are config errors; `runtime.lame_duck`, `runtime.shutdown_grace` and `reload.drain_timeout` may be 0 (no lame duck, no drain).
 
 `max_in_flight` counts deliveries in progress over all of a consumer's endpoints, retries waiting included. With downstreams that handle requests concurrently, the default, 32, passed every webhook point of the benchmark gate. A downstream that handles one request at a time (a single bot process) can deliver more with a lower value: in the benchmarks, one aiogram process offered 5 000 updates/s took 1 809 updates/s with 32 and 2 268–2 280 with 8 ([PERF.md → `max_in_flight`](PERF.md#max_in_flight), which also lists the one point where 32 fell short in a separate set).
 
@@ -170,6 +172,8 @@ Here `shop` polls Telegram: `/start` and `/help` go to the `frontdesk` processes
 
 A queue's `capacity` and `capacity_bytes` count leased updates too. While a backpressure queue refuses updates, `tgin_consumer_backpressure_seconds_total` grows.
 
+**Memory.** `capacity_bytes` counts each update's own bytes. A long-poll update shares memory with the rest of its `getUpdates` response (each response is copied once, to its exact size, and its updates are slices of it), so a queued update keeps its whole response alive. A consumer that receives a small share of a busy bot's updates (an `/admin` command route, an audit filter) and whose clients or endpoint are down can therefore hold up to `limit` × its `capacity_bytes`; a lower `long_poll.limit` bounds this. A webhook update is copied to its own allocation.
+
 **At least once, while the process lives.** Queues live in memory: a crash or kill loses what they hold, and so does a shutdown that ends before they drain. A long poll moves its `getUpdates` offset past an update only once the update is admitted (or matched no rule), and Telegram learns the new offset on the next `getUpdates`. Updates not admitted when tgin stops are not confirmed, so Telegram sends them again to the next poller; after a restart, tgin starts from Telegram's unconfirmed updates, so the last batch admitted before the stop may be delivered a second time. A webhook update is answered `200` only once it is queued; a `503` while shutting down may still let a queued copy through, so Telegram's retry can produce a duplicate. Consumers should tolerate duplicates, for example by `update_id`.
 
 **Pull leases.** A poll leases updates to the polling instance. The instance acknowledges them with the next poll's `offset`, as with Telegram: every update it holds with an `update_id` below a positive `offset` is acknowledged, a negative `offset` acknowledges all it holds, and `0` acknowledges nothing. A poll first returns what the instance still holds from `offset` on (a response lost on the way is delivered again) and renews those leases; otherwise it leases new updates, waiting up to its `timeout`. A lease that is neither acknowledged nor renewed within `lease_timeout` (default 2 minutes) returns to its place in the queue for any instance. A client that always sends `offset=0` never acknowledges anything and receives the same updates again on every poll.
@@ -182,7 +186,7 @@ A queue's `capacity` and `capacity_bytes` count leased updates too. While a back
 - `408`, `429`, any `5xx`, a timeout or a network error is transient: the update is retried after a backoff, a random delay up to `retry.initial` doubled per attempt and capped at `retry.max`, or the endpoint's `Retry-After` if that is longer (capped at `retry.max`);
 - any other `4xx`, and any `3xx` (tgin never follows redirects), dead-letters it at once.
 
-An update is dead-lettered after `retry.max_attempts` attempts, or when its next attempt would come after `retry.max_age` since tgin received it. A dead-lettered update is dropped: logged as `update dead-lettered` (consumer, bot, `update_id`, update type, endpoint index and last error; never the payload or URL) and counted as `tgin_consumer_dropped_total{reason="dead_letter"}`. There is no dead-letter queue.
+An update is dead-lettered after `retry.max_attempts` attempts, or when its next attempt would come after `retry.max_age` since tgin queued it (time a long-poll update was held back by backpressure, or a webhook update spent in Telegram's retries, is not counted). A dead-lettered update is dropped: logged as `update dead-lettered` (consumer, bot, `update_id`, update type, endpoint index and last error; never the payload or URL) and counted as `tgin_consumer_dropped_total{reason="dead_letter"}`. There is no dead-letter queue.
 
 **Circuit breakers.** Each endpoint has a breaker: `breaker.failure_threshold` consecutive transient failures open it for `breaker.open_for`, then it admits a single probe request, whose success closes it. A permanent failure (the endpoint answered) counts as a success for the breaker. While every breaker is open, deliveries wait; an update that waits past `retry.max_age` is dead-lettered.
 
@@ -240,7 +244,7 @@ A long-poll bot and Telegram's webhook exclude each other: with `delete_webhook_
 
 - `SIGHUP` (Unix only);
 - `POST /v1/reload` on the admin API, or `tgin admin reload`, which answer with the result;
-- a change of the config file while `reload.watch` is on (the default). tgin watches the file's directory, waits `reload.debounce` (500 ms) of quiet, and also re-reads the file every 2 s for file systems that send no change events; a change is a change of the file's bytes. A ConfigMap volume updates mounted files in place, but a file mounted with `subPath` is never updated by Kubernetes, so tgin cannot see the new version.
+- a change of the config file while `reload.watch` is on (the default). tgin watches the file's directory, waits `reload.debounce` (500 ms) of quiet, and also re-reads the file every 2 s for file systems that send no change events; a change is a change of the file's bytes. When file events cannot be set up at all (an unreadable directory, the system's watch limit reached), tgin logs `file events unavailable (…); polling every 2 s` and keeps re-reading the file. A ConfigMap volume updates mounted files in place, but a file mounted with `subPath` is never updated by Kubernetes, so tgin cannot see the new version. Likewise, a Docker bind mount of the single file keeps the original inode: an edit saved by renaming over the file (most editors, `sed -i`, Ansible) never reaches the container, though reloads still succeed. Mount the directory instead.
 
 Reloads run one at a time, in order. While tgin shuts down, `POST /v1/reload` answers `503 {"error":"draining"}` and `SIGHUP` is ignored.
 
@@ -255,7 +259,7 @@ Reloads run one at a time, in order. While tgin shuts down, `POST /v1/reload` an
 ```
 
 - Rules and targets apply to the next update.
-- A consumer whose settings changed keeps its queue and applies them live; a push consumer whose endpoints, `balance`, `max_in_flight`, `retry` or `breaker` changed gets a new endpoint set with fresh breakers.
+- A consumer whose settings changed keeps its queue and applies them live; a push consumer whose endpoints, `balance`, `max_in_flight`, `retry` or `breaker` changed gets a new endpoint set with fresh breakers. A reload that only adds bots keeps every push consumer's endpoints, with their breakers and in-flight counts; only the bot names it reports in `X-Tgin-Source` grow.
 - A new consumer starts empty. A consumer whose mode changed (pull ↔ push) is a new, empty instance; the old one drains as if removed.
 - A removed consumer stops receiving updates at once and drains for `reload.drain_timeout` (30 s); what it still holds then is dropped as `tgin_consumer_dropped_total{reason="reload"}`, and its metric series go. A removed pull consumer stays reachable while it drains, on `/c/<name>/getUpdates` and on its aliases (unless the new config gives the path to something else), with its old `auth_token`, so its clients can fetch and acknowledge what it holds.
 - A consumer added back with the same mode while its old instance still drains gets that instance back, with its queue and the new settings; a revived push consumer gets fresh breakers and stays paused if it was paused.
@@ -322,9 +326,9 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 ```
 
 - `phase`: `starting`, `running`, `draining` or `stopped`.
-- `sources[]`, one per bot: `ingress` is `long_poll`, `webhook` or `null`; `state` is `starting`, `running`, `backoff`, `failed` or `stopped`; `error` (present only when there is one) says why a long-poll source backs off or failed, with secrets masked.
+- `sources[]`, one per bot: `ingress` is `long_poll`, `webhook` or `null`; `state` is `starting`, `running`, `backoff`, `failed` or `stopped`. A long poll is `backoff` while it waits out a failed `getMe` or `getUpdates` (its task keeps running); a bot whose source could not be set up is `failed`. `error` (present only when there is one) says why the source backs off or failed, with secrets masked.
 - `consumers[]`: `depth` (waiting to be leased), `leased`, `in_flight` (push deliveries in progress, retries waiting included), `paused`, and for push consumers each endpoint's origin (`scheme://host[:port]`; path, query and credentials are never shown) and breaker (`closed`, `open` or `half_open`).
-- `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls) with its state and, when it backs off or failed, its last error, secrets masked.
+- `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls) with the supervisor's view of it: its state and, when it is restarted after a panic or failed, its last error, secrets masked. A long poll that backs off by itself stays `running` here; see `sources[]`.
 
 `GET /v1/config` shows the config as written, with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`): every secret is `"[redacted]"`, URL fields (`api_url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
 
@@ -362,7 +366,7 @@ Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot b
 |---|---|---|---|
 | `tgin_build_info` | info | `version`, `commit` | The running build; `commit` is `unknown` when the build did not record it. |
 | `tgin_source_updates_total` | counter | `source` | Updates a bot received and handed to routing, including those no rule matched. |
-| `tgin_source_errors_total` | counter | `source`, `reason` | Long poll: failed Bot API calls, by `reason` `network`, `http`, `decode`, `unauthorized` (401/403/404), `rate_limited` (429) or `conflict` (409). Webhook: requests refused by the allowlist or the secret (`unauthorized`), bodies that could not be read (`network`) or were not an update (`decode`). |
+| `tgin_source_errors_total` | counter | `source`, `reason` | Long poll: failed Bot API calls, by `reason` `network`, `http`, `decode`, `unauthorized` (401/403/404), `rate_limited` (429) or `conflict` (409). Webhook: requests refused by the allowlist or the secret (`unauthorized`), bodies that could not be read (`network`), and bodies that were not an update or were over the 1 MiB limit (`decode`). |
 | `tgin_source_dropped_total` | counter | `source`, `reason="buffer_full"` | Exported for every bot; no source increments it in this version. |
 | `tgin_source_state` | gauge | `source`, `state` | 1 for the bot source's current state (`starting`, `running`, `backoff`, `failed`, `stopped`), 0 for the others. |
 | `tgin_routes_unmatched_total` | counter | `source` | Updates no rule matched; they are dropped. |
@@ -372,7 +376,7 @@ Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot b
 | `tgin_consumer_dropped_total` | counter | `consumer`, `reason` | Updates a consumer dropped: `overflow` (`drop_oldest` eviction, or no room), `dead_letter`, `reload` (still held when a removed consumer's drain ended), `purge`, `oversized` (larger than `capacity_bytes`). |
 | `tgin_consumer_backpressure_seconds_total` | counter | `consumer` | Seconds the consumer's queue refused updates. |
 | `tgin_delivery_attempts_total` | counter | `consumer`, `endpoint`, `outcome` | Push attempts per endpoint (its index in `endpoints`, from 0; never the URL), by `outcome` `delivered`, `retry` or `dead_letter`. |
-| `tgin_delivery_latency_seconds` | histogram | `consumer` | From receipt to acknowledgement (pull) or to successful delivery (push); buckets from 1 ms, doubling, 16 of them. |
+| `tgin_delivery_latency_seconds` | histogram | `consumer` | From admission (when tgin queued the update) to acknowledgement (pull) or to successful delivery (push); buckets from 1 ms, doubling, 16 of them. |
 | `tgin_config_reloads_total` | counter | `outcome` | Reloads `applied` or `rejected`. |
 | `tgin_config_generation` | gauge | | The config generation in effect. |
 | `tgin_shutdown_abandoned_total` | counter | | Updates still pending when the shutdown ended. |
@@ -451,7 +455,7 @@ The image (from the repository's `Dockerfile`) is one static binary on `gcr.io/d
 docker build -t tgin .
 docker run -d --name tgin \
   -p 8080:8080 \
-  -v "$PWD/tgin.yaml:/etc/tgin/tgin.yaml:ro" \
+  -v "$PWD/config:/etc/tgin:ro" \
   -e TOKEN=123456:ABC \
   --stop-timeout 30 \
   tgin
@@ -472,7 +476,7 @@ services:
     image: tgin
     stop_grace_period: 30s
     volumes:
-      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+      - ./config:/etc/tgin:ro   # the directory: a file mount misses edits saved by rename
     environment:
       TGIN_ADMIN_TOKEN_FILE: /run/secrets/tgin_admin_token
     secrets:

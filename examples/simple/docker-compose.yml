@@ -5,8 +5,10 @@ services:
     stop_grace_period: 30s
     # No published ports: the bots reach the data plane (8080) on the compose
     # network, and the admin plane stays on the container's loopback.
+    # The directory, not the file: a single-file bind mount keeps the old
+    # inode, so an edit saved by rename would never reach the container.
     volumes:
-      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+      - ./config:/etc/tgin:ro
     environment:
       - TOKEN=${TOKEN:?set TOKEN}
       - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
