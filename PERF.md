@@ -83,7 +83,14 @@ No builds or other benchmarks ran during the measurements. Unrelated, idle conta
 
 Medians of 3 valid runs, run set [`20261016T0155Z-final`](tests/performance/results/20261016T0155Z-final.csv) (+ [reruns](tests/performance/results/20261016T0155Z-final-rerun.csv)). Both engines answered every update in every run (`unreceived` = 0, `dropped_by_generator` = 0), so the throughput half of the gate is met everywhere; the `delivered` columns are shown for completeness.
 
-**Recheck after the M1 final fixes** (copied ingress bodies, `allowed_updates` always sent), the four 10 000 RPS tgin points, 3 runs per engine, all valid, every update answered: set [`20261016T-finalfix`](tests/performance/results/20261016T-finalfix.csv) gives 1.0 / 0.2 p99 medians of 0.99 (long poll, 1 bot), 1.08 (long poll, 3 bots), 1.04 (webhook, 3 bots) and **1.22 (webhook, 1 bot: 0.72 vs 0.59 ms, over the 1.2 limit)**; a confirmation set of that point, [`20261016T-finalfix-wh1-confirm`](tests/performance/results/20261016T-finalfix-wh1-confirm.csv), gives 0.99 (0.84 vs 0.85 ms) with a noisy host (one 1.0 run at 1.52 ms, 0.2 runs 0.61–0.85 ms).
+**Recheck after the M1 final fixes** (copied ingress bodies, `allowed_updates` always sent), the four 10 000 RPS tgin points, 3 runs per engine, all valid, every update answered: set [`20261016T-finalfix`](tests/performance/results/20261016T-finalfix.csv) gives 1.0 / 0.2 p99 medians of 0.99 (long poll, 1 bot), 1.08 (long poll, 3 bots), 1.04 (webhook, 3 bots) and **1.22 (webhook, 1 bot: 0.72 vs 0.59 ms, over the 1.2 limit)**; an unplanned confirmation set of that point, [`20261016T-finalfix-wh1-confirm`](tests/performance/results/20261016T-finalfix-wh1-confirm.csv), gave 0.99 (0.84 vs 0.85 ms) on a noisy host.
+
+**Borderline points (rule set before measuring).** A point whose p99 ratio lies within ±10 % of the limit (1.08×–1.32×) is decided by one dedicated set: 5 valid runs per engine, engines interleaved run by run, the final 1.0 image; it passes if the median ratio is ≤ 1.2×. The set also runs a 1.0 build without the single-frame webhook body copy, to test whether the copy costs latency. Set [`20261016T-r53`](tests/performance/results/20261016T-r53.csv), 10 000 RPS, every update answered in every run, one no-copy run invalid (lag 3.77 ms) and rerun:
+
+| Point | 0.2 p99 median | 1.0 p99 median | 1.0 / 0.2 | 1.0 without the copy | Verdict |
+|---|---:|---:|---:|---:|---|
+| webhook-tgin-1 | 0.57 | 0.59 | 1.04 | 0.59 (1.04) | pass |
+| longpoll-tgin-3 | 0.68 | 0.74 | 1.09 | 0.65 (0.96) | pass |
 
 | Point | RPS | 0.2 delivered | 1.0 delivered | 0.2 p99 ms | 1.0 p99 ms | 1.0 / 0.2 p99 | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
