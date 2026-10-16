@@ -198,13 +198,19 @@ impl Reloader {
             return false;
         };
         match watch_config(&self.path, debounce, WATCH_POLL) {
-            Ok((watcher, changes)) => {
+            Ok((watcher, changes, events)) => {
                 *watch = Some(Watch {
                     _watcher: watcher,
                     changes,
                     debounce,
                 });
-                tracing::info!("watching the config file for changes");
+                match events {
+                    None => tracing::info!("watching the config file for changes"),
+                    Some(err) => tracing::warn!(
+                        "file events unavailable ({err}); polling every {} s",
+                        WATCH_POLL.as_secs()
+                    ),
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "the config file cannot be watched; reload with SIGHUP or POST /v1/reload");

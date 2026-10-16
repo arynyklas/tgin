@@ -6,7 +6,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use tgin_runtime::config::watch_config;
+use tgin_runtime::config::{ConfigWatcher, watch_config};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
 
@@ -39,12 +39,21 @@ fn replace_atomically(file: &Path, content: &str) {
     fs::rename(&tmp, file).unwrap();
 }
 
+/// A watch whose file-system events were set up.
+fn watch(file: &Path, debounce: Duration, poll_every: Duration) -> (ConfigWatcher, Receiver<()>) {
+    let (watcher, rx, events) = watch_config(file, debounce, poll_every).unwrap();
+    if let Some(err) = events {
+        panic!("file events unavailable: {err}");
+    }
+    (watcher, rx)
+}
+
 #[tokio::test]
 async fn watch_detects_atomic_rename() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("tgin.yaml");
     fs::write(&file, "version: 1\n").unwrap();
-    let (_watcher, mut rx) = watch_config(&file, DEBOUNCE, POLL_EVERY).unwrap();
+    let (_watcher, mut rx) = watch(&file, DEBOUNCE, POLL_EVERY);
 
     replace_atomically(&file, "version: 2\n");
     assert_change(&mut rx, "the first rename").await;
@@ -59,7 +68,7 @@ async fn watch_ignores_unchanged_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("tgin.yaml");
     fs::write(&file, "version: 1\n").unwrap();
-    let (_watcher, mut rx) = watch_config(&file, DEBOUNCE, POLL_EVERY).unwrap();
+    let (_watcher, mut rx) = watch(&file, DEBOUNCE, POLL_EVERY);
 
     fs::write(&file, "version: 1\n").unwrap();
     replace_atomically(&file, "version: 1\n");
@@ -76,7 +85,7 @@ async fn watch_closes_channel_on_drop() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("tgin.yaml");
     fs::write(&file, "version: 1\n").unwrap();
-    let (watcher, mut rx) = watch_config(&file, DEBOUNCE, POLL_EVERY).unwrap();
+    let (watcher, mut rx) = watch(&file, DEBOUNCE, POLL_EVERY);
 
     drop(watcher);
     let closed = timeout(ARRIVES, rx.recv())
@@ -91,11 +100,26 @@ async fn watch_falls_back_to_polling() {
     let file = dir.path().join("tgin.yaml");
     fs::write(&file, "version: 1\n").unwrap();
     // An hour of debounce: only the poll thread can report within the test.
-    let (_watcher, mut rx) =
-        watch_config(&file, Duration::from_secs(3600), Duration::from_millis(100)).unwrap();
+    let (_watcher, mut rx) = watch(&file, Duration::from_secs(3600), Duration::from_millis(100));
 
     fs::write(&file, "version: 2\n").unwrap();
     assert_change(&mut rx, "an in-place write, by polling").await;
+}
+
+/// A directory that does not exist yet cannot be watched for events, so the
+/// setup reports that, and the poll still finds the file once it appears.
+#[tokio::test]
+async fn watch_polls_when_events_cannot_be_set_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-yet");
+    let file = missing.join("tgin.yaml");
+    let (_watcher, mut rx, events) =
+        watch_config(&file, DEBOUNCE, Duration::from_millis(100)).unwrap();
+    assert!(events.is_some(), "watching a missing directory succeeded");
+
+    fs::create_dir(&missing).unwrap();
+    fs::write(&file, "version: 1\n").unwrap();
+    assert_change(&mut rx, "the file appeared, by polling").await;
 }
 
 #[test]
@@ -138,7 +162,7 @@ async fn watch_detects_k8s_symlink_swap() {
     let file = dir.path().join("tgin.yaml");
     k8s_publish(dir.path(), "..2026_10_15_1", "version: 1\n");
     std::os::unix::fs::symlink("..data/tgin.yaml", &file).unwrap();
-    let (_watcher, mut rx) = watch_config(&file, DEBOUNCE, POLL_EVERY).unwrap();
+    let (_watcher, mut rx) = watch(&file, DEBOUNCE, POLL_EVERY);
 
     k8s_publish(dir.path(), "..2026_10_15_2", "version: 2\n");
     fs::remove_dir_all(dir.path().join("..2026_10_15_1")).unwrap();

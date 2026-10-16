@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn redactor_masks_overlapping_copies_of_one_secret() {
-        // Prefix "abcab" equals suffix, so two copies can share three bytes.
+        // Prefix "abcab" equals suffix, so two copies can share five bytes.
         let r = Redactor::new(["abcabcab".to_string()]);
         assert_eq!(r.redact("x abcabcabcab y"), "x ##### y");
     }

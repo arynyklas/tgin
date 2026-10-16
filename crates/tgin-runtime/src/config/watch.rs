@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 /// Keeps the watch on a configuration file alive. Dropping it stops
 /// watching; the channel closes shortly after.
 pub struct ConfigWatcher {
-    _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    /// `None` when file-system events could not be set up.
+    _debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     /// Dropping it wakes the poll thread, which then exits.
     _stop_poll: std_mpsc::Sender<()>,
 }
@@ -29,6 +30,9 @@ pub struct ConfigWatcher {
 /// event in the directory, after `debounce` of quiet, re-reads the file.
 /// File-system events are not delivered on every platform (network mounts,
 /// some container setups), so the file is also re-read every `poll_every`.
+/// The poll starts first: when the events cannot be set up (the directory
+/// cannot be watched, or the system's watch limit is reached), the watch
+/// still polls, and the third value says why events are unavailable.
 ///
 /// Bursts coalesce: at most one `()` is pending, and a receiver should
 /// re-read the file rather than count notifications. A file that cannot be
@@ -37,13 +41,13 @@ pub struct ConfigWatcher {
 /// # Errors
 ///
 /// Fails with [`io::ErrorKind::InvalidInput`] if `debounce` is below 4ns or
-/// `poll_every` is zero, and otherwise if the parent directory cannot be
-/// watched or the poll thread cannot be started.
+/// `poll_every` is zero, and otherwise only if the poll thread cannot be
+/// started.
 pub fn watch_config(
     file: &Path,
     debounce: Duration,
     poll_every: Duration,
-) -> io::Result<(ConfigWatcher, mpsc::Receiver<()>)> {
+) -> io::Result<(ConfigWatcher, mpsc::Receiver<()>, Option<io::Error>)> {
     // The debouncer ticks every `debounce / 4`, and the poll thread sleeps
     // `poll_every`; a zero would make either loop without ever sleeping.
     if (debounce / 4).is_zero() {
@@ -65,10 +69,40 @@ pub fn watch_config(
         tx,
     });
 
-    let on_event = Arc::clone(&change);
+    let (stop_poll, stopped) = std_mpsc::channel::<()>();
+    let polled = Arc::clone(&change);
+    thread::Builder::new()
+        .name("tgin-config-poll".to_owned())
+        .spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(poll_every) {
+                polled.check();
+            }
+        })?;
+
+    let (debouncer, events) = match watch_events(file, debounce, change) {
+        Ok(debouncer) => (Some(debouncer), None),
+        Err(err) => (None, Some(err)),
+    };
+    Ok((
+        ConfigWatcher {
+            _debouncer: debouncer,
+            _stop_poll: stop_poll,
+        },
+        rx,
+        events,
+    ))
+}
+
+/// Re-reads the file after every event in its directory, once `debounce`
+/// of quiet has passed.
+fn watch_events(
+    file: &Path,
+    debounce: Duration,
+    change: Arc<Change>,
+) -> io::Result<Debouncer<RecommendedWatcher, RecommendedCache>> {
     let mut debouncer = new_debouncer(debounce, None, move |_: DebounceEventResult| {
         // Errors, such as a dropped event buffer, may hide a change too.
-        on_event.check();
+        change.check();
     })
     .map_err(into_io)?;
     let dir = file
@@ -78,23 +112,7 @@ pub fn watch_config(
     debouncer
         .watch(dir, RecursiveMode::NonRecursive)
         .map_err(into_io)?;
-
-    let (stop_poll, stopped) = std_mpsc::channel::<()>();
-    thread::Builder::new()
-        .name("tgin-config-poll".to_owned())
-        .spawn(move || {
-            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(poll_every) {
-                change.check();
-            }
-        })?;
-
-    Ok((
-        ConfigWatcher {
-            _debouncer: debouncer,
-            _stop_poll: stop_poll,
-        },
-        rx,
-    ))
+    Ok(debouncer)
 }
 
 /// Compares the file with the bytes last seen and reports a difference.
@@ -126,6 +144,7 @@ impl Change {
 fn into_io(err: notify::Error) -> io::Error {
     match err.kind {
         notify::ErrorKind::Io(err) => err,
+        notify::ErrorKind::PathNotFound => io::Error::new(io::ErrorKind::NotFound, err),
         _ => io::Error::other(err),
     }
 }
