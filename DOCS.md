@@ -1,6 +1,6 @@
 # tgin documentation
 
-This is the manual of tgin 1.0. The key-by-key reference of the config file is [docs/config-reference.md](docs/config-reference.md), generated from the config model. Moving from tgin 0.2: [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md).
+This is the manual of tgin 1.0. The key-by-key reference of the config file is [docs/config-reference.md](docs/config-reference.md), generated from the config model.
 
 ## Contents
 
@@ -552,16 +552,16 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 | `tgin config validate <path>` | Check a config file; list every error and warning. |
 | `tgin config print <path>` | Print the config as JSON, defaults filled in (except a webhook's omitted `path`), secrets redacted. |
 | `tgin config schema` | Print the JSON Schema. |
-| `tgin config migrate <path> [-o PATH]` | Convert a tgin 0.2 RON config to YAML ([migration guide](docs/migrating-to-1.0.md)). |
+| `tgin config migrate <path> [-o PATH]` | Convert a RON config (the format of the original tgin) to YAML, on stdout or into `-o/--out`; warnings go to stderr and the top of the YAML. |
 | `tgin admin …` | Call a running tgin's admin API ([`tgin admin`](#tgin-admin)). |
 | `tgin version` / `tgin --version` | Print the version (`tgin version` adds the commit when the build recorded one). |
 
-The 0.2 flag `-f/--file` is refused with a hint to run `tgin config migrate`.
+The flag `-f/--file` is refused: tgin exits 1 and prints `tgin 1.0 reads YAML; convert with: tgin config migrate <file> -o tgin.yaml`.
 
 | Code | Meaning |
 |---|---|
 | 0 | Clean shutdown after a signal (also a signal during start-up), or a command that succeeded. |
-| 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), the 0.2 `-f` flag, or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
+| 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), the `-f` flag, or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
 | 2 | Every source failed for good: Telegram rejected each long-poll bot's token and no webhook bot exists. |
 | 3 | `tgin config migrate` only: converted, with warnings to review (on stderr and at the top of the YAML). |
 | 64 | Malformed command line (unknown command or option, missing argument). |
@@ -572,8 +572,7 @@ Updates lost at the end of a shutdown do not change the exit code; see `tgin_shu
 ## Further reading
 
 - [docs/config-reference.md](docs/config-reference.md) — every config key, type and default.
-- [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) — from tgin 0.2.
-- [PERF.md](PERF.md) — benchmarks against 0.2 and their method.
+- [PERF.md](PERF.md) — benchmarks and their method.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release.
 - [SECURITY.md](SECURITY.md) — reporting vulnerabilities, verifying releases.
 - [examples/simple](examples/simple) — a Compose stack with pull and push consumers.

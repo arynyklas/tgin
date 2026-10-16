@@ -2,13 +2,9 @@
 
 ## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.2.x   | Yes, until 1.0     |
-| < 0.2   | No                 |
-
-Security fixes are released as 0.2.x patch releases until 1.0. A long-term
-support policy will be announced with 1.0.
+No released version is supported yet. tgin 1.0 will be the first supported
+release; until then, security fixes land on the `main` branch. A support
+policy will be announced with 1.0.
 
 ## Reporting a vulnerability
 
@@ -40,6 +36,6 @@ repository by the workflow that publishes it, use the
 ```sh
 gh attestation verify tgin-x86_64-unknown-linux-gnu.tar.xz --repo arynyklas/tgin \
   --signer-workflow arynyklas/tgin/.github/workflows/release.yml
-gh attestation verify oci://ghcr.io/arynyklas/tgin:0.2.0 --repo arynyklas/tgin \
+gh attestation verify oci://ghcr.io/arynyklas/tgin:<version> --repo arynyklas/tgin \
   --signer-workflow arynyklas/tgin/.github/workflows/image.yml
 ```

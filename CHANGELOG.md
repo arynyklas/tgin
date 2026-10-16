@@ -8,38 +8,8 @@ Until 1.0, minor releases (0.x.0) may contain breaking changes.
 
 ## [Unreleased]
 
-tgin 1.0 is a rewrite of the engine, the config and the HTTP surface.
-[docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) lists every change a
-0.2 operator has to act on; `tgin config migrate` converts a 0.2 config.
-
-### Upgrade notes
-
-1. The config file is YAML (`version: 1`), read from `tgin.yaml`, `-c PATH`
-   or `TGIN_CONFIG`. Convert a 0.2 file with
-   `tgin config migrate tgin.ron -o tgin.yaml`; the 0.2 flag `-f` now exits
-   1 with that hint.
-2. HTTP moved to two listeners: the data plane (`server.listen`, default
-   `0.0.0.0:8080`; a migrated config keeps its `server_port`) serves
-   webhooks and pull consumers, and the admin plane (`admin.listen`, default
-   `127.0.0.1:9090`) serves `/livez`, `/readyz`, `/metrics` and the admin API.
-   `/status` is now `/v1/status`. Move probes and scrapers to the admin plane.
-3. Every metric was renamed and relabelled by bot and consumer name; the
-   migration guide maps the 0.2 names.
-4. A malformed command line exits 64 (it exited 2). Exit code 2 now means
-   only that every source failed: Telegram rejected the token of every
-   long-poll bot and no webhook bot exists.
-5. The container image reads `/etc/tgin/tgin.yaml` (`TGIN_CONFIG`) instead of
-   `-f /etc/tgin/config.ron`, declares ports 8080 and 9090, and has a
-   `HEALTHCHECK` running `tgin admin health`. Its `ENTRYPOINT` is the tgin
-   binary: pass arguments directly (`docker run IMAGE -c /path/tgin.yaml`).
-6. The management API (`api`) is gone: edit the config file, which tgin
-   reloads on change, on `SIGHUP` or on `POST /v1/reload`.
-7. Push consumers retry failed deliveries and hold back their bot's source
-   when their queue is full. Migrated push consumers keep 0.2's single
-   attempt and drop-oldest queue until you delete those two lines.
-8. Shutdown takes up to about 22 s with the defaults. Raise Docker's 10 s
-   default stop timeout: `docker run --stop-timeout 30`, Compose
-   `stop_grace_period: 30s`, Kubernetes `terminationGracePeriodSeconds: 30`.
+tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
+[chesnokpeter/tgin](https://github.com/chesnokpeter/tgin).
 
 ### Added
 
@@ -69,10 +39,12 @@ tgin 1.0 is a rewrite of the engine, the config and the HTTP surface.
   `/v1/reload`, and pause, resume, drain and purge per consumer; and
   `tgin admin`, its command-line client (`status`, `reload`, `consumers`,
   `pause`, `resume`, `drain`, `purge`, `health`).
-- `tgin config validate`, `print`, `schema` and `migrate`; config errors
+- `tgin config validate`, `print` and `schema`; config errors
   carry YAML path, line and column; a JSON Schema
   (`schema/tgin.v1.schema.json`) and a generated reference
   (`docs/config-reference.md`).
+- `tgin config migrate` converts a RON config (the format of the original
+  tgin) to YAML.
 - Metrics for sources, routing, consumer queues, deliveries, reloads and
   shutdown, plus `tgin_build_info`.
 - TLS on the data plane with certificate reload; listener limits
@@ -88,29 +60,33 @@ tgin 1.0 is a rewrite of the engine, the config and the HTTP surface.
 - Multi-arch (amd64, arm64) container image at `ghcr.io/arynyklas/tgin`,
   tagged `<version>`, `<major>.<minor>` and, for the highest stable release
   only, `latest`, with a build provenance attestation.
-
-### Changed
-
-- **Breaking:** the config format, CLI, ports, endpoints, metrics, exit
-  code 2 and the container image, as listed under Upgrade notes.
-- **Breaking:** unknown config keys are errors.
-- **Breaking:** the minimum supported Rust version is 1.89.
-- **Breaking:** the container image is a static musl binary on distroless,
-  without a shell, running as the numeric user and group `65532:65532`.
-  Mounted config files, secrets and TLS keys must be readable by uid 65532.
-- References in the config (`${env:NAME}`, `${file:PATH}`) are expanded
-  only in secrets, URLs and file paths; relative file paths resolve against
-  the config file's directory.
+- A YAML config (`version: 1`), read from `tgin.yaml`, `-c PATH` or
+  `TGIN_CONFIG`; unknown keys are errors. References in it
+  (`${env:NAME}`, `${file:PATH}`) are expanded only in secrets, URLs and
+  file paths; relative file paths resolve against the config file's
+  directory.
+- Two listeners: the data plane (`server.listen`, default `0.0.0.0:8080`)
+  serves webhooks and pull consumers, the admin plane (`admin.listen`,
+  default `127.0.0.1:9090`) serves `/livez`, `/readyz`, `/metrics` and the
+  admin API.
+- Exit codes: 2 when every source failed (Telegram rejected the token of
+  every long-poll bot and no webhook bot exists), 64 for a malformed
+  command line, 130 for a second shutdown signal.
 - Long-poll bots delete an active webhook before polling
   (`delete_webhook_on_start`, on by default), keeping pending updates.
+- The container image is a static musl binary on distroless, without a
+  shell, running as the numeric user and group `65532:65532` (mounted
+  config files, secrets and TLS keys must be readable by that uid). It
+  reads `/etc/tgin/tgin.yaml` (`TGIN_CONFIG`), declares ports 8080 and
+  9090, has a `HEALTHCHECK` running `tgin admin health`, and its
+  `ENTRYPOINT` is the tgin binary.
 - Linux musl builds (the static release archives and the container image)
   use mimalloc as the global allocator.
-
-### Removed
-
-- The RON config format (still read by `tgin config migrate`), the `-f`
-  flag, the `api` route-management API, `/status` and the 0.2 metric
-  names.
+- Shutdown takes up to about 22 s with the defaults; give the container a
+  longer stop timeout than Docker's 10 s (`docker run --stop-timeout 30`,
+  Compose `stop_grace_period: 30s`, Kubernetes
+  `terminationGracePeriodSeconds: 30`).
+- The minimum supported Rust version is 1.89.
 
 ### Security
 
@@ -140,8 +116,8 @@ tgin 1.0 is a rewrite of the engine, the config and the HTTP surface.
 
 ### Docs
 
-- README, DOCS and AGENTS describe tgin 1.0; new migration guide and
-  generated config reference; PERF compares 1.0 with 0.2.
+- README, DOCS and AGENTS describe tgin 1.0; generated config reference;
+  PERF.md with benchmarks and their method.
 - Added `SECURITY.md` (supported versions, private reporting, verifying
   release attestations) and this changelog.
 

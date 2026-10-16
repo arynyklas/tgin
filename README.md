@@ -24,10 +24,15 @@
 tgin receives your Telegram bots' updates — by long polling the Bot API or as webhooks — and routes each one, by rules you write, to the processes that handle it: bot instances that poll tgin the way they would poll Telegram, or HTTP services tgin posts to.
 
 > [!IMPORTANT]
-> This is tgin 1.0 in development (`1.0.0-dev`): a rewrite with a new YAML config, new ports and new metrics. There is no stable release yet: the last published artifacts are the 0.2.0 release candidates (`v0.2.0-rc.1`, `v0.2.0-rc.2`), and 1.0 will be the first stable release. Coming from 0.2? Read [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md); `tgin config migrate` converts your config.
+> This is tgin 1.0 in development (`1.0.0-dev`). There is no stable release yet: 1.0 will be the first.
+
+## Origin
+
+tgin began as a fork of [chesnokpeter/tgin](https://github.com/chesnokpeter/tgin) by Peter Chesnokov, whose idea it is: an NGINX-like router that sits in front of Telegram bots and distributes their updates across bot instances. This project rewrote the engine for delivery guarantees (bounded queues with backpressure, leases, retries) and for performance; [Performance](#performance) shows the numbers.
 
 ## Contents
 
+- [Origin](#origin)
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
@@ -118,7 +123,6 @@ Releases carry archives for Linux (glibc and static musl), macOS and Windows on 
 
 - [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, hot reload, admin API, metrics, security, shutdown and deployment.
 - [docs/config-reference.md](docs/config-reference.md) — every config key, generated from the config model.
-- [docs/migrating-to-1.0.md](docs/migrating-to-1.0.md) — moving from tgin 0.2.
 - [PERF.md](PERF.md) — benchmark methodology, results and the harness's limits.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release, including breaking ones.
 - [SECURITY.md](SECURITY.md) — supported versions, private vulnerability reporting, release verification.
