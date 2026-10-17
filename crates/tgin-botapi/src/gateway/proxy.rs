@@ -76,9 +76,12 @@ pub(super) enum Upstream<'a> {
     File(&'a str),
 }
 
-/// Streams `req` to Telegram for `bot` and Telegram's answer back. A
-/// method the bot's limits cover waits for, or is refused by, them first;
-/// its body, when small and buffered, goes once more after a 429.
+/// Streams `req` to Telegram for `bot` and Telegram's answer back.
+///
+/// A method of `rate_limit.methods` (whatever the mode) has its small body
+/// buffered when the limits apply to it or `retry_429.max_wait` is above
+/// zero. Where the limits apply, the request waits for, or is refused by,
+/// them first. A buffered body goes once more after Telegram's 429.
 pub(super) async fn forward(
     bot: &Bot,
     upstream: Upstream<'_>,
@@ -86,18 +89,22 @@ pub(super) async fn forward(
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let (url, file, limited) = match upstream {
+    let (url, file, method) = match upstream {
         Upstream::Method(method) => (
             url(&bot.method_base, method, parts.uri.query()),
             false,
-            bot.limiter.applies(method),
+            Some(method),
         ),
         Upstream::File(file_path) => (
             url(&bot.file_base, file_path, parts.uri.query()),
             true,
-            false,
+            None,
         ),
     };
+    let limited = method.is_some_and(|method| bot.limiter.applies(method));
+    let buffered = limited
+        || (!bot.gateway.retry_429_max_wait.is_zero()
+            && method.is_some_and(|method| bot.limiter.covers(method)));
     let mut headers = HeaderMap::new();
     copy_headers(&parts.headers, &REQUEST_HEADERS, &mut headers);
     if file {
@@ -108,8 +115,9 @@ pub(super) async fn forward(
         label,
         handles: bot.metrics.method(label),
         method: parts.method,
+        limited,
     };
-    if !limited {
+    if !buffered {
         return match call.send(url, headers, body).await {
             Ok((response, _)) => call.relay(response),
             Err(failed) => call.failed(failed),
@@ -117,7 +125,8 @@ pub(super) async fn forward(
     }
 
     let idle = bot.gateway.upstream_idle_timeout;
-    let (payload, chat) = match prepare(&parts.headers, parts.uri.query(), body, idle).await {
+    let query = parts.uri.query();
+    let (payload, chat) = match prepare(&parts.headers, query, body, idle, limited).await {
         Ok(prepared) => prepared,
         Err(failed) => return call.failed(failed),
     };
@@ -173,30 +182,34 @@ enum Failed {
     Idle,
 }
 
-/// The body of a request the limits cover, and the chat it targets:
+/// The body of a request to buffer, and, when the limits apply (`limited`),
+/// the chat it targets:
 /// - a JSON or urlencoded body (or an empty one) is read up to
 ///   [`BUFFER_LIMIT`], waiting at most `idle` for each frame; whole, it is
-///   buffered and its `chat_id` read; longer, what was read and the rest
-///   stream;
-/// - any other body, multipart included, streams unread.
+///   buffered;
+/// - longer, what was read and the rest stream, as does any other body,
+///   multipart included, unread.
 ///
-/// A `chat_id` in the query string comes first, as the Bot API reads the
-/// query before the body. Without a chat only the global quota applies.
+/// The chat is the buffered body's `chat_id`, as Telegram reads it, else
+/// the query string's. A streamed body's `chat_id` cannot be read, so the
+/// query string's is the only chat tgin can know there; without one only
+/// the global quota applies.
 async fn prepare(
     headers: &HeaderMap,
     query: Option<&str>,
     body: Body,
     idle: Duration,
+    limited: bool,
 ) -> Result<(Payload, Option<ChatKey>), Failed> {
     const FORM: HeaderValue = HeaderValue::from_static("application/x-www-form-urlencoded");
-    let from_query = query.and_then(|query| chat_key(Some(&FORM), query.as_bytes()));
+    let query_chat = || query.and_then(|query| chat_key(Some(&FORM), query.as_bytes()));
     let content_type = headers.get(CONTENT_TYPE);
     let readable = matches!(
         content_type.and_then(encoding),
         Some(Encoding::Json | Encoding::Form)
     ) || body.size_hint().exact() == Some(0);
     if !readable {
-        return Ok((Payload::Streamed(body), from_query));
+        return Ok((Payload::Streamed(body), limited.then(query_chat).flatten()));
     }
     let progress = Arc::new(Progress::new());
     let stamped = Body::new(Upload {
@@ -210,10 +223,15 @@ async fn prepare(
     };
     Ok(match read {
         Bounded::Complete(bytes) => {
-            let chat = from_query.or_else(|| chat_key(content_type, &bytes));
+            let chat = limited
+                .then(|| chat_key(content_type, &bytes).or_else(query_chat))
+                .flatten();
             (Payload::Buffered(bytes), chat)
         }
-        Bounded::Over(partial) => (Payload::Streamed(partial.into_body()), from_query),
+        Bounded::Over(partial) => (
+            Payload::Streamed(partial.into_body()),
+            limited.then(query_chat).flatten(),
+        ),
     })
 }
 
@@ -232,12 +250,18 @@ struct Call<'a> {
     label: MethodLabel,
     handles: &'a MethodMetrics,
     method: Method,
+    /// Whether the bot's limits apply to the method; without them `admit`
+    /// books nothing.
+    limited: bool,
 }
 
 impl Call<'_> {
     /// Books the request on the bot's limits and waits out the delay they
-    /// give.
+    /// give; where the limits do not apply (mode `off`), books nothing.
     async fn admit(&self, chat: Option<&ChatKey>) -> Result<(), Limited> {
+        if !self.limited {
+            return Ok(());
+        }
         let now = Instant::now();
         let admitted = self.bot.limiter.acquire(chat, now)?;
         if !admitted.delay.is_zero() {
@@ -338,9 +362,9 @@ impl Call<'_> {
     /// Telegram answered a buffered request with 429. Its body is read up
     /// to [`FLOOD_LIMIT`]; when its `parameters.retry_after` is above zero
     /// and within `retry_429.max_wait`, the request waits that long after
-    /// the 429 arrived (at `at`), books the limits again and goes once
-    /// more. Otherwise, or when the limits refuse it, the 429 goes to the
-    /// client as it came.
+    /// the 429 arrived (at `at`), books the limits again where they apply,
+    /// and goes once more, whatever the rate-limit mode. Otherwise, or when
+    /// the limits refuse it, the 429 goes to the client as it came.
     async fn flood(&self, response: reqwest::Response, at: Instant, again: Again) -> Response {
         let status = response.status();
         let headers = response_headers(&response);
@@ -695,8 +719,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn buffered_read_waits_at_most_idle_per_frame() {
         let idle = Duration::from_secs(5);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let headers = json_headers();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -710,31 +733,71 @@ mod tests {
             pending::<()>().await;
         });
         let started = Instant::now();
-        let read = prepare(&headers, None, Body::from_stream(stream), idle).await;
+        let read = prepare(&headers, None, Body::from_stream(stream), idle, true).await;
         assert!(matches!(read, Err(Failed::Idle)));
         assert_eq!(started.elapsed(), Duration::from_secs(13));
         feeder.abort();
 
         let failing = futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("gone"))]);
-        let read = prepare(&headers, None, Body::from_stream(failing), idle).await;
+        let read = prepare(&headers, None, Body::from_stream(failing), idle, true).await;
         assert!(matches!(read, Err(Failed::ClientClosed)));
+    }
 
-        let read = prepare(
-            &headers,
-            Some("chat_id=%40Chan"),
-            Body::from(r#"{"chat_id":-5}"#),
-            idle,
-        )
-        .await;
-        let Ok((Payload::Buffered(body), chat)) = read else {
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers
+    }
+
+    /// The chat of a buffered body is its own `chat_id`, as Telegram reads
+    /// it, before the query string's; a streamed body's is the query
+    /// string's, the only one tgin can know. Without limits, none is read.
+    #[tokio::test]
+    async fn chat_from_body_before_query() {
+        let idle = Duration::from_secs(5);
+        let headers = json_headers();
+        let query = Some("chat_id=%40Chan");
+        let body = || Body::from(r#"{"chat_id":-5}"#);
+
+        let Ok((Payload::Buffered(bytes), chat)) =
+            prepare(&headers, query, body(), idle, true).await
+        else {
             panic!("buffered");
         };
-        assert_eq!(&body[..], br#"{"chat_id":-5}"#);
-        assert_eq!(
-            chat,
-            Some(ChatKey::Username("chan".into())),
-            "the query comes first"
+        assert_eq!(&bytes[..], br#"{"chat_id":-5}"#);
+        assert_eq!(chat, Some(ChatKey::Id(-5)), "the body comes first");
+
+        let Ok((Payload::Buffered(_), chat)) =
+            prepare(&headers, query, Body::from("{}"), idle, true).await
+        else {
+            panic!("buffered");
+        };
+        assert_eq!(chat, Some(ChatKey::Username("chan".into())));
+
+        let long = format!(r#"{{"chat_id":-5,"text":"{}"}}"#, "x".repeat(BUFFER_LIMIT));
+        let Ok((Payload::Streamed(_), chat)) =
+            prepare(&headers, query, Body::from(long), idle, true).await
+        else {
+            panic!("streamed");
+        };
+        assert_eq!(chat, Some(ChatKey::Username("chan".into())));
+
+        let mut multipart = HeaderMap::new();
+        multipart.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=b"),
         );
+        let Ok((Payload::Streamed(_), chat)) = prepare(&multipart, None, body(), idle, true).await
+        else {
+            panic!("streamed");
+        };
+        assert_eq!(chat, None);
+
+        let Ok((Payload::Buffered(_), chat)) = prepare(&headers, query, body(), idle, false).await
+        else {
+            panic!("buffered");
+        };
+        assert_eq!(chat, None, "no limits, no chat");
     }
 
     #[test]

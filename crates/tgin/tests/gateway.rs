@@ -1113,6 +1113,27 @@ async fn within<F: Future>(what: &str, fut: F) -> F::Output {
     }
 }
 
+/// How long [`quiet`] watches, in real time: far longer than a request
+/// takes over loopback, so one that was due would show up.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Asserts that no request reaches Telegram for [`QUIET`] of real time:
+/// on the frozen clock, nothing the gateway still waits for may go.
+async fn quiet(what: &str, arrivals: &mut mpsc::UnboundedReceiver<Arrival>) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(QUIET);
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        arrival = arrivals.recv() => {
+            let at = arrival.map(|arrival| arrival.at);
+            panic!("{what}: a request reached Telegram at {at:?}");
+        }
+        _ = rx => {}
+    }
+}
+
 /// Yields until `ready`, for at most [`PATIENCE`] of real time.
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     let started = Instant::now();
@@ -1200,7 +1221,10 @@ async fn per_chat_shaping_delays_fourth_message() {
         "the fourth message went at once"
     );
 
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // Not a millisecond early: the booked delay is the whole second.
+    tokio::time::advance(Duration::from_millis(999)).await;
+    quiet("the fourth message before its slot", &mut arrivals).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
     let fourth = within("the fourth request", arrivals.recv())
         .await
         .expect("open");
@@ -1235,28 +1259,35 @@ async fn reject_mode_answers_429_shaped() {
     .await;
 
     let to = |chat: i64| json!({ "chat_id": chat, "text": "hi" });
+    let send = |chat: i64| {
+        let (http, addr) = (tgin.http.clone(), tgin.addr);
+        let body = to(chat);
+        within("a response", async move {
+            call(&http, addr, "sendMessage", &body).await
+        })
+    };
     for _ in 0..3 {
-        let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
-        assert_eq!(response.status(), 200);
+        assert_eq!(send(42).await.status(), 200);
     }
-    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
+    let response = send(42).await;
     assert_eq!(response.headers()["content-type"], "application/json");
     assert_eq!(response.headers()["retry-after"], "1");
-    assert_eq!(status_and_body(response).await, (429, flood(1)));
     assert_eq!(
-        seen(&telegram).await.len(),
+        within("the body", status_and_body(response)).await,
+        (429, flood(1))
+    );
+    assert_eq!(
+        within("the record", seen(&telegram)).await.len(),
         3,
         "a refusal never goes upstream"
     );
 
     // Per chat: another chat is not limited.
-    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(43)).await;
-    assert_eq!(response.status(), 200);
+    assert_eq!(send(43).await.status(), 200);
     // A second later the chat has a slot again.
     tokio::time::advance(Duration::from_secs(1)).await;
-    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
-    assert_eq!(response.status(), 200);
-    assert_eq!(seen(&telegram).await.len(), 5);
+    assert_eq!(send(42).await.status(), 200);
+    assert_eq!(within("the record", seen(&telegram)).await.len(), 5);
 
     tgin.assert_metric(
         r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="rejected"} 1"#,
@@ -1448,7 +1479,10 @@ async fn upstream_429_retried_once_when_buffered() {
         tgin.has_metric(r#"tgin_gateway_upstream_seconds_count{bot="gw",method="sendMessage"} 1"#)
     })
     .await;
-    tokio::time::advance(Duration::from_secs(2)).await;
+    // Not a millisecond early: the retry waits the whole `retry_after`.
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    quiet("the retry before retry_after", &mut arrivals).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
     let second = within("the retry", arrivals.recv()).await.expect("open");
     assert_eq!(second.at, t0 + Duration::from_secs(2));
     assert_eq!(second.body, first.body);
@@ -1496,6 +1530,11 @@ async fn upstream_429_longer_than_max_wait_passes_through() {
         .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
         .mount(&telegram)
         .await;
+    // `sendVoice`: a zero `retry_after` is never waited for.
+    Mock::given(path(format!("/bot{TOKEN}/sendVoice")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(flood(0), "application/json"))
+        .mount(&telegram)
+        .await;
     let tgin = start(&limited_config(
         &telegram.uri(),
         "{ retry_429: { max_wait: 1s } }",
@@ -1524,6 +1563,9 @@ async fn upstream_429_longer_than_max_wait_passes_through() {
     let response = call(&tgin.http, tgin.addr, "sendDice", &chat).await;
     assert_eq!(status_and_body(response).await, (200, SENT.to_owned()));
     assert_eq!(calls("/sendDice").await, 2);
+    let response = call(&tgin.http, tgin.addr, "sendVoice", &chat).await;
+    assert_eq!(status_and_body(response).await, (429, flood(0)));
+    assert_eq!(calls("/sendVoice").await, 1);
 
     tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
     tgin.assert_metric(
@@ -1532,6 +1574,90 @@ async fn upstream_429_longer_than_max_wait_passes_through() {
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="sendPhoto",outcome="rate_limited"} 1"#,
     );
+    tgin.stop().await;
+}
+
+/// Review Focus 3: a request goes upstream at most twice, even when
+/// Telegram answers the second time with a 429 that could be retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_429_goes_upstream_at_most_twice() {
+    let telegram = MockServer::start().await;
+    let again = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1 (again)","parameters":{"retry_after":1}}"#;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&telegram)
+        .await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(again, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ retry_429: { max_wait: 1s } }",
+    ))
+    .await;
+    let response = call(
+        &tgin.http,
+        tgin.addr,
+        "sendMessage",
+        &json!({ "chat_id": 42 }),
+    )
+    .await;
+    assert_eq!(status_and_body(response).await, (429, again.to_owned()));
+    assert_eq!(seen(&telegram).await.len(), 2, "at most two upstream calls");
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+/// The transparent retry does not depend on the rate-limit mode: with
+/// `mode: off` a method of `rate_limit.methods` is still buffered and
+/// retried once, and its retry books no quota (a chat quota of one a
+/// minute would refuse it). A method outside the list streams and is not
+/// retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_is_independent_of_rate_limit_mode() {
+    let telegram = MockServer::start().await;
+    for method in ["sendMessage", "getChat"] {
+        Mock::given(path(format!("/bot{TOKEN}/{method}")))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&telegram)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: off, global: { count: 1, per: 1m, burst: 1 }, per_chat: { count: 1, per: 1m, burst: 1 } }, retry_429: { max_wait: 1s } }",
+    ))
+    .await;
+    let chat = json!({ "chat_id": 42 });
+
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(status_and_body(response).await, (200, SENT.to_owned()));
+    let requests = seen(&telegram).await;
+    assert_eq!(requests.len(), 2, "retried once");
+    assert_eq!(requests[1].body, requests[0].body);
+    let response = call(&tgin.http, tgin.addr, "getChat", &chat).await;
+    assert_eq!(status_and_body(response).await, (429, flood(1)));
+    assert_eq!(seen(&telegram).await.len(), 3, "never retried");
+
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
+    for scope in ["global", "chat", "group"] {
+        for action in ["delayed", "rejected"] {
+            tgin.assert_metric(&format!(
+                r#"tgin_gateway_ratelimited_total{{bot="gw",scope="{scope}",action="{action}"}} 0"#
+            ));
+        }
+    }
     tgin.stop().await;
 }
 
@@ -1614,23 +1740,34 @@ async fn limiter_state_survives_reload_with_same_config() {
         .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
         .mount(&telegram)
         .await;
-    let gateway = |burst: u32| {
+    let gateway = |burst: u32, idle: u32| {
         format!(
-            "{{ rate_limit: {{ mode: reject, per_chat: {{ count: 1, per: 1m, burst: {burst} }} }} }}"
+            "{{ upstream_idle_timeout: {idle}s, rate_limit: {{ mode: reject, per_chat: {{ count: 1, per: 1m, burst: {burst} }} }} }}"
         )
     };
-    let tgin = start(&limited_config(&telegram.uri(), &gateway(3))).await;
+    let tgin = start(&limited_config(&telegram.uri(), &gateway(3, 60))).await;
     let chat = json!({ "chat_id": 42 });
     for _ in 0..3 {
         let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
         assert_eq!(response.status(), 200);
     }
+    // The same file: the bot's entry is kept whole.
     tgin.reload().await;
     let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
     assert_eq!(response.status(), 429, "the reload reset the chat's quota");
 
+    // Another idle timeout: a new entry, which shares the limiter.
+    std::fs::write(&tgin.file, limited_config(&telegram.uri(), &gateway(3, 30))).expect("rewrite");
+    tgin.reload().await;
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(
+        response.status(),
+        429,
+        "the rebuilt entry reset the chat's quota"
+    );
+
     // A changed limit is a new limiter.
-    std::fs::write(&tgin.file, limited_config(&telegram.uri(), &gateway(4))).expect("rewrite");
+    std::fs::write(&tgin.file, limited_config(&telegram.uri(), &gateway(4, 30))).expect("rewrite");
     tgin.reload().await;
     let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
     assert_eq!(response.status(), 200);

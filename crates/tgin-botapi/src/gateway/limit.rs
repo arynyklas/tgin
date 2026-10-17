@@ -93,10 +93,17 @@ impl BotLimiter {
         })
     }
 
-    /// Whether the limits cover `method` (ignoring ASCII case); never in
-    /// `off` mode.
+    /// Whether `method` is one of `rate_limit.methods` (ignoring ASCII
+    /// case), whatever the mode: the send-class methods whose small bodies
+    /// the gateway buffers.
+    pub fn covers(&self, method: &str) -> bool {
+        self.methods.matches(method)
+    }
+
+    /// Whether the limits apply to `method`: it is covered and the mode is
+    /// not `off`.
     pub fn applies(&self, method: &str) -> bool {
-        self.mode != RateMode::Off && self.methods.matches(method)
+        self.mode != RateMode::Off && self.covers(method)
     }
 
     /// Books one request at `now`: on the global quota, then on `chat`'s,
@@ -216,7 +223,13 @@ mod tests {
         assert!(!reject.applies("getChat"));
         assert_eq!(reject.max_delay, Duration::ZERO);
         cfg.mode = RateMode::Off;
-        assert!(!BotLimiter::new(&cfg).unwrap().applies("sendMessage"));
+        let off = BotLimiter::new(&cfg).unwrap();
+        assert!(!off.applies("sendMessage"));
+        assert!(
+            off.covers("sendMessage"),
+            "off mode still covers its methods"
+        );
+        assert!(!off.covers("getChat"));
     }
 
     #[tokio::test(start_paused = true)]
