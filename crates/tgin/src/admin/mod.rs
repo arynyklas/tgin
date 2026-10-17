@@ -69,7 +69,8 @@ pub struct ConsumerStatus {
     pub leased: usize,
     pub in_flight: usize,
     pub paused: bool,
-    /// A push consumer's endpoints, in config order; empty for pull.
+    /// A push consumer's endpoints, in config order, then the one a bot's
+    /// `setWebhook` set; empty for pull.
     pub endpoints: Vec<EndpointStatus>,
 }
 
@@ -81,6 +82,9 @@ pub struct EndpointStatus {
     pub url_redacted: String,
     /// `closed`, `open` or `half_open`.
     pub breaker: String,
+    /// Whether a bot's `setWebhook` set it (absent from older servers).
+    #[serde(default)]
+    pub runtime: bool,
 }
 
 /// One supervised task.

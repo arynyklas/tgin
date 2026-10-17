@@ -12,7 +12,7 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 use tgin_core::config::{self, Config};
 use tgin_core::consumer::{PollRequest, PullConsumer};
-use tgin_core::engine::{Consumer, Engine, EngineRuntime};
+use tgin_core::engine::{Consumer, Engine, EngineRuntime, WebhookChange};
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
@@ -20,6 +20,7 @@ use tgin_core::sink::{Admit, Sink};
 use tgin_runtime::breaker::BreakerState;
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::queue::{HolderId, QueueStats};
+use tgin_runtime::secret::Secret;
 use tgin_runtime::supervisor::{Supervisor, TaskState};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -1114,10 +1115,22 @@ consumers:
         - url: "https://user:pa55word@hooks.example:8443/s3cretpath?token=qs3cret"
           secret_token: hdrs3cret
         - url: "http://plain.example/"
+      accept_set_webhook: true
   p1: { pull: { auth_token: pulls3cret } }
 "#;
     let h = Harness::new(yaml);
     h.engine.pause("p1");
+    let runtime = (
+        "https://rtuser:rtpa55@rt.example/rts3cret?q=rtq"
+            .parse()
+            .expect("url"),
+        Some(Secret::new("rthdrs3cret".to_owned())),
+    );
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("h", SourceId(0), Some(runtime)),
+        Some(WebhookChange::Set)
+    );
     let status = h.engine.status();
     let json = serde_json::to_value(&status).expect("serialize");
     let text = json.to_string();
@@ -1129,6 +1142,9 @@ consumers:
         "hdrs3cret",
         "pulls3cret",
         "user",
+        "rtpa55",
+        "rts3cret",
+        "rtq",
     ] {
         assert!(!text.contains(secret), "{secret} in {text}");
     }
@@ -1144,8 +1160,9 @@ consumers:
                 "in_flight": 0,
                 "paused": false,
                 "endpoints": [
-                    { "index": 0, "origin": "https://hooks.example:8443", "breaker": "closed" },
-                    { "index": 1, "origin": "http://plain.example", "breaker": "closed" },
+                    { "index": 0, "origin": "https://hooks.example:8443", "breaker": "closed", "runtime": false },
+                    { "index": 1, "origin": "http://plain.example", "breaker": "closed", "runtime": false },
+                    { "index": 2, "origin": "https://rt.example", "breaker": "closed", "runtime": true },
                 ],
             },
             {
@@ -1251,4 +1268,260 @@ async fn routes_to_follows_feeder_of_moved_then_retired_pull() {
         "a fed it only before the move"
     );
     assert!(h.engine.routes_to(b, "p1"));
+}
+
+/// The pull consumer a bot's scoped `getUpdates` polls: the current
+/// instance it feeds, or a draining one it fed, never an instance another
+/// bot fed, even when the name now belongs to a consumer of this bot.
+#[tokio::test(start_paused = true)]
+async fn pull_consumer_for_follows_the_feeding_bot() {
+    let h = Harness::new(FEEDERS);
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert!(h.engine.pull_consumer_for(a, "p1").is_some());
+    assert!(h.engine.pull_consumer_for(b, "p1").is_none());
+    assert!(h.engine.pull_consumer_for(b, "p2").is_some());
+    assert!(h.engine.pull_consumer_for(a, "nope").is_none());
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+
+    // `p1` becomes a push consumer of `b`; its pull instance, fed by `a`,
+    // drains.
+    let switched = FEEDERS
+        .replace("to: [{ all: [p1, q] }]", "to: [q]")
+        .replace("to: [p2]", "to: [{ all: [p2, p1] }]")
+        .replace(
+            "  p1: { pull: {} }\n",
+            "  p1: { push: { endpoints: [{ url: \"http://127.0.0.1:9/in\" }] } }\n",
+        );
+    h.engine.apply(&load(&switched)).expect("apply");
+    assert!(h.engine.routes_to(b, "p1"), "b feeds the push consumer");
+    assert!(h.engine.pull_consumer("p1").is_some(), "draining");
+    assert!(
+        h.engine.pull_consumer_for(b, "p1").is_none(),
+        "a's draining updates are not b's to poll"
+    );
+    let draining = h.engine.pull_consumer_for(a, "p1").expect("a's drain");
+    assert_eq!(poll(&draining, "i", 0).await, [1]);
+}
+
+/// Bot `a` feeds the push consumer `hooks`, which takes its endpoint from
+/// `setWebhook`; bot `b` feeds the pull consumer `p`.
+const CAPTURE: &str = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{ to: [hooks] }]
+  - name: b
+    token: "2:bbb"
+    routes: [{ to: [p] }]
+consumers:
+  hooks: { push: { accept_set_webhook: true } }
+  p: { pull: {} }
+"#;
+
+fn webhook(url: &str, secret: Option<&str>) -> Option<(reqwest::Url, Option<Secret<String>>)> {
+    Some((
+        url.parse().expect("url"),
+        secret.map(|s| Secret::new(s.to_owned())),
+    ))
+}
+
+fn runtime_url(h: &Harness, name: &str) -> Option<String> {
+    match h.engine.consumer(name) {
+        Some(Consumer::Push(push)) => push.runtime_endpoint_url().map(String::from),
+        other => panic!("{name} is no push consumer: {}", other.is_some()),
+    }
+}
+
+/// Only the bot that feeds an accepting push consumer sets its runtime
+/// endpoint; the answer tells a change from a repeat.
+#[tokio::test(start_paused = true)]
+async fn set_runtime_endpoint_only_by_the_feeding_bot() {
+    let h = Harness::new(CAPTURE);
+    let (a, b) = (SourceId(0), SourceId(1));
+    let url = "http://127.0.0.1:9/in";
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", b, webhook(url, None)),
+        None
+    );
+    assert_eq!(
+        h.engine.set_runtime_endpoint("p", b, webhook(url, None)),
+        None
+    );
+    assert_eq!(
+        h.engine.set_runtime_endpoint("nope", a, webhook(url, None)),
+        None
+    );
+    assert_eq!(runtime_url(&h, "hooks"), None);
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, Some("s1"))),
+        Some(WebhookChange::Set)
+    );
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, Some("s1"))),
+        Some(WebhookChange::Unchanged)
+    );
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, Some("s2"))),
+        Some(WebhookChange::Set)
+    );
+    assert_eq!(runtime_url(&h, "hooks").as_deref(), Some(url));
+    assert_eq!(
+        h.engine.set_runtime_endpoint("hooks", a, None),
+        Some(WebhookChange::Deleted)
+    );
+    assert_eq!(
+        h.engine.set_runtime_endpoint("hooks", a, None),
+        Some(WebhookChange::AlreadyDeleted)
+    );
+    assert_eq!(runtime_url(&h, "hooks"), None);
+
+    let settings = h.engine.consumer_settings(a, "hooks").expect("hooks");
+    assert!(settings.accept_set_webhook && !settings.honor_drop_pending);
+    assert_eq!(settings.mode, tgin_core::engine::Mode::Push);
+    let settings = h.engine.consumer_settings(b, "p").expect("p");
+    assert!(!settings.accept_set_webhook);
+    assert_eq!(settings.mode, tgin_core::engine::Mode::Pull);
+    assert!(h.engine.consumer_settings(a, "nope").is_none());
+    assert!(
+        h.engine.consumer_settings(b, "hooks").is_none(),
+        "not b's consumer"
+    );
+    assert!(
+        h.engine.consumer_settings(a, "p").is_none(),
+        "not a's consumer"
+    );
+    assert!(matches!(
+        h.engine.consumer_for(a, "hooks"),
+        Some(Consumer::Push(_))
+    ));
+    assert!(h.engine.consumer_for(b, "hooks").is_none());
+    assert!(matches!(
+        h.engine.consumer_for(b, "p"),
+        Some(Consumer::Pull(_))
+    ));
+    assert!(h.engine.consumer_for(a, "p").is_none());
+}
+
+/// `drop_pending_updates` purges the caller's consumer only when it is the
+/// bot's and honours the flag.
+#[tokio::test(start_paused = true)]
+async fn drop_pending_needs_the_feeding_bot_and_the_flag() {
+    let honoring = CAPTURE
+        .replace(
+            "accept_set_webhook: true",
+            "accept_set_webhook: true, honor_drop_pending: true",
+        )
+        .replace(
+            "p: { pull: {} }",
+            "p: { pull: { honor_drop_pending: true } }",
+        );
+    let h = Harness::new(&honoring);
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert_eq!(admit_to(&h.engine, a, "message", 1), Admit::Admitted);
+    assert_eq!(admit_to(&h.engine, b, "message", 2), Admit::Admitted);
+    assert_eq!(h.engine.drop_pending(b, "hooks"), None, "not b's consumer");
+    assert_eq!(h.engine.drop_pending(a, "p"), None, "not a's consumer");
+    assert_eq!(h.engine.drop_pending(a, "nope"), None);
+    assert_eq!(h.stats("hooks").available, 1);
+    assert_eq!(h.stats("p").available, 1);
+    assert_eq!(h.engine.drop_pending(a, "hooks"), Some(1));
+    assert_eq!(h.engine.drop_pending(b, "p"), Some(1));
+    assert_eq!(h.stats("hooks").available, 0);
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="p",reason="purge"} 1"#);
+
+    let h = Harness::new(CAPTURE);
+    assert_eq!(admit_to(&h.engine, a, "message", 1), Admit::Admitted);
+    assert_eq!(h.engine.drop_pending(a, "hooks"), None, "not honoured");
+    assert_eq!(h.stats("hooks").available, 1);
+}
+
+/// A runtime endpoint belongs to the bot whose `setWebhook` set it (R37):
+/// a reload that keeps the consumer and its bot keeps it; one that moves
+/// the consumer to another bot, leaves it with none, or turns
+/// `accept_set_webhook` off clears it.
+#[tokio::test(start_paused = true)]
+async fn runtime_endpoint_cleared_when_feeding_bot_changes() {
+    let h = Harness::new(CAPTURE);
+    let (a, b) = (SourceId(0), SourceId(1));
+    let url = "http://127.0.0.1:9/in";
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None))
+            .is_some()
+    );
+
+    let kept = CAPTURE.replace(
+        "accept_set_webhook: true",
+        "accept_set_webhook: true, max_in_flight: 3, breaker: { failure_threshold: 2 }",
+    );
+    h.engine.apply(&load(&kept)).expect("apply");
+    assert_eq!(runtime_url(&h, "hooks").as_deref(), Some(url), "same bot");
+
+    let moved = CAPTURE
+        .replace("routes: [{ to: [hooks] }]", "routes: [{ to: [p] }]")
+        .replace(
+            "token: \"2:bbb\"\n    routes: [{ to: [p] }]",
+            "token: \"2:bbb\"\n    routes: [{ to: [hooks] }]",
+        );
+    h.engine.apply(&load(&moved)).expect("apply");
+    assert_eq!(runtime_url(&h, "hooks"), None, "b feeds it now");
+    assert_eq!(
+        LOGS.count(&[
+            "runtime endpoint cleared",
+            "consumer=hooks",
+            "no longer feeds"
+        ]),
+        1,
+        "the clearing is logged"
+    );
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None))
+            .is_none()
+    );
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", b, webhook(url, None))
+            .is_some()
+    );
+
+    let orphaned = moved
+        .replace(
+            "token: \"2:bbb\"\n    routes: [{ to: [hooks] }]",
+            "token: \"2:bbb\"\n    routes: [{ to: [q] }]",
+        )
+        .replace(
+            "  p: { pull: {} }\n",
+            "  p: { pull: {} }\n  q: { pull: {} }\n",
+        );
+    h.engine.apply(&load(&orphaned)).expect("apply");
+    assert_eq!(runtime_url(&h, "hooks"), None, "no bot feeds it");
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", b, webhook(url, None))
+            .is_none()
+    );
+
+    h.engine.apply(&load(CAPTURE)).expect("apply");
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None))
+            .is_some()
+    );
+    let refused = CAPTURE.replace(
+        "hooks: { push: { accept_set_webhook: true } }",
+        "hooks: { push: { endpoints: [{ url: \"http://127.0.0.1:9/cfg\" }] } }",
+    );
+    h.engine.apply(&load(&refused)).expect("apply");
+    assert_eq!(runtime_url(&h, "hooks"), None, "accept_set_webhook is off");
+    assert!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None))
+            .is_none()
+    );
 }

@@ -8,6 +8,9 @@
 //! - a consumer with the same name and mode keeps its instance, and so its
 //!   queue, pause flag and breakers unless its endpoints change; new
 //!   parameters apply live;
+//! - a kept push consumer keeps its runtime endpoint (from `setWebhook`)
+//!   while it still accepts one and the bot that set it still feeds it;
+//!   otherwise the endpoint is cleared;
 //! - a removed consumer stops receiving updates at once and drains for
 //!   `reload.drain_timeout`; what it still holds then is dropped
 //!   (`dropped{reason="reload"}`), its tasks stop and its metric series go;
@@ -415,6 +418,7 @@ pub(crate) fn commit(
     if let Some(state) = state {
         shared.state.store(Arc::new(state));
     }
+    keep_runtime_endpoints(&shared.state.load());
     for slot in changes.started.iter().chain(&changes.revived) {
         slot.consumer.update_depth();
     }
@@ -448,6 +452,35 @@ pub(crate) fn compile(
         }
     }
     RouteTable::compile(&rules, &usernames)
+}
+
+/// Clears the runtime endpoint of every current push consumer that no
+/// longer accepts one, or that the bot whose `setWebhook` set it no longer
+/// feeds (R37): a token holder never redirects another bot's updates, not
+/// even across reloads. Draining instances keep theirs to deliver what they
+/// hold.
+fn keep_runtime_endpoints(state: &EngineState) {
+    for target in &state.targets {
+        let Consumer::Push(push) = &target.slot.consumer else {
+            continue;
+        };
+        let Some(source) = push.runtime_endpoint_source() else {
+            continue;
+        };
+        let accepts = state.config.consumers.iter().any(|c| {
+            *c.name == *target.slot.name
+                && matches!(&c.kind, ConsumerKind::Push(p) if p.accept_set_webhook)
+        });
+        let reason = if !accepts {
+            "accept_set_webhook is off"
+        } else if !state.feeds(source, &target.slot.name) {
+            "the bot whose setWebhook set it no longer feeds the consumer"
+        } else {
+            continue;
+        };
+        push.set_runtime_endpoint(None);
+        tracing::info!(consumer = %target.slot.name, reason, "runtime endpoint cleared");
+    }
 }
 
 /// Waits until the retired instance is empty or the drain timeout (at least
@@ -596,6 +629,8 @@ fn options(push: &config::Push, source_names: &Arc<[Arc<str>]>) -> PushOptions {
         balance: push.balance,
         retry: push.retry,
         source_names: Arc::clone(source_names),
+        breaker: push.breaker,
+        runtime_timeout: config::DEFAULT_ENDPOINT_TIMEOUT,
     }
 }
 

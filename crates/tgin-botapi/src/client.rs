@@ -347,7 +347,7 @@ fn webhook_form(req: &SetWebhook, certificate: &Bytes) -> Result<Form, ApiError>
 /// The identity a `getMe` response body describes. The raw `User` is a copy
 /// of its own: it is kept for as long as the bot runs, and must not keep
 /// the connection's read buffer alive.
-fn identity(body: &[u8]) -> Result<Identity, ApiError> {
+pub(crate) fn identity(body: &[u8]) -> Result<Identity, ApiError> {
     let raw: &RawValue = parse_result(body)?;
     let user = serde_json::from_str(raw.get()).map_err(|e| decode_error(&e))?;
     Ok(Identity {

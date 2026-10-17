@@ -7,6 +7,11 @@
 //! until the current one is delivered or dead-lettered. Push leases never
 //! expire: the dispatcher acks every lease it settles and releases the rest
 //! when it stops, so a new dispatcher resumes from the queue alone.
+//!
+//! Besides the configured endpoints, a consumer may hold one runtime
+//! endpoint, which a bot's `setWebhook` set through the gateway. A consumer
+//! with no endpoint at all leases nothing: its updates wait in the queue
+//! until an endpoint arrives.
 
 use std::fmt;
 use std::pin::pin;
@@ -20,7 +25,7 @@ use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use smallvec::SmallVec;
 use tgin_runtime::backoff::{Backoff, honor_retry_after};
-use tgin_runtime::breaker::{Breaker, BreakerState};
+use tgin_runtime::breaker::{Breaker, BreakerConfig, BreakerState};
 use tgin_runtime::http::describe_error;
 use tgin_runtime::queue::{HolderId, LeaseQueue, QueueConfig};
 use tgin_runtime::secret::Secret;
@@ -31,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use crate::config::{Balance, Retry as RetryPolicy};
 use crate::envelope::Envelope;
+use crate::ids::SourceId;
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, DeliveryOutcome, EndpointMetrics};
 
 /// Lease timeout of a push queue (see [`crate::config::Push::queue`]): long
@@ -67,6 +73,30 @@ pub struct PushOptions {
     pub retry: RetryPolicy,
     /// Source names by [`crate::ids::SourceId`], for `X-Tgin-Source` and logs.
     pub source_names: Arc<[Arc<str>]>,
+    /// The breaker of a runtime endpoint: the consumer's `breaker`.
+    pub breaker: BreakerConfig,
+    /// Bound on one request to a runtime endpoint, from connecting to the
+    /// end of the response: [`crate::config::DEFAULT_ENDPOINT_TIMEOUT`].
+    pub runtime_timeout: Duration,
+}
+
+/// The endpoint a bot's `setWebhook` gave a consumer that accepts one. It
+/// sits after the configured endpoints, with a breaker of its own.
+pub struct RuntimeEndpoint {
+    /// May carry a secret: it is never logged or formatted.
+    pub url: reqwest::Url,
+    pub secret_token: Option<Secret<String>>,
+    /// The bot whose `setWebhook` set it.
+    pub source: SourceId,
+}
+
+impl RuntimeEndpoint {
+    fn same(&self, other: &RuntimeEndpoint) -> bool {
+        self.url == other.url
+            && self.source == other.source
+            && self.secret_token.as_ref().map(Secret::expose)
+                == other.secret_token.as_ref().map(Secret::expose)
+    }
 }
 
 pub struct PushConsumer {
@@ -104,7 +134,12 @@ impl PushConsumer {
         client: reqwest::Client,
         metrics: ConsumerMetrics,
     ) -> Self {
-        let targets = Targets::new(&name, endpoints, opts, &metrics);
+        let targets = Targets {
+            slots: configured_slots(&name, endpoints, &metrics),
+            runtime: None,
+            source_headers: source_headers(&opts.source_names),
+            opts,
+        };
         Self {
             name,
             holder: HolderId(Arc::from(HOLDER)),
@@ -146,27 +181,92 @@ impl PushConsumer {
         tokio::spawn(async move { this.dispatch(cancel, force).await })
     }
 
-    /// Replaces the endpoints and options. Deliveries in flight finish on the
-    /// endpoint they were sent to; every later choice, retries included, uses
-    /// the new set. Breaker state comes with the new endpoints: an endpoint
-    /// given again starts from its new breaker.
+    /// Replaces the configured endpoints and the options. Deliveries in
+    /// flight finish on the endpoint they were sent to; every later choice,
+    /// retries included, uses the new set. Breaker state comes with the new
+    /// endpoints: an endpoint given again starts from its new breaker. The
+    /// runtime endpoint stays, with its breaker unless the breaker settings
+    /// changed.
     pub fn set_endpoints(&self, endpoints: Vec<Endpoint>, opts: PushOptions) {
-        let targets = Targets::new(&self.name, endpoints, opts, &self.metrics);
-        self.targets.store(Arc::new(targets));
+        let configured = configured_slots(&self.name, endpoints, &self.metrics);
+        self.targets.rcu(|current| {
+            let mut slots = configured.to_vec();
+            if let Some((runtime, slot)) = current.runtime.as_ref().zip(current.slots.last()) {
+                let same = current.opts.breaker == opts.breaker
+                    && current.opts.runtime_timeout == opts.runtime_timeout;
+                slots.push(if same {
+                    Arc::clone(slot)
+                } else {
+                    runtime_slot(&self.name, runtime, &opts, &self.metrics)
+                });
+            }
+            Targets {
+                slots: slots.into(),
+                runtime: current.runtime.clone(),
+                source_headers: source_headers(&opts.source_names),
+                opts: opts.clone(),
+            }
+        });
         self.changed.notify_waiters();
     }
 
     /// Replaces the options (source names, and what a change of
-    /// `webhook_reply` gives), keeping the endpoints with their breakers and
-    /// in-flight counts.
+    /// `webhook_reply` gives), keeping the endpoints, the runtime one
+    /// included, with their breakers and in-flight counts.
     pub fn set_options(&self, opts: PushOptions) {
-        let current = self.targets.load();
-        self.targets.store(Arc::new(Targets {
+        let headers = source_headers(&opts.source_names);
+        self.targets.rcu(|current| Targets {
             slots: Arc::clone(&current.slots),
-            source_headers: source_headers(&opts.source_names),
-            opts,
-        }));
+            runtime: current.runtime.clone(),
+            source_headers: headers.clone(),
+            opts: opts.clone(),
+        });
         self.changed.notify_waiters();
+    }
+
+    /// Sets the runtime endpoint, with a fresh breaker, or removes it
+    /// (`None`). The configured endpoints stay. Deliveries in flight finish
+    /// on the endpoint they were sent to; a delivery that finds no endpoint
+    /// left returns its update to the queue.
+    pub fn set_runtime_endpoint(&self, endpoint: Option<RuntimeEndpoint>) {
+        let endpoint = endpoint.map(Arc::new);
+        self.targets.rcu(|current| {
+            let mut slots = current.configured().to_vec();
+            if let Some(endpoint) = &endpoint {
+                slots.push(runtime_slot(
+                    &self.name,
+                    endpoint,
+                    &current.opts,
+                    &self.metrics,
+                ));
+            }
+            Targets {
+                slots: slots.into(),
+                runtime: endpoint.clone(),
+                source_headers: current.source_headers.clone(),
+                opts: current.opts.clone(),
+            }
+        });
+        self.changed.notify_waiters();
+    }
+
+    /// The runtime endpoint's URL; it may carry a secret.
+    pub fn runtime_endpoint_url(&self) -> Option<reqwest::Url> {
+        self.targets.load().runtime.as_ref().map(|r| r.url.clone())
+    }
+
+    /// The bot whose `setWebhook` set the runtime endpoint.
+    pub fn runtime_endpoint_source(&self) -> Option<SourceId> {
+        self.targets.load().runtime.as_ref().map(|r| r.source)
+    }
+
+    /// Whether the runtime endpoint is `endpoint`: same URL, secret and bot.
+    pub fn has_runtime_endpoint(&self, endpoint: &RuntimeEndpoint) -> bool {
+        self.targets
+            .load()
+            .runtime
+            .as_ref()
+            .is_some_and(|current| current.same(endpoint))
     }
 
     /// Deliveries in flight, counting those waiting to retry.
@@ -217,13 +317,14 @@ impl PushConsumer {
         self.paused.load(Ordering::SeqCst)
     }
 
-    /// The current endpoints in order: each one's origin and breaker state.
-    pub fn endpoints(&self) -> Vec<(Arc<str>, BreakerState)> {
+    /// The current endpoints in order, the runtime one last: each one's
+    /// origin, breaker state, and whether it is the runtime endpoint.
+    pub fn endpoints(&self) -> Vec<(Arc<str>, BreakerState, bool)> {
         self.targets
             .load()
             .slots
             .iter()
-            .map(|slot| (Arc::clone(&slot.origin), slot.breaker.state()))
+            .map(|slot| (Arc::clone(&slot.origin), slot.breaker.state(), slot.runtime))
             .collect()
     }
 
@@ -242,9 +343,12 @@ impl PushConsumer {
                     break;
                 }
             } else if !self.is_paused() {
-                let max = self.targets.load().opts.max_in_flight;
-                let room = max.saturating_sub(deliveries.len());
-                if room > 0 {
+                let targets = self.targets.load();
+                // With no endpoint at all, nothing is leased: the updates
+                // wait in the queue until one arrives, which notifies
+                // `changed`.
+                let room = targets.opts.max_in_flight.saturating_sub(deliveries.len());
+                if room > 0 && !targets.slots.is_empty() {
                     let leases = self.queue.lease(&self.holder, room, Instant::now());
                     if !leases.is_empty() {
                         for lease in leases {
@@ -283,7 +387,7 @@ impl PushConsumer {
             let mut sent = match self.choose(&envelope, cancel).await {
                 Choice::Send(sent) => sent,
                 // Dropping `held` returns the update to its position.
-                Choice::Cancelled => return,
+                Choice::Cancelled | Choice::NoEndpoint => return,
                 Choice::Expired => {
                     // `max_age` passed before an endpoint could take it.
                     let (endpoint, cause) = match last {
@@ -363,6 +467,9 @@ impl PushConsumer {
             let mut changed = pin!(self.changed.notified());
             changed.as_mut().enable();
             let targets = self.targets.load_full();
+            if targets.slots.is_empty() {
+                return Choice::NoEndpoint;
+            }
             let now = Instant::now();
             let deadline = envelope.received_at.checked_add(targets.opts.retry.max_age);
             if deadline.is_some_and(|deadline| now >= deadline) {
@@ -555,8 +662,11 @@ impl PushConsumer {
 
 /// One endpoint set with the options it was given with.
 struct Targets {
-    /// Shared by the sets that differ only in their source names.
-    slots: Arc<[Slot]>,
+    /// The configured endpoints in order, then the runtime endpoint if
+    /// there is one. Shared by the sets that keep them.
+    slots: Arc<[Arc<Slot>]>,
+    /// What the last slot was built from, when it is the runtime endpoint.
+    runtime: Option<Arc<RuntimeEndpoint>>,
     opts: PushOptions,
     /// `X-Tgin-Source` values by source; `None` for a name that is no valid
     /// header value.
@@ -564,49 +674,81 @@ struct Targets {
 }
 
 impl Targets {
-    fn new(
-        consumer: &str,
-        endpoints: Vec<Endpoint>,
-        opts: PushOptions,
-        metrics: &ConsumerMetrics,
-    ) -> Self {
-        let slots = endpoints
-            .into_iter()
-            .enumerate()
-            .map(|(index, endpoint)| {
-                let secret = match &endpoint.secret_token {
-                    None => SecretHeader::None,
-                    Some(secret) => match HeaderValue::from_str(secret.expose()) {
-                        Ok(mut value) => {
-                            value.set_sensitive(true);
-                            SecretHeader::Valid(value)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                consumer = %consumer,
-                                endpoint = u64::try_from(index).ok(),
-                                "secret_token is not a valid header value; \
-                                 updates for this endpoint are dead-lettered"
-                            );
-                            SecretHeader::Invalid
-                        }
-                    },
-                };
-                Slot {
-                    url: endpoint.url,
-                    origin: endpoint.origin,
-                    secret,
-                    timeout: endpoint.timeout,
-                    breaker: endpoint.breaker,
-                    in_flight: AtomicUsize::new(0),
-                    metrics: metrics.endpoint(index),
-                }
+    /// The configured endpoints, without the runtime one.
+    fn configured(&self) -> &[Arc<Slot>] {
+        let runtime = usize::from(self.runtime.is_some());
+        &self.slots[..self.slots.len().saturating_sub(runtime)]
+    }
+}
+
+fn configured_slots(
+    consumer: &str,
+    endpoints: Vec<Endpoint>,
+    metrics: &ConsumerMetrics,
+) -> Arc<[Arc<Slot>]> {
+    endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoint)| {
+            let secret = secret_header(consumer, endpoint.secret_token.as_ref(), Some(index));
+            Arc::new(Slot {
+                url: endpoint.url,
+                origin: endpoint.origin,
+                secret,
+                timeout: endpoint.timeout,
+                breaker: endpoint.breaker,
+                in_flight: AtomicUsize::new(0),
+                metrics: metrics.endpoint(index),
+                runtime: false,
             })
-            .collect();
-        Self {
-            slots,
-            source_headers: source_headers(&opts.source_names),
-            opts,
+        })
+        .collect()
+}
+
+/// The slot of a runtime endpoint: the options' timeout and a fresh breaker
+/// with their settings, labelled `endpoint="runtime"` in the metrics.
+fn runtime_slot(
+    consumer: &str,
+    endpoint: &RuntimeEndpoint,
+    opts: &PushOptions,
+    metrics: &ConsumerMetrics,
+) -> Arc<Slot> {
+    Arc::new(Slot {
+        url: endpoint.url.clone(),
+        origin: Arc::from(endpoint.url.origin().ascii_serialization()),
+        secret: secret_header(consumer, endpoint.secret_token.as_ref(), None),
+        timeout: opts.runtime_timeout,
+        breaker: Breaker::new(opts.breaker),
+        in_flight: AtomicUsize::new(0),
+        metrics: metrics.runtime_endpoint(),
+        runtime: true,
+    })
+}
+
+/// The secret header of the configured endpoint at `index`, or of the
+/// runtime endpoint (`None`).
+fn secret_header(
+    consumer: &str,
+    secret: Option<&Secret<String>>,
+    index: Option<usize>,
+) -> SecretHeader {
+    let Some(secret) = secret else {
+        return SecretHeader::None;
+    };
+    match HeaderValue::from_str(secret.expose()) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            SecretHeader::Valid(value)
+        }
+        Err(_) => {
+            tracing::warn!(
+                consumer = %consumer,
+                endpoint = index.and_then(|index| u64::try_from(index).ok()),
+                runtime = index.is_none(),
+                "secret_token is not a valid header value; \
+                 updates for this endpoint are dead-lettered"
+            );
+            SecretHeader::Invalid
         }
     }
 }
@@ -627,6 +769,8 @@ struct Slot {
     /// Requests on the wire to this endpoint.
     in_flight: AtomicUsize,
     metrics: EndpointMetrics,
+    /// Whether this is the runtime endpoint.
+    runtime: bool,
 }
 
 enum SecretHeader {
@@ -727,6 +871,8 @@ enum Choice<'a> {
     /// The update reached `max_age`.
     Expired,
     Cancelled,
+    /// The consumer has no endpoint any more.
+    NoEndpoint,
 }
 
 enum Failure {

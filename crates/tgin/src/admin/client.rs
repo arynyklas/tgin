@@ -371,7 +371,10 @@ fn consumers_table(consumers: &[ConsumerStatus]) -> String {
             let endpoints: Vec<String> = consumer
                 .endpoints
                 .iter()
-                .map(|e| format!("{} ({})", e.url_redacted, e.breaker))
+                .map(|e| {
+                    let runtime = if e.runtime { ", runtime" } else { "" };
+                    format!("{} ({}{runtime})", e.url_redacted, e.breaker)
+                })
                 .collect();
             vec![
                 consumer.name.clone(),

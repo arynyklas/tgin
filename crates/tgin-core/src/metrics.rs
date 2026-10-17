@@ -128,10 +128,15 @@ struct ConsumerReasonLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct AttemptLabels {
     consumer: Arc<str>,
-    /// The endpoint's index in its consumer's list, in decimal.
+    /// The endpoint's index in its consumer's list, in decimal, or
+    /// [`RUNTIME_ENDPOINT_LABEL`].
     endpoint: Arc<str>,
     outcome: &'static str,
 }
+
+/// The `endpoint` label of a push consumer's runtime endpoint, the one a
+/// bot's `setWebhook` set.
+pub const RUNTIME_ENDPOINT_LABEL: &str = "runtime";
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabels {
@@ -395,12 +400,14 @@ impl CoreMetrics {
         }
         let mut endpoints = self.endpoints.lock();
         let count = endpoints.remove(&consumer).unwrap_or(0);
-        for index in 0..count {
-            let endpoint: Arc<str> = Arc::from(index.to_string());
+        let labels = (0..count)
+            .map(|index| Arc::from(index.to_string()))
+            .chain(std::iter::once(Arc::from(RUNTIME_ENDPOINT_LABEL)));
+        for endpoint in labels {
             for o in DeliveryOutcome::ALL {
                 self.delivery_attempts.remove(&AttemptLabels {
                     consumer: consumer.clone(),
-                    endpoint: endpoint.clone(),
+                    endpoint: Arc::clone(&endpoint),
                     outcome: o.as_str(),
                 });
             }
@@ -507,11 +514,23 @@ impl ConsumerMetrics {
         let mut endpoints = self.endpoints.lock();
         let count = endpoints.entry(self.consumer.clone()).or_default();
         *count = (*count).max(index.saturating_add(1));
+        self.attempt_handles(&endpoint)
+    }
+
+    /// Resolves the handles of the runtime endpoint, labelled
+    /// [`RUNTIME_ENDPOINT_LABEL`]; `remove_consumer` always removes them.
+    pub fn runtime_endpoint(&self) -> EndpointMetrics {
+        // Under the same lock, so a concurrent removal sees all or none.
+        let _endpoints = self.endpoints.lock();
+        self.attempt_handles(&Arc::from(RUNTIME_ENDPOINT_LABEL))
+    }
+
+    fn attempt_handles(&self, endpoint: &Arc<str>) -> EndpointMetrics {
         EndpointMetrics {
             attempts: DeliveryOutcome::ALL.map(|o| {
                 self.attempts.get_or_create_owned(&AttemptLabels {
                     consumer: self.consumer.clone(),
-                    endpoint: endpoint.clone(),
+                    endpoint: Arc::clone(endpoint),
                     outcome: o.as_str(),
                 })
             }),
@@ -667,6 +686,23 @@ mod tests {
         m.consumer("c1")
             .endpoint(0)
             .attempt(DeliveryOutcome::Delivered);
+        m.remove_consumer("c1");
+        assert!(!text(&reg).contains(r#"consumer="c1""#));
+    }
+
+    #[test]
+    fn runtime_endpoint_series_removed_with_consumer() {
+        let (reg, m) = setup();
+        m.consumer("c1")
+            .runtime_endpoint()
+            .attempt(DeliveryOutcome::Delivered);
+        let out = text(&reg);
+        assert!(
+            lines(&out).contains(
+                &r#"tgin_delivery_attempts_total{consumer="c1",endpoint="runtime",outcome="delivered"} 1"#
+            ),
+            "{out}"
+        );
         m.remove_consumer("c1");
         assert!(!text(&reg).contains(r#"consumer="c1""#));
     }
