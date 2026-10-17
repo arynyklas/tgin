@@ -148,6 +148,23 @@ jobs:
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
 
+  # Real bot frameworks (aiogram, python-telegram-bot, grammY, Telegraf)
+  # against tgin and the fake Telegram in Docker: tests/e2e/compose.yaml.
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: docker version && docker compose version
+      - run: cargo xtask e2e
+
   bench-crate:
     runs-on: ubuntu-24.04
     defaults:

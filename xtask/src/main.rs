@@ -1,6 +1,7 @@
 //! Repository automation for tgin, run with `cargo xtask <command>`.
 
 mod config_docs;
+mod e2e;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,7 +12,10 @@ commands:
   schema                write schema/tgin.v1.schema.json from the config model
   schema --check        fail if schema/tgin.v1.schema.json is out of date
   config-docs           write docs/config-reference.md from the config schema
-  config-docs --check   fail if docs/config-reference.md is out of date";
+  config-docs --check   fail if docs/config-reference.md is out of date
+  e2e                   run the end-to-end suite (Docker): real bot frameworks
+                        against tgin and the fake Telegram; tears it down after
+  e2e --keep            the same, leaving the stack up";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +29,8 @@ fn main() -> ExitCode {
         ["schema", "--check"] => schema(true),
         ["config-docs"] => config_reference(false),
         ["config-docs", "--check"] => config_reference(true),
+        ["e2e"] => e2e::run(false),
+        ["e2e", "--keep"] => e2e::run(true),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE

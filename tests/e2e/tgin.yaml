@@ -1,0 +1,84 @@
+# tgin for the end-to-end suite (`cargo xtask e2e`, tests/e2e/compose.yaml).
+#
+# Eight bots, one per framework and mode, each long-polling the fake Telegram
+# into its own consumer:
+# - `<framework>-poll` → a pull consumer the framework polls through the
+#   gateway's scoped getUpdates;
+# - `<framework>-hook` → a push consumer. aiogram, python-telegram-bot and
+#   grammY register their endpoint with setWebhook on the scoped base
+#   (`accept_set_webhook`, no configured endpoint); Telegraf's endpoint is
+#   configured here, so both paths stay covered.
+# Tokens and secrets are fake values from compose.yaml.
+version: 1
+
+log:
+  level: info
+
+reload:
+  watch: false
+
+admin:
+  # Published on the host's loopback only (compose.yaml); a non-loopback
+  # listen needs a token.
+  listen: ["0.0.0.0:9090"]
+  token: ${env:ADMIN_TOKEN}
+  public_metrics: true
+
+server:
+  listen: ["0.0.0.0:8080"]
+
+bots:
+  - name: aiogram-poll
+    token: ${env:AIOGRAM_POLL_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [aiogram-poll] }]
+  - name: aiogram-hook
+    token: ${env:AIOGRAM_HOOK_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [aiogram-hook] }]
+  - name: ptb-poll
+    token: ${env:PTB_POLL_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [ptb-poll] }]
+  - name: ptb-hook
+    token: ${env:PTB_HOOK_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [ptb-hook] }]
+  - name: grammy-poll
+    token: ${env:GRAMMY_POLL_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [grammy-poll] }]
+  - name: grammy-hook
+    token: ${env:GRAMMY_HOOK_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [grammy-hook] }]
+  - name: telegraf-poll
+    token: ${env:TELEGRAF_POLL_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [telegraf-poll] }]
+  - name: telegraf-hook
+    token: ${env:TELEGRAF_HOOK_TOKEN}
+    api_url: http://fake:8081
+    ingress: { long_poll: {} }
+    routes: [{ to: [telegraf-hook] }]
+
+consumers:
+  aiogram-poll: { pull: {} }
+  ptb-poll: { pull: {} }
+  grammy-poll: { pull: {} }
+  telegraf-poll: { pull: {} }
+  aiogram-hook: { push: { accept_set_webhook: true } }
+  ptb-hook: { push: { accept_set_webhook: true } }
+  grammy-hook: { push: { accept_set_webhook: true } }
+  telegraf-hook:
+    push:
+      endpoints:
+        - url: http://telegraf-hook:8081/hook
+          secret_token: ${env:TELEGRAF_HOOK_SECRET}

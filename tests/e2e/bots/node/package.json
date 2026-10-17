@@ -1,0 +1,11 @@
+{
+  "name": "tgin-e2e-node-bots",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Node bots of the end-to-end suite (cargo xtask e2e).",
+  "type": "module",
+  "dependencies": {
+    "grammy": "1.46.0",
+    "telegraf": "4.16.3"
+  }
+}

@@ -1,0 +1,13 @@
+# The Python bots of the end-to-end suite (`cargo xtask e2e`).
+[project]
+name = "tgin-e2e-python-bots"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "aiogram==3.31.0",
+    "python-telegram-bot[webhooks]==22.8",
+]
+
+[tool.uv]
+# Scripts, not a package: `uv sync` installs the dependencies only.
+package = false
