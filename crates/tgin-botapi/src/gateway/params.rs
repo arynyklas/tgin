@@ -1,6 +1,6 @@
 //! Request parameters from a complete request body, read as the Bot API
 //! reads them (tdlib's `HttpReader`): `multipart/form-data`, then
-//! `application/json`, then `application/x-www-form-urlencoded`, matched as
+//! `application/x-www-form-urlencoded`, then `application/json`, matched as
 //! substrings of the lowercased `Content-Type`; any other body has none. The
 //! query string is the caller's.
 
@@ -11,6 +11,7 @@ use std::fmt;
 use axum::http::HeaderValue;
 use bytes::Bytes;
 use futures_util::FutureExt as _;
+use percent_encoding::percent_decode;
 use serde::de::{self, DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 
@@ -20,7 +21,7 @@ pub const MULTIPART_FIELD_LIMIT: usize = 64 * 1024;
 /// The top-level parameter `name` of `body`, as text:
 /// - JSON: a string as is, a number or a boolean as written; `null`, objects
 ///   and arrays are not text;
-/// - urlencoded: the decoded value;
+/// - urlencoded: the decoded value, which must be UTF-8;
 /// - multipart: a text field of at most [`MULTIPART_FIELD_LIMIT`] bytes, in
 ///   any order; file parts are skipped.
 ///
@@ -37,9 +38,7 @@ pub fn text_param<'a>(
             multipart_param(content_type, body, name).map(Cow::Owned)
         }
         Encoding::Json => json_param(body, name),
-        Encoding::Form => form_urlencoded::parse(body)
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value),
+        Encoding::Form => form_param(body, name),
     }
 }
 
@@ -56,8 +55,8 @@ pub(crate) fn encoding(content_type: &HeaderValue) -> Option<Encoding> {
     let content_type = content_type.as_bytes();
     [
         (&b"multipart/form-data"[..], Encoding::Multipart),
-        (b"application/json", Encoding::Json),
         (b"application/x-www-form-urlencoded", Encoding::Form),
+        (b"application/json", Encoding::Json),
     ]
     .into_iter()
     .find(|(name, _)| {
@@ -66,6 +65,35 @@ pub(crate) fn encoding(content_type: &HeaderValue) -> Option<Encoding> {
             .any(|window| window.eq_ignore_ascii_case(name))
     })
     .map(|(_, encoding)| encoding)
+}
+
+/// The value of the first pair named `name` of an urlencoded body: pairs
+/// split on `&`, name and value on the first `=`. `None` when that value is
+/// not UTF-8 once decoded; a pair whose name is not matches nothing.
+fn form_param<'a>(body: &'a [u8], name: &str) -> Option<Cow<'a, str>> {
+    let value = body
+        .split(|&b| b == b'&')
+        .filter(|pair| !pair.is_empty())
+        .find_map(|pair| {
+            let mut parts = pair.splitn(2, |&b| b == b'=');
+            let key = parts.next().unwrap_or_default();
+            (form_decode(key).as_deref() == Some(name)).then(|| parts.next().unwrap_or_default())
+        })?;
+    form_decode(value)
+}
+
+/// `+` as a space, then percent-decoded; `None` unless UTF-8. Borrowed
+/// unless something was decoded.
+fn form_decode(encoded: &[u8]) -> Option<Cow<'_, str>> {
+    if !encoded.contains(&b'+') {
+        return percent_decode(encoded).decode_utf8().ok();
+    }
+    let spaced: Vec<u8> = encoded
+        .iter()
+        .map(|&b| if b == b'+' { b' ' } else { b })
+        .collect();
+    let decoded = percent_decode(&spaced).decode_utf8().ok()?;
+    Some(Cow::Owned(decoded.into_owned()))
 }
 
 /// The top-level member `name` of a JSON object, as text.
@@ -337,5 +365,52 @@ mod tests {
         }
         assert_eq!(get("multipart/form-data", &body, "big"), None);
         assert_eq!(get(&ct, b"--XyZ-boundary\r\ngarbage", "big"), None);
+    }
+
+    /// A `Content-Type` naming both is a form, as the Bot API server reads it
+    /// (tdlib `HttpReader.cpp:217-221`).
+    #[test]
+    fn text_param_form_wins_over_json() {
+        let ct = "application/x-www-form-urlencoded; profile=application/json";
+        assert_eq!(get(ct, b"chat_id=5", "chat_id").as_deref(), Some("5"));
+        assert_eq!(get(ct, br#"{"chat_id":5}"#, "chat_id"), None);
+        let ct = "application/json; profile=application/x-www-form-urlencoded";
+        assert_eq!(get(ct, b"chat_id=5", "chat_id").as_deref(), Some("5"));
+    }
+
+    /// Form values are UTF-8 like every other parameter; one that is not is
+    /// absent.
+    #[test]
+    fn text_param_form_utf8() {
+        assert_eq!(get(FORM, b"secret_token=%FF", "secret_token"), None);
+        assert_eq!(get(FORM, b"secret_token=\xFF", "secret_token"), None);
+        assert_eq!(get(FORM, b"secret_token=a%E2%82", "secret_token"), None);
+        // The first occurrence wins, even when it cannot be read.
+        assert_eq!(get(FORM, b"text=%FF&text=b", "text"), None);
+        assert_eq!(
+            get(FORM, b"text=%E2%82%AC", "text").as_deref(),
+            Some("\u{20ac}")
+        );
+        assert_eq!(
+            get(FORM, "text=\u{20ac}".as_bytes(), "text").as_deref(),
+            Some("\u{20ac}")
+        );
+        assert_eq!(get(FORM, b"text=a+b%2B", "text").as_deref(), Some("a b+"));
+        // Keys are decoded too; a key that is not UTF-8 matches nothing.
+        assert_eq!(get(FORM, b"chat%5Fid=5", "chat_id").as_deref(), Some("5"));
+        assert_eq!(get(FORM, b"%FF=1&a=2", "a").as_deref(), Some("2"));
+        // No value, empty pairs.
+        assert_eq!(get(FORM, b"&&flag&a=", "flag").as_deref(), Some(""));
+        assert_eq!(get(FORM, b"&&flag&a=", "a").as_deref(), Some(""));
+        assert_eq!(get(FORM, b"a=b=c", "a").as_deref(), Some("b=c"));
+        // Borrowed unless something was decoded.
+        assert!(matches!(
+            get(FORM, b"x=1&url=https://a.example/hook", "url"),
+            Some(Cow::Borrowed("https://a.example/hook"))
+        ));
+        assert!(matches!(
+            get(FORM, b"text=a+b", "text"),
+            Some(Cow::Owned(_))
+        ));
     }
 }

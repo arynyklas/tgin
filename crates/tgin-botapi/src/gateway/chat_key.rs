@@ -115,6 +115,19 @@ mod tests {
             assert_eq!(json(body), None, "{body}");
         }
         assert_eq!(form("text=a"), None);
+        // Read as the Bot API server reads it: a form value that is not
+        // UTF-8 is absent, and a type naming both encodings is a form.
+        assert_eq!(form("chat_id=%40%FF"), None);
+        let form_type = HeaderValue::from_static("application/x-www-form-urlencoded");
+        assert_eq!(chat_key(Some(&form_type), b"chat_id=@\xFF"), None);
+        assert_eq!(form("chat_id=%40%C3%A9t%C3%A9"), username("\u{e9}t\u{e9}"));
+        assert_eq!(
+            key(
+                "application/x-www-form-urlencoded; profile=application/json",
+                "chat_id=@x"
+            ),
+            username("x")
+        );
         assert_eq!(chat_key(None, br#"{"chat_id":1}"#), None);
     }
 
