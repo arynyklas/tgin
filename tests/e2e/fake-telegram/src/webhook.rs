@@ -18,6 +18,8 @@ const SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
 /// Retry delays after a failed delivery without `Retry-After`: 1 s,
 /// doubling up to this.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
+/// The longest bot `Retry-After` honoured, in seconds.
+const MAX_RETRY_AFTER: u64 = 3600;
 
 struct Job {
     url: String,
@@ -80,9 +82,11 @@ pub(crate) async fn deliver(shared: Arc<Shared>, bot: Arc<Bot>) {
                 None
             }
         };
-        let delay = retry_after.map_or_else(
+        // Clamped like `WebhookActor::on_update_error`: 0 means "use the
+        // backoff", and nothing waits longer than an hour.
+        let delay = retry_after.filter(|seconds| *seconds > 0).map_or_else(
             || Duration::from_secs(1u64 << failures.min(3)).min(MAX_RETRY_DELAY),
-            Duration::from_secs,
+            |seconds| Duration::from_secs(seconds.min(MAX_RETRY_AFTER)),
         );
         failures = failures.saturating_add(1);
         if !back_off(&shared, &bot, &job, delay).await {

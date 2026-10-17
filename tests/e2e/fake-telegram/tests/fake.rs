@@ -448,7 +448,8 @@ async fn webhook_set_blocks_get_updates() {
 
 /// Webhooks with scripted answers; each request is reported as
 /// `(path, arrival)`. `/slow` answers 503 with `Retry-After: 2` once, then
-/// 200; `/busy` always answers 503 with `Retry-After: 30`; `/ok` answers 200.
+/// 200; `/busy`, `/zero` and `/huge` always answer 503 with `Retry-After`
+/// 30, 0 and `u64::MAX`; `/ok` answers 200.
 async fn scripted_hooks() -> (String, mpsc::UnboundedReceiver<(String, Instant)>) {
     type Seen = Arc<(mpsc::UnboundedSender<(String, Instant)>, AtomicUsize)>;
     async fn hook(State(seen): State<Seen>, uri: axum::http::Uri) -> Response {
@@ -464,6 +465,8 @@ async fn scripted_hooks() -> (String, mpsc::UnboundedReceiver<(String, Instant)>
         match path.as_str() {
             "/slow" if seen.1.fetch_add(1, Ordering::SeqCst) == 0 => busy("2"),
             "/busy" => busy("30"),
+            "/zero" => busy("0"),
+            "/huge" => busy("18446744073709551615"),
             _ => StatusCode::OK.into_response(),
         }
     }
@@ -477,6 +480,59 @@ async fn scripted_hooks() -> (String, mpsc::UnboundedReceiver<(String, Instant)>
         axum::serve(listener, app).await.unwrap();
     });
     (base, receiver)
+}
+
+/// The bot's `Retry-After` is clamped like `WebhookActor::on_update_error`
+/// does: 0 falls back to the doubling backoff, and a huge value is capped.
+#[tokio::test]
+async fn webhook_retry_after_is_clamped() {
+    let fake = Fake::start().await;
+    let (base, mut seen) = scripted_hooks().await;
+    let mut next = async || {
+        tokio::time::timeout(WAIT, seen.recv())
+            .await
+            .expect("no delivery in time")
+            .unwrap()
+    };
+
+    // `Retry-After: 0` does not re-POST in a tight loop.
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/zero")}))
+        .await;
+    fake.inject(TOKEN, text_update("a")).await;
+    let (_, first) = next().await;
+    let (path, second) = next().await;
+    assert_eq!(path, "/zero");
+    assert!(
+        second - first >= Duration::from_secs(1),
+        "re-POSTed after {:?}",
+        second - first
+    );
+
+    // A huge `Retry-After` neither kills delivery nor outlasts a new webhook.
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/huge")}))
+        .await;
+    let mut posts = 2;
+    loop {
+        posts += 1;
+        if next().await.0 == "/huge" {
+            break;
+        }
+    }
+    // The fake has handled every answer, the /huge one included, and is now
+    // backing off.
+    fake.journal_until(&format!("?token={TOKEN}&kind=webhook"), |entries| {
+        entries.len() == posts
+    })
+    .await;
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/ok")}))
+        .await;
+    while next().await.0 != "/ok" {}
+    let deadline = Instant::now() + WAIT;
+    while fake.ok(TOKEN, "getWebhookInfo", json!({})).await["pending_update_count"] != 0 {
+        assert!(Instant::now() < deadline, "update never delivered");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fake.server.stop().await.unwrap();
 }
 
 #[tokio::test]
