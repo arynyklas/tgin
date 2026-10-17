@@ -124,6 +124,8 @@ consumers:
 struct Call {
     path: String,
     content_type: Option<String>,
+    /// Its `Via` header.
+    via: Option<String>,
     body: Bytes,
     at: tokio::time::Instant,
 }
@@ -218,18 +220,24 @@ impl Telegram {
     }
 }
 
+/// The value of `req`'s header `name`.
+fn header_text(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
+        .map(|v| v.to_str().expect("ASCII").to_owned())
+}
+
 async fn telegram_answer(State(telegram): State<Telegram>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
-    let content_type = req
-        .headers()
-        .get("content-type")
-        .map(|v| v.to_str().expect("ASCII").to_owned());
+    let content_type = header_text(&req, "content-type");
+    let via = header_text(&req, "via");
     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .expect("the request body");
     let call = Call {
         path: path.clone(),
         content_type,
+        via,
         body,
         at: tokio::time::Instant::now(),
     };
@@ -550,9 +558,20 @@ async fn json_reply_executed_once_before_ack() {
     );
     let replies = telegram.calls_to("sendMessage");
     assert_eq!(replies.len(), 2, "one reply call per delivery");
+    // The process's own `Via`, as on its pushes: an `api_url` pointing at
+    // tgin itself is refused instead of executing the reply again.
+    let via = pushed[0]
+        .headers
+        .get("via")
+        .map(|v| v.to_str().expect("ASCII"));
+    assert!(
+        via.is_some_and(|via| via.starts_with("1.1 tgin-")),
+        "{via:?}"
+    );
     for call in &replies {
         assert_eq!(&call.body[..], reply.as_bytes());
         assert_eq!(call.content_type.as_deref(), Some(content_type));
+        assert_eq!(call.via.as_deref(), via);
     }
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="hooked",method="sendMessage",outcome="ok"} 2"#,

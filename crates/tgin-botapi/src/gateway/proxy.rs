@@ -20,7 +20,7 @@ use axum::extract::Request;
 use axum::http::header::{
     ACCEPT, ACCEPT_ENCODING, ACCEPT_RANGES, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION,
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE, RETRY_AFTER, USER_AGENT,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE, RETRY_AFTER, USER_AGENT, VIA,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
@@ -110,6 +110,13 @@ pub(super) async fn forward(
     if file {
         copy_headers(&parts.headers, &FILE_REQUEST_HEADERS, &mut headers);
     }
+    // The intermediaries the request passed, then this process: a request
+    // that comes back to any of them, through an `api_url` that points at
+    // tgin, is refused with `508` instead of forwarded again.
+    for via in parts.headers.get_all(VIA) {
+        headers.append(VIA, via.clone());
+    }
+    headers.append(VIA, bot.via.clone());
     let call = Call {
         bot,
         label,

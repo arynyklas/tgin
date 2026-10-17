@@ -283,7 +283,7 @@ impl App {
         let _ = handles.engine.set((Arc::clone(&engine), core.clone()));
         health.set(ENGINE, Readiness::Ready);
         // Before the sources, which record each bot's identity in it.
-        let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics));
+        let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics, &via));
         gateway.set_bots(gateway_bots(&cfg, &engine), trusted_proxies(&cfg));
         // Set once, here, before any source admits an update.
         let _ = reply.set(gateway.reply_executor());

@@ -443,7 +443,7 @@ async fn headers_filtered_both_ways() {
 
     let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
     let request = format!(
-        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nConnection: x-foo, user-agent\r\nX-Foo: bar\r\nUser-Agent: hop-listed\r\nAuthorization: Bearer downstream-secret\r\nX-Tgin-Instance: i1\r\nX-Forwarded-For: 203.0.113.9\r\nForwarded: for=203.0.113.9\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nConnection: x-foo, user-agent\r\nX-Foo: bar\r\nUser-Agent: hop-listed\r\nAuthorization: Bearer downstream-secret\r\nX-Tgin-Instance: i1\r\nX-Forwarded-For: 203.0.113.9\r\nForwarded: for=203.0.113.9\r\nVia: 1.1 proxy-a\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
     );
     stream.write_all(request.as_bytes()).await.expect("write");
     let response = timeout(PATIENCE, read_response(&mut stream))
@@ -490,6 +490,15 @@ async fn headers_filtered_both_ways() {
     );
     assert_eq!(headers["accept"], "application/json");
     assert_eq!(headers["content-type"], "application/json");
+    // The intermediaries before tgin, then tgin's own pseudonym.
+    let via: Vec<&str> = headers
+        .get_all("via")
+        .iter()
+        .map(|v| v.to_str().expect("ASCII"))
+        .collect();
+    assert_eq!(via.len(), 2, "{via:?}");
+    assert_eq!(via[0], "1.1 proxy-a");
+    assert!(via[1].starts_with("1.1 tgin-"), "{via:?}");
     tgin.stop().await;
 }
 
@@ -1895,5 +1904,37 @@ async fn limiter_state_survives_reload_with_same_config() {
     let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
     assert_eq!(response.status(), 200);
     assert_eq!(seen(&telegram).await.len(), 4);
+    tgin.stop().await;
+}
+
+/// An `api_url` misconfigured to point at this tgin: the gateway's
+/// upstream request carries the process's `Via`, so tgin refuses it with
+/// `508 Loop Detected` instead of forwarding it to itself again and again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_url_pointing_at_tgin_is_refused_not_looped() {
+    let tgin = start(&limited_config("http://127.0.0.1:9", "{}")).await;
+    std::fs::write(
+        &tgin.file,
+        limited_config(&format!("http://{}", tgin.addr), "{}"),
+    )
+    .expect("rewrite");
+    tgin.reload().await;
+    for (method, body) in [
+        ("getChat", json!({ "chat_id": 1 })),
+        ("sendMessage", json!({ "chat_id": 1, "text": "hi" })),
+    ] {
+        let response = timeout(PATIENCE, call(&tgin.http, tgin.addr, method, &body))
+            .await
+            .unwrap_or_else(|_| panic!("{method} answered in time, without a loop"));
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, 508, "{method}: {body}");
+        assert_eq!(
+            body["error_code"], 508,
+            "{method}: the data plane's own refusal"
+        );
+        tgin.assert_metric(&format!(
+            r#"tgin_gateway_requests_total{{bot="gw",method="{method}",outcome="upstream_error"}} 1"#
+        ));
+    }
     tgin.stop().await;
 }

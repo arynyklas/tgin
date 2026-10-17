@@ -358,6 +358,8 @@ Frameworks that reply this way: aiogram's `SimpleRequestHandler(handle_in_backgr
 
 tgin never acts on its own pushes. Every push carries `Via: 1.1 tgin-<pseudonym>`, 16 hex digits chosen at random when the process starts, and both planes answer `508 Loop Detected` to a request whose `Via` lists the process's own pseudonym (RFC 9110 §7.6.3): the admin plane `{"error":"loop detected"}`, the data plane Telegram's shape, each carrying the process's `Via`. So an endpoint that points back at tgin (its webhook ingress, a pull endpoint, the gateway, or the admin API) is refused, and the pushing dispatcher, seeing its own `Via` on the `508`, dead-letters the update at once. Only that `508` is final: any other `508` is a transient `5xx`, retried. The refusal is logged as a warning at most once a minute per plane, with the bot from `X-Tgin-Source`. Another tgin process has another pseudonym, so chained instances still pass updates to each other.
 
+The gateway's calls to Telegram and its webhook replies carry the same `Via`, after any `Via` the downstream's request carried. A bot whose `api_url` points at tgin itself therefore gets `508` (counted `upstream_error`) instead of tgin forwarding the call to itself without end.
+
 ### Gateway metrics
 
 `tgin_gateway_requests_total{bot,method,outcome}` counts every gateway request of a configured bot once, and every webhook reply that went to Telegram. `method` is the method's canonical name (`sendMessage`, whatever case the client used), `other` for a method tgin does not know, and `file` for downloads; a method's series appear on its first request. `outcome` is one of:

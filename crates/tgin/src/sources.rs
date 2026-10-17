@@ -653,6 +653,7 @@ mod tests {
         let core = CoreMetrics::register(registry.registry_mut());
         let supervisor = Arc::new(Supervisor::new());
         let force = CancellationToken::new();
+        let via = tgin_runtime::http::Via::generate();
         let engine = Engine::new(
             cfg,
             core,
@@ -661,7 +662,7 @@ mod tests {
                 supervisor: Arc::clone(&supervisor),
                 stop: CancellationToken::new(),
                 force: force.clone(),
-                via: tgin_runtime::http::Via::generate(),
+                via: via.clone(),
                 reply: Default::default(),
             },
         )
@@ -671,6 +672,7 @@ mod tests {
         let gateway = Arc::new(Gateway::new(
             Arc::clone(&engine),
             GatewayMetrics::register(registry.registry_mut()),
+            &via,
         ));
         gateway.set_bots(crate::app::gateway_bots(cfg, &engine), Vec::new());
         let ingest = CancellationToken::new();

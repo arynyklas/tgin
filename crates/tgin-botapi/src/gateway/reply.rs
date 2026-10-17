@@ -16,7 +16,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_TYPE, VIA};
 use serde::Deserialize;
 use tgin_core::ids::SourceId;
 use tgin_core::reply::{MAX_REPLY_BYTES, Reply, ReplyExecutor};
@@ -183,6 +183,7 @@ impl Call<'_> {
             .post(url(&bot.method_base, method, None))
             .timeout(REPLY_TIMEOUT)
             .header(CONTENT_TYPE, reply.content_type.clone())
+            .header(VIA, bot.via.clone())
             .body(reply.body.clone())
             .send()
             .await;

@@ -27,7 +27,7 @@ use std::time::Duration;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::BytesMut;
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -37,7 +37,7 @@ use reqwest::Url;
 use tgin_core::config;
 use tgin_core::engine::Engine;
 use tgin_core::ids::SourceId;
-use tgin_runtime::http::{ClientOptions, client};
+use tgin_runtime::http::{ClientOptions, Via, client};
 use tgin_runtime::secret::{Secret, secret_eq};
 
 use self::limit::BotLimiter;
@@ -64,6 +64,8 @@ pub struct GatewayBot {
 pub struct Gateway {
     engine: Arc<Engine>,
     metrics: GatewayMetrics,
+    /// This process's `Via`, which every upstream request carries.
+    via: HeaderValue,
     table: ArcSwap<Table>,
     /// `tgin_webhook_replies_total` handles by push consumer.
     replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
@@ -108,6 +110,8 @@ struct Bot {
     /// The gateway profile: no total timeout, the connect timeout above;
     /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
     client: reqwest::Client,
+    /// This process's `Via` (see [`Gateway::new`]).
+    via: HeaderValue,
     metrics: BotMetrics,
     /// Shared with the entries that replace this one while the token and
     /// the rate limits stay the same, so a reload never resets a quota.
@@ -120,6 +124,7 @@ struct Bot {
 impl Bot {
     fn new(
         bot: GatewayBot,
+        via: HeaderValue,
         metrics: BotMetrics,
         identity: Arc<ArcSwapOption<Identity>>,
         limiter: Arc<BotLimiter>,
@@ -141,6 +146,7 @@ impl Bot {
             method_base,
             file_base,
             client,
+            via,
             metrics,
             limiter,
             identity,
@@ -176,11 +182,15 @@ fn base(api_url: &Url, segments: &[&str]) -> Option<Url> {
 
 impl Gateway {
     /// A gateway serving no bot until [`Gateway::set_bots`]; `engine`
-    /// answers which consumers a bot routes to.
-    pub fn new(engine: Arc<Engine>, metrics: GatewayMetrics) -> Gateway {
+    /// answers which consumers a bot routes to. Every request it sends
+    /// upstream, a webhook reply's included, carries `via`, this process's
+    /// `Via`: an `api_url` that points back at tgin is refused with `508`
+    /// instead of forwarding to itself without end.
+    pub fn new(engine: Arc<Engine>, metrics: GatewayMetrics, via: &Via) -> Gateway {
         Gateway {
             engine,
             metrics,
+            via: via.header_value().clone(),
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
         }
@@ -223,7 +233,7 @@ impl Gateway {
                     }
                 },
             };
-            match Bot::new(bot, metrics, identity, limiter) {
+            match Bot::new(bot, self.via.clone(), metrics, identity, limiter) {
                 Some(entry) => entries.push(Arc::new(entry)),
                 None => {
                     tracing::error!(bot = %name, "the bot's api_url cannot be a base URL; the gateway does not serve it")
@@ -508,6 +518,7 @@ mod tests {
             "version: 1\nbots:\n  - { name: a, token: \"1:a\", gateway: { upstream_idle_timeout: 90s } }\n",
         );
         let mut reg = prometheus_client::registry::Registry::with_prefix("tgin");
+        let via = tgin_runtime::http::Via::generate();
         let engine = Engine::new(
             &cfg,
             CoreMetrics::register(&mut reg),
@@ -516,12 +527,12 @@ mod tests {
                 supervisor: Arc::new(Supervisor::new()),
                 stop: CancellationToken::new(),
                 force: CancellationToken::new(),
-                via: tgin_runtime::http::Via::generate(),
+                via: via.clone(),
                 reply: Default::default(),
             },
         )
         .expect("engine");
-        let gateway = Gateway::new(Arc::new(engine), GatewayMetrics::register(&mut reg));
+        let gateway = Gateway::new(Arc::new(engine), GatewayMetrics::register(&mut reg), &via);
         let proxies: Vec<IpNet> = vec!["10.0.0.0/8".parse().expect("net")];
         gateway.set_bots(vec![gateway_bot(&cfg, "1:a")], proxies.clone());
         assert_eq!(gateway.trusted_proxies(), proxies);
