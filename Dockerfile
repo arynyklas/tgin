@@ -13,6 +13,8 @@ WORKDIR /usr/src/tgin
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY xtask ./xtask
+# A workspace member: the workspace does not resolve without it.
+COPY tests/e2e/fake-telegram ./tests/e2e/fake-telegram
 
 # The commit `tgin version` reports; empty leaves it out.
 ARG REVISION=
