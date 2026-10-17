@@ -209,7 +209,8 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    let (update_id, facts) = match extract(&body) {
+    let mut decoded = String::new();
+    let (update_id, facts) = match extract(&body, &mut decoded) {
         Ok(read) => read,
         Err(err) => {
             ingress.metrics.error(SourceErrorReason::Decode);

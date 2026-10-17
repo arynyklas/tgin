@@ -303,8 +303,11 @@ impl<S: Sink> LongPollSource<S> {
         offset: &mut i64,
         ingest: &CancellationToken,
     ) -> bool {
+        // One decode buffer for the batch: escaped text allocates only when
+        // it outgrows what an earlier update needed.
+        let mut decoded = String::new();
         for (update_id, payload) in updates {
-            let facts = match extract(payload) {
+            let facts = match extract(payload, &mut decoded) {
                 Ok((_, facts)) => facts,
                 Err(err) => {
                     tracing::warn!(source = %self.name, update_id, error = %err, "unreadable update; routing it without facts");

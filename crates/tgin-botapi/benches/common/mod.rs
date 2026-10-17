@@ -1,6 +1,8 @@
 //! The hot path the benches and `tests/alloc_budget.rs` measure: 1000
 //! realistic updates (`tests/fixtures/updates.jsonl`) routed by an engine
-//! built from `tests/fixtures/hot_path.yaml`.
+//! built from `tests/fixtures/hot_path.yaml`. `tests/fixtures/updates_escaped.jsonl`
+//! holds the same updates with every text, caption and callback data
+//! non-ASCII, `\u`-escaped as Telegram sends it.
 //!
 //! The engine runs on a current-thread runtime that is never driven, so its
 //! background tasks (pull lease expiry, the push dispatcher) never run: the
@@ -10,6 +12,7 @@
 // Each bench and test target uses its own part of this module.
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use bytes::Bytes;
@@ -31,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const CONFIG: &str = include_str!("../../tests/fixtures/hot_path.yaml");
 pub const UPDATES: &str = include_str!("../../tests/fixtures/updates.jsonl");
+pub const UPDATES_ESCAPED: &str = include_str!("../../tests/fixtures/updates_escaped.jsonl");
 
 /// The bot of `CONFIG` and the username its `getMe` would report.
 pub const BOT: &str = "shop";
@@ -52,26 +56,58 @@ pub fn payloads() -> Vec<Bytes> {
         .collect()
 }
 
-/// `UPDATES` as `getUpdates` response bodies of up to 100 updates each.
-pub fn bodies() -> Vec<Vec<u8>> {
-    let lines: Vec<&str> = UPDATES.lines().filter(|l| !l.is_empty()).collect();
+/// `updates` (one update per line) as `getUpdates` response bodies of up to
+/// 100 updates each.
+pub fn bodies(updates: &str) -> Vec<Vec<u8>> {
+    let lines: Vec<&str> = updates.lines().filter(|l| !l.is_empty()).collect();
     lines
         .chunks(BATCH)
         .map(|chunk| format!(r#"{{"ok":true,"result":[{}]}}"#, chunk.join(",")).into_bytes())
         .collect()
 }
 
-/// The facts of every payload, as the long-poll source extracts them.
+/// The facts of every payload, as the long-poll source extracts them, each
+/// borrowing only its own payload: text the extractor decoded into its buffer
+/// is copied out, so that the facts of every update can live at once.
 pub fn facts(payloads: &[Bytes]) -> Vec<(i64, Facts<'_>)> {
+    let mut decoded = String::new();
     payloads
         .iter()
-        .map(|p| extract(p).expect("fixture updates are valid"))
+        .map(|p| {
+            let payload = std::str::from_utf8(p).expect("fixture updates are UTF-8");
+            let (update_id, f) = extract(p, &mut decoded).expect("fixture updates are valid");
+            let borrowed = |s: &str| rebase(payload, s).expect("borrowed from the payload");
+            let text = |t: Option<Cow<'_, str>>| {
+                t.map(|t| {
+                    rebase(payload, &t).map_or_else(|| Cow::Owned(t.into_owned()), Cow::Borrowed)
+                })
+            };
+            let facts = Facts {
+                update_type: borrowed(f.update_type),
+                chat_id: f.chat_id,
+                chat_type: f.chat_type,
+                user_id: f.user_id,
+                text: text(f.text),
+                callback_data: text(f.callback_data),
+                command: f
+                    .command
+                    .map(|(name, bot)| (borrowed(name), bot.map(borrowed))),
+            };
+            (update_id, facts)
+        })
         .collect()
+}
+
+/// `s` as a slice of `payload` when it lies within it.
+fn rebase<'p>(payload: &'p str, s: &str) -> Option<&'p str> {
+    let at = s.as_ptr().addr().checked_sub(payload.as_ptr().addr())?;
+    payload.get(at..at.checked_add(s.len())?)
 }
 
 /// The envelope admission would queue for `payload`.
 pub fn envelope(source: SourceId, payload: &Bytes) -> Envelope {
-    let (update_id, facts) = extract(payload).expect("fixture updates are valid");
+    let mut decoded = String::new();
+    let (update_id, facts) = extract(payload, &mut decoded).expect("fixture updates are valid");
     Envelope {
         source,
         update_id,
@@ -154,13 +190,14 @@ impl HotPath {
     }
 
     /// What the long-poll source does with one `getUpdates` body: splits
-    /// it, extracts each update's facts and admits it. Returns how many
-    /// updates were admitted.
+    /// it, extracts each update's facts into one decode buffer and admits
+    /// it. Returns how many updates were admitted.
     pub fn ingest(&self, body: &Bytes) -> usize {
         let updates = split_updates(body).expect("fixture bodies are valid");
+        let mut decoded = String::new();
         let mut admitted = 0;
         for (update_id, payload) in &updates {
-            let (_, facts) = extract(payload).expect("fixture updates are valid");
+            let (_, facts) = extract(payload, &mut decoded).expect("fixture updates are valid");
             if self
                 .engine
                 .admit(self.source, *update_id, payload.clone(), &facts)

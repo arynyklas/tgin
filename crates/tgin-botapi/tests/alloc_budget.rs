@@ -90,19 +90,20 @@ fn counter_sees_this_threads_allocations() {
     assert_eq!((n, v.len()), (2, 4), "a reallocation counts");
 }
 
-#[test]
-fn hot_path_allocations_per_update() {
+/// Allocations per update while the warm hot path ingests `updates` (one
+/// update per line) in `getUpdates` bodies of 100.
+fn per_update(updates: &str) -> f64 {
     let hot = HotPath::new();
-    let raw = common::bodies();
-    let updates = common::payloads().len();
-    assert_eq!(updates, 1000, "the fixture holds 1000 updates");
+    let raw = common::bodies(updates);
+    let count = updates.lines().filter(|l| !l.is_empty()).count();
+    assert_eq!(count, 1000, "the fixture holds 1000 updates");
 
     let round = || {
         // A fresh body per poll, as the HTTP client returns one; copying it
         // in is the network's cost, not the hot path's.
         let bodies: Vec<Bytes> = raw.iter().map(|b| Bytes::from(b.clone())).collect();
         let (n, admitted) = allocations(|| bodies.iter().map(|b| hot.ingest(b)).sum::<usize>());
-        assert_eq!(admitted, updates, "every update is admitted");
+        assert_eq!(admitted, count, "every update is admitted");
         drop(bodies);
         hot.drain();
         n
@@ -111,9 +112,25 @@ fn hot_path_allocations_per_update() {
         round();
     }
     let n = round();
+    let per_update = n as f64 / count as f64;
+    eprintln!("hot path: {n} allocations for {count} updates ({per_update:.3} per update)");
+    per_update
+}
 
-    let per_update = n as f64 / updates as f64;
-    eprintln!("hot path: {n} allocations for {updates} updates ({per_update:.3} per update)");
+#[test]
+fn hot_path_allocations_per_update() {
+    let per_update = per_update(common::UPDATES);
+    assert!(
+        per_update <= BUDGET_PER_UPDATE,
+        "{per_update:.3} allocations per update, budget {BUDGET_PER_UPDATE}"
+    );
+}
+
+/// Every text, caption and callback data non-ASCII, which Telegram sends
+/// `\u`-escaped: what a Russian- or Kazakh-language bot ingests.
+#[test]
+fn hot_path_allocations_per_update_escaped_text() {
+    let per_update = per_update(common::UPDATES_ESCAPED);
     assert!(
         per_update <= BUDGET_PER_UPDATE,
         "{per_update:.3} allocations per update, budget {BUDGET_PER_UPDATE}"
