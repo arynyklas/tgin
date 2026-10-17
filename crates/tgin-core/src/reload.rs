@@ -129,8 +129,9 @@ struct Live {
     slot: Arc<Slot>,
     queue: Option<QueueConfig>,
     endpoints: Option<(Vec<Endpoint>, PushOptions)>,
-    /// New source names for a push consumer that keeps its endpoints.
-    source_names: Option<Arc<[Arc<str>]>>,
+    /// New options for a push consumer that keeps its endpoints (and their
+    /// breakers).
+    options: Option<PushOptions>,
 }
 
 /// A bot of the new generation before its metrics are resolved.
@@ -255,7 +256,7 @@ impl Plan {
                                     }
                                     ConsumerKind::Pull(_) => None,
                                 },
-                                source_names: None,
+                                options: None,
                             });
                             revived.push(Arc::clone(slot));
                             Arc::clone(slot)
@@ -358,8 +359,8 @@ pub(crate) fn commit(
         }
         if let (Consumer::Push(push), Some((endpoints, opts))) = (consumer, change.endpoints) {
             push.set_endpoints(endpoints, opts);
-        } else if let (Consumer::Push(push), Some(names)) = (consumer, change.source_names) {
-            push.set_source_names(names);
+        } else if let (Consumer::Push(push), Some(opts)) = (consumer, change.options) {
+            push.set_options(opts);
         }
     }
     for slot in &changes.revived {
@@ -507,9 +508,9 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 }
 
 /// The live changes from `old` to `new` of the same mode, if any. A push
-/// consumer gets new endpoints (and breakers) and options when its delivery
-/// settings or `webhook_reply` change; when only new bots appear, it keeps
-/// them and learns the bots' names.
+/// consumer gets new endpoints (and breakers) when its delivery settings
+/// change; when only `webhook_reply` changes or new bots appear, it keeps
+/// them and gets new options (the bots' names among them).
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
@@ -517,7 +518,7 @@ fn live_change(
     names_grew: bool,
     source_names: &Arc<[Arc<str>]>,
 ) -> Option<Live> {
-    let (queue, endpoints, names) = match (old, new) {
+    let (queue, endpoints, opts) = match (old, new) {
         (ConsumerKind::Pull(old), ConsumerKind::Pull(new)) => {
             ((old.queue != new.queue).then_some(new.queue), None, None)
         }
@@ -526,21 +527,21 @@ fn live_change(
                 || old.balance != new.balance
                 || old.max_in_flight != new.max_in_flight
                 || old.retry != new.retry
-                || old.breaker != new.breaker
-                || old.webhook_reply != new.webhook_reply;
+                || old.breaker != new.breaker;
+            let refresh = names_grew || old.webhook_reply != new.webhook_reply;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
                 delivery.then(|| (endpoints(new), options(new, source_names))),
-                (!delivery && names_grew).then(|| Arc::clone(source_names)),
+                (!delivery && refresh).then(|| options(new, source_names)),
             )
         }
         _ => (None, None, None),
     };
-    (queue.is_some() || endpoints.is_some() || names.is_some()).then(|| Live {
+    (queue.is_some() || endpoints.is_some() || opts.is_some()).then(|| Live {
         slot: Arc::clone(slot),
         queue,
         endpoints,
-        source_names: names,
+        options: opts,
     })
 }
 
@@ -714,7 +715,8 @@ mod tests {
             panic!("one live change");
         };
         assert_eq!(&*live.slot.name, "h");
-        assert!(live.endpoints.is_some(), "push options not refreshed");
+        assert!(live.endpoints.is_none(), "breakers reset");
+        assert!(live.options.is_some(), "push options not refreshed");
 
         let flags = base
             .replace(

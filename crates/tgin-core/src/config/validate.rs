@@ -637,7 +637,7 @@ fn positive(
 }
 
 /// Rejects a duration longer than `limit`; `hint` says what the value
-/// does.
+/// does. A month or year unit is [`duration`]'s to report, once.
 fn at_most(
     diag: &mut Diagnostics,
     path: impl Into<String>,
@@ -645,7 +645,7 @@ fn at_most(
     limit: Duration,
     hint: &str,
 ) {
-    if value.value.get() > limit {
+    if value.value.calendar_unit().is_none() && value.value.get() > limit {
         diag.errors.push(
             ConfigError::new(format!(
                 "`{}` is longer than the maximum of {}",

@@ -513,6 +513,22 @@ bots:
     assert_eq!(gateway.retry_429_max_wait, secs(60));
 }
 
+/// `1M` (a likely typo for `1m`) is reported once, as a month unit, not
+/// also as over the cap.
+#[test]
+fn capped_duration_with_calendar_unit_is_one_error() {
+    for (field, value) in [
+        ("rate_limit: { max_delay", "1M"),
+        ("retry_429: { max_wait", "1y"),
+    ] {
+        let yaml = format!(
+            "version: 1\nbots:\n  - name: a\n    token: \"1:a\"\n    gateway: {{ {field}: {value} }} }}\n"
+        );
+        let err = single_error(&yaml);
+        assert_message(&err, "a month or year unit");
+    }
+}
+
 #[test]
 fn methods_are_lowercased() {
     let cfg = loads(
@@ -613,6 +629,18 @@ fn token_not_gateway_shaped_warns() {
             "version: 1\nbots:\n  - name: a\n    token: {token}\n"
         ));
         assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
+    }
+    // The one rule the gateway path parser applies too.
+    assert!(config::gateway_token("123456:AA-bb_CC"));
+    for bad in [
+        "123456:a%3Ab",
+        "123456:",
+        ":abc",
+        "1x:abc",
+        "123:a:b",
+        "123",
+    ] {
+        assert!(!config::gateway_token(bad), "{bad}");
     }
 }
 

@@ -784,6 +784,51 @@ consumers:
     assert_eq!(down.received_requests().await.expect("recording").len(), 1);
 }
 
+/// A reload that changes only `webhook_reply` keeps the push consumer's
+/// endpoints, with their breakers: only its options change.
+#[tokio::test]
+async fn webhook_reply_change_keeps_push_breakers() {
+    let down = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&down)
+        .await;
+    let base = format!(
+        r#"version: 1
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{{ to: [down] }}]
+consumers:
+  down:
+    push:
+      endpoints: [{{ url: "{}/hook" }}]
+      retry: {{ max_attempts: 1 }}
+      breaker: {{ failure_threshold: 1, open_for: 1h }}
+"#,
+        down.uri()
+    );
+    let h = Harness::new(&base);
+    let Some(Consumer::Push(dead)) = h.engine.consumer("down") else {
+        panic!("down is a push consumer");
+    };
+    assert_eq!(h.admit("message", 1), Admit::Admitted);
+    eventually("the breaker opens", || {
+        dead.endpoints()[0].1 == BreakerState::Open
+    })
+    .await;
+
+    let ignore = base.replace("      retry:", "      webhook_reply: ignore\n      retry:");
+    let report = h.engine.apply(&load(&ignore)).expect("apply");
+    assert_eq!(report.changed, ["down"]);
+    let Some(Consumer::Push(after)) = h.engine.consumer("down") else {
+        panic!("down is a push consumer");
+    };
+    assert!(Arc::ptr_eq(&dead, &after));
+    assert_eq!(dead.endpoints()[0].1, BreakerState::Open);
+    assert_eq!(down.received_requests().await.expect("recording").len(), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn reload_mode_change_drains_then_drops() {
     let h = Harness::new(BASE);

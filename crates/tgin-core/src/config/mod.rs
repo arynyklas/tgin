@@ -31,10 +31,11 @@ pub fn valid_bot_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
 }
 
-/// Whether the Bot API gateway can serve `token`: its path grammar takes
-/// `<digits>:<secret>`, `^[0-9]+:[A-Za-z0-9_-]{1,128}$`, as Telegram issues
-/// them.
-fn gateway_token(token: &str) -> bool {
+/// Whether the Bot API gateway can serve `token`: `<digits>:<secret>`,
+/// `^[0-9]+:[A-Za-z0-9_-]{1,128}$`, as Telegram issues them. The loader
+/// warns about any other bot token, and the gateway path parser applies
+/// this one rule to the token segment after percent-decoding it.
+pub fn gateway_token(token: &str) -> bool {
     let Some((id, secret)) = token.split_once(':') else {
         return false;
     };
