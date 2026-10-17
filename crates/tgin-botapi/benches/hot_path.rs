@@ -23,9 +23,10 @@ fn hot_path(c: &mut Criterion) {
     let mut g = c.benchmark_group("facts");
     g.throughput(updates.clone());
     g.bench_function("extract", |b| {
+        let mut decoded = String::new();
         b.iter(|| {
             for p in &payloads {
-                black_box(extract(black_box(p)).expect("valid"));
+                black_box(extract(black_box(p), &mut decoded).expect("valid"));
             }
         });
     });

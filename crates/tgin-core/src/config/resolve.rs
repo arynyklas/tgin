@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use crate::facts::ChatType;
 use crate::ids::{ConsumerId, SourceId};
 use crate::rules::{self, Predicates, RouteTable, RuleError, RuleSpec, TargetSpec};
 
-pub use super::model::{Balance, LogFormat, LogLevel};
+pub use super::model::{Balance, LogFormat, LogLevel, RateMode, WebhookReply};
 
 /// A loaded, valid configuration. Its rules compile into a [`RouteTable`].
 ///
@@ -112,14 +112,47 @@ pub struct Reload {
     pub drain_timeout: Duration,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bot {
     pub name: String,
     pub token: Secret<String>,
     pub api_url: SensitiveUrl,
     pub ingress: Option<Ingress>,
+    pub gateway: Gateway,
     /// In order; the first match wins.
     pub rules: Vec<RuleSpec>,
+}
+
+/// The Bot API gateway of one bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gateway {
+    /// The read timeout of upstream requests.
+    pub upstream_idle_timeout: Duration,
+    pub rate_limit: RateLimit,
+    /// The longest upstream `retry_after` retried once; zero never retries.
+    pub retry_429_max_wait: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub mode: RateMode,
+    /// At most 60 s; zero behaves like [`RateMode::Reject`].
+    pub max_delay: Duration,
+    /// ASCII-lowercased method names and `prefix*` globs; empty only with
+    /// [`RateMode::Off`].
+    pub methods: Vec<String>,
+    pub global: Rate,
+    pub per_chat: Rate,
+    pub per_group: Rate,
+}
+
+/// `count` requests per `per`, after a burst of `burst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rate {
+    pub count: NonZeroU32,
+    /// Above zero.
+    pub per: Duration,
+    pub burst: NonZeroU32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,10 +221,12 @@ pub struct Pull {
     pub queue: QueueConfig,
     pub auth_token: Option<Secret<String>>,
     pub aliases: Vec<SensitiveRoute>,
+    pub honor_drop_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Push {
+    /// Empty only with `accept_set_webhook`.
     pub endpoints: Vec<Endpoint>,
     pub balance: Balance,
     pub max_in_flight: usize,
@@ -201,6 +236,11 @@ pub struct Push {
     pub on_full: queue::OnFull,
     pub retry: Retry,
     pub breaker: BreakerConfig,
+    /// `setWebhook` on the consumer's gateway path sets a runtime endpoint;
+    /// only for a consumer fed by one bot.
+    pub accept_set_webhook: bool,
+    pub webhook_reply: WebhookReply,
+    pub honor_drop_pending: bool,
 }
 
 impl Push {
@@ -397,10 +437,20 @@ impl Resolver<'_> {
         None
     }
 
-    /// A bot token, checked with the rule the Bot API client applies.
+    /// A bot token, checked with the rule the Bot API client applies. A
+    /// token the gateway cannot serve only warns: the bot still works
+    /// without the gateway.
     fn bot_token(&mut self, path: String, text: &SecretText) -> Option<Secret<String>> {
         let token = self.secret(path.clone(), text)?;
         if super::valid_bot_token(token.expose()) {
+            if !super::gateway_token(token.expose()) {
+                // Never quotes the value: it is the token.
+                self.diag.warning(
+                    path,
+                    text.0.location,
+                    "the Bot API gateway cannot serve this bot: its token is not shaped `<digits>:<secret>`, as Telegram issues them",
+                );
+            }
             return Some(token);
         }
         // Never quotes the value: it is the token.
@@ -538,6 +588,7 @@ impl Resolver<'_> {
                         },
                         auth_token,
                         aliases,
+                        honor_drop_pending: pull.honor_drop_pending,
                     })
                 }
                 raw::Consumer::Push(push) => ConsumerKind::Push(self.push(&path, push)),
@@ -586,6 +637,9 @@ impl Resolver<'_> {
                 failure_threshold: push.breaker.failure_threshold.value,
                 open_for: push.breaker.open_for.value.get(),
             },
+            accept_set_webhook: push.accept_set_webhook,
+            webhook_reply: push.webhook_reply,
+            honor_drop_pending: push.honor_drop_pending,
         }
     }
 
@@ -614,6 +668,7 @@ impl Resolver<'_> {
                     token,
                     api_url,
                     ingress,
+                    gateway: gateway(&bot.gateway),
                     rules,
                 });
             }
@@ -737,6 +792,38 @@ impl Resolver<'_> {
                 self.diag.error(path, location, message);
             }
         }
+    }
+}
+
+fn gateway(gateway: &raw::Gateway) -> Gateway {
+    let limit = &gateway.rate_limit;
+    Gateway {
+        upstream_idle_timeout: gateway.upstream_idle_timeout.value.get(),
+        rate_limit: RateLimit {
+            mode: limit.mode,
+            max_delay: limit.max_delay.value.get(),
+            methods: limit
+                .methods
+                .value
+                .iter()
+                .map(|method| method.value.to_ascii_lowercase())
+                .collect(),
+            global: rate(&limit.global.rate()),
+            per_chat: rate(&limit.per_chat.rate()),
+            per_group: rate(&limit.per_group.rate()),
+        },
+        retry_429_max_wait: gateway.retry_429.max_wait.value.get(),
+    }
+}
+
+/// Validation rejects a zero count or burst; the stand-in only keeps an
+/// invalid config's other errors coming.
+fn rate(rate: &raw::Rate<'_>) -> Rate {
+    let nonzero = |n: u32| NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN);
+    Rate {
+        count: nonzero(rate.count.value),
+        per: rate.per.value.get(),
+        burst: nonzero(rate.burst.value),
     }
 }
 

@@ -42,11 +42,20 @@ pub enum ApiError {
     Config(&'static str),
 }
 
-/// The bot's own account, from `getMe`.
+/// The fields of the bot's own account tgin reads.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct BotUser {
     pub id: i64,
     pub username: Option<String>,
+}
+
+/// The bot's own account, from `getMe`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub user: BotUser,
+    /// The `result` exactly as the Bot API sent it: a `User` object, with
+    /// every field, known to tgin or not.
+    pub raw: Bytes,
 }
 
 /// A `setWebhook` request. `Debug` shows only the URL's origin (its path
@@ -141,9 +150,9 @@ impl BotClient {
         })
     }
 
-    pub async fn get_me(&self) -> Result<BotUser, ApiError> {
+    pub async fn get_me(&self) -> Result<Identity, ApiError> {
         let body = self.send(self.http.get(self.url("getMe")?)).await?;
-        self.scrubbed(parse_result(&body))
+        self.scrubbed(identity(&body))
     }
 
     /// The raw `getUpdates` response body, for [`split_updates`]. `allowed`
@@ -333,6 +342,18 @@ fn webhook_form(req: &SetWebhook, certificate: &Bytes) -> Result<Form, ApiError>
     let certificate = Part::stream_with_length(certificate.clone(), certificate.len() as u64)
         .file_name("certificate.pem");
     Ok(form.part("certificate", certificate))
+}
+
+/// The identity a `getMe` response body describes. The raw `User` is a copy
+/// of its own: it is kept for as long as the bot runs, and must not keep
+/// the connection's read buffer alive.
+pub(crate) fn identity(body: &[u8]) -> Result<Identity, ApiError> {
+    let raw: &RawValue = parse_result(body)?;
+    let user = serde_json::from_str(raw.get()).map_err(|e| decode_error(&e))?;
+    Ok(Identity {
+        user,
+        raw: Bytes::copy_from_slice(raw.get().as_bytes()),
+    })
 }
 
 /// Splits a `getUpdates` body into `(update_id, update)` pairs. Each update
@@ -624,7 +645,7 @@ mod tests {
 
         let bot = client_for(&server.uri());
         assert_eq!(
-            bot.get_me().await.unwrap(),
+            bot.get_me().await.unwrap().user,
             BotUser {
                 id: 42,
                 username: Some("my_bot".into())
@@ -657,7 +678,37 @@ mod tests {
             .await;
         for base in ["/tg", "/tg/"] {
             let bot = client_for(&format!("{}{base}", server.uri()));
-            assert_eq!(bot.get_me().await.unwrap().username, None);
+            assert_eq!(bot.get_me().await.unwrap().user.username, None);
+        }
+    }
+
+    /// The `User` is kept byte for byte, with the fields tgin does not read
+    /// and the server's spacing, so the gateway can answer `getMe` with it.
+    #[tokio::test]
+    async fn get_me_keeps_raw_user() {
+        let server = MockServer::start().await;
+        let user = r#"{"id":42, "is_bot":true,"first_name":"Shop \u0411ot","username":"shop_bot","can_join_groups":true,"can_read_all_group_messages":false,"supports_inline_queries":false,"can_connect_to_business":false,"has_main_web_app":false,"x_future":{"a":[1,2.5,null]}}"#;
+        Mock::given(method("GET"))
+            .and(path(at("getMe")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"ok":true, "result": {user} }}"#)),
+            )
+            .mount(&server)
+            .await;
+        let identity = client_for(&server.uri()).get_me().await.unwrap();
+        assert_eq!(&identity.raw[..], user.as_bytes());
+        assert_eq!(
+            identity.user,
+            BotUser {
+                id: 42,
+                username: Some("shop_bot".into())
+            }
+        );
+        // A copy of its own, not a slice of the connection's read buffer.
+        match identity.raw.try_into_mut() {
+            Ok(owned) => assert_eq!(owned.capacity(), owned.len()),
+            Err(shared) => panic!("the user shares its memory ({} bytes)", shared.len()),
         }
     }
 

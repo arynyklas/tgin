@@ -8,6 +8,9 @@
 //! - a consumer with the same name and mode keeps its instance, and so its
 //!   queue, pause flag and breakers unless its endpoints change; new
 //!   parameters apply live;
+//! - a kept push consumer keeps its runtime endpoint (from `setWebhook`)
+//!   while it still accepts one and the bot that set it still feeds it;
+//!   otherwise the endpoint is cleared;
 //! - a removed consumer stops receiving updates at once and drains for
 //!   `reload.drain_timeout`; what it still holds then is dropped
 //!   (`dropped{reason="reload"}`), its tasks stop and its metric series go;
@@ -26,7 +29,7 @@ use tgin_runtime::supervisor::TaskState;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{self, Config, ConsumerKind};
+use crate::config::{self, Config, ConsumerKind, WebhookReply};
 use crate::consumer::push::{Endpoint, PushOptions};
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::engine::{
@@ -35,6 +38,7 @@ use crate::engine::{
 };
 use crate::ids::SourceId;
 use crate::metrics::{CoreMetrics, ReloadOutcome};
+use crate::reply::ReplyHandle;
 use crate::rules::{RouteTable, RuleError, RuleSpec};
 
 /// How often a drain looks whether its consumer is empty, and the shortest
@@ -129,8 +133,9 @@ struct Live {
     slot: Arc<Slot>,
     queue: Option<QueueConfig>,
     endpoints: Option<(Vec<Endpoint>, PushOptions)>,
-    /// New source names for a push consumer that keeps its endpoints.
-    source_names: Option<Arc<[Arc<str>]>>,
+    /// New options for a push consumer that keeps its endpoints (and their
+    /// breakers).
+    options: Option<PushOptions>,
 }
 
 /// A bot of the new generation before its metrics are resolved.
@@ -231,6 +236,7 @@ impl Plan {
                         &consumer.kind,
                         names_grew,
                         &source_names,
+                        &rt.reply,
                     ));
                     Arc::clone(&target.slot)
                 }
@@ -250,12 +256,13 @@ impl Plan {
                                 slot: Arc::clone(slot),
                                 queue: Some(queue(&consumer.kind)),
                                 endpoints: match &consumer.kind {
-                                    ConsumerKind::Push(push) => {
-                                        Some((endpoints(push), options(push, &source_names)))
-                                    }
+                                    ConsumerKind::Push(push) => Some((
+                                        endpoints(push),
+                                        options(push, &source_names, &rt.reply),
+                                    )),
                                     ConsumerKind::Pull(_) => None,
                                 },
-                                source_names: None,
+                                options: None,
                             });
                             revived.push(Arc::clone(slot));
                             Arc::clone(slot)
@@ -358,8 +365,8 @@ pub(crate) fn commit(
         }
         if let (Consumer::Push(push), Some((endpoints, opts))) = (consumer, change.endpoints) {
             push.set_endpoints(endpoints, opts);
-        } else if let (Consumer::Push(push), Some(names)) = (consumer, change.source_names) {
-            push.set_source_names(names);
+        } else if let (Consumer::Push(push), Some(opts)) = (consumer, change.options) {
+            push.set_options(opts);
         }
     }
     for slot in &changes.revived {
@@ -378,15 +385,20 @@ pub(crate) fn commit(
         }
     }
     // Registered before the swap, so that `pending` and `begin_drain` never
-    // miss them.
+    // miss them. The state still in effect is the one they were current in.
+    let previous = shared.state.load();
     let mut drains = Vec::with_capacity(changes.retiring.len());
     for slot in changes.retiring {
+        if slot.mode() == Mode::Pull {
+            *slot.fed_by.lock() = previous.feeder(&slot.name);
+        }
         let drain = CancellationToken::new();
         *slot.drain.lock() = Some(drain.clone());
         slot.consumer.begin_drain();
         shared.retired.lock().push(Arc::clone(&slot));
         drains.push((slot, drain));
     }
+    drop(previous);
     {
         // A draining instance leaves the gauges of a name in use to the
         // current instance.
@@ -407,6 +419,10 @@ pub(crate) fn commit(
         }
     }
     if let Some(state) = state {
+        // Before the swap: no update the new state admits may reach an
+        // endpoint it no longer allows.
+        keep_runtime_endpoints(shared, &state);
+        evict_rotated_captures(shared, &state);
         shared.state.store(Arc::new(state));
     }
     for slot in changes.started.iter().chain(&changes.revived) {
@@ -442,6 +458,64 @@ pub(crate) fn compile(
         }
     }
     RouteTable::compile(&rules, &usernames)
+}
+
+/// Clears the runtime endpoint of every push consumer of `state` that no
+/// longer accepts one, that the bot whose `setWebhook` set it no longer
+/// feeds (R37), or whose bot's token changed since: a token holder never
+/// redirects another bot's updates, not even across reloads, and rotating a
+/// leaked token evicts what its holder set. Draining instances keep theirs
+/// to deliver what they hold, unless their bot's token changed (see
+/// [`evict_rotated_captures`]).
+fn keep_runtime_endpoints(shared: &Shared, state: &EngineState) {
+    for target in &state.targets {
+        let Consumer::Push(push) = &target.slot.consumer else {
+            continue;
+        };
+        let Some((source, fingerprint)) = push.runtime_endpoint_owner() else {
+            continue;
+        };
+        let accepts = state.config.consumers.iter().any(|c| {
+            *c.name == *target.slot.name
+                && matches!(&c.kind, ConsumerKind::Push(p) if p.accept_set_webhook)
+        });
+        let reason = if !accepts {
+            "accept_set_webhook is off"
+        } else if !state.feeds(source, &target.slot.name) {
+            "the bot whose setWebhook set it no longer feeds the consumer"
+        } else if shared.token_fingerprint(state, source) != Some(fingerprint) {
+            "the token of the bot whose setWebhook set it changed"
+        } else {
+            continue;
+        };
+        push.set_runtime_endpoint(None);
+        tracing::info!(consumer = %target.slot.name, reason, "runtime endpoint cleared");
+    }
+}
+
+/// Clears the runtime endpoint of every draining push instance whose bot's
+/// token `state` changes: rotating a leaked token also stops the updates
+/// a removed consumer still holds from reaching its holder's capture.
+fn evict_rotated_captures(shared: &Shared, state: &EngineState) {
+    for slot in shared.retired.lock().iter() {
+        let Consumer::Push(push) = &slot.consumer else {
+            continue;
+        };
+        let Some((source, fingerprint)) = push.runtime_endpoint_owner() else {
+            continue;
+        };
+        if shared
+            .token_fingerprint(state, source)
+            .is_some_and(|current| current != fingerprint)
+        {
+            push.set_runtime_endpoint(None);
+            tracing::info!(
+                consumer = %slot.name,
+                reason = "the token of the bot whose setWebhook set it changed",
+                "runtime endpoint of a draining instance cleared"
+            );
+        }
+    }
 }
 
 /// Waits until the retired instance is empty or the drain timeout (at least
@@ -508,16 +582,18 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 
 /// The live changes from `old` to `new` of the same mode, if any. A push
 /// consumer gets new endpoints (and breakers) when its delivery settings
-/// change; when only new bots appear, it keeps them and learns the bots'
-/// names.
+/// change; when only `webhook_reply` changes or new bots appear, it keeps
+/// them and gets new options (the bots' names and the reply handle among
+/// them).
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
     new: &ConsumerKind,
     names_grew: bool,
     source_names: &Arc<[Arc<str>]>,
+    reply: &ReplyHandle,
 ) -> Option<Live> {
-    let (queue, endpoints, names) = match (old, new) {
+    let (queue, endpoints, opts) = match (old, new) {
         (ConsumerKind::Pull(old), ConsumerKind::Pull(new)) => {
             ((old.queue != new.queue).then_some(new.queue), None, None)
         }
@@ -527,19 +603,20 @@ fn live_change(
                 || old.max_in_flight != new.max_in_flight
                 || old.retry != new.retry
                 || old.breaker != new.breaker;
+            let refresh = names_grew || old.webhook_reply != new.webhook_reply;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
-                delivery.then(|| (endpoints(new), options(new, source_names))),
-                (!delivery && names_grew).then(|| Arc::clone(source_names)),
+                delivery.then(|| (endpoints(new), options(new, source_names, reply))),
+                (!delivery && refresh).then(|| options(new, source_names, reply)),
             )
         }
         _ => (None, None, None),
     };
-    (queue.is_some() || endpoints.is_some() || names.is_some()).then(|| Live {
+    (queue.is_some() || endpoints.is_some() || opts.is_some()).then(|| Live {
         slot: Arc::clone(slot),
         queue,
         endpoints,
-        source_names: names,
+        options: opts,
     })
 }
 
@@ -562,8 +639,9 @@ fn new_slot(
             Arc::clone(&name),
             push.queue(),
             endpoints(push),
-            options(push, source_names),
+            options(push, source_names, &rt.reply),
             client.clone(),
+            &rt.via,
             handles.clone(),
         ))),
     };
@@ -583,12 +661,20 @@ fn endpoints(push: &config::Push) -> Vec<Endpoint> {
         .collect()
 }
 
-fn options(push: &config::Push, source_names: &Arc<[Arc<str>]>) -> PushOptions {
+/// A push consumer's options; `reply` goes with `webhook_reply: execute`.
+fn options(
+    push: &config::Push,
+    source_names: &Arc<[Arc<str>]>,
+    reply: &ReplyHandle,
+) -> PushOptions {
     PushOptions {
         max_in_flight: push.max_in_flight,
         balance: push.balance,
         retry: push.retry,
         source_names: Arc::clone(source_names),
+        breaker: push.breaker,
+        runtime_timeout: config::DEFAULT_ENDPOINT_TIMEOUT,
+        reply: (push.webhook_reply == WebhookReply::Execute).then(|| Arc::clone(reply)),
     }
 }
 
@@ -651,6 +737,8 @@ mod tests {
             supervisor: Arc::new(Supervisor::new()),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            via: tgin_runtime::http::Via::generate(),
+            reply: Default::default(),
         };
         let one = "version: 1\nbots:\n  - { name: a, token: \"1:a\" }\n";
         let build = |cfg: &Config, old: Option<&EngineState>| {
@@ -675,5 +763,73 @@ mod tests {
             build(&load(&two), Some(&old)),
             Err(BuildError::SourceIdsExhausted)
         ));
+    }
+
+    /// Gateway, setWebhook-capture and webhook-reply settings apply live:
+    /// no restart, no source restart, the same consumer instance; a changed
+    /// `webhook_reply` gives the push consumer new options.
+    #[tokio::test]
+    async fn gateway_and_webhook_reply_changes_apply_live() {
+        let metrics = CoreMetrics::register(&mut Registry::default());
+        let client = reqwest::Client::new();
+        let rt = EngineRuntime {
+            supervisor: Arc::new(Supervisor::new()),
+            stop: CancellationToken::new(),
+            force: CancellationToken::new(),
+            via: tgin_runtime::http::Via::generate(),
+            reply: Default::default(),
+        };
+        let build = |cfg: &Config, old: Option<&EngineState>| {
+            Plan::build(cfg, old, &[], &metrics, &client, &rt).map(Plan::into_parts)
+        };
+        let base = "version: 1\nserver: {}\nbots:\n  - { name: a, token: \"1:a\", routes: [{ to: [h, q] }] }\nconsumers:\n  h: { push: { endpoints: [{ url: \"http://h/\" }] } }\n  q: { pull: {} }\n";
+        let (old, _) = build(&load(base), None).expect("build");
+
+        let gateway = base.replace(
+            "token: \"1:a\",",
+            "token: \"1:a\", gateway: { upstream_idle_timeout: 5s, rate_limit: { mode: reject } },",
+        );
+        let (_, changes) = build(&load(&gateway), Some(&old)).expect("build");
+        let report = &changes.report;
+        assert!(report.sources_restarted.is_empty(), "{report:?}");
+        assert!(report.restart_required.is_empty(), "{report:?}");
+        assert!(report.changed.is_empty(), "{report:?}");
+
+        let ignore = base.replace("}] } }", "}], webhook_reply: ignore } }");
+        let (_, changes) = build(&load(&ignore), Some(&old)).expect("build");
+        assert_eq!(changes.report.changed, ["h"]);
+        assert!(changes.retiring.is_empty() && changes.started.is_empty());
+        let [live] = changes.live.as_slice() else {
+            panic!("one live change");
+        };
+        assert_eq!(&*live.slot.name, "h");
+        assert!(live.endpoints.is_none(), "breakers reset");
+        let opts = live.options.as_ref().expect("push options refreshed");
+        assert!(opts.reply.is_none(), "ignore drops the reply handle");
+
+        // Back to `execute`: the options carry the runtime's one handle.
+        let (ignored, _) = build(&load(&ignore), None).expect("build");
+        let (_, changes) = build(&load(base), Some(&ignored)).expect("build");
+        let [live] = changes.live.as_slice() else {
+            panic!("one live change");
+        };
+        assert!(live.endpoints.is_none(), "breakers reset");
+        let opts = live.options.as_ref().expect("push options refreshed");
+        let handle = opts.reply.as_ref().expect("the reply handle");
+        assert!(Arc::ptr_eq(handle, &rt.reply));
+
+        let flags = base
+            .replace(
+                "}] } }",
+                "}], accept_set_webhook: true, honor_drop_pending: true } }",
+            )
+            .replace(
+                "q: { pull: {} }",
+                "q: { pull: { honor_drop_pending: true } }",
+            );
+        let (_, changes) = build(&load(&flags), Some(&old)).expect("build");
+        assert_eq!(changes.report.changed, ["h", "q"]);
+        assert!(changes.retiring.is_empty() && changes.started.is_empty());
+        assert!(changes.report.restart_required.is_empty());
     }
 }

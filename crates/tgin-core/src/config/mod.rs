@@ -9,17 +9,22 @@ mod sensitive;
 mod validate;
 
 use std::path::Path;
+use std::time::Duration;
 
 use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
 pub use self::model::RawConfig;
 pub use self::resolve::{
-    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Ingress, IpAllowlist, Log,
-    LogFormat, LogLevel, LongPoll, Pull, Push, Reload, Retry, Runtime, Server, Tls, Webhook,
-    WebhookSecret,
+    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Gateway, Ingress, IpAllowlist,
+    Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit, RateMode, Reload, Retry,
+    Runtime, Server, Tls, Webhook, WebhookReply, WebhookSecret,
 };
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
+
+/// A push endpoint's `timeout` when the config gives none; a runtime
+/// endpoint from `setWebhook` always has it.
+pub const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether `token` can be sent as a bot token: non-empty, and only
 /// `[A-Za-z0-9:_-]`. The loader rejects any other token, and the Bot API
@@ -29,6 +34,34 @@ pub fn valid_bot_token(token: &str) -> bool {
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
+/// Whether the Bot API gateway can serve `token`: `<digits>:<secret>`,
+/// `^[0-9]+:[A-Za-z0-9_-]{1,128}$`, as Telegram issues them. The loader
+/// warns about any other bot token, and the gateway path parser applies
+/// this one rule to the token segment after percent-decoding it.
+pub fn gateway_token(token: &str) -> bool {
+    let Some((id, secret)) = token.split_once(':') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && (1..=128).contains(&secret.len())
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Whether `name` is a valid bot or consumer name: 1 to 63 lowercase
+/// letters, digits and `-`, starting with a letter or digit. The loader
+/// checks every name, and the gateway path parser every `/c/<name>`
+/// segment, by this one rule.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let allowed = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    bytes.len() <= 63
+        && bytes.first().is_some_and(allowed)
+        && bytes.iter().all(|c| allowed(c) || *c == b'-')
 }
 
 /// Parses, validates and resolves a config file. `origin` names the file in

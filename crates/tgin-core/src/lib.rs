@@ -9,5 +9,6 @@ pub mod facts;
 pub mod ids;
 pub mod metrics;
 pub mod reload;
+pub mod reply;
 pub mod rules;
 pub mod sink;

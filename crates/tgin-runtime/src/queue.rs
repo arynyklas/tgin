@@ -614,6 +614,19 @@ impl<T: Clone> LeaseQueue<T> {
         available.len()
     }
 
+    /// Drops the unleased items that match `pred`.
+    pub fn purge_where(&self, pred: impl Fn(&T) -> bool) -> usize {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let matched: Vec<u64> = (inner.available.iter().copied())
+            .filter(|seq| inner.entries.get(seq).is_some_and(|e| pred(&e.item)))
+            .collect();
+        for &seq in &matched {
+            inner.remove(seq);
+        }
+        matched.len()
+    }
+
     /// Removes every item, leased or not, and returns them in seq order.
     /// Outstanding permits stay valid.
     pub fn drain_all(&self) -> Vec<T> {
@@ -767,6 +780,34 @@ mod tests {
                 bytes: 3
             }
         );
+    }
+
+    #[test]
+    fn purge_where_drops_matching_unleased_items_only() {
+        let mut cfg = config(10, 100);
+        cfg.ordering = Ordering::PerKey;
+        let q = queue(cfg);
+        let now = Instant::now();
+        push(&q, "a1", Some(1), 1, 1);
+        push(&q, "b1", Some(1), 2, 2);
+        push(&q, "a2", Some(2), 3, 4);
+        push(&q, "b2", None, 4, 8);
+        // a1 leased: it stays, though it matches.
+        assert_eq!(items(&q.lease(&holder("h"), 1, now)), ["a1"]);
+        assert_eq!(q.purge_where(|item| item.starts_with('a')), 1);
+        assert_eq!(
+            q.stats(),
+            QueueStats {
+                available: 2,
+                leased: 1,
+                reserved: 0,
+                bytes: 11
+            }
+        );
+        // Key 1 waits for a1; the rest leases in order.
+        assert_eq!(items(&q.lease(&holder("h"), 10, now)), ["b2"]);
+        assert_eq!(q.ack_below(&holder("h"), 2), 1);
+        assert_eq!(items(&q.lease(&holder("h"), 10, now)), ["b1"]);
     }
 
     #[test]

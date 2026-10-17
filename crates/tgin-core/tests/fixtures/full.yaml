@@ -1,5 +1,5 @@
 # Design §12 example config, adapted to the M1 model:
-# - `accounts` and `data_dir` removed (M3), `bots[].gateway` removed (M2)
+# - `accounts` and `data_dir` removed (M3), `bots[].gateway` left to design.yaml
 # - `allowed_updates: all` replaced by an explicit list (the v1 model takes a list; absent = Telegram's default)
 version: 1
 runtime: { worker_threads: auto, shutdown_grace: 20s }

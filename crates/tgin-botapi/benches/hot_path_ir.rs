@@ -69,8 +69,9 @@ fn fixture() -> (&'static [Bytes], Vec<(i64, Facts<'static>)>) {
 #[cfg(target_os = "linux")]
 fn extract_setup() -> Vec<Bytes> {
     let payloads = common::payloads();
+    let mut decoded = String::new();
     for p in &payloads {
-        black_box(tgin_botapi::extract(p).expect("valid"));
+        black_box(tgin_botapi::extract(p, &mut decoded).expect("valid"));
     }
     payloads
 }
@@ -79,9 +80,11 @@ fn extract_setup() -> Vec<Bytes> {
 #[library_benchmark]
 #[bench::updates(setup = extract_setup, config = limit(EXTRACT_IR))]
 fn extract(payloads: Vec<Bytes>) -> usize {
+    // One decode buffer for the round, as the long-poll source uses per batch.
+    let mut decoded = String::new();
     let n = payloads
         .iter()
-        .filter(|p| black_box(tgin_botapi::extract(black_box(p))).is_ok())
+        .filter(|p| black_box(tgin_botapi::extract(black_box(p), &mut decoded)).is_ok())
         .count();
     // Keeps freeing the fixture out of the count.
     std::mem::forget(payloads);

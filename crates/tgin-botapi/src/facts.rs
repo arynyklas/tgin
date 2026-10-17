@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::ops::Range;
 
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -50,16 +51,19 @@ pub enum FactsError {
 }
 
 /// Reads `update_id` and the routing facts of one update in a single pass,
-/// borrowing from `payload` wherever the JSON holds the value verbatim.
+/// borrowing from `payload` wherever the JSON holds the value verbatim, and
+/// from `decoded` where it does not.
 ///
 /// - `update_type` is the first key other than `update_id` whose value is an
 ///   object, so unknown update types still get one. Empty if there is none.
 /// - `chat` is `.chat`, or `.message.chat` for `callback_query`.
 /// - `user_id` is `.from.id`, or `.user.id`.
 /// - `text` is `.text`, `.caption`, or `.query` for `inline_query`, cut to
-///   4 KiB on a char boundary. Escaped strings are decoded into owned text
-///   (one allocation each); lone surrogates decode to U+FFFD.
-/// - `callback_data` is `.data` for `callback_query`.
+///   4 KiB on a char boundary. Escaped strings are decoded into `decoded`,
+///   which is cleared first: a caller that reuses one buffer across updates
+///   allocates only when a decoded text outgrows it. Lone surrogates decode
+///   to U+FFFD.
+/// - `callback_data` is `.data` for `callback_query`, decoded like `text`.
 /// - `command` is the leading `/token` of `text`, split at the first `@`. It
 ///   borrows from the payload, so a token that contains a JSON escape (other
 ///   than a leading `\/` or `\u002f`) yields no command; command names are
@@ -68,10 +72,13 @@ pub enum FactsError {
 /// Fields of an unexpected JSON type count as absent. Only a payload that is
 /// not a JSON object, has no integer `update_id`, or is not valid JSON
 /// (including invalid escapes) is an error.
-pub fn extract(payload: &[u8]) -> Result<(i64, Facts<'_>), FactsError> {
+pub fn extract<'a>(
+    payload: &'a [u8],
+    decoded: &'a mut String,
+) -> Result<(i64, Facts<'a>), FactsError> {
     let update: Update<'_> = serde_json::from_slice(payload)?;
     let update_id = update.update_id.ok_or(FactsError::MissingUpdateId)?;
-    Ok((update_id, update.into_facts()))
+    Ok((update_id, update.into_facts(decoded)))
 }
 
 #[derive(Default)]
@@ -106,34 +113,56 @@ struct Chat {
 }
 
 impl<'a> Update<'a> {
-    fn into_facts(self) -> Facts<'a> {
+    fn into_facts(self, decoded: &'a mut String) -> Facts<'a> {
+        decoded.clear();
         let Some((update_type, p)) = self.kind else {
             return Facts::default();
         };
         let chat = p.chat.or(p.message_chat);
-        let text = [p.text, p.caption, p.query]
+        let raw_text = [p.text, p.caption, p.query]
             .into_iter()
             .flatten()
             .find_map(string_contents);
-        let (text, command) = match text {
-            Some(inner) => {
-                let text = unescape(inner, TEXT_CAP);
-                let command = command(&text, inner);
-                (Some(text), command)
+        let text = raw_text.map(|inner| unescape(inner, TEXT_CAP, decoded));
+        let callback_data = p
+            .data
+            .and_then(string_contents)
+            .map(|inner| unescape(inner, usize::MAX, decoded));
+        let decoded: &'a str = decoded;
+        let (text, command) = match (text, raw_text) {
+            (Some(text), Some(raw)) => {
+                let escaped = matches!(text, Text::Decoded(_));
+                let text = text.resolve(decoded);
+                (Some(text), command(text, escaped, raw))
             }
-            None => (None, None),
+            _ => (None, None),
         };
         Facts {
             update_type,
             chat_id: chat.and_then(|c| c.id),
             chat_type: chat.and_then(|c| c.kind),
             user_id: p.from.or(p.user).flatten(),
-            text,
-            callback_data: p
-                .data
-                .and_then(string_contents)
-                .map(|inner| unescape(inner, usize::MAX)),
+            text: text.map(Cow::Borrowed),
+            callback_data: callback_data.map(|d| Cow::Borrowed(d.resolve(decoded))),
             command,
+        }
+    }
+}
+
+/// Where the text of a JSON string is.
+#[derive(Debug, PartialEq)]
+enum Text<'a> {
+    /// Verbatim in the payload: the string has no escapes.
+    Verbatim(&'a str),
+    /// Decoded into the buffer, at this range.
+    Decoded(Range<usize>),
+}
+
+impl<'a> Text<'a> {
+    fn resolve(self, decoded: &'a str) -> &'a str {
+        match self {
+            Text::Verbatim(text) => text,
+            Text::Decoded(range) => &decoded[range],
         }
     }
 }
@@ -146,20 +175,22 @@ fn string_contents(raw: &RawValue) -> Option<&str> {
 /// The contents of a JSON string (between its quotes) decoded and cut to at
 /// most `limit` bytes on a char boundary.
 ///
-/// Without escapes the result borrows from `inner`. Otherwise it is built in
-/// one allocation of `min(inner.len(), limit)` bytes, which never grows:
-/// every escape is longer than the UTF-8 it decodes to. Lone surrogates
-/// become U+FFFD. `inner` comes from a `RawValue`, whose escapes serde_json
-/// has already validated; anything malformed would also become U+FFFD.
-fn unescape(inner: &str, limit: usize) -> Cow<'_, str> {
+/// Without escapes the text stays in `inner`. Otherwise it is appended to
+/// `out`, which first reserves `min(inner.len(), limit)` bytes and never
+/// grows past that: every escape is longer than the UTF-8 it decodes to.
+/// Lone surrogates become U+FFFD. `inner` comes from a `RawValue`, whose
+/// escapes serde_json has already validated; anything malformed would also
+/// become U+FFFD.
+fn unescape<'a>(inner: &'a str, limit: usize, out: &mut String) -> Text<'a> {
     if !inner.contains('\\') {
-        return Cow::Borrowed(floor(inner, limit));
+        return Text::Verbatim(floor(inner, limit));
     }
-    let mut out = String::with_capacity(inner.len().min(limit));
+    out.reserve(inner.len().min(limit));
+    let start = out.len();
     let mut rest = inner;
     while !rest.is_empty() {
         let (plain, escaped) = rest.split_at(rest.find('\\').unwrap_or(rest.len()));
-        let room = limit - out.len();
+        let room = limit - (out.len() - start);
         if plain.len() > room {
             out.push_str(floor(plain, room));
             break;
@@ -169,13 +200,13 @@ fn unescape(inner: &str, limit: usize) -> Cow<'_, str> {
             break;
         };
         let (c, after) = unescape_one(escaped);
-        if c.len_utf8() > limit - out.len() {
+        if c.len_utf8() > limit - (out.len() - start) {
             break;
         }
         out.push(c);
         rest = after;
     }
-    Cow::Owned(out)
+    Text::Decoded(start..out.len())
 }
 
 /// The char of one escape, given the text after its `\`, and the text after
@@ -242,19 +273,18 @@ fn floor(s: &str, limit: usize) -> &str {
 }
 
 /// The leading `/name[@bot]` of `text`, borrowed from the payload. `raw` is
-/// the still-escaped JSON string `text` was decoded from.
-fn command<'a>(text: &Cow<'a, str>, raw: &'a str) -> Option<(&'a str, Option<&'a str>)> {
+/// the JSON string `text` was decoded from, `escaped` whether it had escapes.
+fn command<'a>(text: &'a str, escaped: bool, raw: &'a str) -> Option<(&'a str, Option<&'a str>)> {
     let rest = text.strip_prefix('/')?;
     let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let token: &'a str = match text {
-        Cow::Borrowed(s) => s.get(1..1 + len)?,
-        Cow::Owned(_) => {
-            // Find the same bytes in the escaped source after its `/`.
-            let after = ["/", "\\/", "\\u002f", "\\u002F"]
-                .into_iter()
-                .find_map(|slash| raw.strip_prefix(slash))?;
-            after.get(..len).filter(|t| *t == &rest[..len])?
-        }
+    let token: &'a str = if escaped {
+        // Find the same bytes in the escaped source after its `/`.
+        let after = ["/", "\\/", "\\u002f", "\\u002F"]
+            .into_iter()
+            .find_map(|slash| raw.strip_prefix(slash))?;
+        after.get(..len).filter(|t| *t == &rest[..len])?
+    } else {
+        text.get(1..1 + len)?
     };
     Some(match token.split_once('@') {
         Some((name, bot)) => (name, Some(bot)),
@@ -642,8 +672,8 @@ mod tests {
 
     use super::*;
 
-    fn facts(json: &str) -> (i64, Facts<'_>) {
-        extract(json.as_bytes()).expect("the update is valid")
+    fn facts<'a>(json: &'a str, decoded: &'a mut String) -> (i64, Facts<'a>) {
+        extract(json.as_bytes(), decoded).expect("the update is valid")
     }
 
     /// Whether `s` points into `payload`.
@@ -656,7 +686,8 @@ mod tests {
     #[test]
     fn extract_message() {
         let raw = r#"{"update_id":10,"message":{"message_id":1,"from":{"id":42,"is_bot":false,"first_name":"A"},"chat":{"id":-1001234,"type":"supergroup","title":"G"},"date":1,"text":"hello world"}}"#;
-        let (id, f) = facts(raw);
+        let mut d = String::new();
+        let (id, f) = facts(raw, &mut d);
         assert_eq!(id, 10);
         assert_eq!(
             f,
@@ -678,7 +709,7 @@ mod tests {
 
         // A caption stands in for missing text.
         let raw = r#"{"update_id":11,"edited_message":{"chat":{"id":7,"type":"private"},"caption":"a photo","from":{"id":7}}}"#;
-        let (_, f) = facts(raw);
+        let (_, f) = facts(raw, &mut d);
         assert_eq!(f.update_type, "edited_message");
         assert_eq!(f.chat_type, Some(ChatType::Private));
         assert_eq!(f.text.as_deref(), Some("a photo"));
@@ -687,7 +718,8 @@ mod tests {
     #[test]
     fn extract_callback_query() {
         let raw = r#"{"update_id":12,"callback_query":{"id":"77","from":{"id":5,"first_name":"U"},"message":{"message_id":3,"chat":{"id":-5,"type":"group"},"date":1,"text":"menu"},"chat_instance":"ci","data":"buy:1"}}"#;
-        let (_, f) = facts(raw);
+        let mut d = String::new();
+        let (_, f) = facts(raw, &mut d);
         assert_eq!(
             f,
             Facts {
@@ -704,14 +736,15 @@ mod tests {
 
         // `data` and `message.chat` count only for callback queries.
         let raw = r#"{"update_id":13,"message":{"message":{"chat":{"id":1,"type":"private"}},"data":"x"}}"#;
-        let (_, f) = facts(raw);
+        let (_, f) = facts(raw, &mut d);
         assert_eq!((f.chat_id, f.callback_data), (None, None));
     }
 
     #[test]
     fn extract_inline_query() {
         let raw = r#"{"update_id":14,"inline_query":{"id":"q1","from":{"id":9,"first_name":"I"},"query":"/cats cute","offset":"","chat_type":"private"}}"#;
-        let (_, f) = facts(raw);
+        let mut d = String::new();
+        let (_, f) = facts(raw, &mut d);
         assert_eq!(
             f,
             Facts {
@@ -727,13 +760,14 @@ mod tests {
 
         // `query` is text only for inline queries.
         let raw = r#"{"update_id":15,"chosen_inline_result":{"result_id":"r","from":{"id":9},"query":"q"}}"#;
-        assert_eq!(facts(raw).1.text, None);
+        assert_eq!(facts(raw, &mut d).1.text, None);
     }
 
     #[test]
     fn extract_chat_member() {
         let raw = r#"{"update_id":16,"chat_member":{"chat":{"id":-100,"type":"channel","title":"C"},"from":{"id":1},"date":1,"old_chat_member":{"user":{"id":2},"status":"left"},"new_chat_member":{"user":{"id":2},"status":"member"}}}"#;
-        let (_, f) = facts(raw);
+        let mut d = String::new();
+        let (_, f) = facts(raw, &mut d);
         assert_eq!(f.update_type, "chat_member");
         assert_eq!(f.chat_id, Some(-100));
         assert_eq!(f.chat_type, Some(ChatType::Channel));
@@ -742,13 +776,14 @@ mod tests {
         // `user` stands in for a missing `from`.
         let raw =
             r#"{"update_id":17,"poll_answer":{"poll_id":"p","user":{"id":3},"option_ids":[0]}}"#;
-        assert_eq!(facts(raw).1.user_id, Some(3));
+        assert_eq!(facts(raw, &mut d).1.user_id, Some(3));
     }
 
     #[test]
     fn extract_unknown_type() {
         let raw = r#"{"x_flag":true,"update_id":18,"x_list":[{"a":1}],"future_thing":{"chat":{"id":3,"type":"brand_new"},"user":{"id":4},"text":"t"},"message":{"chat":{"id":9}}}"#;
-        let (id, f) = facts(raw);
+        let mut d = String::new();
+        let (id, f) = facts(raw, &mut d);
         assert_eq!(id, 18);
         assert_eq!(f.update_type, "future_thing");
         assert_eq!(f.chat_id, Some(3));
@@ -757,10 +792,16 @@ mod tests {
         assert_eq!(f.text.as_deref(), Some("t"));
 
         // No object-valued key: no update type.
-        assert_eq!(facts(r#"{"update_id":19,"x":1}"#).1, Facts::default());
+        assert_eq!(
+            facts(r#"{"update_id":19,"x":1}"#, &mut d).1,
+            Facts::default()
+        );
 
         // An escaped key still names a known update type.
-        let (_, f) = facts(r#"{"update_id":20,"me\u0073sage":{"te\u0078t":"hi"}}"#);
+        let (_, f) = facts(
+            r#"{"update_id":20,"me\u0073sage":{"te\u0078t":"hi"}}"#,
+            &mut d,
+        );
         assert_eq!(f.update_type, "message");
         assert_eq!(f.text.as_deref(), Some("hi"));
     }
@@ -779,50 +820,69 @@ mod tests {
             r#"{"update_id":1,"message":{"text":"\u12"}}"#,
             r#"{"update_id":1,"message":{"text":"\u12g4"}}"#,
         ] {
-            assert!(extract(bad.as_bytes()).is_err(), "{bad}");
+            assert!(
+                extract(bad.as_bytes(), &mut String::new()).is_err(),
+                "{bad}"
+            );
         }
         assert!(matches!(
-            extract(br#"{"message":{}}"#),
+            extract(br#"{"message":{}}"#, &mut String::new()),
             Err(FactsError::MissingUpdateId)
         ));
     }
 
     #[test]
-    fn extract_escaped_text_owned() {
+    fn extract_escaped_text_decoded() {
         // Telegram escapes `/` and non-ASCII text.
         let raw = r#"{"update_id":21,"message":{"chat":{"id":1,"type":"private"},"text":"\/start@my_bot \"quoted\" \u041f\ud83d\ude00"}}"#;
-        let (_, f) = facts(raw);
-        assert_eq!(
-            f.text,
-            Some(Cow::<str>::Owned("/start@my_bot \"quoted\" П😀".into()))
-        );
-        assert!(matches!(f.text, Some(Cow::Owned(_))));
+        let mut d = String::new();
+        let (_, f) = facts(raw, &mut d);
+        let text = f.text.as_deref().expect("text");
+        assert_eq!(text, "/start@my_bot \"quoted\" П😀");
+        assert!(!inside(raw, text), "decoded text lives in the buffer");
         let (name, bot) = f.command.expect("a command");
         assert_eq!((name, bot), ("start", Some("my_bot")));
         assert!(inside(raw, name));
         assert!(inside(raw, bot.unwrap_or_default()));
 
         let raw = r#"{"update_id":22,"callback_query":{"from":{"id":1},"data":"a\nb"}}"#;
-        assert!(matches!(facts(raw).1.callback_data, Some(Cow::Owned(d)) if d == "a\nb"));
+        assert_eq!(facts(raw, &mut d).1.callback_data.as_deref(), Some("a\nb"));
+
+        // Escaped text and escaped callback data share the buffer.
+        let raw = r#"{"update_id":26,"callback_query":{"from":{"id":1},"text":"\u00e9\/","data":"\u043a\/1"}}"#;
+        let f = facts(raw, &mut d).1;
+        assert_eq!(f.text.as_deref(), Some("é/"));
+        assert_eq!(f.callback_data.as_deref(), Some("к/1"));
 
         // A lone surrogate decodes to U+FFFD instead of failing the update.
         let raw = r#"{"update_id":23,"message":{"text":"\ud83d \/x"}}"#;
-        let f = facts(raw).1;
+        let f = facts(raw, &mut d).1;
         assert_eq!(f.text.as_deref(), Some("\u{fffd} /x"));
         assert_eq!(f.command, None);
 
         // `\u002f` as the leading slash still yields a borrowed command.
         let raw = r#"{"update_id":24,"message":{"text":"\u002Fhelp@b\u00e9 x"}}"#;
-        assert_eq!(facts(raw).1.command, None, "the bot name is escaped");
+        assert_eq!(
+            facts(raw, &mut d).1.command,
+            None,
+            "the bot name is escaped"
+        );
         let raw = r#"{"update_id":25,"message":{"text":"\u002fhelp@bot \u00e9"}}"#;
-        let (name, bot) = facts(raw).1.command.expect("a command");
+        let (name, bot) = facts(raw, &mut d).1.command.expect("a command");
         assert_eq!((name, bot), ("help", Some("bot")));
         assert!(inside(raw, name));
     }
 
+    /// `unescape` of a JSON string's contents, cut to `limit` bytes.
+    fn capped(inner: &str, limit: usize) -> String {
+        let mut out = String::new();
+        let text = unescape(inner, limit, &mut out);
+        text.resolve(&out).to_owned()
+    }
+
     /// `unescape` of a JSON string's contents, with no cap.
-    fn unescaped(inner: &str) -> Cow<'_, str> {
-        unescape(inner, usize::MAX)
+    fn unescaped(inner: &str) -> String {
+        capped(inner, usize::MAX)
     }
 
     #[test]
@@ -838,10 +898,14 @@ mod tests {
     #[test]
     fn unescape_borrows_without_escapes() {
         let inner = "plain é text";
-        let out = unescaped(inner);
-        assert!(matches!(out, Cow::Borrowed(s) if std::ptr::eq(s, inner)));
-        assert!(matches!(unescape(inner, 8), Cow::Borrowed("plain \u{e9}")));
-        assert!(matches!(unescape(inner, 7), Cow::Borrowed("plain ")));
+        let mut out = String::new();
+        assert!(matches!(
+            unescape(inner, usize::MAX, &mut out),
+            Text::Verbatim(s) if std::ptr::eq(s, inner)
+        ));
+        assert_eq!(unescape(inner, 8, &mut out), Text::Verbatim("plain \u{e9}"));
+        assert_eq!(unescape(inner, 7, &mut out), Text::Verbatim("plain "));
+        assert_eq!(out.capacity(), 0, "nothing is decoded");
     }
 
     #[test]
@@ -873,32 +937,65 @@ mod tests {
 
     #[test]
     fn unescape_stops_at_cap_on_char_boundary() {
-        assert_eq!(unescape(r"ab\ncd", 3), "ab\n");
-        assert_eq!(unescape(r"ab\ncd", 2), "ab");
-        assert_eq!(unescape(r"\u20ac\u20ac", 6), "€€");
-        assert_eq!(unescape(r"\u20ac\u20ac", 5), "€");
-        assert_eq!(unescape(r"\u20ac\u20ac", 3), "€");
-        assert_eq!(unescape(r"\u20ac\u20ac", 2), "");
-        assert_eq!(unescape(r"\ud83d\ude00a", 4), "😀");
-        assert_eq!(unescape(r"\ud83d\ude00a", 3), "");
-        assert_eq!(unescape(r"x\né", 3), "x\n");
-        assert_eq!(unescape(r"x\néé", 4), "x\né");
-        assert_eq!(unescape(r"\n", 0), "");
+        assert_eq!(capped(r"ab\ncd", 3), "ab\n");
+        assert_eq!(capped(r"ab\ncd", 2), "ab");
+        assert_eq!(capped(r"\u20ac\u20ac", 6), "€€");
+        assert_eq!(capped(r"\u20ac\u20ac", 5), "€");
+        assert_eq!(capped(r"\u20ac\u20ac", 3), "€");
+        assert_eq!(capped(r"\u20ac\u20ac", 2), "");
+        assert_eq!(capped(r"\ud83d\ude00a", 4), "😀");
+        assert_eq!(capped(r"\ud83d\ude00a", 3), "");
+        assert_eq!(capped(r"x\né", 3), "x\n");
+        assert_eq!(capped(r"x\néé", 4), "x\né");
+        assert_eq!(capped(r"\n", 0), "");
     }
 
     #[test]
-    fn unescape_allocates_once() {
-        // Every escape is longer than its output, so the buffer sized from the
-        // input never grows.
+    fn unescape_caps_what_it_appends() {
+        // The cap counts the decoded text alone, not what the buffer held.
+        let mut out = String::from("held");
+        let text = unescape(r"\u20ac\u20ac", 5, &mut out);
+        assert_eq!(text, Text::Decoded(4..7));
+        assert_eq!(out, "held€");
+    }
+
+    #[test]
+    fn unescape_reserves_once() {
+        // Every escape is longer than its output, so the room reserved from
+        // the input is never outgrown: decoding into a buffer that already
+        // has that room never reallocates.
         for (inner, limit) in [
             (r"\u20ac\ud83d\ude00\/\n plain \u00e9", usize::MAX),
             (r"\u20ac\u20ac\u20ac", 7),
             (r"\ud83d", usize::MAX),
         ] {
-            match unescape(inner, limit) {
-                Cow::Owned(s) => assert_eq!(s.capacity(), inner.len().min(limit), "{inner}"),
-                Cow::Borrowed(_) => panic!("{inner} has escapes"),
-            }
+            let mut out = String::from("held");
+            out.reserve_exact(inner.len().min(limit));
+            let room = out.capacity();
+            let text = unescape(inner, limit, &mut out);
+            assert!(matches!(text, Text::Decoded(_)), "{inner} has escapes");
+            assert_eq!(out.capacity(), room, "{inner}");
+        }
+    }
+
+    #[test]
+    fn unescape_reserves_up_front() {
+        // Each input decodes to far less than its length, so growing the
+        // buffer by its output alone would leave less room than this.
+        for (inner, limit) in [
+            (r"\u00e9".repeat(100), usize::MAX),
+            (r"\u00e9".repeat(100), 500),
+            (r"\ud83d\ude00".repeat(50), 400),
+        ] {
+            let mut out = String::new();
+            let text = unescape(&inner, limit, &mut out);
+            assert!(matches!(text, Text::Decoded(_)), "{inner} has escapes");
+            let reserved = inner.len().min(limit);
+            assert!(
+                out.capacity() >= reserved,
+                "{} bytes reserved, {reserved} expected",
+                out.capacity()
+            );
         }
     }
 
@@ -907,21 +1004,22 @@ mod tests {
         // 3-byte chars: 4096 is not a char boundary, so the cut lands at 4095.
         let long = "€".repeat(2000);
         let raw = format!(r#"{{"update_id":23,"message":{{"text":"{long}"}}}}"#);
-        let (_, f) = facts(&raw);
+        let mut d = String::new();
+        let (_, f) = facts(&raw, &mut d);
         let text = f.text.expect("text");
-        assert!(matches!(text, Cow::Borrowed(_)));
+        assert!(inside(&raw, &text));
         assert_eq!(text.len(), 4095);
         assert_eq!(text, long[..4095]);
 
         let escaped = "\\u20ac".repeat(2000);
         let raw = format!(r#"{{"update_id":24,"message":{{"text":"{escaped}"}}}}"#);
-        let text = facts(&raw).1.text.expect("text");
-        assert!(matches!(text, Cow::Owned(_)));
+        let text = facts(&raw, &mut d).1.text.expect("text");
+        assert!(!inside(&raw, &text));
         assert_eq!(text, long[..4095]);
 
         let exact = "a".repeat(4096);
         let raw = format!(r#"{{"update_id":25,"message":{{"text":"{exact}b"}}}}"#);
-        assert_eq!(facts(&raw).1.text.as_deref(), Some(exact.as_str()));
+        assert_eq!(facts(&raw, &mut d).1.text.as_deref(), Some(exact.as_str()));
     }
 
     #[test]
@@ -937,9 +1035,10 @@ mod tests {
             ("hello /start", None),
             (" /start", None),
         ];
+        let mut d = String::new();
         for (text, expected) in cases {
             let raw = json!({"update_id": 1, "message": {"text": text}}).to_string();
-            assert_eq!(facts(&raw).1.command, expected, "{text:?}");
+            assert_eq!(facts(&raw, &mut d).1.command, expected, "{text:?}");
         }
     }
 
@@ -1401,22 +1500,51 @@ mod tests {
             .boxed()
     }
 
+    /// Whether the `len` bytes at address `at` lie within `s`.
+    fn within(s: &str, (at, len): (usize, usize)) -> bool {
+        let start = s.as_ptr().addr();
+        at >= start && at + len <= start + s.len()
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         #[test]
         fn extract_matches_reference(json in update_json()) {
             let expected = reference(&json);
-            let (id, f) = extract(json.as_bytes())
+            let mut decoded = String::new();
+            let (id, f) = extract(json.as_bytes(), &mut decoded)
                 .map_err(|e| TestCaseError::fail(format!("{e}")))?;
             if let Some((name, bot)) = f.command {
                 prop_assert!(inside(&json, name));
                 prop_assert!(inside(&json, bot.unwrap_or(name)));
             }
-            if let Some(Cow::Borrowed(t)) = &f.text {
-                prop_assert!(inside(&json, t));
-            }
+            let spans: Vec<(usize, usize)> = [f.text.as_deref(), f.callback_data.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(|t| (t.as_ptr().addr(), t.len()))
+                .collect();
             prop_assert_eq!((id, OwnedFacts::from(&f)), expected);
+            // Text is the payload's own bytes, or decoded into the buffer.
+            for span in spans {
+                prop_assert!(within(&json, span) || within(&decoded, span));
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// A source decodes every update of a batch into one buffer.
+        #[test]
+        fn extract_reuses_one_buffer(batch in prop::collection::vec(update_json(), 1..8)) {
+            let mut decoded = String::new();
+            for json in &batch {
+                let (id, f) = extract(json.as_bytes(), &mut decoded)
+                    .map_err(|e| TestCaseError::fail(format!("{e}")))?;
+                prop_assert_eq!((id, OwnedFacts::from(&f)), reference(json));
+                prop_assert!(decoded.len() <= json.len(), "the buffer holds one update's text");
+            }
         }
     }
 }

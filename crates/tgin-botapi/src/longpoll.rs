@@ -15,7 +15,7 @@ use tgin_runtime::supervisor::Exit;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{ApiError, BotClient, BotUser, split_updates};
+use crate::client::{ApiError, BotClient, Identity, split_updates};
 use crate::facts::extract;
 
 /// Telegram wants a positive `getUpdates` `timeout`; 0 would turn the long
@@ -33,7 +33,7 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
 const WEBHOOK_REDELETE_GUARD: Duration = Duration::from_secs(60);
 
 /// Called with the bot's account after every successful `getMe`.
-pub type OnIdentity = Arc<dyn Fn(SourceId, &BotUser) + Send + Sync>;
+pub type OnIdentity = Arc<dyn Fn(SourceId, &Identity) + Send + Sync>;
 
 /// How a [`LongPollSource`] polls.
 #[derive(Clone, Debug)]
@@ -185,11 +185,11 @@ impl<S: Sink> LongPollSource<S> {
         &self,
         ingest: &CancellationToken,
         backoff: &mut Backoff,
-    ) -> Result<BotUser, Exit> {
+    ) -> Result<Identity, Exit> {
         loop {
             let err = match ingest.run_until_cancelled(self.client.get_me()).await {
                 None => return Err(Exit::Done),
-                Some(Ok(user)) => return Ok(user),
+                Some(Ok(identity)) => return Ok(identity),
                 Some(Err(err)) => err,
             };
             self.count(&err);
@@ -215,17 +215,17 @@ impl<S: Sink> LongPollSource<S> {
     async fn poll(&self, ingest: &CancellationToken) -> Exit {
         let (initial, max, floor) = self.opts.backoff;
         let mut backoff = Backoff::new(initial, max, floor);
-        let user = match self.identify(ingest, &mut backoff).await {
-            Ok(user) => user,
+        let identity = match self.identify(ingest, &mut backoff).await {
+            Ok(identity) => identity,
             Err(exit) => return exit,
         };
-        (self.on_identity)(self.id, &user);
+        (self.on_identity)(self.id, &identity);
         *self.last_error.lock() = None;
         self.metrics.set_state(SourceStateLabel::Running);
         tracing::info!(
             source = %self.name,
-            bot_id = user.id,
-            username = user.username.as_deref().unwrap_or_default(),
+            bot_id = identity.user.id,
+            username = identity.user.username.as_deref().unwrap_or_default(),
             "long poll started"
         );
 
@@ -303,8 +303,11 @@ impl<S: Sink> LongPollSource<S> {
         offset: &mut i64,
         ingest: &CancellationToken,
     ) -> bool {
+        // One decode buffer for the batch: escaped text allocates only when
+        // it outgrows what an earlier update needed.
+        let mut decoded = String::new();
         for (update_id, payload) in updates {
-            let facts = match extract(payload) {
+            let facts = match extract(payload, &mut decoded) {
                 Ok((_, facts)) => facts,
                 Err(err) => {
                     tracing::warn!(source = %self.name, update_id, error = %err, "unreadable update; routing it without facts");

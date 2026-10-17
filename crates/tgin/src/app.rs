@@ -11,15 +11,20 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tgin_botapi::ApiError;
+use tgin_botapi::gateway::{Gateway, GatewayBot, GatewayMetrics};
 use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
+use tgin_core::reply::ReplyHandle;
+use tgin_runtime::backoff::Backoff;
 use tgin_runtime::config::Env;
-use tgin_runtime::http::{self, ClientOptions, RunningServer, ServerOptions, TlsFiles};
+use tgin_runtime::http::{
+    self, ClientOptions, RunningServer, ServerOptions, TlsFiles, Via, refuse_loops,
+};
 use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
-use tgin_runtime::supervisor::Supervisor;
+use tgin_runtime::supervisor::{Exit, Supervisor};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +41,10 @@ use crate::sources::{Kind, Sources, source_task};
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// How often shutdown checks whether the queues have drained.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
+/// How long the drain waits, once nothing is pending, for the downstreams'
+/// calls through the gateway: a bot answers an update after acknowledging
+/// it, so its call can come in after the queues have emptied.
+const GATEWAY_QUIET: Duration = Duration::from_secs(1);
 /// How often the sources are checked for having all failed.
 const SOURCES_CHECK: Duration = Duration::from_secs(1);
 /// The readiness component of the engine.
@@ -48,6 +57,10 @@ const ADMIN_PLANE: &str = "admin_plane";
 const ADMIN_MAX_CONNECTIONS: usize = 256;
 /// How long an admin client may take to send a request head.
 const ADMIN_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// The supervised task that forgets idle rate-limit keys.
+const GATEWAY_SWEEP: &str = "gateway-sweep";
+/// How often it runs.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// Why tgin could not start.
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +178,8 @@ pub(crate) struct Shared {
     pub(crate) redactor: Arc<ArcSwap<Redactor>>,
     /// The config in effect; a reload swaps it once the engine applied it.
     pub(crate) config: ArcSwap<Config>,
+    /// The Bot API gateway; a reload gives it the new bots.
+    pub(crate) gateway: Arc<Gateway>,
     pub(crate) sources: Sources,
     pub(crate) reloads: ReloadQueue,
     /// Whether an admin listener is bound to a non-loopback address. The
@@ -244,11 +259,18 @@ impl App {
 
         let mut registry = MetricsRegistry::new(VERSION, commit().unwrap_or("unknown"));
         let core = CoreMetrics::register(registry.registry_mut());
+        let gateway_metrics = GatewayMetrics::register(registry.registry_mut());
         let metrics = Arc::new(registry);
         let client = http::client(&ClientOptions::default());
         let supervisor = Arc::clone(&handles.supervisor);
         let force = handles.lifecycle.force_token();
         let ingest = handles.lifecycle.ingest_token();
+        // This process's name in the `Via` of its pushes; both planes refuse
+        // a request that carries it, so tgin never acts on its own pushes.
+        let via = Via::generate();
+        // Push consumers read the reply executor through this handle; the
+        // gateway that executes replies needs the engine first.
+        let reply = ReplyHandle::default();
         let engine = Arc::new(Engine::new(
             &cfg,
             core.clone(),
@@ -257,11 +279,19 @@ impl App {
                 supervisor: Arc::clone(&supervisor),
                 stop: handles.stop.clone(),
                 force: force.clone(),
+                via: via.clone(),
+                reply: Arc::clone(&reply),
             },
         )?);
         // Set once, here: the slot is new with `handles`.
         let _ = handles.engine.set((Arc::clone(&engine), core.clone()));
         health.set(ENGINE, Readiness::Ready);
+        // Before the sources, which record each bot's identity in it.
+        let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics, &via));
+        gateway.set_bots(gateway_bots(&cfg, &engine), trusted_proxies(&cfg));
+        // Set once, here, before any source admits an update.
+        let _ = reply.set(gateway.reply_executor());
+        spawn_sweep(&supervisor, Arc::clone(&gateway), handles.stop.clone());
 
         let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
         let cfg = Arc::new(cfg);
@@ -274,11 +304,13 @@ impl App {
             supervisor: Arc::clone(&supervisor),
             redactor,
             config: ArcSwap::new(Arc::clone(&cfg)),
+            gateway: Arc::clone(&gateway),
             sources: Sources::new(
                 Arc::clone(&engine),
                 Arc::clone(&supervisor),
                 Arc::clone(&health),
                 client,
+                Arc::clone(&gateway),
                 ingest.clone(),
                 force,
             ),
@@ -297,9 +329,13 @@ impl App {
                 max_connections: ADMIN_MAX_CONNECTIONS,
                 header_read_timeout: ADMIN_HEADER_TIMEOUT,
             };
-            let running = http::serve(admin::router(Arc::clone(&shared)), &opts)
-                .await
-                .map_err(StartError::Admin)?;
+            let admin = refuse_loops(
+                admin::router(Arc::clone(&shared)),
+                via.clone(),
+                "admin",
+                admin::loop_detected,
+            );
+            let running = http::serve(admin, &opts).await.map_err(StartError::Admin)?;
             let addrs = running.local_addrs.clone();
             *handles.admin.lock() = Some(running);
             tracing::info!(listen = ?addrs, "admin plane listening");
@@ -317,7 +353,9 @@ impl App {
 
         let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
-                let routes = Arc::new(DataRoutes::new(&cfg, server, &engine, &ingest));
+                let routes = Arc::new(DataRoutes::new(
+                    &cfg, server, &engine, &ingest, gateway, via,
+                ));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
                     key: tls.key_file.expose().clone(),
@@ -493,15 +531,35 @@ impl App {
         lifecycle.ingest_token().cancel();
         self.shared.sources.webhooks_stopped();
         engine.begin_drain();
+        let gateway = &self.shared.gateway;
+        // Until nothing is pending and, for `GATEWAY_QUIET` since then, no
+        // call has been forwarded to Telegram; calls the gateway answers
+        // itself, polls included, do not count. Without a data plane no
+        // call can come.
+        let quiet = if serving {
+            GATEWAY_QUIET
+        } else {
+            Duration::ZERO
+        };
         let drained = tokio::time::timeout(timing.grace, async {
-            while engine.pending() > 0 {
+            let mut busy = Instant::now();
+            loop {
+                let now = Instant::now();
+                if engine.pending() > 0 {
+                    busy = now;
+                } else if let Some(forwarded) = gateway.upstream_busy_at(now) {
+                    busy = busy.max(forwarded);
+                }
+                if now.saturating_duration_since(busy) >= quiet {
+                    return;
+                }
                 tokio::time::sleep(DRAIN_POLL).await;
             }
         })
         .await
         .is_ok();
         if !drained {
-            tracing::warn!(pending = engine.pending(), grace = ?timing.grace, "the queues did not drain within the shutdown grace");
+            tracing::warn!(pending = engine.pending(), grace = ?timing.grace, "the queues and the gateway's calls did not settle within the shutdown grace");
         }
 
         self.handles.stop.cancel();
@@ -656,6 +714,57 @@ pub fn secrets(cfg: &Config) -> Vec<String> {
         }
     }
     secrets
+}
+
+/// The bots of `cfg` as the gateway serves them, with the engine's ids;
+/// `engine` has applied `cfg`.
+pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
+    cfg.bots
+        .iter()
+        .filter_map(|bot| {
+            let Some(source) = engine.source_id(&bot.name) else {
+                tracing::error!(bot = %bot.name, "the engine has no source for this bot; the gateway does not serve it");
+                return None;
+            };
+            Some(GatewayBot {
+                name: Arc::from(bot.name.as_str()),
+                source,
+                token: bot.token.clone(),
+                api_url: bot.api_url.expose().clone(),
+                gateway: bot.gateway.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Supervises [`GATEWAY_SWEEP`]: every [`SWEEP_EVERY`], each gateway bot's
+/// limiter forgets the keys whose quota is back to a fresh key's, so a
+/// stream of one-off chats does not grow it for ever. `stop` ends it.
+fn spawn_sweep(supervisor: &Supervisor, gateway: Arc<Gateway>, stop: CancellationToken) {
+    supervisor.spawn(
+        Arc::from(GATEWAY_SWEEP),
+        Backoff::new(Duration::from_secs(1), SWEEP_EVERY, Duration::ZERO),
+        stop,
+        move || sweep(Arc::clone(&gateway)),
+    );
+}
+
+/// One run of [`GATEWAY_SWEEP`]; it ends only when its task is stopped.
+async fn sweep(gateway: Arc<Gateway>) -> Exit {
+    let mut every = tokio::time::interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        gateway.sweep_limiters(Instant::now());
+    }
+}
+
+/// The proxies whose forwarding headers the data plane trusts.
+pub(crate) fn trusted_proxies(cfg: &Config) -> Vec<tgin_botapi::IpNet> {
+    cfg.server
+        .as_ref()
+        .map(|server| server.trusted_proxies.clone())
+        .unwrap_or_default()
 }
 
 /// The secret Telegram must send with each update of `bot`'s webhook.

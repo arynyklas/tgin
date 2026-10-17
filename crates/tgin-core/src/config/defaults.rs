@@ -4,8 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use super::model::{
-    Admin, At, Balance, Breaker, ByteSize, HumanDuration, IpAllowlist, Log, LogFormat, LogLevel,
-    LongPoll, OnFull, Ordering, Pull, Reload, Retry, Runtime, Server, Template, Webhook,
+    Admin, At, Balance, Breaker, ByteSize, ChatRate, Endpoint, Gateway, GlobalRate, GroupRate,
+    HumanDuration, IpAllowlist, Log, LogFormat, LogLevel, LongPoll, OnFull, Ordering, Pull,
+    RateLimit, RateMode, Reload, Retry, Retry429, Runtime, Server, Template, Webhook, WebhookReply,
     WebhookSecret, WorkerThreads,
 };
 
@@ -53,7 +54,15 @@ pub(super) fn on_full() -> OnFull {
 }
 
 pub(super) fn endpoint_timeout() -> At<HumanDuration> {
-    duration(secs(10))
+    duration(super::DEFAULT_ENDPOINT_TIMEOUT)
+}
+
+pub(super) fn endpoints() -> At<Vec<Endpoint>> {
+    At::new(Vec::new())
+}
+
+pub(super) fn webhook_reply() -> WebhookReply {
+    WebhookReply::Execute
 }
 
 impl Default for Runtime {
@@ -135,6 +144,71 @@ impl Default for Webhook {
     }
 }
 
+impl Default for Gateway {
+    fn default() -> Self {
+        Self {
+            upstream_idle_timeout: duration(secs(60)),
+            rate_limit: RateLimit::default(),
+            retry_429: Retry429::default(),
+        }
+    }
+}
+
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self {
+            mode: RateMode::Shape,
+            max_delay: duration(secs(5)),
+            methods: At::new(
+                ["send*", "copyMessage*", "forwardMessage*"]
+                    .map(|method| At::new(method.to_owned()))
+                    .into(),
+            ),
+            global: GlobalRate::default(),
+            per_chat: ChatRate::default(),
+            per_group: GroupRate::default(),
+        }
+    }
+}
+
+impl Default for GlobalRate {
+    fn default() -> Self {
+        Self {
+            count: At::new(30),
+            per: duration(secs(1)),
+            burst: At::new(30),
+        }
+    }
+}
+
+impl Default for ChatRate {
+    fn default() -> Self {
+        Self {
+            count: At::new(1),
+            per: duration(secs(1)),
+            burst: At::new(3),
+        }
+    }
+}
+
+impl Default for GroupRate {
+    fn default() -> Self {
+        Self {
+            count: At::new(20),
+            per: duration(secs(60)),
+            burst: At::new(20),
+        }
+    }
+}
+
+impl Default for Retry429 {
+    fn default() -> Self {
+        Self {
+            max_wait: duration(secs(10)),
+        }
+    }
+}
+
 impl Default for Pull {
     fn default() -> Self {
         Self {
@@ -145,6 +219,7 @@ impl Default for Pull {
             ordering: ordering(),
             auth_token: None,
             aliases: Vec::new(),
+            honor_drop_pending: false,
         }
     }
 }

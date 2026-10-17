@@ -11,7 +11,9 @@ pub struct ClientOptions {
     pub connect_timeout: Duration,
     /// Bound on a whole request, from connecting to the end of the response
     /// body; a request can override it with `RequestBuilder::timeout`.
-    pub request_timeout: Duration,
+    /// `None` sets none, for transfers that may take as long as their
+    /// bytes keep flowing (the caller bounds idleness itself).
+    pub request_timeout: Option<Duration>,
     /// How long an idle pooled connection is kept for reuse.
     pub pool_idle_timeout: Duration,
     /// Follow up to 10 redirects. Off by default: tgin never needs them, and
@@ -31,7 +33,7 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(10),
+            request_timeout: Some(Duration::from_secs(10)),
             pool_idle_timeout: Duration::from_secs(90),
             follow_redirects: false,
             proxy: None,
@@ -51,13 +53,15 @@ impl Default for ClientOptions {
 pub fn client(opts: &ClientOptions) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(opts.connect_timeout)
-        .timeout(opts.request_timeout)
         .pool_idle_timeout(opts.pool_idle_timeout)
         .redirect(if opts.follow_redirects {
             reqwest::redirect::Policy::limited(10)
         } else {
             reqwest::redirect::Policy::none()
         });
+    if let Some(timeout) = opts.request_timeout {
+        builder = builder.timeout(timeout);
+    }
     if let Some(proxy) = &opts.proxy {
         builder = builder.proxy(proxy.clone());
     }
@@ -258,5 +262,35 @@ mod tests {
         let direct = client(&via_proxy(true)).get(&url).send().await;
         assert_eq!(direct.expect("response").status().as_u16(), 200);
         assert_eq!((seen(&target).await, seen(&proxy).await), (1, 1));
+    }
+
+    /// `request_timeout: None` sets no total deadline: a response slower
+    /// than the default deadline would allow still arrives, while
+    /// `Some` cuts it.
+    #[tokio::test]
+    async fn request_timeout_none_has_no_deadline() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let url = format!("{}/slow", server.uri());
+        let with = |request_timeout| ClientOptions {
+            request_timeout,
+            ..direct()
+        };
+
+        let cut = client(&with(Some(Duration::from_millis(100))))
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the deadline passes first");
+        assert!(cut.is_timeout(), "{}", describe_error(&cut));
+
+        let response = client(&with(None)).get(&url).send().await;
+        assert_eq!(response.expect("no deadline").status().as_u16(), 200);
     }
 }

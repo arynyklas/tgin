@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
-use tgin_botapi::{BotClient, BotUser, LongPollOptions, LongPollSource};
+use tgin_botapi::{BotClient, BotUser, Identity, LongPollOptions, LongPollSource};
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
@@ -62,6 +62,11 @@ fn batch(ids: &[i64]) -> ResponseTemplate {
 
 fn ok(result: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({ "ok": true, "result": result }))
+}
+
+/// The bot's `User`, as `getMe` answers by default.
+fn me() -> Value {
+    json!({ "id": 42, "is_bot": true, "first_name": "Bot", "username": "tgin_bot" })
 }
 
 fn api_error(status: u16, description: &str, retry_after: Option<u64>) -> ResponseTemplate {
@@ -120,9 +125,7 @@ struct Telegram {
 
 impl Telegram {
     async fn start(replies: Vec<ResponseTemplate>) -> Self {
-        let me =
-            ok(json!({ "id": 42, "is_bot": true, "first_name": "Bot", "username": "tgin_bot" }));
-        Self::start_with(me, replies).await
+        Self::start_with(ok(me()), replies).await
     }
 
     async fn start_with(get_me: ResponseTemplate, replies: Vec<ResponseTemplate>) -> Self {
@@ -265,7 +268,7 @@ impl Sink for Recorder {
     }
 }
 
-type Identities = Arc<Mutex<Vec<(SourceId, BotUser)>>>;
+type Identities = Arc<Mutex<Vec<(SourceId, Identity)>>>;
 
 struct Fixture {
     registry: Registry,
@@ -286,8 +289,8 @@ impl Fixture {
             opts,
             sink,
             metrics,
-            Arc::new(move |id: SourceId, user: &BotUser| {
-                seen.lock().push((id, user.clone()));
+            Arc::new(move |id: SourceId, identity: &Identity| {
+                seen.lock().push((id, identity.clone()));
             }),
         );
         Self {
@@ -476,9 +479,12 @@ async fn fatal_on_401() {
 async fn get_me_learns_username() {
     let mut tg = Telegram::start(vec![]).await;
     let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), options());
-    let bot = BotUser {
-        id: 42,
-        username: Some("tgin_bot".into()),
+    let bot = Identity {
+        user: BotUser {
+            id: 42,
+            username: Some("tgin_bot".into()),
+        },
+        raw: Bytes::from(me().to_string()),
     };
 
     let (ingest, handle) = fx.spawn();

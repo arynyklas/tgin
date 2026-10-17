@@ -109,7 +109,7 @@ struct Answer {
 fn client_options(timeout: Duration) -> ClientOptions {
     ClientOptions {
         connect_timeout: timeout,
-        request_timeout: timeout,
+        request_timeout: Some(timeout),
         no_proxy: true,
         ..ClientOptions::default()
     }
@@ -371,7 +371,10 @@ fn consumers_table(consumers: &[ConsumerStatus]) -> String {
             let endpoints: Vec<String> = consumer
                 .endpoints
                 .iter()
-                .map(|e| format!("{} ({})", e.url_redacted, e.breaker))
+                .map(|e| {
+                    let runtime = if e.runtime { ", runtime" } else { "" };
+                    format!("{} ({}{runtime})", e.url_redacted, e.breaker)
+                })
                 .collect();
             vec![
                 consumer.name.clone(),

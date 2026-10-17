@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "xtask", "tests/e2e/fake-telegram"]
 # The benchmark harness is a separate crate with its own Cargo.lock.
 exclude = ["tests/performance/benchmark"]
 
@@ -22,6 +22,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+form_urlencoded = "1.2.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 gungraun = "0.20.0"
 humantime = "2.4.0"
@@ -30,8 +31,10 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
 ipnet = "2.12.2"
 mimalloc = { version = "0.1.52", default-features = false }
+multer = "3.1.0"
 notify-debouncer-full = "0.7.0"
 parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
 prometheus-client = "0.25.1"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rand = "0.10.3"

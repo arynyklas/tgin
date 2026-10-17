@@ -63,6 +63,40 @@
           "minLength": 1,
           "type": "string"
         },
+        "gateway": {
+          "$ref": "#/$defs/Gateway",
+          "default": {
+            "rate_limit": {
+              "global": {
+                "burst": 30,
+                "count": 30,
+                "per": "1s"
+              },
+              "max_delay": "5s",
+              "methods": [
+                "send*",
+                "copyMessage*",
+                "forwardMessage*"
+              ],
+              "mode": "shape",
+              "per_chat": {
+                "burst": 3,
+                "count": 1,
+                "per": "1s"
+              },
+              "per_group": {
+                "burst": 20,
+                "count": 20,
+                "per": "1m"
+              }
+            },
+            "retry_429": {
+              "max_wait": "10s"
+            },
+            "upstream_idle_timeout": "1m"
+          },
+          "description": "The Bot API gateway for this bot's downstream clients. Changes apply\nlive."
+        },
         "ingress": {
           "anyOf": [
             {
@@ -89,7 +123,7 @@
         },
         "token": {
           "$ref": "#/$defs/Secret",
-          "description": "The bot token: only ASCII letters, digits, `:`, `_` and `-`."
+          "description": "The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot\nAPI gateway serves only tokens shaped `<digits>:<secret>`."
         }
       },
       "required": [
@@ -134,6 +168,32 @@
           "type": "string"
         }
       ]
+    },
+    "ChatRate": {
+      "additionalProperties": false,
+      "description": "Requests per chat.",
+      "properties": {
+        "burst": {
+          "default": 3,
+          "description": "Requests let through at once before the rate applies; at\nleast 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "count": {
+          "default": 1,
+          "description": "Requests per `per`; at least 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "per": {
+          "$ref": "#/$defs/Duration",
+          "default": "1s",
+          "description": "The period `count` requests are spread over; above 0."
+        }
+      },
+      "type": "object"
     },
     "ChatType": {
       "enum": [
@@ -229,6 +289,103 @@
       "required": [
         "url"
       ],
+      "type": "object"
+    },
+    "Gateway": {
+      "additionalProperties": false,
+      "description": "The Bot API gateway: how tgin forwards the bot's requests from\ndownstream clients to the Bot API.",
+      "properties": {
+        "rate_limit": {
+          "$ref": "#/$defs/RateLimit",
+          "default": {
+            "global": {
+              "burst": 30,
+              "count": 30,
+              "per": "1s"
+            },
+            "max_delay": "5s",
+            "methods": [
+              "send*",
+              "copyMessage*",
+              "forwardMessage*"
+            ],
+            "mode": "shape",
+            "per_chat": {
+              "burst": 3,
+              "count": 1,
+              "per": "1s"
+            },
+            "per_group": {
+              "burst": 20,
+              "count": 20,
+              "per": "1m"
+            }
+          }
+        },
+        "retry_429": {
+          "$ref": "#/$defs/Retry429",
+          "default": {
+            "max_wait": "10s"
+          }
+        },
+        "upstream_idle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "1m",
+          "description": "Longest wait for the Bot API to accept or send the next bytes of a\nrequest; at least 1s. A transfer that keeps moving is never cut."
+        }
+      },
+      "type": "object"
+    },
+    "GlobalRate": {
+      "additionalProperties": false,
+      "description": "Requests of the bot, over all chats.",
+      "properties": {
+        "burst": {
+          "default": 30,
+          "description": "Requests let through at once before the rate applies; at\nleast 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "count": {
+          "default": 30,
+          "description": "Requests per `per`; at least 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "per": {
+          "$ref": "#/$defs/Duration",
+          "default": "1s",
+          "description": "The period `count` requests are spread over; above 0."
+        }
+      },
+      "type": "object"
+    },
+    "GroupRate": {
+      "additionalProperties": false,
+      "description": "Requests per group, supergroup or channel (a negative `chat_id` or an\n`@username`), on top of `per_chat`.",
+      "properties": {
+        "burst": {
+          "default": 20,
+          "description": "Requests let through at once before the rate applies; at\nleast 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "count": {
+          "default": 20,
+          "description": "Requests per `per`; at least 1.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "per": {
+          "$ref": "#/$defs/Duration",
+          "default": "1m",
+          "description": "The period `count` requests are spread over; above 0."
+        }
+      },
       "type": "object"
     },
     "Ingress": {
@@ -486,6 +643,11 @@
           "default": "64MiB",
           "description": "Most queued bytes."
         },
+        "honor_drop_pending": {
+          "default": false,
+          "description": "Let `deleteWebhook` with `drop_pending_updates: true`, sent on this\nconsumer's gateway path, drop the calling bot's queued updates;\nthose another bot left before a reload stay. Off, the flag is\nignored.",
+          "type": "boolean"
+        },
         "lease_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "2m",
@@ -506,6 +668,11 @@
       "additionalProperties": false,
       "description": "tgin posts each update to HTTP endpoints, with retries and a circuit\nbreaker per endpoint.",
       "properties": {
+        "accept_set_webhook": {
+          "default": false,
+          "description": "Let `setWebhook`, sent on this consumer's gateway path, add its URL\nas an endpoint until tgin restarts, instead of answering it without\neffect. Only for a consumer fed by one bot. Whoever holds that bot's\ntoken then chooses where tgin posts its updates, from inside your\nnetwork: enable it only for trusted downstreams.",
+          "type": "boolean"
+        },
         "balance": {
           "$ref": "#/$defs/Balance",
           "default": "round_robin"
@@ -530,11 +697,17 @@
           "description": "Most queued bytes."
         },
         "endpoints": {
-          "description": "Where updates are posted; at least one.",
+          "default": [],
+          "description": "Where updates are posted. Empty only with `accept_set_webhook: true`;\nupdates then queue until a `setWebhook` gives an endpoint.",
           "items": {
             "$ref": "#/$defs/Endpoint"
           },
           "type": "array"
+        },
+        "honor_drop_pending": {
+          "default": false,
+          "description": "Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with\n`drop_pending_updates: true`, sent on this consumer's gateway path,\ndrop the calling bot's queued updates; other bots' stay. Off, the\nflag is ignored.",
+          "type": "boolean"
         },
         "max_in_flight": {
           "default": 32,
@@ -559,12 +732,86 @@
             "max_age": "1h",
             "max_attempts": 10
           }
+        },
+        "webhook_reply": {
+          "$ref": "#/$defs/WebhookReply",
+          "default": "execute"
         }
       },
-      "required": [
-        "endpoints"
-      ],
       "type": "object"
+    },
+    "RateLimit": {
+      "additionalProperties": false,
+      "description": "Telegram's flood limits, applied before a request goes upstream.",
+      "properties": {
+        "global": {
+          "$ref": "#/$defs/GlobalRate",
+          "default": {
+            "burst": 30,
+            "count": 30,
+            "per": "1s"
+          }
+        },
+        "max_delay": {
+          "$ref": "#/$defs/Duration",
+          "default": "5s",
+          "description": "Longest delay `shape` adds before it answers 429 instead; at most\n1m. `0s` behaves like `reject`."
+        },
+        "methods": {
+          "default": [
+            "send*",
+            "copyMessage*",
+            "forwardMessage*"
+          ],
+          "description": "The methods limited, ignoring case: a method name, or a prefix\nfollowed by `*`. At least one unless `mode: off`.",
+          "items": {
+            "pattern": "^[A-Za-z]+\\*?$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/RateMode",
+          "default": "shape"
+        },
+        "per_chat": {
+          "$ref": "#/$defs/ChatRate",
+          "default": {
+            "burst": 3,
+            "count": 1,
+            "per": "1s"
+          }
+        },
+        "per_group": {
+          "$ref": "#/$defs/GroupRate",
+          "default": {
+            "burst": 20,
+            "count": 20,
+            "per": "1m"
+          }
+        }
+      },
+      "type": "object"
+    },
+    "RateMode": {
+      "description": "What a request beyond the limits gets.",
+      "oneOf": [
+        {
+          "const": "shape",
+          "description": "Delayed until the limits admit it, up to `max_delay`; a longer wait\nis answered with 429 at once.",
+          "type": "string"
+        },
+        {
+          "const": "reject",
+          "description": "Answered with 429 at once.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "No limits.",
+          "type": "string"
+        }
+      ]
     },
     "Reload": {
       "additionalProperties": false,
@@ -613,6 +860,18 @@
           "format": "uint32",
           "minimum": 1,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Retry429": {
+      "additionalProperties": false,
+      "description": "The transparent retry of a request the Bot API answered with 429.",
+      "properties": {
+        "max_wait": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "Longest `retry_after` waited out before the one retry; at most 1m.\nA longer one passes the 429 through; `0s` turns the retry off."
         }
       },
       "type": "object"
@@ -962,6 +1221,21 @@
         }
       },
       "type": "object"
+    },
+    "WebhookReply": {
+      "description": "What tgin does with a Bot API method call in an endpoint's response\nbody, the way Telegram handles a webhook reply.",
+      "oneOf": [
+        {
+          "const": "execute",
+          "description": "Call the method through the gateway, once, before the update is\nacknowledged.",
+          "type": "string"
+        },
+        {
+          "const": "ignore",
+          "description": "Ignore the response body.",
+          "type": "string"
+        }
+      ]
     },
     "WebhookSecret": {
       "anyOf": [

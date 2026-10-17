@@ -273,6 +273,8 @@ consumers:
                 supervisor: Arc::new(Supervisor::new()),
                 stop: CancellationToken::new(),
                 force: force.clone(),
+                via: tgin_runtime::http::Via::generate(),
+                reply: Default::default(),
             };
             let engine =
                 Engine::new(&load(yaml), metrics, reqwest::Client::new(), rt).expect("engine");

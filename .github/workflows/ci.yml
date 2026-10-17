@@ -113,7 +113,7 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo build --release --locked --target "$TARGET"
+      - run: cargo build --release --locked -p tgin --target "$TARGET"
       - name: Check the binary is statically linked
         run: |
           bin="target/$TARGET/release/tgin"
@@ -147,6 +147,51 @@ jobs:
           push: false
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+
+  # Real bot frameworks (aiogram, python-telegram-bot, grammY, Telegraf)
+  # against tgin and the fake Telegram in Docker: tests/e2e/compose.yaml.
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: docker version && docker compose version
+      # The two Rust images through the GHA layer cache (tgin's also reads the
+      # `docker` job's), into the buildx builder `cargo xtask e2e` builds with,
+      # so the runner's own `docker compose build` finds every layer cached.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the tgin image (cached)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: tgin-e2e-tgin:local
+          cache-from: |
+            type=gha,scope=e2e-tgin
+            type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=e2e-tgin
+      - name: Build the fake Telegram image (cached)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: tests/e2e/fake-telegram/Dockerfile
+          load: true
+          tags: tgin-e2e-fake:local
+          cache-from: type=gha,scope=e2e-fake
+          cache-to: type=gha,mode=max,scope=e2e-fake
+      - run: cargo xtask e2e
+      # The runner prints the logs itself on a failure it detects; this
+      # covers a run cut short (job timeout, cancellation) with the stack up.
+      - name: Compose logs
+        if: failure() || cancelled()
+        run: docker compose -f tests/e2e/compose.yaml -p tgin-e2e logs --no-color --timestamps
 
   bench-crate:
     runs-on: ubuntu-24.04
