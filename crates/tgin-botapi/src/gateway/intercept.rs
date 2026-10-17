@@ -424,6 +424,8 @@ mod tests {
         }
     }
 
+    /// The query string's value first, as Telegram reads it and as the
+    /// rate limits key a call's chat.
     #[test]
     fn params_query_first_then_body() {
         let json = HeaderValue::from_static("application/json");

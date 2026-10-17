@@ -1,6 +1,8 @@
 //! Request parameters read the way the Bot API server reads them
 //! (`td/tdnet/td/net/HttpReader.cpp`): the query string first, then a JSON,
-//! URL-encoded or multipart body, whose fields win.
+//! URL-encoded or multipart body. A name's first value wins, so the query
+//! string's beats the body's, as the server's `Query::arg` takes the first
+//! match.
 
 use std::{collections::BTreeMap, convert::Infallible};
 
@@ -43,8 +45,13 @@ impl Params {
     /// Read a URL-encoded query string or form body.
     pub fn add_form(&mut self, form: &[u8]) {
         for (key, value) in form_urlencoded::parse(form) {
-            self.args.insert(key.into_owned(), value.into_owned());
+            self.add(key.into_owned(), value.into_owned());
         }
+    }
+
+    /// Adds an argument unless the name already has one.
+    fn add(&mut self, name: String, value: String) {
+        self.args.entry(name).or_insert(value);
     }
 
     /// Read a body by its content type. Like the server, the match is a
@@ -81,7 +88,7 @@ impl Params {
                 serde_json::Value::String(text) => text,
                 other => other.to_string(),
             };
-            self.args.insert(key, text);
+            self.add(key, text);
         }
         Ok(())
     }
@@ -108,10 +115,7 @@ impl Params {
                     content_type: part_type,
                     data,
                 }),
-                None => {
-                    self.args
-                        .insert(name, String::from_utf8_lossy(&data).into_owned());
-                }
+                None => self.add(name, String::from_utf8_lossy(&data).into_owned()),
             }
         }
         Ok(())

@@ -191,10 +191,11 @@ enum Failed {
 /// - longer, what was read and the rest stream, as does any other body,
 ///   multipart included, unread.
 ///
-/// The chat is the buffered body's `chat_id`, as Telegram reads it, else
-/// the query string's. A streamed body's `chat_id` cannot be read, so the
-/// query string's is the only chat tgin can know there; without one only
-/// the global quota applies.
+/// The chat is the query string's `chat_id`, else the buffered body's, as
+/// Telegram reads it (`HttpReader` parses the URL before the body, and
+/// `Query::arg` takes the first match). A streamed body's `chat_id` cannot
+/// be read, so the query string's is the only chat tgin can know there;
+/// without one only the global quota applies.
 async fn prepare(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -225,7 +226,7 @@ async fn prepare(
     Ok(match read {
         Bounded::Complete(bytes) => {
             let chat = limited
-                .then(|| chat_key(content_type, &bytes).or_else(query_chat))
+                .then(|| query_chat().or_else(|| chat_key(content_type, &bytes)))
                 .flatten();
             (Payload::Buffered(bytes), chat)
         }
@@ -775,11 +776,13 @@ mod tests {
         headers
     }
 
-    /// The chat of a buffered body is its own `chat_id`, as Telegram reads
-    /// it, before the query string's; a streamed body's is the query
-    /// string's, the only one tgin can know. Without limits, none is read.
+    /// The chat of a buffered body is the query string's `chat_id`, as
+    /// Telegram reads it (`HttpReader` parses the URL before the body, and
+    /// `Query::arg` takes the first match), else the body's own; a streamed
+    /// body's is the query string's, the only one tgin can know. Without
+    /// limits, none is read.
     #[tokio::test]
-    async fn chat_from_body_before_query() {
+    async fn chat_from_query_before_body() {
         let idle = Duration::from_secs(5);
         let headers = json_headers();
         let query = Some("chat_id=%40Chan");
@@ -791,7 +794,18 @@ mod tests {
             panic!("buffered");
         };
         assert_eq!(&bytes[..], br#"{"chat_id":-5}"#);
-        assert_eq!(chat, Some(ChatKey::Id(-5)), "the body comes first");
+        assert_eq!(
+            chat,
+            Some(ChatKey::Username("chan".into())),
+            "the query comes first"
+        );
+
+        let Ok((Payload::Buffered(_), chat)) =
+            prepare(&headers, Some("x=1"), body(), idle, true).await
+        else {
+            panic!("buffered");
+        };
+        assert_eq!(chat, Some(ChatKey::Id(-5)), "else the body's");
 
         let Ok((Payload::Buffered(_), chat)) =
             prepare(&headers, query, Body::from("{}"), idle, true).await

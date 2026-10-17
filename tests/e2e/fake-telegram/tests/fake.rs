@@ -201,7 +201,8 @@ async fn offset_semantics() {
     assert_eq!(fake.update_ids(TOKEN, json!({"offset": -2})).await, [4, 5]);
     assert_eq!(fake.update_ids(TOKEN, json!({})).await, [4, 5]);
 
-    // Body fields win over the query string.
+    // The query string's fields win over the body's: offset 1 confirms
+    // nothing, and limit 1 returns one.
     let response = fake
         .http
         .post(fake.url(&format!("/bot{TOKEN}/getUpdates?offset=1&limit=1")))
@@ -210,7 +211,7 @@ async fn offset_semantics() {
         .await
         .unwrap();
     let body: Value = response.json().await.unwrap();
-    assert_eq!(ids(&body["result"]), [5]);
+    assert_eq!(ids(&body["result"]), [4]);
 
     // Everything confirmed: an empty answer at once with timeout 0.
     assert!(
@@ -968,18 +969,29 @@ async fn chunked_and_multipart_bodies_accepted() {
     assert_eq!(body["result"]["document"]["file_size"], 3);
     assert_eq!(body["result"]["document"]["file_name"], "x.bin");
 
-    // A form body wins over the query string.
+    // The query string wins over a form body, and a field's first value
+    // wins, as the server's `Query::arg` takes the first match.
     let response = fake
         .http
-        .post(fake.url(&format!("/bot{TOKEN}/sendMessage?chat_id=1&text=q")))
+        .post(fake.url(&format!("/bot{TOKEN}/sendMessage?chat_id=1&text=q&text=r")))
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("text=b+x%21&chat_id=2")
+        .send()
+        .await
+        .unwrap();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["chat"]["id"], 1);
+    assert_eq!(body["result"]["text"], "q");
+    let response = fake
+        .http
+        .post(fake.url(&format!("/bot{TOKEN}/sendMessage?chat_id=1")))
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body("text=b+x%21")
         .send()
         .await
         .unwrap();
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["result"]["chat"]["id"], 1);
-    assert_eq!(body["result"]["text"], "b x!");
+    assert_eq!(body["result"]["text"], "b x!", "the body fills the rest");
 
     // python-telegram-bot's parameterless POST: no body, no Content-Type.
     let response = fake
@@ -1009,7 +1021,8 @@ async fn chunked_and_multipart_bodies_accepted() {
     assert_eq!(sends[0]["http_method"], "POST");
     assert_eq!(sends[0]["args"], json!({"chat_id": "77", "text": "hi"}));
     assert_eq!(sends[1]["transfer_encoding"], Value::Null);
-    assert_eq!(sends[1]["args"], json!({"chat_id": "1", "text": "b x!"}));
+    assert_eq!(sends[1]["args"], json!({"chat_id": "1", "text": "q"}));
+    assert_eq!(sends[2]["args"], json!({"chat_id": "1", "text": "b x!"}));
     // Empty filter values count as absent.
     let documents = fake.journal("?token=&method=sendDocument").await;
     assert_eq!(documents.len(), 1);

@@ -328,7 +328,7 @@ Each bot's `gateway.rate_limit` holds its calls to Telegram's flood limits befor
 | `per_chat` | 1 per second, burst 3 | the calls to one `chat_id` |
 | `per_group` | 20 per minute, burst 20 | on top of `per_chat`, the calls to a negative `chat_id` or an `@username` (groups, supergroups and channels) |
 
-A call books every quota it needs, or none, each for the instant the call leaves: when one quota delays it, the others are charged for that later slot, so a backlog on `global` does not let one chat's calls bunch up beyond `per_chat`. When tgin holds its body (a JSON or urlencoded body up to 64 KiB), its chat is the body's `chat_id`, else the query string's; a body that streams unread (a multipart upload, or a longer body) leaves only the query string's. A call whose chat tgin does not know counts against `global` only. `@username` keys ignore case.
+A call books every quota it needs, or none, each for the instant the call leaves: when one quota delays it, the others are charged for that later slot, so a backlog on `global` does not let one chat's calls bunch up beyond `per_chat`. Its chat is the query string's `chat_id`, else, when tgin holds its body (a JSON or urlencoded body up to 64 KiB), the body's, as telegram-bot-api reads a parameter given in both places; a body that streams unread (a multipart upload, or a longer body) leaves only the query string's. A call whose chat tgin does not know counts against `global` only. `@username` keys ignore case.
 
 What a call beyond the limits gets depends on `mode`:
 
