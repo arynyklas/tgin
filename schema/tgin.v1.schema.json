@@ -670,7 +670,7 @@
       "properties": {
         "accept_set_webhook": {
           "default": false,
-          "description": "Let `setWebhook`, sent on this consumer's gateway path, add its URL\nas an endpoint until tgin restarts, instead of answering it without\neffect. Only for a consumer fed by one bot.",
+          "description": "Let `setWebhook`, sent on this consumer's gateway path, add its URL\nas an endpoint until tgin restarts, instead of answering it without\neffect. Only for a consumer fed by one bot. Whoever holds that bot's\ntoken then chooses where tgin posts its updates, from inside your\nnetwork: enable it only for trusted downstreams.",
           "type": "boolean"
         },
         "balance": {

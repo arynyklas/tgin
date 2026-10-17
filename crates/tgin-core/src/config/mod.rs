@@ -9,6 +9,7 @@ mod sensitive;
 mod validate;
 
 use std::path::Path;
+use std::time::Duration;
 
 use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
@@ -20,6 +21,10 @@ pub use self::resolve::{
 };
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
+
+/// A push endpoint's `timeout` when the config gives none; a runtime
+/// endpoint from `setWebhook` always has it.
+pub const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether `token` can be sent as a bot token: non-empty, and only
 /// `[A-Za-z0-9:_-]`. The loader rejects any other token, and the Bot API

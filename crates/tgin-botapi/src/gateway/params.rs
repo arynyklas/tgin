@@ -70,7 +70,7 @@ pub(crate) fn encoding(content_type: &HeaderValue) -> Option<Encoding> {
 /// The value of the first pair named `name` of an urlencoded body: pairs
 /// split on `&`, name and value on the first `=`. `None` when that value is
 /// not UTF-8 once decoded; a pair whose name is not matches nothing.
-fn form_param<'a>(body: &'a [u8], name: &str) -> Option<Cow<'a, str>> {
+pub(crate) fn form_param<'a>(body: &'a [u8], name: &str) -> Option<Cow<'a, str>> {
     let value = body
         .split(|&b| b == b'&')
         .filter(|pair| !pair.is_empty())

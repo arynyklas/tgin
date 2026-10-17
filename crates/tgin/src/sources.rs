@@ -661,6 +661,7 @@ mod tests {
                 supervisor: Arc::clone(&supervisor),
                 stop: CancellationToken::new(),
                 force: force.clone(),
+                via: tgin_runtime::http::Via::generate(),
             },
         )
         .expect("engine");

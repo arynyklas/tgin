@@ -10,6 +10,7 @@
 //! name, for as long as it stays configured, and an id is never given to
 //! another bot. Sources must admit with [`Engine::source_id`].
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,7 +20,9 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tgin_runtime::backoff::Backoff;
 use tgin_runtime::breaker::BreakerState;
+use tgin_runtime::http::Via;
 use tgin_runtime::queue::{LeaseQueue, OnFull};
+use tgin_runtime::secret::Secret;
 use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -27,7 +30,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, ConsumerKind};
+use crate::consumer::push::RuntimeEndpoint;
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::envelope::Envelope;
 use crate::ids::{ConsumerId, SourceId};
@@ -45,6 +49,8 @@ pub struct EngineRuntime {
     pub stop: CancellationToken,
     /// Aborts in-flight push deliveries (second signal or deadline).
     pub force: CancellationToken,
+    /// This process's `Via` pseudonym, sent with every push.
+    pub via: Via,
 }
 
 /// Why a config could not be turned into an engine state. Nothing changed.
@@ -495,7 +501,43 @@ pub(crate) struct Shared {
     pub(crate) retired: Mutex<Vec<Arc<Slot>>>,
     /// Set by [`Engine::begin_drain`]; instances started later drain too.
     pub(crate) draining: AtomicBool,
+    /// Random per process: keys the token fingerprints of runtime
+    /// endpoints, so no fingerprint reveals or outlives a token.
+    pub(crate) token_keys: RandomState,
 }
+
+impl Shared {
+    /// The keyed fingerprint of the bot `source`'s token in `state`.
+    pub(crate) fn token_fingerprint(&self, state: &EngineState, source: SourceId) -> Option<u64> {
+        let info = state.source(source)?;
+        let bot = state.config.bots.iter().find(|b| *b.name == *info.name)?;
+        Some(self.token_keys.hash_one(bot.token.expose().as_str()))
+    }
+
+    /// The fingerprint of `token` if it is the bot `source`'s token in
+    /// `state`, the token a request authenticated with still being the
+    /// bot's current one.
+    fn authenticated(
+        &self,
+        state: &EngineState,
+        source: SourceId,
+        token: &Secret<String>,
+    ) -> Result<u64, TokenChanged> {
+        let fingerprint = self.token_keys.hash_one(token.expose().as_str());
+        if self.token_fingerprint(state, source) == Some(fingerprint) {
+            Ok(fingerprint)
+        } else {
+            Err(TokenChanged)
+        }
+    }
+}
+
+/// A bot-scoped change was refused: the token the request authenticated
+/// with is no longer the bot's (a reload rotated it, or removed the bot,
+/// while the request was in flight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the bot's token changed while the request was in flight")]
+pub struct TokenChanged;
 
 /// A retired instance's dispatcher, to forget once it has stopped.
 pub(crate) struct Retired {
@@ -581,6 +623,7 @@ impl Engine {
                 write: Mutex::new(()),
                 retired: Mutex::new(Vec::new()),
                 draining: AtomicBool::new(false),
+                token_keys: RandomState::new(),
             }),
             scratch: Mutex::new(Vec::new()),
             client,
@@ -639,6 +682,152 @@ impl Engine {
                 && slot.mode() == Mode::Pull
                 && *slot.fed_by.lock() == Some(source)
         })
+    }
+
+    /// The pull consumer `name` that the bot `source` polls through its
+    /// gateway path: the current instance if a rule of `source` targets it,
+    /// else an instance a reload removed or replaced that still drains and
+    /// that `source` fed. Never an instance another bot fed.
+    pub fn pull_consumer_for(&self, source: SourceId, name: &str) -> Option<Arc<PullConsumer>> {
+        let state = self.shared.state.load();
+        if let Some(Consumer::Pull(c)) = state.target(name).map(|t| &t.slot.consumer)
+            && state.feeds(source, name)
+        {
+            return Some(Arc::clone(c));
+        }
+        self.shared
+            .retired
+            .lock()
+            .iter()
+            .filter(|s| *s.name == *name && *s.fed_by.lock() == Some(source))
+            .find_map(|s| match &s.consumer {
+                Consumer::Pull(c) => Some(Arc::clone(c)),
+                Consumer::Push(_) => None,
+            })
+    }
+
+    /// The consumer `name` as the bot `source` sees it through its gateway
+    /// path: the current instance if a rule of `source` targets it, else a
+    /// pull instance a reload removed or replaced that still drains and that
+    /// `source` fed.
+    pub fn consumer_for(&self, source: SourceId, name: &str) -> Option<Consumer> {
+        let state = self.shared.state.load();
+        if state.feeds(source, name)
+            && let Some(target) = state.target(name)
+        {
+            return Some(target.slot.consumer.clone());
+        }
+        drop(state);
+        self.pull_consumer_for(source, name).map(Consumer::Pull)
+    }
+
+    /// What the gateway answers by for the consumer `name` of the current
+    /// config; `None` unless a rule of the bot `source` targets it.
+    pub fn consumer_settings(&self, source: SourceId, name: &str) -> Option<ConsumerSettings> {
+        let state = self.shared.state.load();
+        if !state.feeds(source, name) {
+            return None;
+        }
+        let consumer = state.config.consumers.iter().find(|c| c.name == name)?;
+        Some(match &consumer.kind {
+            ConsumerKind::Pull(pull) => ConsumerSettings {
+                mode: Mode::Pull,
+                accept_set_webhook: false,
+                honor_drop_pending: pull.honor_drop_pending,
+            },
+            ConsumerKind::Push(push) => ConsumerSettings {
+                mode: Mode::Push,
+                accept_set_webhook: push.accept_set_webhook,
+                honor_drop_pending: push.honor_drop_pending,
+            },
+        })
+    }
+
+    /// The bot `source`'s `drop_pending_updates`, sent with `token`: purges
+    /// the consumer `name` (as [`Engine::purge`]) when a rule of `source`
+    /// targets it and it has `honor_drop_pending: true`; otherwise `None`
+    /// and nothing is dropped. Serialized with reloads, so another bot's
+    /// consumer is never purged.
+    ///
+    /// # Errors
+    ///
+    /// `token` is no longer `source`'s token (a reload rotated it while the
+    /// request was in flight): nothing is dropped.
+    pub fn drop_pending(
+        &self,
+        source: SourceId,
+        token: &Secret<String>,
+        name: &str,
+    ) -> Result<Option<usize>, TokenChanged> {
+        let _write = self.shared.write.lock();
+        let state = self.shared.state.load();
+        self.shared.authenticated(&state, source, token)?;
+        let honors = state.config.consumers.iter().any(|c| {
+            c.name == name
+                && match &c.kind {
+                    ConsumerKind::Pull(pull) => pull.honor_drop_pending,
+                    ConsumerKind::Push(push) => push.honor_drop_pending,
+                }
+        });
+        if !honors || !state.feeds(source, name) {
+            return Ok(None);
+        }
+        Ok(state.target(name).map(|target| purge_slot(&target.slot)))
+    }
+
+    /// Applies the bot `source`'s `setWebhook` (`Some`: URL and secret
+    /// token) or `deleteWebhook` (`None`), sent with `token`, to the push
+    /// consumer `consumer`. `None` when the consumer takes no runtime
+    /// endpoint from `source`: it is no push consumer of the current config
+    /// with `accept_set_webhook: true` that a rule of `source` targets.
+    /// Serialized with reloads, which clear an endpoint whose bot no longer
+    /// feeds its consumer or whose token changed.
+    ///
+    /// # Errors
+    ///
+    /// `token` is no longer `source`'s token (a reload rotated it while the
+    /// request was in flight): nothing changes.
+    pub fn set_runtime_endpoint(
+        &self,
+        consumer: &str,
+        source: SourceId,
+        token: &Secret<String>,
+        endpoint: Option<(reqwest::Url, Option<Secret<String>>)>,
+    ) -> Result<Option<WebhookChange>, TokenChanged> {
+        let _write = self.shared.write.lock();
+        let state = self.shared.state.load();
+        let token_fingerprint = self.shared.authenticated(&state, source, token)?;
+        let Some(Consumer::Push(push)) = state.target(consumer).map(|t| &t.slot.consumer) else {
+            return Ok(None);
+        };
+        let accepts = state.config.consumers.iter().any(|c| {
+            c.name == consumer && matches!(&c.kind, ConsumerKind::Push(p) if p.accept_set_webhook)
+        });
+        if !accepts || !state.feeds(source, consumer) {
+            return Ok(None);
+        }
+        let had = push.runtime_endpoint_owner().is_some();
+        let Some((url, secret_token)) = endpoint else {
+            if !had {
+                return Ok(Some(WebhookChange::AlreadyDeleted));
+            }
+            push.set_runtime_endpoint(None);
+            tracing::info!(consumer = %consumer, "runtime endpoint removed by deleteWebhook");
+            return Ok(Some(WebhookChange::Deleted));
+        };
+        let endpoint = RuntimeEndpoint {
+            url,
+            secret_token,
+            source,
+            token_fingerprint,
+        };
+        if push.has_runtime_endpoint(&endpoint) {
+            return Ok(Some(WebhookChange::Unchanged));
+        }
+        let origin = endpoint.url.origin().ascii_serialization();
+        push.set_runtime_endpoint(Some(endpoint));
+        tracing::info!(consumer = %consumer, origin = %origin, "runtime endpoint set by setWebhook");
+        Ok(Some(WebhookChange::Set))
     }
 
     /// Sets the username of a bot of the current generation, so that its
@@ -756,15 +945,19 @@ impl Engine {
     /// `dropped{reason="purge"}`; `None` if there is no such consumer.
     pub fn purge(&self, name: &str) -> Option<usize> {
         let state = self.shared.state.load();
-        let slot = &state.target(name)?.slot;
-        let purged = slot.consumer.queue().purge();
-        slot.metrics.dropped(
-            ConsumerDropReason::Purge,
-            u64::try_from(purged).unwrap_or(u64::MAX),
-        );
-        slot.consumer.update_depth();
-        Some(purged)
+        Some(purge_slot(&state.target(name)?.slot))
     }
+}
+
+/// Drops the slot's unleased updates, counted as `dropped{reason="purge"}`.
+fn purge_slot(slot: &Slot) -> usize {
+    let purged = slot.consumer.queue().purge();
+    slot.metrics.dropped(
+        ConsumerDropReason::Purge,
+        u64::try_from(purged).unwrap_or(u64::MAX),
+    );
+    slot.consumer.update_depth();
+    purged
 }
 
 /// The engine's state for `/v1/status`.
@@ -783,7 +976,7 @@ pub struct ConsumerStatus {
     pub leased: usize,
     pub in_flight: usize,
     pub paused: bool,
-    /// Push consumers only.
+    /// Push consumers only: the configured endpoints, then the runtime one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<EndpointStatus>>,
 }
@@ -794,6 +987,30 @@ pub struct EndpointStatus {
     /// `scheme://host[:port]`, as config renderings show it.
     pub origin: String,
     pub breaker: BreakerStatus,
+    /// Whether a bot's `setWebhook` set it.
+    pub runtime: bool,
+}
+
+/// What the gateway needs to know of a consumer of the current config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerSettings {
+    pub mode: Mode,
+    /// A push consumer takes a runtime endpoint from `setWebhook`.
+    pub accept_set_webhook: bool,
+    /// `deleteWebhook(drop_pending_updates=true)` purges the consumer.
+    pub honor_drop_pending: bool,
+}
+
+/// What [`Engine::set_runtime_endpoint`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebhookChange {
+    /// A new runtime endpoint, with a fresh breaker.
+    Set,
+    /// The same URL, secret token and bot: nothing changed.
+    Unchanged,
+    Deleted,
+    /// There was none to delete.
+    AlreadyDeleted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -822,10 +1039,11 @@ fn consumer_status(c: &Consumer) -> ConsumerStatus {
             push.endpoints()
                 .into_iter()
                 .enumerate()
-                .map(|(index, (origin, breaker))| EndpointStatus {
+                .map(|(index, (origin, breaker, runtime))| EndpointStatus {
                     index,
                     origin: origin.to_string(),
                     breaker: breaker.into(),
+                    runtime,
                 })
                 .collect(),
         ),

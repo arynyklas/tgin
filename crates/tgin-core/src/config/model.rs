@@ -548,7 +548,9 @@ pub struct Push {
     pub breaker: Breaker,
     /// Let `setWebhook`, sent on this consumer's gateway path, add its URL
     /// as an endpoint until tgin restarts, instead of answering it without
-    /// effect. Only for a consumer fed by one bot.
+    /// effect. Only for a consumer fed by one bot. Whoever holds that bot's
+    /// token then chooses where tgin posts its updates, from inside your
+    /// network: enable it only for trusted downstreams.
     #[serde(default)]
     pub accept_set_webhook: bool,
     #[serde(default = "defaults::webhook_reply")]

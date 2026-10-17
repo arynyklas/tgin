@@ -54,7 +54,7 @@ pub(super) fn on_full() -> OnFull {
 }
 
 pub(super) fn endpoint_timeout() -> At<HumanDuration> {
-    duration(secs(10))
+    duration(super::DEFAULT_ENDPOINT_TIMEOUT)
 }
 
 pub(super) fn endpoints() -> At<Vec<Endpoint>> {

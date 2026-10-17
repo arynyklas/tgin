@@ -96,6 +96,8 @@ Names of bots and consumers are 1 to 63 lowercase letters, digits and `-`, start
 
 `max_in_flight` counts deliveries in progress over all of a consumer's endpoints, retries waiting included. With downstreams that handle requests concurrently, the default, 32, delivered every update at every webhook point of the benchmarks. A downstream that handles one request at a time (a single bot process) can deliver more with a lower value: in benchmarks from an earlier session, before the load generator's 100-connection cap, one aiogram process offered 5 000 updates/s took 1 809 updates/s with 32 and 2 268–2 280 with 8 ([PERF.md → `max_in_flight`](PERF.md#max_in_flight)).
 
+**Runtime endpoint.** A push consumer with `accept_set_webhook: true` (allowed only on a consumer fed by one bot) takes an endpoint from that bot's `setWebhook` on the consumer's gateway path, `/c/<consumer>/bot<token>/setWebhook`: an `http` or `https` `url` (`https` when it has no scheme, as on Telegram) with an optional `secret_token`, sent as `X-Telegram-Bot-Api-Secret-Token`. Whoever holds the bot's token then chooses where tgin posts the consumer's updates, from inside your network, so enable it only for trusted downstreams; tgin refuses its own pushes (see [Push consumers](#push-consumers-the-requests-tgin-sends)), so the endpoint cannot be tgin itself. It sits after the configured endpoints, with its own breaker (the consumer's `breaker`) and the default 10 s timeout; `setWebhook` with an empty `url` or `deleteWebhook` removes it. It survives a reload that keeps the consumer, `accept_set_webhook: true`, the bot feeding it and that bot's token; a reload that changes any of those clears it (logged), so rotating a leaked token evicts what its holder set, and a restart forgets it. A `setWebhook` or `deleteWebhook` still in flight when its token is rotated changes nothing and answers `401 Unauthorized`; the bodies of these requests (and of a consumer-scoped `getUpdates`) must arrive within the bot's `gateway.upstream_idle_timeout`, or the request gets `408 Request Timeout`, and a body announced over 64 KiB is refused at once (`413`, or for `getUpdates` `400`, as on `/c/<consumer>/getUpdates`). A push consumer with no endpoint at all leases nothing: its updates wait in the queue, bounded by `capacity` and `on_full`, and `retry.max_age` still counts from admission. `drop_pending_updates=true` on `deleteWebhook` (or on a captured `setWebhook`) purges the calling consumer only, and only with `honor_drop_pending: true`.
+
 ### Example
 
 ```yaml
@@ -184,7 +186,7 @@ A queue's `capacity` and `capacity_bytes` count leased updates too. While a back
 
 - a `2xx` answer delivers it;
 - `408`, `429`, any `5xx`, a timeout or a network error is transient: the update is retried after a backoff, a random delay up to `retry.initial` doubled per attempt and capped at `retry.max`, or the endpoint's `Retry-After` if that is longer (capped at `retry.max`);
-- any other `4xx`, and any `3xx` (tgin never follows redirects), dead-letters it at once.
+- any other `4xx`, any `3xx` (tgin never follows redirects), and a `508 Loop Detected` that carries the pushing process's own `Via` (the endpoint is this tgin itself, which refused its own push) dead-letter it at once. Any other `508` is a transient `5xx`.
 
 An update is dead-lettered after `retry.max_attempts` attempts, or when its next attempt would come after `retry.max_age` since tgin queued it (time a long-poll update was held back by backpressure, or a webhook update spent in Telegram's retries, is not counted). A dead-lettered update is dropped: logged as `update dead-lettered` (consumer, bot, `update_id`, update type, endpoint index and last error; never the payload or URL) and counted as `tgin_consumer_dropped_total{reason="dead_letter"}`. There is no dead-letter queue.
 
@@ -214,8 +216,11 @@ Each attempt is a `POST` of the update's JSON to the endpoint `url` with these h
 | `X-Tgin-Source` | The name of the bot the update came from. |
 | `X-Tgin-Update-Type` | The update type, such as `message`. |
 | `X-Telegram-Bot-Api-Secret-Token` | The endpoint's `secret_token`, if set (1 to 256 of `A-Za-z0-9_-`, checked at load). |
+| `Via` | `1.1 tgin-<16 hex digits>`: a pseudonym chosen at random when the process starts. |
 
 Each request is bounded by the endpoint's `timeout` (default 10 s). The endpoint should answer `2xx` once it has taken the update; see [Delivery semantics](#delivery-semantics) for the other answers.
+
+**tgin never acts on its own pushes.** Both planes answer `508 Loop Detected` to a request whose `Via` lists this process's pseudonym (RFC 9110 §7.6.3): the admin plane `{"error":"loop detected"}`, the data plane Telegram's shape, each with the process's own `Via` header. So an endpoint that points back at tgin (its webhook ingress, a pull endpoint, the gateway, or the admin API) is refused, and the pushing dispatcher, seeing its own `Via` on the `508`, dead-letters the update at once. The refusal is logged as a warning at most once a minute per plane, with the bot from `X-Tgin-Source`. Another tgin process has another pseudonym, so chained instances still pass updates to each other.
 
 ## Webhook ingress
 
@@ -316,7 +321,7 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
   "consumers": [
     {"name": "audit", "mode": "push", "depth": 0, "leased": 1, "in_flight": 1,
      "paused": false,
-     "endpoints": [{"url_redacted": "https://audit.internal", "breaker": "closed"}]}
+     "endpoints": [{"url_redacted": "https://audit.internal", "breaker": "closed", "runtime": false}]}
   ],
   "tasks": [
     {"name": "source:shop", "state": "running"},
@@ -327,7 +332,7 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 
 - `phase`: `starting`, `running`, `draining` or `stopped`.
 - `sources[]`, one per bot: `ingress` is `long_poll`, `webhook` or `null`; `state` is `starting`, `running`, `backoff`, `failed` or `stopped`. A long poll is `backoff` while it waits out a failed `getMe` or `getUpdates` (its task keeps running); a bot whose source could not be set up is `failed`. `error` (present only when there is one) says why the source backs off or failed, with secrets masked.
-- `consumers[]`: `depth` (waiting to be leased), `leased`, `in_flight` (push deliveries in progress, retries waiting included), `paused`, and for push consumers each endpoint's origin (`scheme://host[:port]`; path, query and credentials are never shown) and breaker (`closed`, `open` or `half_open`).
+- `consumers[]`: `depth` (waiting to be leased), `leased`, `in_flight` (push deliveries in progress, retries waiting included), `paused`, and for push consumers each endpoint's origin (`scheme://host[:port]`; path, query and credentials are never shown), breaker (`closed`, `open` or `half_open`) and `runtime`: `true` for the endpoint a bot's `setWebhook` set through the gateway (listed after the configured ones), `false` for a configured one.
 - `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls) with the supervisor's view of it: its state and, when it is restarted after a panic or failed, its last error, secrets masked. A long poll that backs off by itself stays `running` here; see `sources[]`.
 
 `GET /v1/config` shows the config as written, with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`): every secret is `"[redacted]"`, URL fields (`api_url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
@@ -375,7 +380,7 @@ Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot b
 | `tgin_consumer_in_flight` | gauge | `consumer` | Push deliveries in progress, retries waiting included; 0 for pull consumers. |
 | `tgin_consumer_dropped_total` | counter | `consumer`, `reason` | Updates a consumer dropped: `overflow` (`drop_oldest` eviction, or no room), `dead_letter`, `reload` (still held when a removed consumer's drain ended), `purge`, `oversized` (larger than `capacity_bytes`). |
 | `tgin_consumer_backpressure_seconds_total` | counter | `consumer` | Seconds the consumer's queue refused updates. |
-| `tgin_delivery_attempts_total` | counter | `consumer`, `endpoint`, `outcome` | Push attempts per endpoint (its index in `endpoints`, from 0; never the URL), by `outcome` `delivered`, `retry` or `dead_letter`. |
+| `tgin_delivery_attempts_total` | counter | `consumer`, `endpoint`, `outcome` | Push attempts per endpoint (its index in `endpoints`, from 0, or `runtime` for the endpoint a `setWebhook` set; never the URL), by `outcome` `delivered`, `retry` or `dead_letter`. |
 | `tgin_delivery_latency_seconds` | histogram | `consumer` | From admission (when tgin queued the update) to acknowledgement (pull) or to successful delivery (push); buckets from 1 ms, doubling, 16 of them. |
 | `tgin_config_reloads_total` | counter | `outcome` | Reloads `applied` or `rejected`. |
 | `tgin_config_generation` | gauge | | The config generation in effect. |

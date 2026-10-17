@@ -168,6 +168,7 @@ impl HotPath {
             supervisor: std::sync::Arc::new(Supervisor::new()),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            via: tgin_runtime::http::Via::generate(),
         };
         let engine = {
             let _enter = rt.enter();

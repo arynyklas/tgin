@@ -9,12 +9,13 @@ use bytes::Bytes;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 use tgin_core::consumer::push::{
-    Balance, Endpoint, LEASE_TIMEOUT, PushConsumer, PushOptions, RetryPolicy,
+    Balance, Endpoint, LEASE_TIMEOUT, PushConsumer, PushOptions, RetryPolicy, RuntimeEndpoint,
 };
 use tgin_core::envelope::Envelope;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
-use tgin_runtime::breaker::{Breaker, BreakerConfig};
+use tgin_runtime::breaker::{Breaker, BreakerConfig, BreakerState};
+use tgin_runtime::http::Via;
 use tgin_runtime::queue::{OnFull, Ordering, QueueConfig};
 use tgin_runtime::secret::Secret;
 use tokio::task::JoinHandle;
@@ -55,6 +56,21 @@ fn options(balance: Balance, max_in_flight: usize, retry: RetryPolicy) -> PushOp
         balance,
         retry,
         source_names: Arc::from([Arc::<str>::from("bot1")]),
+        breaker: BreakerConfig {
+            failure_threshold: 1000,
+            open_for: Duration::from_secs(60),
+        },
+        runtime_timeout: Duration::from_secs(5),
+    }
+}
+
+/// The endpoint a `setWebhook` of bot 0 names.
+fn runtime(server: &MockServer, route: &str, secret: Option<&str>) -> RuntimeEndpoint {
+    RuntimeEndpoint {
+        url: format!("{}{route}", server.uri()).parse().expect("url"),
+        secret_token: secret.map(|s| Secret::new(s.to_owned())),
+        source: SourceId(0),
+        token_fingerprint: 7,
     }
 }
 
@@ -102,6 +118,7 @@ fn client() -> reqwest::Client {
 struct Harness {
     reg: Registry,
     consumer: Arc<PushConsumer>,
+    via: Via,
     cancel: CancellationToken,
     force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -112,17 +129,20 @@ impl Harness {
         LazyLock::force(&LOGS);
         let mut reg = Registry::with_prefix("tgin");
         let metrics = CoreMetrics::register(&mut reg).consumer("hooks");
+        let via = Via::generate();
         let consumer = Arc::new(PushConsumer::new(
             Arc::from("hooks"),
             cfg,
             endpoints,
             opts,
             client(),
+            &via,
             metrics,
         ));
         let mut h = Self {
             reg,
             consumer,
+            via,
             cancel: CancellationToken::new(),
             force: CancellationToken::new(),
             task: None,
@@ -320,6 +340,8 @@ async fn delivers_with_headers() {
         assert_eq!(header(req, "x-tgin-source"), Some("bot1"));
         assert_eq!(header(req, "x-tgin-update-type"), Some("message"));
         assert_eq!(header(req, "x-tgin-attempt"), Some("1"));
+        let via = format!("1.1 {}", h.via.pseudonym());
+        assert_eq!(header(req, "via"), Some(via.as_str()));
         let id = update_id(req);
         let key = if id == 2 { "42" } else { "null" };
         assert_eq!(
@@ -984,4 +1006,201 @@ async fn force_during_backoff_keeps_chat_order() {
     h.settled().await;
     let order: Vec<i64> = requests(&server).await.iter().map(update_id).collect();
     assert_eq!(order, [1, 1, 2]);
+}
+
+#[tokio::test]
+async fn runtime_endpoint_receives_updates_with_secret() {
+    let server = MockServer::start().await;
+    ok(&server).await;
+    let configured = MockServer::start().await;
+    ok(&configured).await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        Vec::new(),
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    assert!(h.consumer.runtime_endpoint_url().is_none());
+    let set = runtime(&server, "/rt", Some("rt-secret_1"));
+    let url = set.url.clone();
+    h.consumer.set_runtime_endpoint(Some(set));
+    assert_eq!(h.consumer.runtime_endpoint_url(), Some(url));
+    assert_eq!(h.consumer.runtime_endpoint_owner(), Some((SourceId(0), 7)));
+    h.admit(1, None);
+    h.settled().await;
+    let got = requests(&server).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        header(&got[0], "via"),
+        Some(format!("1.1 {}", h.via.pseudonym()).as_str())
+    );
+    assert!(on(&got[0], "/rt"));
+    assert_eq!(
+        header(&got[0], "x-telegram-bot-api-secret-token"),
+        Some("rt-secret_1")
+    );
+    let origin: Arc<str> = Arc::from(server.uri());
+    assert_eq!(
+        h.consumer.endpoints(),
+        [(Arc::clone(&origin), BreakerState::Closed, true)]
+    );
+    h.assert_metric(
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="runtime",outcome="delivered"} 1"#,
+    );
+
+    // A reload's new endpoint set, or new options, keep it: configured
+    // endpoints first, the runtime one last.
+    h.consumer.set_endpoints(
+        vec![endpoint(&configured, "/cfg")],
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    h.consumer
+        .set_options(options(Balance::RoundRobin, 1, retry(10, 50, 5)));
+    assert_eq!(
+        h.consumer.endpoints(),
+        [
+            (Arc::from(configured.uri()), BreakerState::Closed, false),
+            (Arc::clone(&origin), BreakerState::Closed, true),
+        ]
+    );
+    h.admit(2, None);
+    h.admit(3, None);
+    h.settled().await;
+    assert_eq!(requests(&server).await.len(), 2);
+    assert_eq!(requests(&configured).await.len(), 1);
+
+    h.consumer.set_runtime_endpoint(None);
+    assert!(h.consumer.runtime_endpoint_url().is_none());
+    assert_eq!(
+        h.consumer.endpoints(),
+        [(Arc::from(configured.uri()), BreakerState::Closed, false)]
+    );
+    assert!(
+        !LOGS.text().contains("rt-secret_1"),
+        "the secret was logged"
+    );
+}
+
+/// Push consumer with no endpoint at all (decision 8, R21): it leases
+/// nothing, so updates admitted before a `setWebhook` stay queued, none
+/// dead-lettered, and the dispatcher sleeps until an endpoint arrives. On
+/// the paused clock the 50-minute sleep completes only if the dispatcher
+/// idles: a busy loop would never let the clock advance, and the watchdog
+/// on the real clock fails the test.
+#[test]
+fn updates_queued_before_set_webhook_are_delivered() {
+    let (done, finished) = std::sync::mpsc::channel();
+    let test = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let h = Harness::new(
+                queue(Ordering::None),
+                Vec::new(),
+                options(Balance::RoundRobin, 4, retry(10, 50, 10)),
+            );
+            for id in 1..=3 {
+                h.admit(id, None);
+            }
+            // Below the 1 h `max_age`, which still counts from admission.
+            sleep(Duration::from_secs(50 * 60)).await;
+            let stats = h.consumer.queue().stats();
+            assert_eq!((stats.available, stats.leased), (3, 0), "nothing leased");
+            assert_eq!(h.consumer.in_flight(), 0);
+            let dead = r#"tgin_consumer_dropped_total{consumer="hooks",reason="dead_letter"}"#;
+            assert_eq!(h.value(dead), 0);
+
+            tokio::time::resume();
+            let server = MockServer::start().await;
+            ok(&server).await;
+            h.consumer
+                .set_runtime_endpoint(Some(runtime(&server, "/late", None)));
+            let mut ids: Vec<i64> = wait_requests(&server, 3)
+                .await
+                .iter()
+                .map(update_id)
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [1, 2, 3]);
+            h.settled().await;
+            assert_eq!(h.value(dead), 0, "none dead-lettered");
+
+            // Without its endpoint again, it stops leasing: a new update
+            // stays queued.
+            h.consumer.set_runtime_endpoint(None);
+            h.admit(4, None);
+            tokio::task::yield_now().await;
+            let stats = h.consumer.queue().stats();
+            assert_eq!((stats.available, stats.leased), (1, 0));
+        });
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(Duration::from_secs(60)) {
+        Ok(()) => test.join().expect("the test thread"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(test.join().expect_err("the test panicked"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the dispatcher never idled: a busy loop kept the paused clock still")
+        }
+    }
+}
+
+/// A 508 carrying the pushing process's own `Via` is this tgin refusing
+/// its own push: the update is dead-lettered at once, never retried.
+#[tokio::test]
+async fn own_loop_detected_dead_letters_at_once() {
+    let server = MockServer::start().await;
+    // Answers as tgin's loop refusal does: 508, signed with the `Via` the
+    // push came with.
+    Mock::given(method("POST"))
+        .respond_with(|req: &Request| {
+            let via = req.headers.get("via").expect("a Via header").clone();
+            ResponseTemplate::new(508).insert_header("via", via)
+        })
+        .mount(&server)
+        .await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/self")],
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    h.admit(1, None);
+    h.settled().await;
+    assert_eq!(requests(&server).await.len(), 1, "never retried");
+    h.assert_metric(&format!("{} 1", h.attempts(0, "dead_letter")));
+    h.assert_metric(&format!("{} 0", h.attempts(0, "retry")));
+}
+
+/// Any other 508 (another server's, or another tgin's) is a transient 5xx:
+/// retried like a 503.
+#[tokio::test]
+async fn other_loop_detected_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(508).insert_header("via", "1.1 tgin-0000000000000001"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(508))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    ok(&server).await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/elsewhere")],
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    h.admit(1, None);
+    h.settled().await;
+    assert_eq!(requests(&server).await.len(), 3, "two 508s, then delivered");
+    h.assert_metric(&format!("{} 2", h.attempts(0, "retry")));
+    h.assert_metric(&format!("{} 1", h.attempts(0, "delivered")));
+    h.assert_metric(&format!("{} 0", h.attempts(0, "dead_letter")));
 }

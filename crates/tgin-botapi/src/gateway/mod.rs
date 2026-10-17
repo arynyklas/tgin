@@ -8,6 +8,7 @@
 
 pub mod chat_key;
 pub mod errors;
+mod intercept;
 pub mod limit;
 pub mod methods;
 pub mod metrics;
@@ -252,8 +253,9 @@ impl Gateway {
     /// The data router's fallback. A path that is no gateway path answers
     /// Telegram's `404 Not Found`; a token that matches no configured bot
     /// `401 Unauthorized`; a consumer the bot does not route to `404`; a
-    /// method other than GET or POST `405`. Everything else streams to
-    /// Telegram.
+    /// method other than GET or POST `405`. `getUpdates`, `getMe`, the
+    /// webhook methods, `logOut` and `close` are answered here (see
+    /// `intercept`). Everything else streams to Telegram.
     pub async fn handle(&self, req: Request) -> Response {
         let uri = req.uri().clone();
         let Some(target) = path::parse(uri.path()) else {
@@ -297,6 +299,23 @@ impl Gateway {
         if req.method() != Method::GET && req.method() != Method::POST {
             handles.count(Outcome::Rejected);
             return errors::error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+        }
+        if let Upstream::Method(_) = upstream {
+            let call = intercept::Call {
+                engine: &self.engine,
+                bot,
+                consumer,
+                label,
+                trusted_proxies: &table.trusted_proxies,
+            };
+            return match call.route(req).await {
+                intercept::Routed::Answered(response) => response,
+                intercept::Routed::Proxy(req) => proxy::forward(bot, upstream, label, req).await,
+                intercept::Routed::ProxyAndLearn(req) => {
+                    let response = proxy::forward(bot, upstream, label, req).await;
+                    intercept::learn_identity(bot, response).await
+                }
+            };
         }
         proxy::forward(bot, upstream, label, req).await
     }
@@ -488,6 +507,7 @@ mod tests {
                 supervisor: Arc::new(Supervisor::new()),
                 stop: CancellationToken::new(),
                 force: CancellationToken::new(),
+                via: tgin_runtime::http::Via::generate(),
             },
         )
         .expect("engine");

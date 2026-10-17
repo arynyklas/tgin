@@ -318,7 +318,7 @@ tgin posts each update to HTTP endpoints, with retries and a circuit breaker per
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `accept_set_webhook` | boolean | `false` | Let `setWebhook`, sent on this consumer's gateway path, add its URL as an endpoint until tgin restarts, instead of answering it without effect. Only for a consumer fed by one bot. |
+| `accept_set_webhook` | boolean | `false` | Let `setWebhook`, sent on this consumer's gateway path, add its URL as an endpoint until tgin restarts, instead of answering it without effect. Only for a consumer fed by one bot. Whoever holds that bot's token then chooses where tgin posts its updates, from inside your network: enable it only for trusted downstreams. |
 | `balance` | [Balance](#balance) | `round_robin` | How a push consumer picks the endpoint for each attempt, among those whose circuit breaker admits a request. |
 | `breaker` | [Breaker](#breaker) | `{"failure_threshold":5,"open_for":"30s"}` | Per-endpoint circuit breaker. |
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |

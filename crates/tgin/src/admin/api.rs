@@ -13,6 +13,7 @@ use tgin_core::config::{self, Ingress};
 use tgin_core::engine::{BreakerStatus, Mode};
 use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
 use tgin_runtime::config::ConfigError;
+use tgin_runtime::http::bearer_matches;
 use tgin_runtime::lifecycle::Phase;
 use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
@@ -21,7 +22,6 @@ use tgin_runtime::supervisor::TaskState;
 use super::{ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
 use crate::app::Shared;
 use crate::cli::VERSION;
-use crate::data_server::bearer_matches;
 use crate::reload::ReloadError;
 use crate::sources::{Kind, source_task};
 
@@ -61,6 +61,11 @@ fn authorized(shared: &Shared, headers: &HeaderMap) -> bool {
 
 fn error(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(json!({ "error": message }))).into_response()
+}
+
+/// `508 Loop Detected`: the request is one of this tgin's own pushes.
+pub(crate) fn loop_detected() -> Response {
+    error(StatusCode::LOOP_DETECTED, "loop detected")
 }
 
 fn unauthorized() -> Response {
@@ -235,6 +240,7 @@ fn status_of(shared: &Shared) -> Status {
                         BreakerStatus::HalfOpen => "half_open",
                     }
                     .to_owned(),
+                    runtime: endpoint.runtime,
                 })
                 .collect(),
         })
