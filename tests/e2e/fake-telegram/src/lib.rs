@@ -8,7 +8,9 @@
 //! - `POST /fake/updates/{token}`: queue an Update (JSON object); assigns
 //!   `update_id` when absent; answers `{"update_id":N}`.
 //! - `GET /fake/calls?token=&method=&kind=`: the journal (calls, downloads,
-//!   webhook deliveries), oldest first. `DELETE /fake/calls` clears it.
+//!   webhook deliveries), oldest first; empty filter values are ignored. A
+//!   call's `status` is `null` while it is pending and 499 when its client
+//!   went away first. `DELETE /fake/calls` clears it.
 //! - `POST /fake/faults`: `{token, method, status, retry_after?, count,
 //!   delay_ms?, description?}`; the next `count` calls answer `status`.
 //! - `GET /fake/health`.

@@ -157,6 +157,10 @@ pub(crate) struct BotState {
     pub next_message_id: i64,
     /// By `file_id`.
     pub files: HashMap<String, StoredFile>,
+    /// Bumped whenever a webhook is set anew or deleted; a delivery
+    /// started under an older one neither records errors nor keeps backing
+    /// off.
+    pub webhook_generation: u64,
     pub last_error: Option<(i64, String)>,
 }
 

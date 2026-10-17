@@ -3,8 +3,9 @@
 
 use std::{pin::pin, sync::Arc, time::Duration};
 
-use axum::http::header::{CONTENT_TYPE, TRANSFER_ENCODING};
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER, TRANSFER_ENCODING};
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::{
     api::{self, Call},
@@ -14,12 +15,15 @@ use crate::{
 };
 
 const SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
-/// Retry delays after a failed delivery: 1 s, doubling up to this.
+/// Retry delays after a failed delivery without `Retry-After`: 1 s,
+/// doubling up to this.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 struct Job {
     url: String,
     secret_token: Option<String>,
+    /// `BotState::webhook_generation` when the job was taken.
+    generation: u64,
     update_id: i64,
     payload: Bytes,
 }
@@ -30,6 +34,8 @@ struct Delivered {
     reason: &'static str,
     content_type: Option<String>,
     transfer_encoding: Option<String>,
+    /// The bot's `Retry-After`, in seconds.
+    retry_after: Option<u64>,
     body: Bytes,
 }
 
@@ -48,40 +54,70 @@ pub(crate) async fn deliver(shared: Arc<Shared>, bot: Arc<Bot>) {
                 () = shared.cancel.cancelled() => return,
             }
         };
-        let succeeded = match post(&shared, &job).await {
+        let retry_after = match post(&shared, &job).await {
             Ok(delivered) if (200..300).contains(&delivered.status) => {
                 failures = 0;
                 delivered_ok(&shared, &bot, &job, delivered).await;
-                true
+                continue;
             }
             Ok(delivered) => {
                 let message = format!(
                     "Wrong response from the webhook: {} {}",
                     delivered.status, delivered.reason
                 );
+                record_error(&bot, &job, message);
                 let mut entry = delivery_entry(&bot, &job, &delivered);
                 entry.status = Some(delivered.status);
                 shared.journal.record(entry);
-                bot.state.lock().last_error = Some((unix_seconds(), message));
-                false
+                delivered.retry_after
             }
             Err(error) => {
+                record_error(&bot, &job, error.clone());
                 let mut entry = Entry::new(&bot.token, bot.id, Kind::Webhook, "POST");
                 entry.update_id = Some(job.update_id);
-                entry.error = Some(error.clone());
+                entry.error = Some(error);
                 shared.journal.record(entry);
-                bot.state.lock().last_error = Some((unix_seconds(), error));
-                false
+                None
             }
         };
-        if !succeeded {
-            let delay = Duration::from_secs(1u64 << failures.min(3)).min(MAX_RETRY_DELAY);
-            failures = failures.saturating_add(1);
-            tokio::select! {
-                () = tokio::time::sleep(delay) => {}
-                () = shared.cancel.cancelled() => return,
-            }
+        let delay = retry_after.map_or_else(
+            || Duration::from_secs(1u64 << failures.min(3)).min(MAX_RETRY_DELAY),
+            Duration::from_secs,
+        );
+        failures = failures.saturating_add(1);
+        if !back_off(&shared, &bot, &job, delay).await {
+            return;
         }
+        if bot.state.lock().webhook_generation != job.generation {
+            failures = 0;
+        }
+    }
+}
+
+/// Wait `delay` before retrying, cut short when the webhook is set anew or
+/// deleted. `false` once the server stops.
+async fn back_off(shared: &Shared, bot: &Bot, job: &Job, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        let mut notified = pin!(bot.changed.notified());
+        notified.as_mut().enable();
+        if bot.state.lock().webhook_generation != job.generation {
+            return true;
+        }
+        tokio::select! {
+            () = notified => {}
+            () = tokio::time::sleep_until(deadline) => return true,
+            () = shared.cancel.cancelled() => return false,
+        }
+    }
+}
+
+/// `last_error` belongs to the webhook the failed POST went to: a delivery
+/// that outlived its webhook records nothing.
+fn record_error(bot: &Bot, job: &Job, message: String) {
+    let mut state = bot.state.lock();
+    if state.webhook_generation == job.generation {
+        state.last_error = Some((unix_seconds(), message));
     }
 }
 
@@ -93,6 +129,7 @@ fn next_job(bot: &Bot) -> Option<Job> {
     Some(Job {
         url: webhook.url.clone(),
         secret_token: webhook.secret_token.clone(),
+        generation: state.webhook_generation,
         update_id: update.update_id,
         payload: update.payload.clone(),
     })
@@ -118,12 +155,14 @@ async fn post(shared: &Shared, job: &Job) -> Result<Delivered, String> {
     };
     let content_type = header(CONTENT_TYPE);
     let transfer_encoding = header(TRANSFER_ENCODING);
+    let retry_after = header(RETRY_AFTER).and_then(|value| value.trim().parse().ok());
     let body = response.bytes().await.map_err(describe)?;
     Ok(Delivered {
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or(""),
         content_type,
         transfer_encoding,
+        retry_after,
         body,
     })
 }
@@ -149,11 +188,12 @@ fn delivery_entry(bot: &Bot, job: &Job, delivered: &Delivered) -> Entry {
     entry
 }
 
-/// Telegram ignores a reply naming no method, `getUpdates`-style `get*`
-/// methods, and the webhook and session methods.
+/// Telegram ignores a reply naming an empty method, any `get*` method, and
+/// the webhook and session methods, in any case.
 fn refused(method: &str) -> bool {
     let method = method.to_ascii_lowercase();
-    method.starts_with("get")
+    method.is_empty()
+        || method.starts_with("get")
         || matches!(
             method.as_str(),
             "setwebhook" | "deletewebhook" | "close" | "logout"
@@ -170,24 +210,21 @@ async fn delivered_ok(shared: &Arc<Shared>, bot: &Arc<Bot>, job: &Job, delivered
         {
             state.queue.remove(index);
         }
-        state.last_error = None;
     }
 
     // The response is read like a request (`HttpReader`); a body that does
-    // not parse yields no arguments, hence no method.
+    // not parse yields no arguments, hence no method, and its error is
+    // journaled.
     let mut params = Params::default();
     let content_type = delivered.content_type.clone().unwrap_or_default();
-    if params
-        .add_body(&content_type, delivered.body.clone())
-        .await
-        .is_err()
-    {
-        params = Params::default();
-    }
-    let method = params
-        .get("method")
-        .filter(|method| !method.is_empty())
-        .map(str::to_owned);
+    let parse_error = match params.add_body(&content_type, delivered.body.clone()).await {
+        Ok(()) => None,
+        Err(error) => {
+            params = Params::default();
+            Some(error.description().to_owned())
+        }
+    };
+    let method = params.get("method").map(str::to_owned);
     let outcome = method.as_deref().map(|method| {
         if refused(method) {
             ReplyOutcome::Refused
@@ -200,6 +237,7 @@ async fn delivered_ok(shared: &Arc<Shared>, bot: &Arc<Bot>, job: &Job, delivered
     entry.status = Some(delivered.status);
     entry.reply_method.clone_from(&method);
     entry.reply = outcome;
+    entry.error = parse_error;
     shared.journal.record(entry);
 
     if let (Some(method), Some(ReplyOutcome::Executed)) = (method, outcome) {

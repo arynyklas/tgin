@@ -46,7 +46,8 @@ pub struct FileEntry {
 }
 
 /// One journal line. Calls are recorded when they arrive, so `status` is
-/// `null` while a call (a long poll) is still pending.
+/// `null` while a call (a long poll) is still pending, and
+/// [`ABANDONED`] (499) once the client went away before the answer.
 #[derive(Clone, Debug, Serialize)]
 pub struct Entry {
     pub seq: u64,
@@ -126,16 +127,19 @@ impl Filter {
             Kind::File => "file",
             Kind::Webhook => "webhook",
         };
-        self.token
-            .as_ref()
-            .is_none_or(|token| *token == entry.token)
-            && self
-                .method
-                .as_ref()
-                .is_none_or(|method| method.eq_ignore_ascii_case(&entry.method))
-            && self.kind.as_ref().is_none_or(|wanted| wanted == kind)
+        // `?token=&method=getMe` filters by method only.
+        fn wanted(value: &Option<String>) -> Option<&str> {
+            value.as_deref().filter(|value| !value.is_empty())
+        }
+        wanted(&self.token).is_none_or(|token| token == entry.token)
+            && wanted(&self.method).is_none_or(|method| method.eq_ignore_ascii_case(&entry.method))
+            && wanted(&self.kind).is_none_or(|wanted| wanted == kind)
     }
 }
+
+/// The status of a call whose client disconnected before it was answered
+/// (nginx's "client closed request").
+pub const ABANDONED: u16 = 499;
 
 #[derive(Default)]
 pub struct Journal {
@@ -160,6 +164,17 @@ impl Journal {
         seq
     }
 
+    /// Record a call that is answered later: dropping the guard before
+    /// [`Pending::finish`] (hyper drops the handler when the client
+    /// disconnects) marks it [`ABANDONED`].
+    pub fn pending(&self, entry: Entry) -> Pending<'_> {
+        Pending {
+            journal: self,
+            seq: self.record(entry),
+            finished: false,
+        }
+    }
+
     /// Set the status of a recorded entry (a no-op once cleared).
     pub fn finish(&self, seq: u64, status: u16) {
         let mut inner = self.inner.lock();
@@ -180,6 +195,28 @@ impl Journal {
 
     pub fn clear(&self) {
         self.inner.lock().entries.clear();
+    }
+}
+
+/// A recorded call still waiting for its answer.
+pub struct Pending<'a> {
+    journal: &'a Journal,
+    seq: u64,
+    finished: bool,
+}
+
+impl Pending<'_> {
+    pub fn finish(mut self, status: u16) {
+        self.finished = true;
+        self.journal.finish(self.seq, status);
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.journal.finish(self.seq, ABANDONED);
+        }
     }
 }
 

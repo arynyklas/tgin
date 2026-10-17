@@ -7,8 +7,8 @@ use axum::{
     body::to_bytes,
     extract::Request,
     http::{
-        HeaderMap, StatusCode,
-        header::{CONTENT_TYPE, TRANSFER_ENCODING},
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_TYPE, RETRY_AFTER, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
 };
@@ -36,10 +36,12 @@ const WEBHOOK_ACTIVE: &str = "Conflict: can't use getUpdates method while webhoo
 const TERMINATED_BY_POLL: &str = "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running";
 const TERMINATED_BY_SET_WEBHOOK: &str = "Conflict: terminated by setWebhook request";
 
-/// A Bot API response: status and JSON body.
+/// A Bot API response: status, JSON body, and `Retry-After` for a 429
+/// (the server sets the header whenever the error carries `retry_after`).
 pub(crate) struct Answer {
     pub status: StatusCode,
     pub body: Bytes,
+    retry_after: Option<u64>,
 }
 
 impl Answer {
@@ -58,6 +60,7 @@ impl Answer {
         Self {
             status: StatusCode::OK,
             body: Bytes::from(body),
+            retry_after: None,
         }
     }
 
@@ -73,6 +76,7 @@ impl Answer {
         Self {
             status: StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             body: Bytes::from(body),
+            retry_after,
         }
     }
 
@@ -94,13 +98,21 @@ impl Answer {
         Self {
             status: StatusCode::OK,
             body: Bytes::from(body),
+            retry_after: None,
         }
     }
 }
 
 impl IntoResponse for Answer {
     fn into_response(self) -> Response {
-        (self.status, [(CONTENT_TYPE, "application/json")], self.body).into_response()
+        let mut response =
+            (self.status, [(CONTENT_TYPE, "application/json")], self.body).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -133,29 +145,23 @@ fn header(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// A percent-decoded token and its bot id; `None` for an invalid token.
-fn decode_token(raw: &str) -> Option<(String, i64)> {
-    let token = percent_decode_str(raw).decode_utf8().ok()?.into_owned();
-    let id = bot_id(&token)?;
-    Some((token, id))
-}
-
-/// Everything outside the control API.
+/// Everything outside the control API. Like td's `HttpReader`, the whole
+/// path is percent-decoded before the token is split off at the first `/`.
 pub(crate) async fn handle(shared: Arc<Shared>, request: Request) -> Response {
-    let path = request.uri().path().to_owned();
+    let path = percent_decode_str(request.uri().path())
+        .decode_utf8_lossy()
+        .into_owned();
     if let Some(rest) = path.strip_prefix("/file/bot") {
         return download(&shared, request.method().as_str(), rest);
     }
     let Some(rest) = path.strip_prefix("/bot") else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        return Answer::error(404, "Not Found", None).into_response();
     };
-    let (raw_token, raw_method) = rest.split_once('/').unwrap_or((rest, ""));
-    let Some((token, id)) = decode_token(raw_token) else {
+    let (token, method) = rest.split_once('/').unwrap_or((rest, ""));
+    let Some(id) = bot_id(token) else {
         return Answer::error(401, INVALID_TOKEN, None).into_response();
     };
-    let method = percent_decode_str(raw_method)
-        .decode_utf8_lossy()
-        .into_owned();
+    let (token, method) = (token.to_owned(), method.to_owned());
     if method.is_empty() {
         return Answer::error(404, METHOD_NOT_FOUND, None).into_response();
     }
@@ -195,7 +201,7 @@ pub(crate) async fn execute(shared: &Arc<Shared>, bot: &Arc<Bot>, call: Call) ->
     if method == "getupdates" && fault.is_none() {
         return get_updates(shared, bot, &call).await;
     }
-    let seq = shared.journal.record(call.entry(bot));
+    let pending = shared.journal.pending(call.entry(bot));
     let answer = match fault {
         Some(fault) => {
             if let Some(delay) = fault.delay_ms {
@@ -208,7 +214,7 @@ pub(crate) async fn execute(shared: &Arc<Shared>, bot: &Arc<Bot>, call: Call) ->
         }
         None => dispatch(shared, bot, &method, &call.params),
     };
-    shared.journal.finish(seq, answer.status.as_u16());
+    pending.finish(answer.status.as_u16());
     answer
 }
 
@@ -480,7 +486,11 @@ fn set_webhook(bot: &Bot, params: &Params) -> Answer {
         current.url == webhook.url && current.secret_token == webhook.secret_token
     });
     state.webhook = Some(webhook);
-    state.last_error = None;
+    if !unchanged {
+        // A new webhook: its delivery starts afresh, without the old error.
+        state.webhook_generation += 1;
+        state.last_error = None;
+    }
     drop(state);
     bot.changed.notify_waiters();
     let description = if unchanged {
@@ -497,6 +507,9 @@ fn delete_webhook(bot: &Bot, params: &Params) -> Answer {
         state.queue.clear();
     }
     let was_set = state.webhook.take().is_some();
+    if was_set {
+        state.webhook_generation += 1;
+    }
     state.last_error = None;
     drop(state);
     bot.changed.notify_waiters();
@@ -528,9 +541,10 @@ fn webhook_info(state: &BotState) -> Value {
     info
 }
 
-/// `getUpdates`: refused while a webhook is set; otherwise it becomes the
-/// bot's current poll (ending an older pending one with 409), confirms by
-/// `offset` and returns at once or parks up to `timeout`.
+/// `getUpdates`: refused while a webhook is set; otherwise confirms by
+/// `offset` and answers at once when there are updates or `timeout` is 0.
+/// Only a call that parks becomes the bot's current poll and ends an older
+/// parked one with 409 (`Client::do_get_updates`).
 async fn get_updates(shared: &Shared, bot: &Bot, call: &Call) -> Answer {
     let params = &call.params;
     let offset = params.integer("offset", 0, i64::MIN, i64::MAX);
@@ -538,26 +552,33 @@ async fn get_updates(shared: &Shared, bot: &Bot, call: &Call) -> Answer {
     let timeout = params.integer("timeout", 0, 0, LONG_POLL_MAX);
     let timeout = Duration::from_secs(timeout.unsigned_abs());
 
-    // Register before journaling: once a test sees the call, it is current.
-    let poll = {
+    // Register before journaling: once a test sees a pending call, it is
+    // the current poll.
+    let parked = {
         let mut state = bot.state.lock();
         if state.webhook.is_some() {
-            None
+            Err(Answer::error(409, WEBHOOK_ACTIVE, None))
         } else {
-            state.poll_seq += 1;
             state.confirm(offset);
-            Some(state.poll_seq)
+            if timeout.is_zero() || !state.queue.is_empty() {
+                Err(Answer::batch(
+                    state.queue.iter().take(limit).map(|u| &u.payload),
+                ))
+            } else {
+                state.poll_seq += 1;
+                Ok(state.poll_seq)
+            }
         }
     };
-    let seq = shared.journal.record(call.entry(bot));
-    let answer = match poll {
-        None => Answer::error(409, WEBHOOK_ACTIVE, None),
-        Some(poll) => {
+    let pending = shared.journal.pending(call.entry(bot));
+    let answer = match parked {
+        Err(answer) => answer,
+        Ok(poll) => {
             bot.changed.notify_waiters();
             long_poll(shared, bot, poll, limit, timeout).await
         }
     };
-    shared.journal.finish(seq, answer.status.as_u16());
+    pending.finish(answer.status.as_u16());
     answer
 }
 
@@ -597,20 +618,17 @@ async fn long_poll(
     }
 }
 
-/// `GET /file/bot{token}/{file_path}`, token and path percent-decoded.
+/// `GET /file/bot{token}/{file_path}`; `rest` is already percent-decoded.
 fn download(shared: &Arc<Shared>, http_method: &str, rest: &str) -> Response {
-    let (raw_token, raw_path) = rest.split_once('/').unwrap_or((rest, ""));
-    let Some((token, id)) = decode_token(raw_token) else {
+    let (token, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let Some(id) = bot_id(token) else {
         return Answer::error(401, INVALID_TOKEN, None).into_response();
     };
-    let path = percent_decode_str(raw_path)
-        .decode_utf8_lossy()
-        .into_owned();
-    let bot = shared.bot(&token, id);
-    let mut entry = Entry::new(&token, id, Kind::File, http_method);
-    entry.args.insert("file_path".to_owned(), path.clone());
+    let bot = shared.bot(token, id);
+    let mut entry = Entry::new(token, id, Kind::File, http_method);
+    entry.args.insert("file_path".to_owned(), path.to_owned());
     let seq = shared.journal.record(entry);
-    let data = bot.state.lock().file_by_path(&path).map(|f| f.data.clone());
+    let data = bot.state.lock().file_by_path(path).map(|f| f.data.clone());
     match data {
         Some(data) => {
             shared.journal.finish(seq, 200);

@@ -1,7 +1,10 @@
 //! The fake Bot API against real sockets: what an end-to-end test sees.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -122,6 +125,16 @@ impl Fake {
             entries.iter().filter(|e| e["status"].is_null()).count() == pending
         })
         .await;
+    }
+
+    /// A `getUpdates` call in the background; yields status and raw body.
+    fn spawn_poll(&self, token: &str, body: Value) -> tokio::task::JoinHandle<(u16, Bytes)> {
+        let http = self.http.clone();
+        let url = self.url(&format!("/bot{token}/getUpdates"));
+        tokio::spawn(async move {
+            let response = http.post(url).json(&body).send().await.unwrap();
+            (response.status().as_u16(), response.bytes().await.unwrap())
+        })
     }
 }
 
@@ -245,37 +258,27 @@ async fn offset_semantics() {
 #[tokio::test]
 async fn overlapping_polls_conflict() {
     let fake = Fake::start().await;
-    let older = {
-        let http = fake.http.clone();
-        let url = fake.url(&format!("/bot{TOKEN}/getUpdates"));
-        tokio::spawn(async move {
-            let response = http
-                .post(url)
-                .json(&json!({"timeout": 50}))
-                .send()
-                .await
-                .unwrap();
-            (response.status().as_u16(), response.bytes().await.unwrap())
-        })
-    };
+    let older = fake.spawn_poll(TOKEN, json!({"timeout": 50}));
     fake.wait_pending_poll(TOKEN, 1).await;
 
     // Another token's poll does not disturb it.
     assert!(fake.update_ids(OTHER, json!({})).await.is_empty());
+    // Nor does a call of the same token that answers at once: only a call
+    // that parks ends the older one (`Client::do_get_updates`).
+    assert!(
+        fake.update_ids(TOKEN, json!({"timeout": 0}))
+            .await
+            .is_empty()
+    );
+    fake.inject(TOKEN, text_update("first")).await;
+    let (status, body) = older.await.unwrap();
+    assert_eq!(status, 200);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ids(&body["result"]), [1]);
 
-    let newer = {
-        let http = fake.http.clone();
-        let url = fake.url(&format!("/bot{TOKEN}/getUpdates"));
-        tokio::spawn(async move {
-            let response = http
-                .post(url)
-                .json(&json!({"timeout": 50}))
-                .send()
-                .await
-                .unwrap();
-            response.json::<Value>().await.unwrap()
-        })
-    };
+    let older = fake.spawn_poll(TOKEN, json!({"offset": 2, "timeout": 50}));
+    fake.wait_pending_poll(TOKEN, 1).await;
+    let newer = fake.spawn_poll(TOKEN, json!({"offset": 2, "timeout": 50}));
     let (status, body) = older.await.unwrap();
     assert_eq!(status, 409);
     assert_eq!(
@@ -286,9 +289,10 @@ async fn overlapping_polls_conflict() {
     // The newer poll is still parked and is served normally.
     fake.wait_pending_poll(TOKEN, 1).await;
     fake.inject(TOKEN, text_update("hi")).await;
-    let body = newer.await.unwrap();
-    assert_eq!(body["ok"], true);
-    assert_eq!(ids(&body["result"]), [1]);
+    let (status, body) = newer.await.unwrap();
+    assert_eq!(status, 200);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ids(&body["result"]), [2]);
 
     let statuses: Vec<Value> = fake
         .journal(&format!("?token={TOKEN}&method=getUpdates"))
@@ -296,7 +300,34 @@ async fn overlapping_polls_conflict() {
         .iter()
         .map(|entry| entry["status"].clone())
         .collect();
-    assert_eq!(statuses, [json!(409), json!(200)]);
+    assert_eq!(statuses, [json!(200), json!(200), json!(409), json!(200)]);
+    fake.server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_poll_is_not_left_pending() {
+    let fake = Fake::start().await;
+    let head = format!(
+        "POST /bot{TOKEN}/getUpdates HTTP/1.1\r\nHost: fake\r\n\
+         Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{{\"timeout\":50}}"
+    );
+    let mut stream = TcpStream::connect(fake.server.addr()).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    fake.wait_pending_poll(TOKEN, 1).await;
+
+    // The client goes away (tgin cancels its poll on shutdown or restart).
+    drop(stream);
+    let query = format!("?token={TOKEN}&method=getUpdates");
+    let entries = fake
+        .journal_until(&query, |entries| !entries[0]["status"].is_null())
+        .await;
+    assert_eq!(entries[0]["status"], 499);
+
+    // The next poll is the only pending one.
+    let poll = fake.spawn_poll(TOKEN, json!({"timeout": 50}));
+    fake.wait_pending_poll(TOKEN, 1).await;
+    fake.inject(TOKEN, text_update("x")).await;
+    assert_eq!(poll.await.unwrap().0, 200);
     fake.server.stop().await.unwrap();
 }
 
@@ -415,6 +446,97 @@ async fn webhook_set_blocks_get_updates() {
     fake.server.stop().await.unwrap();
 }
 
+/// Webhooks with scripted answers; each request is reported as
+/// `(path, arrival)`. `/slow` answers 503 with `Retry-After: 2` once, then
+/// 200; `/busy` always answers 503 with `Retry-After: 30`; `/ok` answers 200.
+async fn scripted_hooks() -> (String, mpsc::UnboundedReceiver<(String, Instant)>) {
+    type Seen = Arc<(mpsc::UnboundedSender<(String, Instant)>, AtomicUsize)>;
+    async fn hook(State(seen): State<Seen>, uri: axum::http::Uri) -> Response {
+        let path = uri.path().to_owned();
+        seen.0.send((path.clone(), Instant::now())).unwrap();
+        let busy = |seconds: &'static str| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, seconds)],
+            )
+                .into_response()
+        };
+        match path.as_str() {
+            "/slow" if seen.1.fetch_add(1, Ordering::SeqCst) == 0 => busy("2"),
+            "/busy" => busy("30"),
+            _ => StatusCode::OK.into_response(),
+        }
+    }
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .fallback(hook)
+        .with_state(Arc::new((sender, AtomicUsize::new(0))));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (base, receiver)
+}
+
+#[tokio::test]
+async fn webhook_retry_after_and_last_error() {
+    let fake = Fake::start().await;
+    let (base, mut seen) = scripted_hooks().await;
+    let mut next = async || {
+        tokio::time::timeout(WAIT, seen.recv())
+            .await
+            .expect("no delivery in time")
+            .unwrap()
+    };
+    let deliveries = |count: usize| {
+        move |entries: &[Value]| entries.iter().filter(|e| e["kind"] == "webhook").count() == count
+    };
+    let journal = format!("?token={TOKEN}&kind=webhook");
+
+    // The bot's Retry-After (2 s) replaces the fake's own 1 s backoff.
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/slow")}))
+        .await;
+    fake.inject(TOKEN, text_update("a")).await;
+    let (_, failed) = next().await;
+    let (_, retried) = next().await;
+    assert!(
+        retried - failed >= Duration::from_secs(2),
+        "retried after {:?}",
+        retried - failed
+    );
+    fake.journal_until(&journal, deliveries(2)).await;
+    // The last error outlives later successes.
+    let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert_eq!(info["pending_update_count"], 0);
+    assert_eq!(
+        info["last_error_message"],
+        "Wrong response from the webhook: 503 Service Unavailable"
+    );
+
+    // A new webhook starts without an error.
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/busy")}))
+        .await;
+    let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert!(info.get("last_error_message").is_none(), "{info}");
+    fake.inject(TOKEN, text_update("b")).await;
+    assert_eq!(next().await.0, "/busy");
+    fake.journal_until(&journal, deliveries(3)).await;
+    let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert!(info.get("last_error_message").is_some(), "{info}");
+
+    // setWebhook cuts the 30 s Retry-After short: the update goes to the
+    // new webhook at once.
+    fake.ok(TOKEN, "setWebhook", json!({"url": format!("{base}/ok")}))
+        .await;
+    assert_eq!(next().await.0, "/ok");
+    fake.journal_until(&journal, deliveries(4)).await;
+    let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert_eq!(info["pending_update_count"], 0);
+    assert!(info.get("last_error_message").is_none(), "{info}");
+    fake.server.stop().await.unwrap();
+}
+
 struct Delivery {
     secret: Option<String>,
     content_type: Option<String>,
@@ -444,15 +566,14 @@ async fn replying_hook() -> (String, mpsc::UnboundedReceiver<Delivery>) {
             body: update,
         })
         .unwrap();
+        if let Some(method) = text.strip_prefix("reply:") {
+            let body = json!({"method": method, "chat_id": 1}).to_string();
+            return ([(CONTENT_TYPE, "application/json")], body).into_response();
+        }
         match text.as_str() {
             "echo" => (
                 [(CONTENT_TYPE, "application/json")],
                 r#"{"method":"sendMessage","chat_id":42,"text":"echo"}"#,
-            )
-                .into_response(),
-            "get" => (
-                [(CONTENT_TYPE, "application/json")],
-                r#"{"method":"getMe"}"#,
             )
                 .into_response(),
             "doc" => {
@@ -469,6 +590,11 @@ async fn replying_hook() -> (String, mpsc::UnboundedReceiver<Delivery>) {
                     --XyZ--\r\n";
                 ([(CONTENT_TYPE, "multipart/form-data; boundary=XyZ")], body).into_response()
             }
+            "unparsable" => (
+                [(CONTENT_TYPE, "application/json")],
+                r#"[{"method":"sendMessage"}]"#,
+            )
+                .into_response(),
             _ => StatusCode::OK.into_response(),
         }
     }
@@ -497,21 +623,31 @@ async fn webhook_delivery_and_reply_journaled() {
     let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
     assert_eq!(info["url"], hook.as_str());
 
-    for text in ["echo", "get", "doc", "plain"] {
+    // Telegram refuses an empty method, every `get*` method and the webhook
+    // and session methods, in any case.
+    let texts = [
+        "echo",
+        "reply:getMe",
+        "doc",
+        "plain",
+        "reply:DeleteWebhook",
+        "reply:setWebhook",
+        "reply:Close",
+        "reply:logout",
+        "reply:",
+        "reply:GETCHAT",
+        "unparsable",
+    ];
+    for text in texts {
         fake.inject(TOKEN, text_update(text)).await;
     }
     let entries = fake
         .journal_until(&format!("?token={TOKEN}"), |entries| {
-            let deliveries = entries.iter().filter(|e| e["kind"] == "webhook").count();
-            let replies = entries
-                .iter()
-                .filter(|e| e["via"] == "webhook_reply")
-                .count();
-            deliveries == 4 && replies == 2
+            entries.iter().filter(|e| e["kind"] == "webhook").count() == texts.len()
         })
         .await;
 
-    for (index, text) in ["echo", "get", "doc", "plain"].iter().enumerate() {
+    for (index, text) in texts.iter().enumerate() {
         let delivery = seen.recv().await.unwrap();
         assert_eq!(delivery.secret.as_deref(), Some("s3cr3t"));
         assert_eq!(delivery.content_type.as_deref(), Some("application/json"));
@@ -519,42 +655,43 @@ async fn webhook_delivery_and_reply_journaled() {
         assert_eq!(delivery.body["message"]["text"], *text);
     }
 
-    let deliveries: Vec<(Value, Value, Value, Value)> = entries
+    let deliveries: Vec<Value> = entries
         .iter()
         .filter(|e| e["kind"] == "webhook")
         .map(|e| {
-            (
-                e["update_id"].clone(),
-                e["status"].clone(),
-                e["reply_method"].clone(),
-                e["reply"].clone(),
-            )
+            json!([
+                e["update_id"],
+                e["status"],
+                e["reply_method"],
+                e["reply"],
+                e["error"]
+            ])
         })
         .collect();
+    let refused = |id: i64, method: &str| json!([id, 200, method, "refused", null]);
     assert_eq!(
         deliveries,
         [
-            (
-                json!(1),
-                json!(200),
-                json!("sendMessage"),
-                json!("executed")
-            ),
-            (json!(2), json!(200), json!("getMe"), json!("refused")),
-            (
-                json!(3),
-                json!(200),
-                json!("sendDocument"),
-                json!("executed")
-            ),
-            (json!(4), json!(200), Value::Null, Value::Null),
+            json!([1, 200, "sendMessage", "executed", null]),
+            refused(2, "getMe"),
+            json!([3, 200, "sendDocument", "executed", null]),
+            json!([4, 200, null, null, null]),
+            refused(5, "DeleteWebhook"),
+            refused(6, "setWebhook"),
+            refused(7, "Close"),
+            refused(8, "logout"),
+            refused(9, ""),
+            refused(10, "GETCHAT"),
+            json!([11, 200, null, null, "Bad Request: can't parse JSON object"]),
         ]
     );
 
+    // Only the executed replies became calls, after their deliveries.
     let replies: Vec<&Value> = entries
         .iter()
         .filter(|e| e["via"] == "webhook_reply")
         .collect();
+    assert_eq!(replies.len(), 2);
     assert_eq!(replies[0]["kind"], "call");
     assert_eq!(replies[0]["method"], "sendMessage");
     assert_eq!(replies[0]["args"]["chat_id"], "42");
@@ -567,10 +704,23 @@ async fn webhook_delivery_and_reply_journaled() {
         json!([{"name": "document", "filename": "r.txt", "size": 5}])
     );
     assert_eq!(replies[1]["status"], 200);
-    // A refused reply never runs.
-    assert!(!entries.iter().any(|e| e["method"] == "getMe"));
-
+    // Refused replies never ran: the webhook is still set.
+    let calls: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["kind"] == "call")
+        .map(|e| &e["method"])
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "setWebhook",
+            "getWebhookInfo",
+            "sendMessage",
+            "sendDocument"
+        ]
+    );
     let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert_eq!(info["url"], hook.as_str());
     assert_eq!(info["pending_update_count"], 0);
     fake.server.stop().await.unwrap();
 }
@@ -589,10 +739,18 @@ async fn fault_injection_429() {
         .await;
 
     let message = json!({"chat_id": 42, "text": "hello"});
-    let (status, body) = fake.call_raw(TOKEN, "sendMessage", message.clone()).await;
-    assert_eq!(status, 429);
+    let response = fake
+        .http
+        .post(fake.url(&format!("/bot{TOKEN}/sendMessage")))
+        .json(&message)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    // Clients that read only the header see the same delay.
+    assert_eq!(response.headers()["retry-after"], "3");
     assert_eq!(
-        body,
+        response.bytes().await.unwrap(),
         &br#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3","parameters":{"retry_after":3}}"#[..]
     );
     let result = fake.ok(TOKEN, "sendMessage", message).await;
@@ -796,9 +954,9 @@ async fn chunked_and_multipart_bodies_accepted() {
     assert_eq!(sends[0]["args"], json!({"chat_id": "77", "text": "hi"}));
     assert_eq!(sends[1]["transfer_encoding"], Value::Null);
     assert_eq!(sends[1]["args"], json!({"chat_id": "1", "text": "b x!"}));
-    let documents = fake
-        .journal(&format!("?token={TOKEN}&method=sendDocument"))
-        .await;
+    // Empty filter values count as absent.
+    let documents = fake.journal("?token=&method=sendDocument").await;
+    assert_eq!(documents.len(), 1);
     assert_eq!(documents[0]["transfer_encoding"], "chunked");
     assert_eq!(
         documents[0]["args"],
@@ -821,15 +979,17 @@ async fn chunked_and_multipart_bodies_accepted() {
     fake.server.stop().await.unwrap();
 }
 
+/// Tokens follow the e2e brief's rule, `^[0-9]+:[A-Za-z0-9_-]+$` with a
+/// positive id, which is narrower than the official server's (that one
+/// answers 421 for a non-integer bot id, for example); the error texts and
+/// the path handling are the official server's.
 #[tokio::test]
-async fn token_and_method_errors_match_official_server() {
+async fn token_and_method_errors_follow_the_brief_token_rule() {
     let fake = Fake::start().await;
-    // `%2F` decodes to a slash inside the token.
     for token in [
         "0123",
         "123",
         "abc:def",
-        "123:bad%2Fx",
         "123:white%20space",
         "123:",
         "0:abc",
@@ -847,15 +1007,43 @@ async fn token_and_method_errors_match_official_server() {
             "{token}"
         );
     }
+    let not_found = br#"{"ok":false,"error_code":404,"description":"Not Found: method not found"}"#;
     let (status, body) = fake.call_raw(TOKEN, "noSuchMethod", json!({})).await;
     assert_eq!(status, 404);
-    assert_eq!(
-        body,
-        &br#"{"ok":false,"error_code":404,"description":"Not Found: method not found"}"#[..]
-    );
+    assert_eq!(body, &not_found[..]);
     // Telegram matches method names case-insensitively.
     let me = fake.ok(TOKEN, "GETME", json!({})).await;
     assert_eq!(me["id"], 123456);
+
+    // The whole path is percent-decoded before the token is split off, as
+    // td's HttpReader does: an encoded slash separates token and method.
+    let encoded = TOKEN.replace(':', "%3A");
+    let response = fake
+        .http
+        .get(fake.url(&format!("/bot{encoded}%2FgetMe")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = fake
+        .http
+        .get(fake.url("/bot123:bad%2Fx/getMe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.bytes().await.unwrap(), &not_found[..]);
+
+    // Paths outside /bot… get the server's JSON 404.
+    for path in ["/", "/nope", "/api/getMe"] {
+        let response = fake.http.get(fake.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            &br#"{"ok":false,"error_code":404,"description":"Not Found"}"#[..]
+        );
+    }
 
     let response = fake
         .http
