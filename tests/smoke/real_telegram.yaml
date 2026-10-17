@@ -1,0 +1,49 @@
+# The tgin config of real_telegram.py, a template: the script fills in each
+# @NAME@ and writes the result to its work directory. The bot token is never
+# in a file: tgin reads it from TGIN_SMOKE_TOKEN, which the script sets for
+# tgin alone.
+version: 1
+
+runtime:
+  lame_duck: 0s
+  shutdown_grace: 5s
+
+log:
+  # Debug lines too, so that the final scan for the token covers them.
+  level: debug
+
+reload:
+  watch: false
+
+server:
+  listen: ["@DATA@"]
+
+# Loopback only, so the admin API needs no token.
+admin:
+  listen: ["@ADMIN@"]
+
+bots:
+  - name: smoke
+    token: ${env:TGIN_SMOKE_TOKEN}
+    api_url: "@API_URL@"
+    ingress:
+      long_poll:
+        timeout: 10s
+    routes:
+      - to: [workers, hooks, captured]
+
+consumers:
+  # Polled by the script on /c/workers/bot<token>/getUpdates.
+  workers:
+    pull: {}
+  # Pushes to hook.py, which answers the marked message with a webhook reply.
+  hooks:
+    push:
+      endpoints:
+        - url: "@HOOK_URL@"
+          secret_token: "@HOOK_SECRET@"
+      webhook_reply: execute
+  # No endpoint until the script's setWebhook on /c/captured/bot<token>/.
+  captured:
+    push:
+      accept_set_webhook: true
