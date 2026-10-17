@@ -1455,6 +1455,43 @@ async fn drop_pending_needs_the_feeding_bot_and_the_flag() {
     assert_eq!(h.stats("hooks").available, 1);
 }
 
+/// A consumer fed by several bots: one bot's `drop_pending_updates` drops
+/// only that bot's updates, as Telegram drops only the caller's.
+#[tokio::test(start_paused = true)]
+async fn drop_pending_drops_only_the_callers_updates() {
+    let yaml = r#"version: 1
+server: {}
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{ to: [shared] }]
+  - name: b
+    token: "2:bbb"
+    routes: [{ to: [shared] }]
+consumers:
+  shared: { push: { endpoints: [{ url: "http://127.0.0.1:9/x" }], honor_drop_pending: true } }
+"#;
+    let h = Harness::new(yaml);
+    let (a, b) = (SourceId(0), SourceId(1));
+    // Paused, so the updates stay queued.
+    assert!(h.engine.pause("shared"));
+    assert_eq!(admit_to(&h.engine, a, "message", 1), Admit::Admitted);
+    assert_eq!(admit_to(&h.engine, b, "message", 2), Admit::Admitted);
+    assert_eq!(admit_to(&h.engine, a, "message", 3), Admit::Admitted);
+    assert_eq!(h.stats("shared").available, 3);
+    assert_eq!(
+        h.engine.drop_pending(a, &tok("1:aaa"), "shared"),
+        Ok(Some(2))
+    );
+    assert_eq!(h.stats("shared").available, 1, "b's update survives");
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="shared",reason="purge"} 2"#);
+    assert_eq!(
+        h.engine.drop_pending(b, &tok("2:bbb"), "shared"),
+        Ok(Some(1))
+    );
+    assert_eq!(h.stats("shared").available, 0);
+}
+
 /// A runtime endpoint belongs to the bot whose `setWebhook` set it (R37):
 /// a reload that keeps the consumer and its bot keeps it; one that moves
 /// the consumer to another bot, leaves it with none, or turns

@@ -324,7 +324,7 @@ tgin posts each update to HTTP endpoints, with retries and a circuit breaker per
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |
 | `capacity_bytes` | [ByteSize](#bytesize) | `64MiB` | Most queued bytes. |
 | `endpoints` | list of [Endpoint](#endpoint) | `[]` | Where updates are posted. Empty only with `accept_set_webhook: true`; updates then queue until a `setWebhook` gives an endpoint. |
-| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with `drop_pending_updates: true`, sent on this consumer's gateway path, empty the consumer's queue. Off, the flag is ignored. |
+| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with `drop_pending_updates: true`, sent on this consumer's gateway path, drop the calling bot's queued updates; other bots' stay. Off, the flag is ignored. |
 | `max_in_flight` | integer (at least 1) | `32` | Most deliveries at once over all endpoints, counting those waiting to retry. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |

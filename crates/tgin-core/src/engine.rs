@@ -761,11 +761,13 @@ impl Engine {
         })
     }
 
-    /// The bot `source`'s `drop_pending_updates`, sent with `token`: purges
-    /// the consumer `name` (as [`Engine::purge`]) when a rule of `source`
-    /// targets it and it has `honor_drop_pending: true`; otherwise `None`
-    /// and nothing is dropped. Serialized with reloads, so another bot's
-    /// consumer is never purged.
+    /// The bot `source`'s `drop_pending_updates`, sent with `token`: drops
+    /// the unleased updates of `source` from the consumer `name` (counted as
+    /// [`Engine::purge`] counts) when a rule of `source` targets it and it
+    /// has `honor_drop_pending: true`; otherwise `None` and nothing is
+    /// dropped. As on Telegram, only the caller's updates go: another bot
+    /// feeding the same consumer keeps its own. Serialized with reloads, so
+    /// another bot's consumer is never purged.
     ///
     /// # Errors
     ///
@@ -790,7 +792,22 @@ impl Engine {
         if !honors || !state.feeds(source, name) {
             return Ok(None);
         }
-        Ok(state.target(name).map(|target| purge_slot(&target.slot)))
+        let Some(target) = state.target(name) else {
+            return Ok(None);
+        };
+        // Fed by the caller alone, the consumer holds the caller's updates,
+        // and at most some a reload left from a bot that fed it before.
+        let others_feed = state
+            .sources
+            .iter()
+            .flatten()
+            .any(|info| info.id != source && state.feeds(info.id, name));
+        Ok(Some(if others_feed {
+            let queue = target.slot.consumer.queue();
+            purged(&target.slot, queue.purge_where(|e| e.source == source))
+        } else {
+            purge_slot(&target.slot)
+        }))
     }
 
     /// Whether `token` is still the bot's token that `binding` was made
@@ -980,13 +997,17 @@ impl Engine {
 
 /// Drops the slot's unleased updates, counted as `dropped{reason="purge"}`.
 fn purge_slot(slot: &Slot) -> usize {
-    let purged = slot.consumer.queue().purge();
+    purged(slot, slot.consumer.queue().purge())
+}
+
+/// Counts `n` updates purged from the slot.
+fn purged(slot: &Slot, n: usize) -> usize {
     slot.metrics.dropped(
         ConsumerDropReason::Purge,
-        u64::try_from(purged).unwrap_or(u64::MAX),
+        u64::try_from(n).unwrap_or(u64::MAX),
     );
     slot.consumer.update_depth();
-    purged
+    n
 }
 
 /// The engine's state for `/v1/status`.

@@ -557,7 +557,8 @@ pub struct Push {
     pub webhook_reply: WebhookReply,
     /// Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with
     /// `drop_pending_updates: true`, sent on this consumer's gateway path,
-    /// empty the consumer's queue. Off, the flag is ignored.
+    /// drop the calling bot's queued updates; other bots' stay. Off, the
+    /// flag is ignored.
     #[serde(default)]
     pub honor_drop_pending: bool,
 }
