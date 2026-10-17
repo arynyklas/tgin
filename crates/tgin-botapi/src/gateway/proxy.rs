@@ -792,6 +792,15 @@ mod tests {
             panic!("streamed");
         };
         assert_eq!(chat, None);
+        let Ok((Payload::Streamed(_), chat)) = prepare(&multipart, query, body(), idle, true).await
+        else {
+            panic!("streamed");
+        };
+        assert_eq!(
+            chat,
+            Some(ChatKey::Username("chan".into())),
+            "a multipart body's chat is the query's"
+        );
 
         let Ok((Payload::Buffered(_), chat)) = prepare(&headers, query, body(), idle, false).await
         else {

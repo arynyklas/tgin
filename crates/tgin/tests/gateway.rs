@@ -1616,13 +1616,14 @@ async fn upstream_429_goes_upstream_at_most_twice() {
 
 /// The transparent retry does not depend on the rate-limit mode: with
 /// `mode: off` a method of `rate_limit.methods` is still buffered and
-/// retried once, and its retry books no quota (a chat quota of one a
-/// minute would refuse it). A method outside the list streams and is not
-/// retried.
+/// retried once, and its retry books no quota. Off mode reads no chat, so
+/// only the global quota could be in play: one request a minute, which a
+/// booked resend of `sendMessage` would take, refusing `sendPhoto`'s. A
+/// method outside the list streams and is not retried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_is_independent_of_rate_limit_mode() {
     let telegram = MockServer::start().await;
-    for method in ["sendMessage", "getChat"] {
+    for method in ["sendMessage", "sendPhoto", "getChat"] {
         Mock::given(path(format!("/bot{TOKEN}/{method}")))
             .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
             .up_to_n_times(1)
@@ -1636,7 +1637,7 @@ async fn retry_is_independent_of_rate_limit_mode() {
         .await;
     let tgin = start(&limited_config(
         &telegram.uri(),
-        "{ rate_limit: { mode: off, global: { count: 1, per: 1m, burst: 1 }, per_chat: { count: 1, per: 1m, burst: 1 } }, retry_429: { max_wait: 1s } }",
+        "{ rate_limit: { mode: off, global: { count: 1, per: 1m, burst: 1 } }, retry_429: { max_wait: 1s } }",
     ))
     .await;
     let chat = json!({ "chat_id": 42 });
@@ -1646,11 +1647,14 @@ async fn retry_is_independent_of_rate_limit_mode() {
     let requests = seen(&telegram).await;
     assert_eq!(requests.len(), 2, "retried once");
     assert_eq!(requests[1].body, requests[0].body);
+    let response = call(&tgin.http, tgin.addr, "sendPhoto", &chat).await;
+    assert_eq!(status_and_body(response).await, (200, SENT.to_owned()));
+    assert_eq!(seen(&telegram).await.len(), 4, "retried once");
     let response = call(&tgin.http, tgin.addr, "getChat", &chat).await;
     assert_eq!(status_and_body(response).await, (429, flood(1)));
-    assert_eq!(seen(&telegram).await.len(), 3, "never retried");
+    assert_eq!(seen(&telegram).await.len(), 5, "never retried");
 
-    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 2"#);
     for scope in ["global", "chat", "group"] {
         for action in ["delayed", "rejected"] {
             tgin.assert_metric(&format!(
