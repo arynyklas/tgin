@@ -1262,6 +1262,109 @@ async fn per_chat_shaping_delays_fourth_message() {
     tgin.stop().await;
 }
 
+/// Steps the frozen clock in 10 ms ticks for `span`, collecting what
+/// reaches Telegram, each stamped against `t0`.
+async fn arrivals_over(
+    arrivals: &mut mpsc::UnboundedReceiver<Arrival>,
+    t0: tokio::time::Instant,
+    span: Duration,
+) -> Vec<(Duration, Bytes)> {
+    let mut seen = Vec::new();
+    let tick = Duration::from_millis(10);
+    let mut passed = Duration::ZERO;
+    while passed <= span {
+        // Real time for requests already released to cross loopback.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = tx.send(());
+        });
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                arrival = arrivals.recv() => {
+                    let arrival = arrival.expect("open");
+                    seen.push((arrival.at - t0, arrival.body));
+                }
+                _ = &mut rx => break,
+            }
+        }
+        tokio::time::advance(tick).await;
+        passed += tick;
+    }
+    seen
+}
+
+/// The e2e shaping scenario's pattern: grammY sends five messages to one
+/// private chat at once (`Promise.all`), with the default limits. They
+/// reach Telegram at exactly 0, 0, 0, 1 s and 2 s.
+#[tokio::test(start_paused = true)]
+async fn five_at_once_to_one_chat_arrive_at_the_chat_rate() {
+    let frozen = freeze();
+    let (api, mut arrivals) = stamped_telegram(vec![(200, SENT.to_owned())]).await;
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let t0 = tokio::time::Instant::now();
+    let sends: Vec<_> = (1..=5)
+        .map(|i| {
+            let (http, addr) = (tgin.http.clone(), tgin.addr);
+            let body = json!({ "chat_id": 42, "text": format!("burst {i}") });
+            tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
+        })
+        .collect();
+    let seen = arrivals_over(&mut arrivals, t0, Duration::from_millis(2_500)).await;
+    let at: Vec<Duration> = seen.iter().map(|(at, _)| *at).collect();
+    let s = Duration::from_secs;
+    assert_eq!(at, [s(0), s(0), s(0), s(1), s(2)]);
+    for send in sends {
+        assert_eq!(within("a response", send).await.expect("sent"), 200);
+    }
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// The same burst while another chat's call of the same bot waits out
+/// Telegram's 429 (`retry_after` 1) and books the limits again: the burst
+/// still arrives at 0, 0, 0, 1 s and 2 s, and the retry at 1 s.
+#[tokio::test(start_paused = true)]
+async fn five_at_once_beside_a_429_retry_arrive_at_the_chat_rate() {
+    let frozen = freeze();
+    let (api, mut arrivals) = stamped_telegram(vec![(429, flood(1)), (200, SENT.to_owned())]).await;
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let t0 = tokio::time::Instant::now();
+    let flooded = {
+        let (http, addr) = (tgin.http.clone(), tgin.addr);
+        let body = json!({ "chat_id": 41, "text": "flood" });
+        tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
+    };
+    let first = within("the flooded call", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!(first.at, t0);
+    let sends: Vec<_> = (1..=5)
+        .map(|i| {
+            let (http, addr) = (tgin.http.clone(), tgin.addr);
+            let body = json!({ "chat_id": 42, "text": format!("burst {i}") });
+            tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
+        })
+        .collect();
+    let seen = arrivals_over(&mut arrivals, t0, Duration::from_millis(2_500)).await;
+    let of = |needle: &[u8]| -> Vec<Duration> {
+        seen.iter()
+            .filter(|(_, body)| body.windows(needle.len()).any(|w| w == needle))
+            .map(|(at, _)| *at)
+            .collect()
+    };
+    let s = Duration::from_secs;
+    assert_eq!(of(b"burst"), [s(0), s(0), s(0), s(1), s(2)]);
+    assert_eq!(of(b"flood"), [s(1)]);
+    assert_eq!(within("the retry", flooded).await.expect("sent"), 200);
+    for send in sends {
+        assert_eq!(within("a response", send).await.expect("sent"), 200);
+    }
+    frozen.thaw();
+    tgin.stop().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn reject_mode_answers_429_shaped() {
     let frozen = freeze();
@@ -1455,15 +1558,15 @@ async fn multipart_uses_global_only_and_is_never_retried() {
     assert_eq!(requests.len(), 4, "never retried");
     assert_eq!(requests[3].body, long.as_bytes());
 
-    // The global quota still applies: the fifth request is tgin's own 429.
-    // Four in any window of 4 × 1 min: the next slot is up to 4 min away.
+    // The global quota still applies: the fifth request is tgin's own 429,
+    // one interval (1 min) after the burst of 4.
     let response = document().await.expect("response");
     assert_eq!(response.status(), 429);
     let (_, body) = json_of(response).await;
     let retry_after = body["parameters"]["retry_after"]
         .as_u64()
         .expect("retry_after");
-    assert!((1..=240).contains(&retry_after), "{body}");
+    assert!((1..=60).contains(&retry_after), "{body}");
     assert_eq!(seen(&telegram).await.len(), 4);
     tgin.assert_metric(
         r#"tgin_gateway_ratelimited_total{bot="gw",scope="global",action="rejected"} 1"#,

@@ -347,8 +347,8 @@ mod tests {
                 scope: Scope::Chat
             }
         );
-        // Another chat is not held back by the second one's wait: the
-        // calendar's second slot at once is still free.
+        // Another chat is not held back by the second one's wait: global's
+        // burst still has a slot now.
         let third = limiter.acquire(Some(&ChatKey::Id(8)), now).unwrap();
         assert_eq!(
             third,
@@ -357,12 +357,13 @@ mod tests {
                 scope: Scope::Global
             }
         );
-        // Now two are booked at once: a fourth waits for the window.
+        // Global is now 0, 0 and 2 s: a fourth fits at 1 s, as a GCRA of
+        // 1/s burst 2 lets it, without moving the booking at 2 s.
         let fourth = limiter.acquire(Some(&ChatKey::Id(9)), now).unwrap();
         assert_eq!(
             fourth,
             Admitted {
-                delay: Duration::from_secs(2),
+                delay: Duration::from_secs(1),
                 scope: Scope::Global
             }
         );
@@ -455,9 +456,9 @@ mod tests {
 
     proptest::proptest! {
         /// Whatever the schedule, the start times of the admitted requests
-        /// keep every quota: at most 5 bot-wide in any 500 ms (10/s burst
-        /// 5), and per chat (2/s burst 2) and per group (1/s burst 2) GCRA
-        /// conformance, `s_j − s_i ≥ (j − i − (burst − 1)) × T`.
+        /// keep every quota by the GCRA condition on sorted starts,
+        /// `t_j − t_i ≥ (j − i + 1 − burst) × T`: bot-wide (10/s burst 5),
+        /// per chat (2/s burst 2) and per group (1/s burst 2).
         #[test]
         fn every_quota_holds_on_the_start_times(
             requests in proptest::collection::vec((0u64..150, 0usize..6), 1..200),
@@ -475,17 +476,15 @@ mod tests {
             }
             starts.sort();
             let all: Vec<Instant> = starts.iter().map(|(s, _)| *s).collect();
-            for run in all.windows(6) {
-                proptest::prop_assert!(run[5] - run[0] >= Duration::from_millis(500), "{all:?}");
-            }
             let gcra = |of: &[Instant], interval: Duration, burst: u32| {
                 (0..of.len()).all(|i| {
                     (i + 1..of.len()).all(|j| {
-                        let n = u32::try_from(j - i).unwrap_or(u32::MAX);
-                        n < burst || of[j] - of[i] >= interval * (n - (burst - 1))
+                        let n = u32::try_from(j - i).unwrap_or(u32::MAX) + 1;
+                        n <= burst || of[j] - of[i] >= interval * (n - burst)
                     })
                 })
             };
+            proptest::prop_assert!(gcra(&all, Duration::from_millis(100), 5), "{all:?}");
             for (chat, key) in chats.iter().enumerate() {
                 let of: Vec<Instant> =
                     starts.iter().filter(|(_, c)| *c == chat).map(|(s, _)| *s).collect();
@@ -505,8 +504,8 @@ mod tests {
         // The defaults: 30/s burst 30, per chat 1/s burst 3, per group 20/min burst 20.
         let limiter = limiter(rate(30, 1, 30), rate(1, 1, 3), rate(20, 60, 20));
         let now = Instant::now();
-        // 110 other chats: three full bot-wide windows, and 20 in the fourth.
-        for chat in 0..110 {
+        // The reviewer's probe: 146 other chats first.
+        for chat in 0..146 {
             limiter
                 .acquire(Some(&ChatKey::Id(1_000 + chat)), now)
                 .expect("within max_delay");

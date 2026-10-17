@@ -338,8 +338,7 @@ macro_rules! rate_block {
 }
 
 rate_block! {
-    /// Requests of the bot, over all chats: at most `burst` in any window
-    /// of `burst × per / count`.
+    /// Requests of the bot, over all chats.
     GlobalRate
 }
 
