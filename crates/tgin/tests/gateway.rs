@@ -648,6 +648,10 @@ async fn slow_transfer_not_cut_while_bytes_flow() {
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="unreachable"} 1"#,
     );
+    // Counted once: a stalled upload is no client that left.
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="client_closed"} 0"#,
+    );
     tgin.assert_metric(r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="ok"} 1"#);
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="upstream_error"} 1"#,
@@ -686,6 +690,9 @@ async fn upstream_unreachable_is_502_shaped() {
     );
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="offline",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="offline",method="sendMessage",outcome="client_closed"} 0"#,
     );
     let logs = LOGS.text();
     assert!(
