@@ -72,7 +72,7 @@ pub struct Gateway {
     /// `tgin_webhook_replies_total` handles by push consumer.
     replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
     /// The requests forwarded to Telegram, for the shutdown's drain.
-    upstreams: Upstreams,
+    upstreams: Arc<Upstreams>,
 }
 
 /// The gateway's requests forwarded to Telegram: how many are in flight,
@@ -83,19 +83,20 @@ struct Upstreams {
     last: Mutex<Option<Instant>>,
 }
 
-/// One request on its way to Telegram, counted in [`Upstreams`] until it
-/// is dropped.
-struct Forwarding<'a>(&'a Upstreams);
+/// One request forwarded to Telegram, counted in [`Upstreams`] until it is
+/// dropped: with its response body, which may stream long after the
+/// headers, or with the request when no body is relayed.
+pub(super) struct Forwarding(Arc<Upstreams>);
 
-impl<'a> Forwarding<'a> {
-    fn new(upstreams: &'a Upstreams) -> Forwarding<'a> {
+impl Forwarding {
+    fn new(upstreams: &Arc<Upstreams>) -> Forwarding {
         upstreams.in_flight.fetch_add(1, Ordering::SeqCst);
         *upstreams.last.lock() = Some(Instant::now());
-        Forwarding(upstreams)
+        Forwarding(Arc::clone(upstreams))
     }
 }
 
-impl Drop for Forwarding<'_> {
+impl Drop for Forwarding {
     fn drop(&mut self) {
         // Stamped first: whoever sees nothing in flight sees this end.
         *self.0.last.lock() = Some(Instant::now());
@@ -225,7 +226,7 @@ impl Gateway {
             via: via.header_value().clone(),
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
-            upstreams: Upstreams::default(),
+            upstreams: Arc::default(),
         }
     }
 
@@ -363,18 +364,18 @@ impl Gateway {
             return match call.route(req).await {
                 intercept::Routed::Answered(response) => response,
                 intercept::Routed::Proxy(req) => {
-                    let _forwarding = Forwarding::new(&self.upstreams);
-                    proxy::forward(bot, upstream, label, req).await
+                    let forwarding = Forwarding::new(&self.upstreams);
+                    proxy::forward(bot, upstream, label, req, forwarding).await
                 }
                 intercept::Routed::ProxyAndLearn(req) => {
-                    let _forwarding = Forwarding::new(&self.upstreams);
-                    let response = proxy::forward(bot, upstream, label, req).await;
+                    let forwarding = Forwarding::new(&self.upstreams);
+                    let response = proxy::forward(bot, upstream, label, req, forwarding).await;
                     intercept::learn_identity(bot, response).await
                 }
             };
         }
-        let _forwarding = Forwarding::new(&self.upstreams);
-        proxy::forward(bot, upstream, label, req).await
+        let forwarding = Forwarding::new(&self.upstreams);
+        proxy::forward(bot, upstream, label, req, forwarding).await
     }
 
     /// When the gateway last forwarded a request to Telegram: `now` while

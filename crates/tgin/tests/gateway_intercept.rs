@@ -1819,6 +1819,68 @@ async fn drain_not_held_open_by_a_poller() {
         .expect("the poller does not panic");
 }
 
+/// Telegram answering `getMe` for `TOKEN`, and any file download with
+/// 8 KiB sent 1 KiB every 500 ms.
+async fn telegram_trickling_files() -> String {
+    let router = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+        if uri.path().ends_with("/getMe") {
+            let me = format!(r#"{{"ok":true,"result":{ME}}}"#);
+            return (
+                [("content-type", "application/json")],
+                axum::body::Body::from(me),
+            );
+        }
+        let chunks = futures_util::stream::unfold(0u32, |sent| async move {
+            if sent == 8 {
+                return None;
+            }
+            if sent > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Some((
+                Ok::<_, io::Error>(axum::body::Bytes::from(vec![b'f'; 1024])),
+                sent + 1,
+            ))
+        });
+        (
+            [("content-type", "application/octet-stream")],
+            axum::body::Body::from_stream(chunks),
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A download still streaming is a call in flight: one started 100 ms
+/// after the shutdown began and taking 3.5 s arrives whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_finishes_a_slow_download() {
+    let api = telegram_trickling_files().await;
+    let tgin = start(&drain_config(&api, "10s")).await;
+    tgin.signals
+        .send(SignalKind::Terminate)
+        .await
+        .expect("the app listens");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let response = tgin
+        .http
+        .get(tgin.url(&format!("/file/bot{TOKEN}/documents/file_0.bin")))
+        .send()
+        .await
+        .expect("response");
+    assert_eq!(response.status(), 200);
+    let body = timeout(PATIENCE, response.bytes())
+        .await
+        .expect("the body in time")
+        .expect("the whole body");
+    assert_eq!(body.len(), 8 * 1024);
+    tgin.stopped().await;
+}
+
 /// A removed push consumer's `tgin_webhook_replies_total` series stay
 /// while its retired instance drains, and go when the drain ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

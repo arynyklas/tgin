@@ -35,7 +35,7 @@ use super::chat_key::{ChatKey, chat_key};
 use super::limit::Limited;
 use super::metrics::{BotMetrics, MethodLabel, MethodMetrics, Outcome, RateAction};
 use super::params::{Encoding, encoding};
-use super::{Bot, Bounded, errors, read_bounded};
+use super::{Bot, Bounded, Forwarding, errors, read_bounded};
 
 /// The longest request body of a limited method read for its chat and
 /// kept to be sent again after a 429.
@@ -87,6 +87,7 @@ pub(super) async fn forward(
     upstream: Upstream<'_>,
     label: MethodLabel,
     req: Request,
+    forwarding: Forwarding,
 ) -> Response {
     let (parts, body) = req.into_parts();
     let (url, file, method) = match upstream {
@@ -124,6 +125,7 @@ pub(super) async fn forward(
         method: parts.method,
         limited,
         counted: AtomicBool::new(false),
+        forwarding: Mutex::new(Some(forwarding)),
     };
     if !buffered {
         return match call.send(url, headers, body).await {
@@ -267,6 +269,9 @@ struct Call<'a> {
     /// Whether the request's outcome is counted, or left to its response
     /// body's [`Tally`].
     counted: AtomicBool,
+    /// The request in flight for the shutdown's drain: handed to the
+    /// relayed body, else dropped with this call.
+    forwarding: Mutex<Option<Forwarding>>,
 }
 
 impl Drop for Call<'_> {
@@ -384,6 +389,7 @@ impl Call<'_> {
             bot: self.bot.metrics.clone(),
             label: self.label,
             outcome: outcome(status),
+            _forwarding: self.forwarding.lock().take(),
         };
         let download = Download::new(
             response,
@@ -652,6 +658,9 @@ struct Tally {
     label: MethodLabel,
     /// From the status; replaced by `upstream_error` when the body fails.
     outcome: Outcome,
+    /// Keeps the request in flight for the shutdown's drain until the body
+    /// ends, fails or is dropped.
+    _forwarding: Option<Forwarding>,
 }
 
 impl Tally {
