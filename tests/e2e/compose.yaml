@@ -68,6 +68,10 @@ services:
     image: ${TGIN_E2E_PROJECT:-tgin-e2e}-tgin:local
     stop_grace_period: 30s
     environment:
+      # The gateway at debug (`log.level` has no per-target form): a failed
+      # scenario's compose logs then show each call's rate-limit delay and
+      # its scope. Bot names and methods only, never a path or a token.
+      RUST_LOG: info,tgin_botapi::gateway=debug
       ADMIN_TOKEN: e2e-fake-admin-token
       AIOGRAM_POLL_TOKEN: *aiogram-poll-token
       AIOGRAM_HOOK_TOKEN: *aiogram-hook-token
