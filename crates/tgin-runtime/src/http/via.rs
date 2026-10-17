@@ -69,9 +69,10 @@ impl Via {
 }
 
 /// `router`, refusing every request whose `Via` names `via` with
-/// `refusal()`: a request this process sent came back to it. A warning,
-/// at most one a minute, names `plane` and the bot from `X-Tgin-Source`;
-/// never a path or a URL.
+/// `refusal()`, `via`'s own `Via` added: a request this process sent came
+/// back to it, and the sender tells its own refusal by that header. A
+/// warning, at most one a minute, names `plane` and the bot from
+/// `X-Tgin-Source`; never a path or a URL.
 pub fn refuse_loops(
     router: Router,
     via: Via,
@@ -121,7 +122,13 @@ async fn refuse(State(guard): State<Arc<LoopGuard>>, req: Request, next: Next) -
              a push endpoint points at tgin itself"
         );
     }
-    (guard.refusal)()
+    // Signed with this process's `Via`, so the pushing dispatcher can tell
+    // its own refusal from another server's 508.
+    let mut response = (guard.refusal)();
+    response
+        .headers_mut()
+        .insert(VIA, guard.via.header_value().clone());
+    response
 }
 
 #[cfg(test)]

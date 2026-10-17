@@ -109,9 +109,10 @@ pub struct PushConsumer {
     queue: LeaseQueue<Envelope>,
     targets: ArcSwap<Targets>,
     client: reqwest::Client,
-    /// `Via: 1.1 <pseudonym>` on every push, so tgin refuses a push that
-    /// comes back to itself (RFC 9110 §7.6.3).
-    via: HeaderValue,
+    /// This process's `Via`: sent as `Via: 1.1 <pseudonym>` on every push,
+    /// so tgin refuses a push that comes back to itself (RFC 9110 §7.6.3),
+    /// and found on that refusal's `508`.
+    via: Via,
     metrics: ConsumerMetrics,
     /// Round-robin position, shared by every endpoint set.
     cursor: AtomicUsize,
@@ -155,7 +156,7 @@ impl PushConsumer {
             queue: LeaseQueue::new(cfg),
             targets: ArcSwap::from_pointee(targets),
             client,
-            via: via.header_value().clone(),
+            via: via.clone(),
             metrics,
             cursor: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
@@ -571,7 +572,7 @@ impl PushConsumer {
         let slot = sent.slot();
         let mut headers = HeaderMap::with_capacity(6);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(VIA, self.via.clone());
+        headers.insert(VIA, self.via.header_value().clone());
         headers.insert(
             HeaderName::from_static(ATTEMPT_HEADER),
             HeaderValue::from(attempt),
@@ -606,8 +607,12 @@ impl PushConsumer {
                 let status = response.status();
                 if status.is_success() {
                     Ok(())
-                } else if status == StatusCode::LOOP_DETECTED {
-                    // The endpoint is this process itself: never retried.
+                } else if status == StatusCode::LOOP_DETECTED
+                    && self.via.seen_in(response.headers())
+                {
+                    // This process refused its own push: the endpoint is
+                    // tgin itself, and retrying changes nothing. Any other
+                    // 508 is a server's transient error.
                     Err(Failure::Permanent(Cause::Status(status.as_u16())))
                 } else if status == StatusCode::REQUEST_TIMEOUT
                     || status == StatusCode::TOO_MANY_REQUESTS

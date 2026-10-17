@@ -1148,13 +1148,18 @@ fn updates_queued_before_set_webhook_are_delivered() {
     }
 }
 
-/// An endpoint that answers 508 Loop Detected is this tgin itself: the
-/// update is dead-lettered at once, never retried.
+/// A 508 carrying the pushing process's own `Via` is this tgin refusing
+/// its own push: the update is dead-lettered at once, never retried.
 #[tokio::test]
-async fn loop_detected_dead_letters_at_once() {
+async fn own_loop_detected_dead_letters_at_once() {
     let server = MockServer::start().await;
+    // Answers as tgin's loop refusal does: 508, signed with the `Via` the
+    // push came with.
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(508))
+        .respond_with(|req: &Request| {
+            let via = req.headers.get("via").expect("a Via header").clone();
+            ResponseTemplate::new(508).insert_header("via", via)
+        })
         .mount(&server)
         .await;
     let h = Harness::new(
@@ -1167,4 +1172,35 @@ async fn loop_detected_dead_letters_at_once() {
     assert_eq!(requests(&server).await.len(), 1, "never retried");
     h.assert_metric(&format!("{} 1", h.attempts(0, "dead_letter")));
     h.assert_metric(&format!("{} 0", h.attempts(0, "retry")));
+}
+
+/// Any other 508 (another server's, or another tgin's) is a transient 5xx:
+/// retried like a 503.
+#[tokio::test]
+async fn other_loop_detected_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(508).insert_header("via", "1.1 tgin-0000000000000001"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(508))
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    ok(&server).await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/elsewhere")],
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    h.admit(1, None);
+    h.settled().await;
+    assert_eq!(requests(&server).await.len(), 3, "two 508s, then delivered");
+    h.assert_metric(&format!("{} 2", h.attempts(0, "retry")));
+    h.assert_metric(&format!("{} 1", h.attempts(0, "delivered")));
+    h.assert_metric(&format!("{} 0", h.attempts(0, "dead_letter")));
 }

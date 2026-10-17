@@ -25,7 +25,7 @@ use axum::response::Response;
 use ipnet::IpNet;
 use reqwest::Url;
 use serde::Serialize;
-use tgin_core::engine::{Consumer, Engine, Mode, WebhookChange};
+use tgin_core::engine::{Consumer, Engine, Mode, TokenChanged, WebhookChange};
 use tgin_runtime::secret::Secret;
 
 use super::metrics::{MethodLabel, Outcome};
@@ -107,49 +107,92 @@ impl Call<'_> {
         self.bot.metrics.method(self.label).count(outcome);
     }
 
-    async fn get_updates(&self, req: Request) -> Response {
-        self.count(Outcome::Local);
-        let Some(consumer) = self.consumer else {
-            return errors::error(StatusCode::CONFLICT, PROXY_ONLY_GET_UPDATES);
+    /// The request body, read up to [`PARAMS_LIMIT`] bytes within the
+    /// bot's `upstream_idle_timeout`, so a client cannot hold an intercept
+    /// (and the token it authenticated with) open by stalling its body. A
+    /// failed or stalled read is logged and counted `client_closed`; the
+    /// caller answers it with [`Abandoned::response`].
+    async fn read_body(&self, body: Body) -> Result<Bounded, Abandoned> {
+        let idle = self.bot.gateway.upstream_idle_timeout;
+        let abandoned = match tokio::time::timeout(idle, read_bounded(body, PARAMS_LIMIT)).await {
+            Ok(Ok(read)) => return Ok(read),
+            Ok(Err(_)) => Abandoned::Closed,
+            Err(_) => Abandoned::Stalled,
         };
-        match self.engine.pull_consumer_for(self.bot.source, consumer) {
-            Some(pull) => pull::poll(&pull, req, self.trusted_proxies).await,
-            None => errors::error(
-                StatusCode::CONFLICT,
-                &format!("Conflict: {consumer} is not a pull consumer of this bot"),
-            ),
-        }
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), reason = abandoned.reason(), "gateway request abandoned");
+        self.count(Outcome::ClientClosed);
+        Err(abandoned)
+    }
+
+    /// A bot-scoped change found the bot's token changed since this request
+    /// authenticated: the token is no longer valid, as on the next request.
+    fn token_changed(&self) -> Response {
+        tracing::info!(bot = %self.bot.name, method = self.label.as_str(), "refused: the bot's token changed while the request was in flight");
+        self.count(Outcome::Rejected);
+        errors::error(StatusCode::UNAUTHORIZED, "Unauthorized")
+    }
+
+    async fn get_updates(&self, req: Request) -> Response {
+        let pull = self.consumer.map(|consumer| {
+            (
+                consumer,
+                self.engine.pull_consumer_for(self.bot.source, consumer),
+            )
+        });
+        let pull = match pull {
+            None => {
+                self.count(Outcome::Local);
+                return errors::error(StatusCode::CONFLICT, PROXY_ONLY_GET_UPDATES);
+            }
+            Some((consumer, None)) => {
+                self.count(Outcome::Local);
+                return errors::error(
+                    StatusCode::CONFLICT,
+                    &format!("Conflict: {consumer} is not a pull consumer of this bot"),
+                );
+            }
+            Some((_, Some(pull))) => pull,
+        };
+        let (parts, body) = req.into_parts();
+        // A body over the limit goes on to `poll`, which refuses it as on
+        // the consumer's own path.
+        let body = match self.read_body(body).await {
+            Ok(Bounded::Complete(body)) => Body::from(body),
+            Ok(Bounded::Over(partial)) => partial.into_body(),
+            Err(abandoned) => return abandoned.response(),
+        };
+        self.count(Outcome::Local);
+        pull::poll(
+            &pull,
+            Request::from_parts(parts, body),
+            self.trusted_proxies,
+        )
+        .await
     }
 
     /// `setWebhook` (`set`) or `deleteWebhook`. A push consumer that accepts
     /// it takes or drops its runtime endpoint; anything else only answers
     /// as Telegram would. `drop_pending_updates` purges the calling consumer
-    /// alone, and only one that honours it.
+    /// alone, and only one that honours it. Both changes are bound to the
+    /// token this request authenticated with: rotated meanwhile, they are
+    /// refused with `401`.
     async fn webhook(&self, req: Request, set: bool) -> Response {
         let (parts, body) = req.into_parts();
-        let body = match read_bounded(body, PARAMS_LIMIT).await {
+        let body = match self.read_body(body).await {
             Ok(Bounded::Complete(body)) => body,
             Ok(Bounded::Over(_)) => {
                 self.count(Outcome::Local);
                 return errors::error(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE);
             }
-            Err(_) => {
-                tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request abandoned: the client closed the request body early");
-                self.count(Outcome::ClientClosed);
-                return errors::error(
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request: the request body ended early",
-                );
-            }
+            Err(abandoned) => return abandoned.response(),
         };
-        self.count(Outcome::Local);
         let content_type = parts.headers.get(header::CONTENT_TYPE);
         let param = |name| param(parts.uri.query(), content_type, &body, name);
         let drop_pending = param("drop_pending_updates").is_some_and(|v| to_bool(&v));
         // `deleteWebhook` is `setWebhook` with no URL.
         let url = if set { param("url") } else { None }.unwrap_or_default();
 
-        let source = self.bot.source;
+        let (source, token) = (self.bot.source, &self.bot.token);
         let capturing = self.consumer.filter(|&consumer| {
             self.engine
                 .consumer_settings(source, consumer)
@@ -160,6 +203,7 @@ impl Call<'_> {
                 match runtime_endpoint(&url, param("secret_token").as_deref()) {
                     Ok(endpoint) => Some(endpoint),
                     Err(description) => {
+                        self.count(Outcome::Local);
                         return errors::error(StatusCode::BAD_REQUEST, description);
                     }
                 }
@@ -169,12 +213,26 @@ impl Call<'_> {
         if let Some(consumer) = self.consumer
             && drop_pending
             && (!set || capturing.is_some())
-            && let Some(purged) = self.engine.drop_pending(source, consumer)
         {
-            tracing::info!(bot = %self.bot.name, consumer = %consumer, method = self.label.as_str(), purged, "pending updates dropped by drop_pending_updates");
+            match self.engine.drop_pending(source, token, consumer) {
+                Ok(Some(purged)) => {
+                    tracing::info!(bot = %self.bot.name, consumer = %consumer, method = self.label.as_str(), purged, "pending updates dropped by drop_pending_updates");
+                }
+                Ok(None) => {}
+                Err(TokenChanged) => return self.token_changed(),
+            }
         }
-        let change = capturing
-            .and_then(|consumer| self.engine.set_runtime_endpoint(consumer, source, endpoint));
+        let change = match capturing {
+            Some(consumer) => match self
+                .engine
+                .set_runtime_endpoint(consumer, source, token, endpoint)
+            {
+                Ok(change) => change,
+                Err(TokenChanged) => return self.token_changed(),
+            },
+            None => None,
+        };
+        self.count(Outcome::Local);
         let description = match change {
             Some(WebhookChange::Set) => WEBHOOK_WAS_SET,
             Some(WebhookChange::Unchanged) if drop_pending => WEBHOOK_WAS_SET,
@@ -213,6 +271,34 @@ impl Call<'_> {
         match serde_json::to_vec(&info) {
             Ok(result) => errors::ok_raw(&result),
             Err(_) => errors::error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+        }
+    }
+}
+
+/// Why an intercepted request's body was not read.
+#[derive(Clone, Copy)]
+enum Abandoned {
+    /// The client closed it early.
+    Closed,
+    /// No complete body within `upstream_idle_timeout`.
+    Stalled,
+}
+
+impl Abandoned {
+    fn reason(self) -> &'static str {
+        match self {
+            Abandoned::Closed => "the client closed the request body early",
+            Abandoned::Stalled => "no complete request body within upstream_idle_timeout",
+        }
+    }
+
+    fn response(self) -> Response {
+        match self {
+            Abandoned::Closed => errors::error(
+                StatusCode::BAD_REQUEST,
+                "Bad Request: the request body ended early",
+            ),
+            Abandoned::Stalled => errors::error(StatusCode::REQUEST_TIMEOUT, "Request Timeout"),
         }
     }
 }

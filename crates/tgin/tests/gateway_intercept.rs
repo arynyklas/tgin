@@ -16,6 +16,8 @@ use tgin::exit::Outcome;
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::lifecycle::{SignalKind, Signals};
 use tgin_runtime::obs::MetricsRegistry;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -1277,5 +1279,219 @@ consumers:
         .get(&format!("/c/p1/bot{TOKEN}/getUpdates?offset=2&timeout=0"))
         .await;
     assert_eq!((status, update_ids(&body).len()), (200, 0), "{body}");
+    tgin.stop().await;
+}
+
+/// The token a reload rotates `TOKEN` to, under the same bot name.
+const NEW_TOKEN: &str = "555555555:CCCCrotatedSecretTokenValue_-xyz";
+
+/// Telegram, answering `getMe` for `NEW_TOKEN` too.
+async fn telegram_with_rotation() -> MockServer {
+    let telegram = telegram().await;
+    Mock::given(path(format!("/bot{NEW_TOKEN}/getMe")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"ok":true,"result":{"id":555555555,"is_bot":true,"first_name":"Rotated","username":"hooked_bot"}}"#,
+            "application/json",
+        ))
+        .with_priority(1)
+        .mount(&telegram)
+        .await;
+    telegram
+}
+
+/// Waits until the gateway serves `token`: the reload applies the engine
+/// before the gateway's bot table.
+async fn wait_token(tgin: &Tgin, token: &str) {
+    let started = Instant::now();
+    while tgin.get(&format!("/bot{token}/getWebhookInfo")).await.0 != 200 {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the gateway never served the token"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Opens `POST path` with a JSON `body` and sends only its first 4 bytes.
+async fn stalled_post(tgin: &Tgin, path: &str, body: &[u8]) -> TcpStream {
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: tgin\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    stream
+        .write_all(&body[..4])
+        .await
+        .expect("part of the body");
+    stream
+}
+
+/// Reads one response with a `Content-Length` JSON body off `stream`.
+async fn raw_response(stream: &mut TcpStream) -> (u16, Value) {
+    let read = async {
+        let mut buf = Vec::new();
+        let head_end = loop {
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = stream.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "connection closed before the response head");
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8(buf[..head_end].to_vec()).expect("ASCII head");
+        let status = head[9..12].parse().expect("status");
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().expect("length"))
+            })
+            .unwrap_or(0);
+        let mut body = buf[head_end + 4..].to_vec();
+        while body.len() < length {
+            let mut chunk = [0u8; 4096];
+            let n = stream.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "connection closed before the body ended");
+            body.extend_from_slice(&chunk[..n]);
+        }
+        (status, serde_json::from_slice(&body).expect("JSON body"))
+    };
+    timeout(PATIENCE, read).await.expect("answered in time")
+}
+
+/// The reviewer's probe: a leaked token's holder keeps one `setWebhook`
+/// open across the rotation of that token. When it completes, it is
+/// refused with `401`, nothing is stored, and later updates do not reach
+/// the old holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_old_token_set_webhook_changes_nothing_after_rotation() {
+    let telegram = telegram_with_rotation().await;
+    let attacker = downstream().await;
+    let yaml = intercept_config(&telegram.uri(), "");
+    let tgin = start(&yaml).await;
+    let set = format!("/c/hooks/bot{TOKEN}/setWebhook");
+    let capture = format!("{}/in", attacker.uri());
+    assert_eq!(
+        tgin.post_json(&set, &json!({ "url": capture })).await.0,
+        200
+    );
+    tgin.admit(1).await;
+    delivered(&attacker, 1).await;
+
+    let body = serde_json::to_vec(&json!({ "url": capture })).expect("JSON");
+    let mut stream = stalled_post(&tgin, &set, &body).await;
+    let rotated = yaml.replace(TOKEN, NEW_TOKEN);
+    tgin.reload(&rotated, 2).await;
+    wait_token(&tgin, NEW_TOKEN).await;
+    let info = format!("/c/hooks/bot{NEW_TOKEN}/getWebhookInfo");
+    assert_eq!(
+        tgin.get(&info).await.1["result"]["url"],
+        "",
+        "the rotation evicted it"
+    );
+
+    stream
+        .write_all(&body[4..])
+        .await
+        .expect("the rest of the body");
+    assert_eq!(
+        raw_response(&mut stream).await,
+        (401, telegram_error(401, "Unauthorized"))
+    );
+    assert_eq!(
+        tgin.get(&info).await.1["result"]["url"],
+        "",
+        "nothing stored"
+    );
+    tgin.admit(2).await;
+    tgin.wait_held("hooks", 1).await;
+    assert_eq!(
+        attacker.received_requests().await.expect("recording").len(),
+        1,
+        "only the update from before the rotation reached the old holder"
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="hooked",method="setWebhook",outcome="rejected"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+/// The same for `deleteWebhook(drop_pending_updates=true)`: a request that
+/// authenticated with the old token purges nothing after the rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_old_token_drop_pending_purges_nothing_after_rotation() {
+    let telegram = telegram_with_rotation().await;
+    let yaml = intercept_config(&telegram.uri(), "");
+    let tgin = start(&yaml).await;
+    tgin.admit(1).await;
+    tgin.wait_held("workers", 1).await;
+
+    let body = serde_json::to_vec(&json!({ "drop_pending_updates": true })).expect("JSON");
+    let mut stream = stalled_post(
+        &tgin,
+        &format!("/c/workers/bot{TOKEN}/deleteWebhook"),
+        &body,
+    )
+    .await;
+    tgin.reload(&yaml.replace(TOKEN, NEW_TOKEN), 2).await;
+    wait_token(&tgin, NEW_TOKEN).await;
+    stream
+        .write_all(&body[4..])
+        .await
+        .expect("the rest of the body");
+    assert_eq!(
+        raw_response(&mut stream).await,
+        (401, telegram_error(401, "Unauthorized"))
+    );
+    tgin.wait_held("workers", 1).await;
+    tgin.assert_metric(r#"tgin_consumer_dropped_total{consumer="workers",reason="purge"} 0"#);
+
+    // The new token's holder can.
+    assert_eq!(
+        tgin.post_json(
+            &format!("/c/workers/bot{NEW_TOKEN}/deleteWebhook"),
+            &json!({ "drop_pending_updates": true })
+        )
+        .await
+        .0,
+        200
+    );
+    tgin.wait_held("workers", 0).await;
+    tgin.stop().await;
+}
+
+/// An intercepted request whose body stalls ends at the bot's
+/// `upstream_idle_timeout`: `408`, counted `client_closed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_intercept_body_ends_at_idle_bound() {
+    let telegram = telegram().await;
+    let yaml = intercept_config(&telegram.uri(), "").replace(
+        "    ingress:",
+        "    gateway: { upstream_idle_timeout: 1s }\n    ingress:",
+    );
+    let tgin = start(&yaml).await;
+    let body =
+        serde_json::to_vec(&json!({ "url": "https://bot.example/x", "timeout": 0 })).expect("JSON");
+    for (path, method) in [
+        (format!("/c/hooks/bot{TOKEN}/setWebhook"), "setWebhook"),
+        (format!("/c/workers/bot{TOKEN}/getUpdates"), "getUpdates"),
+    ] {
+        let started = Instant::now();
+        let mut stream = stalled_post(&tgin, &path, &body).await;
+        assert_eq!(
+            raw_response(&mut stream).await,
+            (408, telegram_error(408, "Request Timeout")),
+            "{method}"
+        );
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(900), "{method}: {waited:?}");
+        tgin.assert_metric(&format!(
+            r#"tgin_gateway_requests_total{{bot="hooked",method="{method}",outcome="client_closed"}} 1"#
+        ));
+    }
+    assert_eq!(tgin.consumer("hooks").await["endpoints"], json!([]));
     tgin.stop().await;
 }

@@ -22,6 +22,7 @@ use tgin_runtime::backoff::Backoff;
 use tgin_runtime::breaker::BreakerState;
 use tgin_runtime::http::Via;
 use tgin_runtime::queue::{LeaseQueue, OnFull};
+use tgin_runtime::secret::Secret;
 use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -512,7 +513,31 @@ impl Shared {
         let bot = state.config.bots.iter().find(|b| *b.name == *info.name)?;
         Some(self.token_keys.hash_one(bot.token.expose().as_str()))
     }
+
+    /// The fingerprint of `token` if it is the bot `source`'s token in
+    /// `state`, the token a request authenticated with still being the
+    /// bot's current one.
+    fn authenticated(
+        &self,
+        state: &EngineState,
+        source: SourceId,
+        token: &Secret<String>,
+    ) -> Result<u64, TokenChanged> {
+        let fingerprint = self.token_keys.hash_one(token.expose().as_str());
+        if self.token_fingerprint(state, source) == Some(fingerprint) {
+            Ok(fingerprint)
+        } else {
+            Err(TokenChanged)
+        }
+    }
 }
+
+/// A bot-scoped change was refused: the token the request authenticated
+/// with is no longer the bot's (a reload rotated it, or removed the bot,
+/// while the request was in flight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the bot's token changed while the request was in flight")]
+pub struct TokenChanged;
 
 /// A retired instance's dispatcher, to forget once it has stopped.
 pub(crate) struct Retired {
@@ -718,13 +743,25 @@ impl Engine {
         })
     }
 
-    /// The bot `source`'s `drop_pending_updates`: purges the consumer `name`
-    /// (as [`Engine::purge`]) when a rule of `source` targets it and it has
-    /// `honor_drop_pending: true`; otherwise `None` and nothing is dropped.
-    /// Serialized with reloads, so another bot's consumer is never purged.
-    pub fn drop_pending(&self, source: SourceId, name: &str) -> Option<usize> {
+    /// The bot `source`'s `drop_pending_updates`, sent with `token`: purges
+    /// the consumer `name` (as [`Engine::purge`]) when a rule of `source`
+    /// targets it and it has `honor_drop_pending: true`; otherwise `None`
+    /// and nothing is dropped. Serialized with reloads, so another bot's
+    /// consumer is never purged.
+    ///
+    /// # Errors
+    ///
+    /// `token` is no longer `source`'s token (a reload rotated it while the
+    /// request was in flight): nothing is dropped.
+    pub fn drop_pending(
+        &self,
+        source: SourceId,
+        token: &Secret<String>,
+        name: &str,
+    ) -> Result<Option<usize>, TokenChanged> {
         let _write = self.shared.write.lock();
         let state = self.shared.state.load();
+        self.shared.authenticated(&state, source, token)?;
         let honors = state.config.consumers.iter().any(|c| {
             c.name == name
                 && match &c.kind {
@@ -733,57 +770,64 @@ impl Engine {
                 }
         });
         if !honors || !state.feeds(source, name) {
-            return None;
+            return Ok(None);
         }
-        Some(purge_slot(&state.target(name)?.slot))
+        Ok(state.target(name).map(|target| purge_slot(&target.slot)))
     }
 
     /// Applies the bot `source`'s `setWebhook` (`Some`: URL and secret
-    /// token) or `deleteWebhook` (`None`) to the push consumer `consumer`.
-    /// `None` when the consumer takes no runtime endpoint from `source`: it
-    /// is no push consumer of the current config with
-    /// `accept_set_webhook: true` that a rule of `source` targets. Serialized
-    /// with reloads, which clear an endpoint whose bot no longer feeds its
-    /// consumer.
+    /// token) or `deleteWebhook` (`None`), sent with `token`, to the push
+    /// consumer `consumer`. `None` when the consumer takes no runtime
+    /// endpoint from `source`: it is no push consumer of the current config
+    /// with `accept_set_webhook: true` that a rule of `source` targets.
+    /// Serialized with reloads, which clear an endpoint whose bot no longer
+    /// feeds its consumer or whose token changed.
+    ///
+    /// # Errors
+    ///
+    /// `token` is no longer `source`'s token (a reload rotated it while the
+    /// request was in flight): nothing changes.
     pub fn set_runtime_endpoint(
         &self,
         consumer: &str,
         source: SourceId,
-        endpoint: Option<(reqwest::Url, Option<tgin_runtime::secret::Secret<String>>)>,
-    ) -> Option<WebhookChange> {
+        token: &Secret<String>,
+        endpoint: Option<(reqwest::Url, Option<Secret<String>>)>,
+    ) -> Result<Option<WebhookChange>, TokenChanged> {
         let _write = self.shared.write.lock();
         let state = self.shared.state.load();
-        let Consumer::Push(push) = &state.target(consumer)?.slot.consumer else {
-            return None;
+        let token_fingerprint = self.shared.authenticated(&state, source, token)?;
+        let Some(Consumer::Push(push)) = state.target(consumer).map(|t| &t.slot.consumer) else {
+            return Ok(None);
         };
         let accepts = state.config.consumers.iter().any(|c| {
             c.name == consumer && matches!(&c.kind, ConsumerKind::Push(p) if p.accept_set_webhook)
         });
         if !accepts || !state.feeds(source, consumer) {
-            return None;
+            return Ok(None);
         }
         let had = push.runtime_endpoint_owner().is_some();
         let Some((url, secret_token)) = endpoint else {
             if !had {
-                return Some(WebhookChange::AlreadyDeleted);
+                return Ok(Some(WebhookChange::AlreadyDeleted));
             }
             push.set_runtime_endpoint(None);
             tracing::info!(consumer = %consumer, "runtime endpoint removed by deleteWebhook");
-            return Some(WebhookChange::Deleted);
+            return Ok(Some(WebhookChange::Deleted));
         };
         let endpoint = RuntimeEndpoint {
             url,
             secret_token,
             source,
-            token_fingerprint: self.shared.token_fingerprint(&state, source)?,
+            token_fingerprint,
         };
         if push.has_runtime_endpoint(&endpoint) {
-            return Some(WebhookChange::Unchanged);
+            return Ok(Some(WebhookChange::Unchanged));
         }
         let origin = endpoint.url.origin().ascii_serialization();
         push.set_runtime_endpoint(Some(endpoint));
         tracing::info!(consumer = %consumer, origin = %origin, "runtime endpoint set by setWebhook");
-        Some(WebhookChange::Set)
+        Ok(Some(WebhookChange::Set))
     }
 
     /// Sets the username of a bot of the current generation, so that its
