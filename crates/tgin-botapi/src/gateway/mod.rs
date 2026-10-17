@@ -8,6 +8,7 @@
 
 pub mod chat_key;
 pub mod errors;
+pub mod limit;
 pub mod methods;
 pub mod metrics;
 pub mod params;
@@ -34,6 +35,7 @@ use tgin_core::ids::SourceId;
 use tgin_runtime::http::{ClientOptions, client};
 use tgin_runtime::secret::{Secret, secret_eq};
 
+use self::limit::BotLimiter;
 pub use self::metrics::GatewayMetrics;
 use self::metrics::{BotMetrics, MethodLabel, Outcome};
 use self::path::GatewayPath;
@@ -100,6 +102,9 @@ struct Bot {
     /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
     client: reqwest::Client,
     metrics: BotMetrics,
+    /// Shared with the entries that replace this one while the token and
+    /// the rate limits stay the same, so a reload never resets a quota.
+    limiter: Arc<BotLimiter>,
     /// Shared with the entries that replace this one while the token stays
     /// the same, so an identity learned meanwhile is never lost.
     identity: Arc<ArcSwapOption<Identity>>,
@@ -110,6 +115,7 @@ impl Bot {
         bot: GatewayBot,
         metrics: BotMetrics,
         identity: Arc<ArcSwapOption<Identity>>,
+        limiter: Arc<BotLimiter>,
     ) -> Option<Bot> {
         let token = bot.token.expose();
         let method_base = base(&bot.api_url, &[&format!("bot{token}")])?;
@@ -129,6 +135,7 @@ impl Bot {
             file_base,
             client,
             metrics,
+            limiter,
             identity,
         })
     }
@@ -172,8 +179,9 @@ impl Gateway {
     }
 
     /// Replaces the bot table. An entry whose token, `api_url` and gateway
-    /// config are unchanged keeps its state (client, identity); a bot whose
-    /// token stays keeps its identity. A removed bot's metric series go.
+    /// config are unchanged keeps its state (client, identity, limiter); a
+    /// bot whose token stays keeps its identity, and its limiter too while
+    /// its rate limits stay. A removed bot's metric series go.
     pub fn set_bots(&self, bots: Vec<GatewayBot>, trusted_proxies: Vec<IpNet>) {
         let old = self.table.load_full();
         let mut entries = Vec::with_capacity(bots.len());
@@ -187,11 +195,26 @@ impl Gateway {
                 || self.metrics.bot(&bot.name),
                 |previous| previous.metrics.clone(),
             );
+            let same_token = |previous: &&Arc<Bot>| previous.token.expose() == bot.token.expose();
             let identity = previous
-                .filter(|previous| previous.token.expose() == bot.token.expose())
+                .filter(same_token)
                 .map_or_else(Arc::default, |previous| Arc::clone(&previous.identity));
+            let kept_limiter = previous
+                .filter(same_token)
+                .filter(|previous| previous.gateway.rate_limit == bot.gateway.rate_limit)
+                .map(|previous| Arc::clone(&previous.limiter));
             let name = Arc::clone(&bot.name);
-            match Bot::new(bot, metrics, identity) {
+            let limiter = match kept_limiter {
+                Some(limiter) => limiter,
+                None => match BotLimiter::new(&bot.gateway.rate_limit) {
+                    Ok(limiter) => Arc::new(limiter),
+                    Err(err) => {
+                        tracing::error!(bot = %name, error = %err, "the bot's rate limits are invalid; the gateway does not serve it");
+                        continue;
+                    }
+                },
+            };
+            match Bot::new(bot, metrics, identity, limiter) {
                 Some(entry) => entries.push(Arc::new(entry)),
                 None => {
                     tracing::error!(bot = %name, "the bot's api_url cannot be a base URL; the gateway does not serve it")

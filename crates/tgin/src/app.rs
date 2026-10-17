@@ -15,12 +15,13 @@ use tgin_botapi::gateway::{Gateway, GatewayBot, GatewayMetrics};
 use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
+use tgin_runtime::backoff::Backoff;
 use tgin_runtime::config::Env;
 use tgin_runtime::http::{self, ClientOptions, RunningServer, ServerOptions, TlsFiles};
 use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
-use tgin_runtime::supervisor::Supervisor;
+use tgin_runtime::supervisor::{Exit, Supervisor};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +50,10 @@ const ADMIN_PLANE: &str = "admin_plane";
 const ADMIN_MAX_CONNECTIONS: usize = 256;
 /// How long an admin client may take to send a request head.
 const ADMIN_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// The supervised task that forgets idle rate-limit keys.
+const GATEWAY_SWEEP: &str = "gateway-sweep";
+/// How often it runs.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// Why tgin could not start.
 #[derive(Debug, thiserror::Error)]
@@ -269,6 +274,7 @@ impl App {
         // Before the sources, which record each bot's identity in it.
         let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics));
         gateway.set_bots(gateway_bots(&cfg, &engine), trusted_proxies(&cfg));
+        spawn_sweep(&supervisor, Arc::clone(&gateway), handles.stop.clone());
 
         let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
         let cfg = Arc::new(cfg);
@@ -686,6 +692,28 @@ pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
             })
         })
         .collect()
+}
+
+/// Supervises [`GATEWAY_SWEEP`]: every [`SWEEP_EVERY`], each gateway bot's
+/// limiter forgets the keys whose quota is back to a fresh key's, so a
+/// stream of one-off chats does not grow it for ever. `stop` ends it.
+fn spawn_sweep(supervisor: &Supervisor, gateway: Arc<Gateway>, stop: CancellationToken) {
+    supervisor.spawn(
+        Arc::from(GATEWAY_SWEEP),
+        Backoff::new(Duration::from_secs(1), SWEEP_EVERY, Duration::ZERO),
+        stop,
+        move || sweep(Arc::clone(&gateway)),
+    );
+}
+
+/// One run of [`GATEWAY_SWEEP`]; it ends only when its task is stopped.
+async fn sweep(gateway: Arc<Gateway>) -> Exit {
+    let mut every = tokio::time::interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        gateway.sweep_limiters(Instant::now());
+    }
 }
 
 /// The proxies whose forwarding headers the data plane trusts.

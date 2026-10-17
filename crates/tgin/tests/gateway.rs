@@ -104,6 +104,8 @@ consumers:
 /// The app, running on signals the test sends.
 struct Tgin {
     addr: SocketAddr,
+    /// The admin plane's first address, if it listens.
+    admin: Option<SocketAddr>,
     file: PathBuf,
     signals: mpsc::Sender<SignalKind>,
     run: JoinHandle<Outcome>,
@@ -122,11 +124,13 @@ async fn start(yaml: &str) -> Tgin {
         .unwrap_or_else(|err| panic!("invalid test config: {err:?}"));
     let app = App::start(boot).await.expect("tgin starts");
     let addr = app.data_addrs()[0];
+    let admin = app.admin_addrs().first().copied();
     let metrics = app.metrics();
     let (signals, rx) = mpsc::channel(4);
     let run = tokio::spawn(app.run(Signals::from_channel(rx)));
     Tgin {
         addr,
+        admin,
         file,
         signals,
         run,
@@ -1015,5 +1019,621 @@ async fn consumer_scoped_route_requires_consumer_of_bot() {
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 3"#,
     );
+    tgin.stop().await;
+}
+
+// Rate limiting and 429 smoothing.
+
+const ADMIN_TOKEN: &str = "admin-token-value-123";
+const SENT: &str = r#"{"ok":true,"result":{"message_id":1}}"#;
+
+/// Bot `gw` (`TOKEN`) with `gateway` as its gateway block, and an admin
+/// plane that takes [`ADMIN_TOKEN`].
+fn limited_config(api: &str, gateway: &str) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"], token: "{ADMIN_TOKEN}" }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    api_url: "{api}"
+    gateway: {gateway}
+    routes: [{{ to: [workers] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+"#
+    )
+}
+
+/// `429 Too Many Requests` as Telegram writes it.
+fn flood(retry_after: u64) -> String {
+    format!(
+        r#"{{"ok":false,"error_code":429,"description":"Too Many Requests: retry after {retry_after}","parameters":{{"retry_after":{retry_after}}}}}"#
+    )
+}
+
+/// POSTs `body` as JSON to the gateway's `method` of `TOKEN`.
+async fn call(
+    http: &reqwest::Client,
+    addr: SocketAddr,
+    method: &str,
+    body: &Value,
+) -> reqwest::Response {
+    http.post(format!("http://{addr}/bot{TOKEN}/{method}"))
+        .json(body)
+        .send()
+        .await
+        .expect("response")
+}
+
+/// The status and raw body of a gateway call.
+async fn status_and_body(response: reqwest::Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    (status, response.text().await.expect("body"))
+}
+
+/// Tokio's clock, frozen: the test's runtime starts paused, and a blocking
+/// task keeps the paused clock from jumping to the next timer whenever the
+/// runtime waits for a socket (tokio holds that jump back while a blocking
+/// task runs), so that time moves only by [`tokio::time::advance`]. Taken
+/// first thing, every instant is then a whole number of milliseconds after
+/// the timer driver's start: a timer due at an instant `advance` reaches
+/// fires, where a sub-millisecond offset would leave it 1 ms short.
+struct Frozen(std::sync::mpsc::Sender<()>);
+
+fn freeze() -> Frozen {
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    drop(tokio::task::spawn_blocking(move || {
+        let _ = held.recv();
+    }));
+    Frozen(hold)
+}
+
+impl Frozen {
+    /// Real time again, for the shutdown's own timers.
+    fn thaw(self) {
+        drop(self.0);
+        tokio::time::resume();
+    }
+}
+
+/// `fut`, bounded by [`PATIENCE`] of real time: tokio's timers do not run
+/// while the clock is frozen.
+async fn within<F: Future>(what: &str, fut: F) -> F::Output {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(PATIENCE);
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        out = fut => out,
+        _ = rx => panic!("{what} did not happen within {PATIENCE:?}"),
+    }
+}
+
+/// Yields until `ready`, for at most [`PATIENCE`] of real time.
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(started.elapsed() < PATIENCE, "{what} never happened");
+        tokio::task::yield_now().await;
+    }
+}
+
+impl Tgin {
+    fn has_metric(&self, line: &str) -> bool {
+        self.metrics.encode().lines().any(|l| l == line)
+    }
+
+    /// `POST /v1/reload`, which answers once the reload is applied.
+    async fn reload(&self) {
+        let admin = self.admin.expect("an admin plane");
+        let response = self
+            .http
+            .post(format!("http://{admin}/v1/reload"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .expect("reload");
+        assert_eq!(response.status(), 200, "{:?}", response.text().await);
+    }
+}
+
+/// A request as Telegram saw it, stamped with tokio's clock.
+struct Arrival {
+    at: tokio::time::Instant,
+    body: Bytes,
+}
+
+/// Telegram as a small server in this runtime: every request is stamped
+/// and sent to the returned channel, and answered with `answers` in turn,
+/// the last one repeating.
+async fn stamped_telegram(
+    answers: Vec<(u16, String)>,
+) -> (SocketAddr, mpsc::UnboundedReceiver<Arrival>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answers = Arc::new(answers);
+    let router = axum::Router::new().fallback(move |body: Bytes| {
+        let at = tokio::time::Instant::now();
+        let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (status, answer) = answers[n.min(answers.len() - 1)].clone();
+        let _ = tx.send(Arrival { at, body });
+        async move {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(answer))
+                .expect("response")
+        }
+    });
+    (serve(router).await, rx)
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_chat_shaping_delays_fourth_message() {
+    let frozen = freeze();
+    let (api, mut arrivals) = stamped_telegram(vec![(200, SENT.to_owned())]).await;
+    // Defaults: shape up to 5 s; per chat 1/s after a burst of 3.
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let t0 = tokio::time::Instant::now();
+
+    let body = json!({ "chat_id": 42, "text": "hi" });
+    let sends: Vec<_> = (0..4)
+        .map(|_| {
+            let (http, addr, body) = (tgin.http.clone(), tgin.addr, body.clone());
+            tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
+        })
+        .collect();
+    for _ in 0..3 {
+        let arrival = within("an upstream request", arrivals.recv())
+            .await
+            .expect("open");
+        assert_eq!(arrival.at, t0);
+    }
+    let delayed = r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="delayed"} 1"#;
+    until("the fourth message's delay", || tgin.has_metric(delayed)).await;
+    assert!(
+        arrivals.try_recv().is_err(),
+        "the fourth message went at once"
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let fourth = within("the fourth request", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!(fourth.at, t0 + Duration::from_secs(1));
+    assert_eq!(&fourth.body[..], body.to_string().as_bytes());
+    for send in sends {
+        assert_eq!(within("a response", send).await.expect("sent"), 200);
+    }
+    tgin.assert_metric(delayed);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="global",action="delayed"} 0"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="ok"} 4"#,
+    );
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reject_mode_answers_429_shaped() {
+    let frozen = freeze();
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: reject } }",
+    ))
+    .await;
+
+    let to = |chat: i64| json!({ "chat_id": chat, "text": "hi" });
+    for _ in 0..3 {
+        let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
+        assert_eq!(response.status(), 200);
+    }
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(status_and_body(response).await, (429, flood(1)));
+    assert_eq!(
+        seen(&telegram).await.len(),
+        3,
+        "a refusal never goes upstream"
+    );
+
+    // Per chat: another chat is not limited.
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(43)).await;
+    assert_eq!(response.status(), 200);
+    // A second later the chat has a slot again.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &to(42)).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(seen(&telegram).await.len(), 5);
+
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="rejected"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="delayed"} 0"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="ok"} 5"#,
+    );
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_quota_applies_to_negative_ids_and_usernames() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: reject, per_chat: { count: 100, per: 1s, burst: 100 }, per_group: { count: 1, per: 1h, burst: 2 } } }",
+    ))
+    .await;
+    let send = |body: Value| {
+        let (http, addr) = (tgin.http.clone(), tgin.addr);
+        async move { call(&http, addr, "sendMessage", &body).await }
+    };
+    let form = |chat: &str| {
+        tgin.http
+            .post(tgin.url(&format!("/bot{TOKEN}/sendMessage")))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("chat_id={chat}&text=hi"))
+            .send()
+    };
+
+    // A negative id, as a number and as a string: one group.
+    let a = send(json!({ "chat_id": -1001, "text": "a" })).await;
+    assert_eq!(a.status(), 200);
+    let b = send(json!({ "chat_id": -1001, "text": "b" })).await;
+    assert_eq!(b.status(), 200);
+    let c = send(json!({ "chat_id": "-1001", "text": "c" })).await;
+    let (status, body) = status_and_body(c).await;
+    assert_eq!(status, 429, "{body}");
+    // A username, form-encoded and as JSON, in any case: one group.
+    let a = form("%40SomeChannel").await.expect("response");
+    assert_eq!(a.status(), 200);
+    let b = form("@somechannel").await.expect("response");
+    assert_eq!(b.status(), 200);
+    let c = send(json!({ "chat_id": "@SOMECHANNEL", "text": "c" })).await;
+    let (status, body) = status_and_body(c).await;
+    assert_eq!(status, 429, "{body}");
+    // A private chat has no group quota.
+    for _ in 0..3 {
+        let response = send(json!({ "chat_id": 7, "text": "x" })).await;
+        assert_eq!(response.status(), 200);
+    }
+
+    assert_eq!(seen(&telegram).await.len(), 7);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="group",action="rejected"} 2"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="rejected"} 0"#,
+    );
+    tgin.stop().await;
+}
+
+/// A multipart body with `chat_id` and one small file.
+fn multipart(chat_id: &str) -> (&'static str, String) {
+    (
+        "multipart/form-data; boundary=tginboundary",
+        format!(
+            "--tginboundary\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n--tginboundary\r\nContent-Disposition: form-data; name=\"document\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--tginboundary--\r\n"
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_uses_global_only_and_is_never_retried() {
+    let telegram = MockServer::start().await;
+    for method in ["sendDocument", "sendMessage"] {
+        Mock::given(path(format!("/bot{TOKEN}/{method}")))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
+            .mount(&telegram)
+            .await;
+    }
+    // One request per chat, four in all, and a retry would be allowed.
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: reject, global: { count: 1, per: 1m, burst: 4 }, per_chat: { count: 1, per: 1m, burst: 1 } }, retry_429: { max_wait: 10s } }",
+    ))
+    .await;
+    let document = || {
+        let (content_type, body) = multipart("42");
+        tgin.http
+            .post(tgin.url(&format!("/bot{TOKEN}/sendDocument")))
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+    };
+
+    // Twice to one chat: the per-chat quota does not apply to multipart,
+    // and Telegram's 429 reaches the client after one upstream call.
+    for sent in 1..=2 {
+        let response = document().await.expect("response");
+        assert_eq!(status_and_body(response).await, (429, flood(1)));
+        assert_eq!(seen(&telegram).await.len(), sent, "never retried");
+    }
+    // A JSON body longer than 64 KiB streams: no chat key, no retry.
+    let long = json!({ "chat_id": 42, "text": "x".repeat(70 * 1024) }).to_string();
+    let response = tgin
+        .http
+        .post(tgin.url(&format!("/bot{TOKEN}/sendMessage")))
+        .header("content-type", "application/json")
+        .body(long.clone())
+        .send()
+        .await
+        .expect("response");
+    assert_eq!(status_and_body(response).await, (429, flood(1)));
+    let requests = seen(&telegram).await;
+    assert_eq!(requests.len(), 3, "never retried");
+    assert_eq!(requests[2].body, long.as_bytes());
+    // The same without a length: read up to the bound, then streamed whole.
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    for chunk in long.as_bytes().chunks(16 * 1024) {
+        let framed = format!("{:x}\r\n", chunk.len());
+        stream.write_all(framed.as_bytes()).await.expect("size");
+        stream.write_all(chunk).await.expect("chunk");
+        stream.write_all(b"\r\n").await.expect("chunk end");
+    }
+    stream.write_all(b"0\r\n\r\n").await.expect("last chunk");
+    let raw = timeout(PATIENCE, read_response(&mut stream))
+        .await
+        .expect("a response");
+    assert_eq!((raw.status, &raw.body[..]), (429, flood(1).as_bytes()));
+    let requests = seen(&telegram).await;
+    assert_eq!(requests.len(), 4, "never retried");
+    assert_eq!(requests[3].body, long.as_bytes());
+
+    // The global quota still applies: the fifth request is tgin's own 429.
+    let response = document().await.expect("response");
+    assert_eq!(response.status(), 429);
+    let (_, body) = json_of(response).await;
+    let retry_after = body["parameters"]["retry_after"]
+        .as_u64()
+        .expect("retry_after");
+    assert!((1..=60).contains(&retry_after), "{body}");
+    assert_eq!(seen(&telegram).await.len(), 4);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="global",action="rejected"} 1"#,
+    );
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 0"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rate_limited"} 3"#,
+    );
+    tgin.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn upstream_429_retried_once_when_buffered() {
+    let frozen = freeze();
+    let (api, mut arrivals) = stamped_telegram(vec![(429, flood(2)), (200, SENT.to_owned())]).await;
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let t0 = tokio::time::Instant::now();
+
+    let body = json!({ "chat_id": 42, "text": "hi" });
+    let send = {
+        let (http, addr, body) = (tgin.http.clone(), tgin.addr, body.clone());
+        tokio::spawn(
+            async move { status_and_body(call(&http, addr, "sendMessage", &body).await).await },
+        )
+    };
+    let first = within("the first request", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!(first.at, t0);
+    // Telegram's 429 has arrived; the retry waits its `retry_after`.
+    until("the 429's arrival", || {
+        tgin.has_metric(r#"tgin_gateway_upstream_seconds_count{bot="gw",method="sendMessage"} 1"#)
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let second = within("the retry", arrivals.recv()).await.expect("open");
+    assert_eq!(second.at, t0 + Duration::from_secs(2));
+    assert_eq!(second.body, first.body);
+    assert_eq!(&first.body[..], body.to_string().as_bytes());
+    assert_eq!(
+        within("the response", send).await.expect("sent"),
+        (200, SENT.to_owned())
+    );
+    assert!(arrivals.try_recv().is_err(), "at most two upstream calls");
+
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="ok"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 0"#,
+    );
+    tgin.assert_metric(r#"tgin_gateway_upstream_seconds_count{bot="gw",method="sendMessage"} 2"#);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_429_longer_than_max_wait_passes_through() {
+    let telegram = MockServer::start().await;
+    // `sendMessage`: 2 s, over `max_wait`.
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(flood(2), "application/json"))
+        .mount(&telegram)
+        .await;
+    // `sendPhoto`: a 429 without `retry_after`.
+    let bare = r#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#;
+    Mock::given(path(format!("/bot{TOKEN}/sendPhoto")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(bare, "application/json"))
+        .mount(&telegram)
+        .await;
+    // `sendDice`: exactly `max_wait`, once; then success.
+    Mock::given(path(format!("/bot{TOKEN}/sendDice")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&telegram)
+        .await;
+    Mock::given(path(format!("/bot{TOKEN}/sendDice")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ retry_429: { max_wait: 1s } }",
+    ))
+    .await;
+    let chat = json!({ "chat_id": 42 });
+    let calls = |method: &'static str| {
+        let telegram = &telegram;
+        async move {
+            seen(telegram)
+                .await
+                .iter()
+                .filter(|r| r.url.path().ends_with(method))
+                .count()
+        }
+    };
+
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(status_and_body(response).await, (429, flood(2)));
+    assert_eq!(calls("/sendMessage").await, 1);
+    let response = call(&tgin.http, tgin.addr, "sendPhoto", &chat).await;
+    assert_eq!(status_and_body(response).await, (429, bare.to_owned()));
+    assert_eq!(calls("/sendPhoto").await, 1);
+    // The bound is inclusive.
+    let response = call(&tgin.http, tgin.addr, "sendDice", &chat).await;
+    assert_eq!(status_and_body(response).await, (200, SENT.to_owned()));
+    assert_eq!(calls("/sendDice").await, 2);
+
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 1"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendPhoto",outcome="rate_limited"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_429_retry_denied_by_limiter_passes_through() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_raw(flood(1), "application/json"))
+        .mount(&telegram)
+        .await;
+    // The chat's only slot this minute goes to the first send.
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: reject, per_chat: { count: 1, per: 1m, burst: 1 } } }",
+    ))
+    .await;
+    let response = call(
+        &tgin.http,
+        tgin.addr,
+        "sendMessage",
+        &json!({ "chat_id": 42 }),
+    )
+    .await;
+    assert_eq!(status_and_body(response).await, (429, flood(1)));
+    assert_eq!(seen(&telegram).await.len(), 1);
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 0"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="rejected"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_send_methods_unlimited() {
+    let telegram = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    // One request a minute, for the bot and per chat.
+    let tgin = start(&limited_config(
+        &telegram.uri(),
+        "{ rate_limit: { mode: reject, global: { count: 1, per: 1m, burst: 1 }, per_chat: { count: 1, per: 1m, burst: 1 } } }",
+    ))
+    .await;
+    let chat = json!({ "chat_id": 42 });
+    for method in [
+        "getChat",
+        "getChat",
+        "getChat",
+        "answerCallbackQuery",
+        "setMyCommands",
+    ] {
+        let response = call(&tgin.http, tgin.addr, method, &chat).await;
+        assert_eq!(response.status(), 200, "{method}");
+    }
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(response.status(), 200);
+    // Method names ignore case: this is `sendMessage` again.
+    let other = json!({ "chat_id": 43 });
+    let response = call(&tgin.http, tgin.addr, "SENDMESSAGE", &other).await;
+    assert_eq!(response.status(), 429);
+    let response = call(&tgin.http, tgin.addr, "copyMessages", &other).await;
+    assert_eq!(response.status(), 429);
+    assert_eq!(seen(&telegram).await.len(), 6);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="gw",scope="global",action="rejected"} 2"#,
+    );
+    tgin.assert_metric(r#"tgin_gateway_requests_total{bot="gw",method="getChat",outcome="ok"} 3"#);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limiter_state_survives_reload_with_same_config() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let gateway = |burst: u32| {
+        format!(
+            "{{ rate_limit: {{ mode: reject, per_chat: {{ count: 1, per: 1m, burst: {burst} }} }} }}"
+        )
+    };
+    let tgin = start(&limited_config(&telegram.uri(), &gateway(3))).await;
+    let chat = json!({ "chat_id": 42 });
+    for _ in 0..3 {
+        let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+        assert_eq!(response.status(), 200);
+    }
+    tgin.reload().await;
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(response.status(), 429, "the reload reset the chat's quota");
+
+    // A changed limit is a new limiter.
+    std::fs::write(&tgin.file, limited_config(&telegram.uri(), &gateway(4))).expect("rewrite");
+    tgin.reload().await;
+    let response = call(&tgin.http, tgin.addr, "sendMessage", &chat).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(seen(&telegram).await.len(), 4);
     tgin.stop().await;
 }

@@ -191,7 +191,12 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
     }
 
     /// Undoes `admit` when no later booking for `key` happened; otherwise does
-    /// nothing.
+    /// nothing: the slot is then lost, and the quota still holds.
+    ///
+    /// `admit` must be what this limiter's [`KeyedLimiter::acquire`]
+    /// returned for this `key`. Stamps are unique only within a shard, so
+    /// another limiter's `Admit`, or one for another key, could match an
+    /// unrelated booking by chance and undo it.
     pub fn cancel(&self, key: &K, admit: Admit) {
         let mut guard = self.shard(key).lock();
         let map = &mut guard.map;

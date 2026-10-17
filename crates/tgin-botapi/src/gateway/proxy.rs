@@ -22,16 +22,26 @@ use axum::http::header::{
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderName,
     IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE, RETRY_AFTER, USER_AGENT,
 };
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use parking_lot::Mutex;
 use reqwest::Url;
+use serde::Deserialize;
 use tgin_runtime::http::describe_error;
 use tokio::time::{Instant, Sleep, sleep_until};
 
-use super::metrics::{BotMetrics, MethodLabel, MethodMetrics, Outcome};
-use super::{Bot, errors};
+use super::chat_key::{ChatKey, chat_key};
+use super::limit::Limited;
+use super::metrics::{BotMetrics, MethodLabel, MethodMetrics, Outcome, RateAction};
+use super::params::{Encoding, encoding};
+use super::{Bot, Bounded, errors, read_bounded};
+
+/// The longest request body of a limited method read for its chat and
+/// kept to be sent again after a 429.
+const BUFFER_LIMIT: usize = 64 * 1024;
+/// The longest upstream 429 body read for its `retry_after`.
+const FLOOD_LIMIT: usize = 64 * 1024;
 
 /// Request headers forwarded on every route.
 const REQUEST_HEADERS: [HeaderName; 5] = [
@@ -66,78 +76,339 @@ pub(super) enum Upstream<'a> {
     File(&'a str),
 }
 
-/// Streams `req` to Telegram for `bot` and Telegram's answer back.
+/// Streams `req` to Telegram for `bot` and Telegram's answer back. A
+/// method the bot's limits cover waits for, or is refused by, them first;
+/// its body, when small and buffered, goes once more after a 429.
 pub(super) async fn forward(
     bot: &Bot,
     upstream: Upstream<'_>,
     label: MethodLabel,
     req: Request,
 ) -> Response {
-    let handles = bot.metrics.method(label);
-    let idle = bot.gateway.upstream_idle_timeout;
     let (parts, body) = req.into_parts();
-    let (url, file) = match upstream {
-        Upstream::Method(method) => (url(&bot.method_base, method, parts.uri.query()), false),
-        Upstream::File(file_path) => (url(&bot.file_base, file_path, parts.uri.query()), true),
+    let (url, file, limited) = match upstream {
+        Upstream::Method(method) => (
+            url(&bot.method_base, method, parts.uri.query()),
+            false,
+            bot.limiter.applies(method),
+        ),
+        Upstream::File(file_path) => (
+            url(&bot.file_base, file_path, parts.uri.query()),
+            true,
+            false,
+        ),
     };
     let mut headers = HeaderMap::new();
     copy_headers(&parts.headers, &REQUEST_HEADERS, &mut headers);
     if file {
         copy_headers(&parts.headers, &FILE_REQUEST_HEADERS, &mut headers);
     }
+    let call = Call {
+        bot,
+        label,
+        handles: bot.metrics.method(label),
+        method: parts.method,
+    };
+    if !limited {
+        return match call.send(url, headers, body).await {
+            Ok((response, _)) => call.relay(response),
+            Err(failed) => call.failed(failed),
+        };
+    }
 
+    let idle = bot.gateway.upstream_idle_timeout;
+    let (payload, chat) = match prepare(&parts.headers, parts.uri.query(), body, idle).await {
+        Ok(prepared) => prepared,
+        Err(failed) => return call.failed(failed),
+    };
+    if let Err(limited) = call.admit(chat.as_ref()).await {
+        call.refuse(limited);
+        return errors::too_many_requests(limited.retry_after_secs());
+    }
+    match payload {
+        Payload::Streamed(body) => match call.send(url, headers, body).await {
+            Ok((response, _)) => call.relay(response),
+            Err(failed) => call.failed(failed),
+        },
+        Payload::Buffered(request) => {
+            let first = call
+                .send(url.clone(), headers.clone(), Body::from(request.clone()))
+                .await;
+            let (response, at) = match first {
+                Ok(first) => first,
+                Err(failed) => return call.failed(failed),
+            };
+            if response.status() != StatusCode::TOO_MANY_REQUESTS
+                || bot.gateway.retry_429_max_wait.is_zero()
+            {
+                return call.relay(response);
+            }
+            let again = Again {
+                url,
+                headers,
+                body: request,
+                chat,
+            };
+            call.flood(response, at, again).await
+        }
+    }
+}
+
+/// A request body as it goes upstream.
+enum Payload {
+    /// Read whole: it can be sent again.
+    Buffered(Bytes),
+    /// Streamed: it goes once.
+    Streamed(Body),
+}
+
+/// Why a request got no response from Telegram.
+#[derive(Debug)]
+enum Failed {
+    /// Reading the client's body failed: the client went away.
+    ClientClosed,
+    /// Telegram could not be reached (logged where it happened).
+    Unreachable,
+    /// Nothing moved for `upstream_idle_timeout`, in either direction.
+    Idle,
+}
+
+/// The body of a request the limits cover, and the chat it targets:
+/// - a JSON or urlencoded body (or an empty one) is read up to
+///   [`BUFFER_LIMIT`], waiting at most `idle` for each frame; whole, it is
+///   buffered and its `chat_id` read; longer, what was read and the rest
+///   stream;
+/// - any other body, multipart included, streams unread.
+///
+/// A `chat_id` in the query string comes first, as the Bot API reads the
+/// query before the body. Without a chat only the global quota applies.
+async fn prepare(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    body: Body,
+    idle: Duration,
+) -> Result<(Payload, Option<ChatKey>), Failed> {
+    const FORM: HeaderValue = HeaderValue::from_static("application/x-www-form-urlencoded");
+    let from_query = query.and_then(|query| chat_key(Some(&FORM), query.as_bytes()));
+    let content_type = headers.get(CONTENT_TYPE);
+    let readable = matches!(
+        content_type.and_then(encoding),
+        Some(Encoding::Json | Encoding::Form)
+    ) || body.size_hint().exact() == Some(0);
+    if !readable {
+        return Ok((Payload::Streamed(body), from_query));
+    }
     let progress = Arc::new(Progress::new());
-    let upload = Upload {
+    let stamped = Body::new(Upload {
         body: Mutex::new(body),
         progress: Arc::clone(&progress),
+    });
+    let read = match await_headers(read_bounded(stamped, BUFFER_LIMIT), &progress, idle).await {
+        Waited::Ready(Ok(read)) => read,
+        Waited::Ready(Err(_)) => return Err(Failed::ClientClosed),
+        Waited::Idle => return Err(Failed::Idle),
     };
-    let started = Instant::now();
-    let send = bot
-        .client
-        .request(parts.method, url)
-        .headers(headers)
-        .body(reqwest::Body::wrap(upload))
-        .send();
-    let response = match await_headers(send, &progress, idle).await {
-        Waited::Ready(Ok(response)) => response,
-        Waited::Ready(Err(_)) if progress.client_failed() => {
-            // The downstream went away mid-body: not Telegram's failure,
-            // and nobody reads the answer.
-            tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request abandoned: the client closed the request body early");
-            handles.count(Outcome::ClientClosed);
-            return errors::error(
-                StatusCode::BAD_REQUEST,
-                "Bad Request: the request body ended early",
-            );
+    Ok(match read {
+        Bounded::Complete(bytes) => {
+            let chat = from_query.or_else(|| chat_key(content_type, &bytes));
+            (Payload::Buffered(bytes), chat)
         }
-        Waited::Ready(Err(err)) => {
-            tracing::warn!(bot = %bot.name, method = label.as_str(), error = %describe_error(&err), "gateway request failed: Telegram is unreachable");
-            return unreachable(handles);
-        }
-        Waited::Idle => {
-            tracing::warn!(bot = %bot.name, method = label.as_str(), idle_timeout = ?idle, "gateway request failed: no progress within upstream_idle_timeout");
-            return unreachable(handles);
-        }
-    };
-    handles.upstream_seconds(started.elapsed().as_secs_f64());
+        Bounded::Over(partial) => (Payload::Streamed(partial.into_body()), from_query),
+    })
+}
 
-    let status = response.status();
+/// What a buffered request needs to go upstream once more.
+struct Again {
+    url: Url,
+    headers: HeaderMap,
+    body: Bytes,
+    chat: Option<ChatKey>,
+}
+
+/// One gateway request to Telegram: what each of its upstream attempts
+/// shares.
+struct Call<'a> {
+    bot: &'a Bot,
+    label: MethodLabel,
+    handles: &'a MethodMetrics,
+    method: Method,
+}
+
+impl Call<'_> {
+    /// Books the request on the bot's limits and waits out the delay they
+    /// give.
+    async fn admit(&self, chat: Option<&ChatKey>) -> Result<(), Limited> {
+        let now = Instant::now();
+        let admitted = self.bot.limiter.acquire(chat, now)?;
+        if !admitted.delay.is_zero() {
+            self.bot
+                .metrics
+                .ratelimited(admitted.scope, RateAction::Delayed);
+            tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), scope = admitted.scope.as_str(), delay = ?admitted.delay, "gateway request delayed by the rate limits");
+            sleep_until(deadline(now, admitted.delay)).await;
+        }
+        Ok(())
+    }
+
+    /// Counts a request the limits refused.
+    fn refuse(&self, limited: Limited) {
+        self.bot
+            .metrics
+            .ratelimited(limited.scope, RateAction::Rejected);
+        self.handles.count(Outcome::RateLimited);
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), scope = limited.scope.as_str(), retry_after = ?limited.retry_after, "gateway request refused by the rate limits");
+    }
+
+    /// Sends `body` to `url` and waits for Telegram's response headers:
+    /// the response and when its headers arrived.
+    async fn send(
+        &self,
+        url: Url,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Result<(reqwest::Response, Instant), Failed> {
+        let idle = self.bot.gateway.upstream_idle_timeout;
+        let progress = Arc::new(Progress::new());
+        let upload = Upload {
+            body: Mutex::new(body),
+            progress: Arc::clone(&progress),
+        };
+        let started = Instant::now();
+        let send = self
+            .bot
+            .client
+            .request(self.method.clone(), url)
+            .headers(headers)
+            .body(reqwest::Body::wrap(upload))
+            .send();
+        let response = match await_headers(send, &progress, idle).await {
+            Waited::Ready(Ok(response)) => response,
+            Waited::Ready(Err(_)) if progress.client_failed() => return Err(Failed::ClientClosed),
+            Waited::Ready(Err(err)) => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: Telegram is unreachable");
+                return Err(Failed::Unreachable);
+            }
+            Waited::Idle => return Err(Failed::Idle),
+        };
+        let at = Instant::now();
+        self.handles
+            .upstream_seconds(at.duration_since(started).as_secs_f64());
+        Ok((response, at))
+    }
+
+    /// The answer to a request that got no response, counted.
+    fn failed(&self, failed: Failed) -> Response {
+        match failed {
+            Failed::ClientClosed => {
+                // Not Telegram's failure, and nobody reads the answer.
+                tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request abandoned: the client closed the request body early");
+                self.handles.count(Outcome::ClientClosed);
+                errors::error(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request: the request body ended early",
+                )
+            }
+            Failed::Unreachable => unreachable(self.handles),
+            Failed::Idle => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
+                unreachable(self.handles)
+            }
+        }
+    }
+
+    /// Telegram's answer, streamed to the client and counted once it ends.
+    fn relay(&self, response: reqwest::Response) -> Response {
+        let status = response.status();
+        let headers = response_headers(&response);
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), status = status.as_u16(), "gateway request proxied");
+        let tally = Tally {
+            name: Arc::clone(&self.bot.name),
+            bot: self.bot.metrics.clone(),
+            label: self.label,
+            outcome: outcome(status),
+        };
+        let download = Download::new(
+            response,
+            self.bot.gateway.upstream_idle_timeout,
+            Some(tally),
+        );
+        answer(status, headers, Body::new(download))
+    }
+
+    /// Telegram answered a buffered request with 429. Its body is read up
+    /// to [`FLOOD_LIMIT`]; when its `parameters.retry_after` is above zero
+    /// and within `retry_429.max_wait`, the request waits that long after
+    /// the 429 arrived (at `at`), books the limits again and goes once
+    /// more. Otherwise, or when the limits refuse it, the 429 goes to the
+    /// client as it came.
+    async fn flood(&self, response: reqwest::Response, at: Instant, again: Again) -> Response {
+        let status = response.status();
+        let headers = response_headers(&response);
+        let idle = self.bot.gateway.upstream_idle_timeout;
+        let body = Body::new(Download::new(response, idle, None));
+        let flood = match read_bounded(body, FLOOD_LIMIT).await {
+            Ok(Bounded::Complete(flood)) => flood,
+            Ok(Bounded::Over(partial)) => {
+                // Telegram's 429s are small: this one streams through, and
+                // counts as relayed.
+                self.handles.count(Outcome::RateLimited);
+                return answer(status, headers, partial.into_body());
+            }
+            Err(err) => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %err, "gateway response aborted");
+                self.handles.count(Outcome::UpstreamError);
+                return errors::error(
+                    StatusCode::BAD_GATEWAY,
+                    "Bad Gateway: Telegram is unreachable",
+                );
+            }
+        };
+        let max_wait = self.bot.gateway.retry_429_max_wait;
+        let Some(wait) = retry_after(&flood).filter(|wait| !wait.is_zero() && *wait <= max_wait)
+        else {
+            self.handles.count(Outcome::RateLimited);
+            return answer(status, headers, Body::from(flood));
+        };
+        sleep_until(deadline(at, wait)).await;
+        if let Err(limited) = self.admit(again.chat.as_ref()).await {
+            self.refuse(limited);
+            return answer(status, headers, Body::from(flood));
+        }
+        self.bot.metrics.retried();
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), retry_after = ?wait, "gateway request sent again after Telegram's 429");
+        match self
+            .send(again.url, again.headers, Body::from(again.body))
+            .await
+        {
+            Ok((response, _)) => self.relay(response),
+            Err(failed) => self.failed(failed),
+        }
+    }
+}
+
+/// `parameters.retry_after` of a Bot API error body.
+fn retry_after(body: &[u8]) -> Option<Duration> {
+    #[derive(Deserialize)]
+    struct Flood {
+        parameters: Option<Parameters>,
+    }
+    #[derive(Deserialize)]
+    struct Parameters {
+        retry_after: Option<u64>,
+    }
+    let flood: Flood = serde_json::from_slice(body).ok()?;
+    flood.parameters?.retry_after.map(Duration::from_secs)
+}
+
+/// The allowlisted headers of `response`.
+fn response_headers(response: &reqwest::Response) -> HeaderMap {
     let mut headers = HeaderMap::new();
     copy_headers(response.headers(), &RESPONSE_HEADERS, &mut headers);
-    tracing::debug!(bot = %bot.name, method = label.as_str(), status = status.as_u16(), "gateway request proxied");
-    let body = axum::http::Response::<reqwest::Body>::from(response).into_body();
-    let download = Download {
-        body,
-        idle,
-        sleep: Box::pin(sleep_until(deadline(Instant::now(), idle))),
-        tally: Some(Tally {
-            name: Arc::clone(&bot.name),
-            bot: bot.metrics.clone(),
-            label,
-            outcome: outcome(status),
-        }),
-    };
-    let mut out = Response::new(Body::new(download));
+    headers
+}
+
+fn answer(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
+    let mut out = Response::new(body);
     *out.status_mut() = status;
     *out.headers_mut() = headers;
     out
@@ -246,7 +517,8 @@ enum Waited<T> {
 }
 
 /// Waits for `send` until `idle` has passed since the request body last
-/// moved (or ended; at the start for a body that never does).
+/// moved (or ended; at the start for a body that never does). Also bounds
+/// the read of a body tgin buffers, whose frames stamp `progress` alike.
 async fn await_headers<F: Future>(
     send: F,
     progress: &Progress,
@@ -337,10 +609,20 @@ struct Download {
     body: reqwest::Body,
     idle: Duration,
     sleep: Pin<Box<Sleep>>,
+    /// `None` while the caller reads the body itself.
     tally: Option<Tally>,
 }
 
 impl Download {
+    fn new(response: reqwest::Response, idle: Duration, tally: Option<Tally>) -> Download {
+        Download {
+            body: axum::http::Response::<reqwest::Body>::from(response).into_body(),
+            idle,
+            sleep: Box::pin(sleep_until(deadline(Instant::now(), idle))),
+            tally,
+        }
+    }
+
     fn fail(&mut self, err: DownloadError) -> Poll<Option<Result<Frame<Bytes>, DownloadError>>> {
         if let Some(tally) = self.tally.take() {
             tracing::warn!(bot = %tally.name, method = tally.label.as_str(), error = %err, "gateway response aborted");
@@ -406,6 +688,68 @@ mod tests {
     use std::future::pending;
 
     use super::*;
+
+    /// A body tgin buffers is read with the same idle bound: a client that
+    /// stops sending gets `Idle` after exactly `idle` without a frame, and
+    /// one that goes away is told apart.
+    #[tokio::test(start_paused = true)]
+    async fn buffered_read_waits_at_most_idle_per_frame() {
+        let idle = Duration::from_secs(5);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let feeder = tokio::spawn(async move {
+            for chunk in [&b"{\"chat_id\""[..], b":-5,"] {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                tx.send(Ok(Bytes::from_static(chunk))).await.expect("open");
+            }
+            // Stalls, keeping the body open.
+            pending::<()>().await;
+        });
+        let started = Instant::now();
+        let read = prepare(&headers, None, Body::from_stream(stream), idle).await;
+        assert!(matches!(read, Err(Failed::Idle)));
+        assert_eq!(started.elapsed(), Duration::from_secs(13));
+        feeder.abort();
+
+        let failing = futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("gone"))]);
+        let read = prepare(&headers, None, Body::from_stream(failing), idle).await;
+        assert!(matches!(read, Err(Failed::ClientClosed)));
+
+        let read = prepare(
+            &headers,
+            Some("chat_id=%40Chan"),
+            Body::from(r#"{"chat_id":-5}"#),
+            idle,
+        )
+        .await;
+        let Ok((Payload::Buffered(body), chat)) = read else {
+            panic!("buffered");
+        };
+        assert_eq!(&body[..], br#"{"chat_id":-5}"#);
+        assert_eq!(
+            chat,
+            Some(ChatKey::Username("chan".into())),
+            "the query comes first"
+        );
+    }
+
+    #[test]
+    fn retry_after_of_flood_bodies() {
+        let flood = br#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 7","parameters":{"retry_after":7}}"#;
+        assert_eq!(retry_after(flood), Some(Duration::from_secs(7)));
+        for body in [
+            &br#"{"ok":false,"error_code":429,"description":"Too Many Requests"}"#[..],
+            br#"{"parameters":{"retry_after":-1}}"#,
+            br#"{"parameters":{"migrate_to_chat_id":-100}}"#,
+            b"<html>busy</html>",
+        ] {
+            assert_eq!(retry_after(body), None);
+        }
+    }
 
     /// The wait for headers ends only after `idle` without progress: each
     /// stamp moves the deadline.
