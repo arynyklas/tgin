@@ -119,23 +119,25 @@ consumers:
     )
 }
 
-/// One call Telegram received.
+/// One call Telegram received, stamped with tokio's clock.
 #[derive(Clone, Debug)]
 struct Call {
     path: String,
     content_type: Option<String>,
     body: Bytes,
-    at: Instant,
+    at: tokio::time::Instant,
 }
 
 /// Telegram: `getMe` answers the bot; every other call answers `answer`
-/// (`{"ok":true,"result":true}` by default). The first call other than
-/// `getMe` waits for `hold`'s release when one is set.
+/// (`{"ok":true,"result":true}` by default) and goes to `arrivals` when
+/// one is taken. The first call other than `getMe` waits for `hold`'s
+/// release when one is set, for at most [`PATIENCE`] of real time.
 #[derive(Clone, Default)]
 struct Telegram {
     calls: Arc<Mutex<Vec<Call>>>,
     hold: Arc<Mutex<Option<Hold>>>,
     answer: Arc<Mutex<Option<(u16, String)>>>,
+    arrivals: Arc<Mutex<Option<mpsc::UnboundedSender<Call>>>>,
 }
 
 struct Hold {
@@ -167,6 +169,13 @@ impl Telegram {
             release: released,
         });
         (arrival, release)
+    }
+
+    /// Every later call other than `getMe`, as it arrives.
+    fn arrivals(&self) -> mpsc::UnboundedReceiver<Call> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.arrivals.lock().expect("arrivals") = Some(tx);
+        rx
     }
 
     /// The calls of `method` so far.
@@ -218,23 +227,95 @@ async fn telegram_answer(State(telegram): State<Telegram>, req: Request) -> Resp
     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .expect("the request body");
-    telegram.calls.lock().expect("calls").push(Call {
+    let call = Call {
         path: path.clone(),
         content_type,
         body,
-        at: Instant::now(),
-    });
+        at: tokio::time::Instant::now(),
+    };
+    telegram.calls.lock().expect("calls").push(call.clone());
     if path.ends_with("/getMe") {
         return json_response(200, ME.to_owned());
+    }
+    if let Some(arrivals) = &*telegram.arrivals.lock().expect("arrivals") {
+        let _ = arrivals.send(call);
     }
     let hold = telegram.hold.lock().expect("hold").take();
     if let Some(hold) = hold {
         let _ = hold.arrived.send(());
-        let _ = timeout(PATIENCE, hold.release).await;
+        tokio::select! {
+            _ = hold.release => {}
+            _ = real_time(PATIENCE) => {}
+        }
     }
     let answer = telegram.answer.lock().expect("answer").clone();
     let (status, body) = answer.unwrap_or_else(|| (200, OK_TRUE.to_owned()));
     json_response(status, body)
+}
+
+/// Fires after `wait` of real time, whatever tokio's clock does.
+fn real_time(wait: Duration) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(wait);
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Tokio's clock, frozen (as in `gateway.rs`): the test's runtime starts
+/// paused, and a blocking task keeps the paused clock from jumping to the
+/// next timer whenever the runtime waits for a socket, so time moves only
+/// by [`tokio::time::advance`]. Taken first thing, every instant is a whole
+/// number of milliseconds after the timer driver's start.
+struct Frozen(std::sync::mpsc::Sender<()>);
+
+fn freeze() -> Frozen {
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    drop(tokio::task::spawn_blocking(move || {
+        let _ = held.recv();
+    }));
+    Frozen(hold)
+}
+
+impl Frozen {
+    /// Real time again, for the shutdown's own timers.
+    fn thaw(self) {
+        drop(self.0);
+        tokio::time::resume();
+    }
+}
+
+/// `fut`, bounded by [`PATIENCE`] of real time.
+async fn within<F: Future>(what: &str, fut: F) -> F::Output {
+    tokio::select! {
+        out = fut => out,
+        _ = real_time(PATIENCE) => panic!("{what} did not happen within {PATIENCE:?}"),
+    }
+}
+
+/// How long [`quiet`] watches, in real time: far longer than a call takes
+/// over loopback, so one that was due would show up.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Asserts that no call reaches Telegram for [`QUIET`] of real time.
+async fn quiet(what: &str, arrivals: &mut mpsc::UnboundedReceiver<Call>) {
+    tokio::select! {
+        call = arrivals.recv() => {
+            let at = call.map(|call| call.at);
+            panic!("{what}: a call reached Telegram at {at:?}");
+        }
+        _ = real_time(QUIET) => {}
+    }
+}
+
+/// Yields until `ready`, for at most [`PATIENCE`] of real time.
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(started.elapsed() < PATIENCE, "{what} never happened");
+        tokio::task::yield_now().await;
+    }
 }
 
 fn json_response(status: u16, body: String) -> Response {
@@ -289,6 +370,10 @@ impl Tgin {
     fn assert_metric(&self, line: &str) {
         let out = self.metrics.encode();
         assert!(out.lines().any(|l| l == line), "missing {line:?} in\n{out}");
+    }
+
+    fn has_metric(&self, line: &str) -> bool {
+        self.metrics.encode().lines().any(|l| l == line)
     }
 
     /// Waits until the metric line `line` is exported.
@@ -780,13 +865,15 @@ async fn failed_delivery_never_executes_reply() {
     tgin.stop().await;
 }
 
-/// Replies go through the bot's rate limits, in `shape` mode here: a reply
-/// waits for the global quota's next slot, and one whose chat quota has no
-/// slot within `max_delay` is not executed (`rate_limited`, a warn line).
-/// Its update is delivered all the same.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Replies go through the bot's rate limits, in `shape` mode here, on the
+/// frozen clock: a reply waits exactly for the global quota's next slot,
+/// and one whose chat quota has no slot within `max_delay` is not executed
+/// (`rate_limited`, a warn line). Its update is delivered all the same.
+#[tokio::test(start_paused = true)]
 async fn reply_rate_limited_in_shape_mode() {
+    let frozen = freeze();
     let telegram = Telegram::default();
+    let mut arrivals = telegram.arrivals();
     let api = telegram.serve().await;
     let json = "application/json";
     let down = MockServer::start().await;
@@ -801,34 +888,50 @@ async fn reply_rate_limited_in_shape_mode() {
         ..Extra::default()
     };
     let tgin = start(&config(&api, &down.uri(), &extra)).await;
+    let t0 = tokio::time::Instant::now();
+    let executed = |n: u32| {
+        format!(r#"tgin_webhook_replies_total{{consumer="hooks",outcome="executed"}} {n}"#)
+    };
 
     tgin.admit(1, 5).await;
-    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 1"#)
-        .await;
+    let call = within("the first reply", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!((call.at, &call.body[..]), (t0, first.as_bytes()));
+    until("the first reply executed", || tgin.has_metric(&executed(1))).await;
+
     // The global quota's next slot is a second after the first reply's.
     tgin.admit(2, 6).await;
-    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 2"#)
-        .await;
+    let delayed =
+        r#"tgin_gateway_ratelimited_total{bot="hooked",scope="global",action="delayed"} 1"#;
+    until("the second reply's delay", || tgin.has_metric(delayed)).await;
+    tokio::time::advance(Duration::from_millis(999)).await;
+    quiet("the second reply before its slot", &mut arrivals).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let call = within("the second reply", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!(
+        (call.at, &call.body[..]),
+        (t0 + Duration::from_secs(1), second.as_bytes())
+    );
+    until("the second reply executed", || {
+        tgin.has_metric(&executed(2))
+    })
+    .await;
+
     // Chat 5's next slot is a minute away, past `max_delay`.
     tgin.admit(3, 5).await;
-    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="rate_limited"} 1"#)
-        .await;
-    tgin.wait_held("hooks", 0).await;
-
-    let sent = telegram.calls_to("sendMessage");
-    let bodies: Vec<&[u8]> = sent.iter().map(|c| &c.body[..]).collect();
-    assert_eq!(bodies, [first.as_bytes(), second.as_bytes()]);
-    let gap = sent[1].at.duration_since(sent[0].at);
-    assert!(
-        gap >= Duration::from_millis(800),
-        "the second reply waited only {gap:?}"
-    );
+    let refused = r#"tgin_webhook_replies_total{consumer="hooks",outcome="rate_limited"} 1"#;
+    until("the third reply refused", || tgin.has_metric(refused)).await;
+    let delivered =
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="0",outcome="delivered"} 3"#;
+    until("every update delivered", || tgin.has_metric(delivered)).await;
+    quiet("the refused reply", &mut arrivals).await;
     tgin.assert_metric(
         r#"tgin_gateway_ratelimited_total{bot="hooked",scope="chat",action="rejected"} 1"#,
     );
-    tgin.assert_metric(
-        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="0",outcome="delivered"} 3"#,
-    );
+    tgin.assert_metric(&executed(2));
     let logs = LOGS.text();
     assert!(
         logs.lines().any(|l| l.contains("WARN")
@@ -838,6 +941,94 @@ async fn reply_rate_limited_in_shape_mode() {
         "no rate-limit warning"
     );
     assert_no_token_logged();
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// A reply's call to Telegram ends after 30 s in all: it counts `failed`
+/// and `unreachable`, and the update is delivered.
+#[tokio::test(start_paused = true)]
+async fn reply_call_bounded_by_30s() {
+    let frozen = freeze();
+    let telegram = Telegram::default();
+    let (arrived, release) = telegram.hold_next();
+    let api = telegram.serve().await;
+    let down = MockServer::start().await;
+    let reply = r#"{"method":"sendMessage","chat_id":5,"text":"slow"}"#;
+    answer_update(&down, 1, 200, "application/json", reply).await;
+    let tgin = start(&config(&api, &down.uri(), &Extra::default())).await;
+    let failed = r#"tgin_webhook_replies_total{consumer="hooks",outcome="failed"} 1"#;
+
+    tgin.admit(1, 5).await;
+    within("the reply reaches Telegram", arrived)
+        .await
+        .expect("held");
+    tokio::time::advance(Duration::from_millis(29_999)).await;
+    let _ = real_time(QUIET).await;
+    assert!(!tgin.has_metric(failed), "the reply call ended before 30 s");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    until("the reply call times out", || tgin.has_metric(failed)).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="hooked",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    let delivered =
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="0",outcome="delivered"} 1"#;
+    until("the update delivered", || tgin.has_metric(delivered)).await;
+    drop(release);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// A multipart reply's `chat_id` is not read for the limits, as for a
+/// streamed gateway request: only the global quota applies, so it goes
+/// while its chat's quota is used up. A JSON reply to that chat is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_reply_limited_by_global_quota_only() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let json = "application/json";
+    let boundary = "limits-boundary";
+    let upload = multipart(
+        boundary,
+        &[
+            ("method", None, b"sendDocument"),
+            ("chat_id", None, b"7"),
+            ("document", Some("a.bin"), b"\x01\x02"),
+        ],
+    );
+    let down = MockServer::start().await;
+    let to_seven = r#"{"method":"sendMessage","chat_id":7,"text":"x"}"#;
+    answer_update(&down, 1, 200, json, to_seven).await;
+    answer_update(
+        &down,
+        2,
+        200,
+        &format!("multipart/form-data; boundary={boundary}"),
+        upload.clone(),
+    )
+    .await;
+    answer_update(&down, 3, 200, json, to_seven).await;
+    let extra = Extra {
+        bot: "    gateway: { rate_limit: { mode: reject, per_chat: { count: 1, per: 1m, burst: 1 } } }\n",
+        ..Extra::default()
+    };
+    let tgin = start(&config(&api, &down.uri(), &extra)).await;
+    for id in 1..=3 {
+        tgin.admit(id, 5).await;
+    }
+
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="rate_limited"} 1"#)
+        .await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 2"#);
+    let [sent] = &telegram.calls_to("sendDocument")[..] else {
+        panic!("the multipart reply goes");
+    };
+    assert_eq!(&sent.body[..], &upload[..]);
+    assert_eq!(telegram.calls_to("sendMessage").len(), 1);
+    tgin.assert_metric(
+        r#"tgin_gateway_ratelimited_total{bot="hooked",scope="chat",action="rejected"} 1"#,
+    );
     tgin.stop().await;
 }
 

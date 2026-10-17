@@ -21,6 +21,7 @@ use tgin_runtime::breaker::{Breaker, BreakerConfig, BreakerState};
 use tgin_runtime::http::Via;
 use tgin_runtime::queue::{OnFull, Ordering, QueueConfig};
 use tgin_runtime::secret::Secret;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -1420,5 +1421,74 @@ async fn chunked_reply_bounded_without_length() {
         panic!("one reply handed over: {}", handed.len());
     };
     assert_eq!(reply.body, Bytes::from(chunked_reply().concat()));
+    h.assert_metric(&format!("{} 2", h.attempts(0, "delivered")));
+}
+
+/// An executor that signals each reply it is handed, then holds it until
+/// the test releases it.
+struct Gate {
+    entered: Notify,
+    release: Semaphore,
+}
+
+impl ReplyExecutor for Gate {
+    fn execute<'a>(
+        &'a self,
+        _consumer: &'a str,
+        _source: SourceId,
+        _reply: Reply,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+        })
+    }
+
+    fn too_large(&self, _consumer: &str, _source: SourceId) {}
+}
+
+/// R26: a delivery gives its endpoint's in-flight claim back before its
+/// reply runs, so `least_in_flight` sees the endpoint free while the reply
+/// is executed, and the next update goes to the same endpoint.
+#[tokio::test]
+async fn endpoint_released_before_reply_runs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"method":"sendMessage","chat_id":1,"text":"a"}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let gate = Arc::new(Gate {
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let handle: ReplyHandle = Arc::default();
+    let executor: Arc<dyn ReplyExecutor> = gate.clone();
+    assert!(handle.set(executor).is_ok());
+    let mut opts = options(Balance::LeastInFlight, 2, retry(10, 50, 5));
+    opts.reply = Some(handle);
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/a"), endpoint(&server, "/b")],
+        opts,
+    );
+    h.admit(1, None);
+    timeout(WAIT, gate.entered.notified())
+        .await
+        .expect("the first reply runs");
+    h.admit(2, None);
+    let got = wait_requests(&server, 2).await;
+    let to_b = got.iter().filter(|req| on(req, "/b")).count();
+    assert_eq!(
+        (got.len() - to_b, to_b),
+        (2, 0),
+        "the endpoint was still claimed while its reply ran"
+    );
+    gate.release.add_permits(2);
+    h.settled().await;
     h.assert_metric(&format!("{} 2", h.attempts(0, "delivered")));
 }

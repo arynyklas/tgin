@@ -15,8 +15,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
-use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use tgin_core::ids::SourceId;
 use tgin_core::reply::{MAX_REPLY_BYTES, Reply, ReplyExecutor};
@@ -28,7 +28,7 @@ use super::chat_key::chat_key;
 use super::metrics::{MethodLabel, Outcome, RateAction, ReplyMetrics, ReplyOutcome};
 use super::params::text_param;
 use super::proxy::{deadline, outcome, url};
-use super::{Bot, Gateway};
+use super::{Bot, Bounded, Gateway, read_bounded};
 
 /// Bound on a reply's call to Telegram, from connecting to the end of the
 /// response. The body is in memory, so no upload can be slow.
@@ -194,7 +194,12 @@ impl Call<'_> {
             return;
         }
         self.counts.count(ReplyOutcome::Failed);
-        let body = read_limited(response, REFUSAL_LIMIT).await;
+        // Bounded by the request's total timeout, as the whole call is.
+        let body = Body::new(axum::http::Response::<reqwest::Body>::from(response).into_body());
+        let body = match read_bounded(body, REFUSAL_LIMIT).await {
+            Ok(Bounded::Complete(body)) => Some(body),
+            Ok(Bounded::Over(_)) | Err(_) => None,
+        };
         let description = body
             .as_deref()
             .and_then(description)
@@ -202,18 +207,6 @@ impl Call<'_> {
             .unwrap_or_default();
         tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), status = status.as_u16(), description = %description, "webhook reply failed: Telegram refused it");
     }
-}
-
-/// `response`'s body when it is at most `limit` bytes and arrives whole.
-async fn read_limited(mut response: reqwest::Response, limit: usize) -> Option<Bytes> {
-    let mut body = BytesMut::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Some(body.freeze())
 }
 
 /// The `description` of a Bot API error body.
