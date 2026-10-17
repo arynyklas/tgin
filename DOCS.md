@@ -261,7 +261,7 @@ The data plane also serves the Bot API to the bots behind tgin. A downstream set
 
 Configured routes (webhook paths, `/c/<consumer>/getUpdates` and aliases) are matched first; every other data-plane path goes to the gateway. It serves `GET` and `POST`, and passes the query string on as it came. A path is a gateway path when:
 
-- its token segment, percent-decoded once (python-telegram-bot sends the `:` as `%3A`), has Telegram's shape `<digits>:<secret>`, with 1 to 128 of `A-Za-z0-9_-` after the colon;
+- its token segment, percent-decoded once (python-telegram-bot sends the `:` as `%3A` in file URLs), has Telegram's shape `<digits>:<secret>`, with 1 to 128 of `A-Za-z0-9_-` after the colon;
 - the method, the last segment, is a letter followed by up to 63 letters, digits or `_`; it is matched ignoring ASCII case, as Telegram matches it (`GETME` is `getMe`);
 - a file path is not empty and has no `.` or `..` segment (also when written `%2e`) and no `\`;
 - `<consumer>` is a valid name.
@@ -279,14 +279,14 @@ Whoever holds a bot's token can use the gateway as that bot, as with Telegram, a
 
 ### Forwarding
 
-A call that no intercept answers goes to `{api_url}/bot<token>/<method>`, and a download to `{api_url}/file/bot<token>/<file_path>`, keeping the path of `api_url`. Both bodies stream in both directions and keep their `Content-Length` when they have one, so uploads and downloads of any size pass through in constant memory. tgin reads a body whole only where it must, each with a bound: the JSON or urlencoded body of a method in [`rate_limit.methods`](#rate-limits) (its chat, and a possible resend), up to 64 KiB; the parameters of an [intercepted](#intercepts) call, up to 64 KiB; Telegram's `429` answers and the `getMe` answer that fills tgin's cache, up to 64 KiB; and [webhook replies](#webhook-replies), up to 1 MiB.
+A call that no intercept answers goes to `{api_url}/bot<token>/<method>`, and a download to `{api_url}/file/bot<token>/<file_path>`, keeping the path of `api_url`. Both bodies stream in both directions and keep their `Content-Length` when they have one, so uploads and downloads of any size pass through in constant memory. tgin reads a body whole only where it must, each with a bound: the JSON or urlencoded body of a method in [`rate_limit.methods`](#rate-limits) (its chat, and a possible resend), up to 64 KiB; the parameters of an [intercepted](#intercepts) call, up to 64 KiB; Telegram's `429` answers and the `getMe` answer that fills tgin's cache, up to 64 KiB; Telegram's error answer to a webhook reply, up to 64 KiB; and [webhook replies](#webhook-replies), up to 1 MiB.
 
 Only these headers pass, except one that the message's `Connection` header names:
 
 - to Telegram: `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding` and `User-Agent`, and on file paths also `Range`, `If-None-Match` and `If-Modified-Since`;
 - back to the client: `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Disposition`, `Retry-After`, `Cache-Control`, `ETag`, `Last-Modified`, `Accept-Ranges` and `Content-Range`.
 
-Connecting to Telegram may take 5 s; after that no total timeout applies, and the bot's `gateway.upstream_idle_timeout` (`1m`) bounds the time in which nothing moves. Telegram's response headers must arrive within it of the request body's last bytes, whether the client stopped sending or Telegram stopped reading, and each part of the response body within it of the previous one. A transfer that keeps moving is never cut. A request that gets no response is answered `502 Bad Gateway: Telegram is unreachable`; a response body that fails or stalls after its headers aborts the client's connection. The gateway has no circuit breaker: each request fails on its own. Its requests use the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment if set and never follow redirects.
+Connecting to Telegram may take 5 s; after that no total timeout applies, and the bot's `gateway.upstream_idle_timeout` (`1m`) bounds the time in which nothing moves. Telegram's response headers must arrive within it of the request body's last bytes, whether the client stopped sending or Telegram stopped reading, and each part of the response body within it of the previous one. A transfer that keeps moving is never cut. A request that gets no response is answered `502 Bad Gateway: Telegram is unreachable`; a response body that fails or stalls after its headers aborts the client's connection, except for the two answers tgin reads whole before it replies (Telegram's `429` to a call whose body tgin holds, and the `getMe` answer that fills its cache), where the client gets `502 Bad Gateway: Telegram is unreachable` instead (counted `upstream_error`). The gateway has no circuit breaker: each request fails on its own. Its requests use the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment if set and never follow redirects.
 
 tgin knows the methods of Bot API 10.3. A method it does not know is forwarded like any other and counted with the metric label `other`; only known methods are intercepted.
 
@@ -303,7 +303,7 @@ tgin knows the methods of Bot API 10.3. A method it does not know is forwarded l
 
 `drop_pending_updates` on a `deleteWebhook`, or on a `setWebhook` that a consumer accepts, empties the calling consumer's queue (as `purge` does) when that consumer has `honor_drop_pending: true`, and is ignored otherwise; on the bot path it never drops anything.
 
-The answers follow telegram-bot-api's `Client.cpp`: its descriptions (`Webhook is already set`, `Webhook is already deleted`, `Bad Request: invalid webhook URL specified`, `Bad Request: secret token is too long`, `Bad Request: secret token contains illegal characters`), its order of parameters (the query string first, then a JSON, urlencoded or multipart body's text fields) and its booleans (`true`, `yes` or `1`, in any case). Intercepted calls never reach Telegram and count as outcome `local`, so a framework that calls `deleteWebhook` when it starts polling (python-telegram-bot, grammY and Telegraf do), `setWebhook` or `logOut` cannot remove tgin's webhook, drop the updates Telegram holds for it or log the bot out. The body of a `setWebhook`, a `deleteWebhook` or a consumer-scoped `getUpdates` must arrive within the bot's `upstream_idle_timeout` (else `408 Request Timeout`) and whole (else `400 Bad Request: the request body ended early`); a body announced over 64 KiB is refused at once (`413 Request Entity Too Large`, or `400` for `getUpdates`, as on `/c/<consumer>/getUpdates`).
+The answers follow telegram-bot-api's `Client.cpp`: its descriptions (`Webhook is already set`, `Webhook is already deleted`, `Bad Request: invalid webhook URL specified`, `Bad Request: secret token is too long`, `Bad Request: secret token contains illegal characters`), its order of parameters (the query string first, then a JSON, urlencoded or multipart body's text fields) and its booleans (`true`, `yes` or `1`, in any case). Intercepted calls (except a `getMe` before tgin knows the bot's identity) never reach Telegram and count as outcome `local`, so a framework that calls `deleteWebhook` when it starts polling (python-telegram-bot, grammY and Telegraf do), `setWebhook` or `logOut` cannot remove tgin's webhook, drop the updates Telegram holds for it or log the bot out. The body of a `setWebhook`, a `deleteWebhook` or a consumer-scoped `getUpdates` must arrive within the bot's `upstream_idle_timeout` (else `408 Request Timeout`) and whole (else `400 Bad Request: the request body ended early`); a body announced over 64 KiB is refused at once (`413 Request Entity Too Large`, or `400` for `getUpdates`, as on `/c/<consumer>/getUpdates`).
 
 ### `setWebhook` capture
 
@@ -421,6 +421,15 @@ consumers:
 ```
 
 [examples/simple](examples/simple) runs a complete stack.
+
+### Self-hosted Bot API server
+
+A bot's `api_url` may point at a self-hosted [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server instead of `https://api.telegram.org`. Its method calls and tgin's long poll work through it as through Telegram, and so does the gateway's forwarding of method calls. Two things do not work through tgin with such a server:
+
+- **File downloads.** The gateway forwards downloads to `{api_url}/file/bot<token>/<file_path>`, a route the server does not serve; with `--local`, `getFile` answers an absolute path on the server's disk instead of a `file_path` to download.
+- **Webhook ingress from it.** `register: true` registers only an `https` `public_url`, and `ip_allowlist: telegram` names Telegram's networks, not the server's.
+
+Never expose the server itself: it has no authentication of its own, and its statistics port (`--http-stat-port`) shows the bots' tokens. Keep it on a network only tgin reaches.
 
 ### Checking against real Telegram
 

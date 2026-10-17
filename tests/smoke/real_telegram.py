@@ -470,7 +470,10 @@ class Run:
         def send(i):
             start = time.monotonic()
             text = f"tgin smoke: shaped send {i}/{SEND_CONCURRENCY} (burst 3, then 1 per second)"
-            status, answer = call(self.gateway, "sendMessage", {"chat_id": chat, "text": text})
+            try:
+                status, answer = call(self.gateway, "sendMessage", {"chat_id": chat, "text": text})
+            except Exception as err:  # noqa: BLE001 - recorded masked, never raised in the thread
+                status, answer = None, MASK(repr(err))
             results[i] = (time.monotonic() - start, status, answer)
 
         threads = [threading.Thread(target=send, args=(i,)) for i in range(1, SEND_CONCURRENCY + 1)]
@@ -481,10 +484,15 @@ class Run:
         durations = sorted(r[0] for r in results.values())
         CHECK(
             f"{SEND_CONCURRENCY} sends to the chat at once all succeed",
-            all(r[1] == 200 and isinstance(r[2], dict) and r[2].get("ok") for r in results.values()),
-            {i: r[1] for i, r in results.items()},
+            len(results) == SEND_CONCURRENCY
+            and all(r[1] == 200 and isinstance(r[2], dict) and r[2].get("ok") for r in results.values()),
+            {i: r[1] if r[1] is not None else r[2] for i, r in sorted(results.items())},
         )
-        CHECK("the last send was shaped by about 1 s", durations[-1] - durations[0] >= 0.8, [round(d, 2) for d in durations])
+        CHECK(
+            "the last send was shaped by about 1 s",
+            len(durations) == SEND_CONCURRENCY and durations[-1] - durations[0] >= 0.8,
+            [round(d, 2) for d in durations],
+        )
         delayed = metric(self.admin, "tgin_gateway_ratelimited_total", scope="chat", action="delayed") - delayed_before
         CHECK("metrics: the chat quota's delay was counted", delayed >= 1, delayed)
 
