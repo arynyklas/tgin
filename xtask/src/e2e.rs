@@ -899,10 +899,10 @@ impl Suite {
     /// Scenario 7: shaping: grammY sends 5 messages to one chat at once. Under
     /// the default per-chat limit (burst 3, 1/s) tgin delays exactly the 4th
     /// and 5th (the gate: its own count), and the fake sees the 1/s pacing:
-    /// the last arrival at least 1.8 s after the first, and the 4th at least
-    /// 0.8 s after the first and 0.8 s before the last. The arrival bounds
-    /// leave room for latency differences between the messages; the exact
-    /// 2 s holds only at tgin's limiter.
+    /// the last arrival 1.8 s to 3 s after the first (2 s at tgin's limiter,
+    /// so an over-delay fails too), and the 4th at least 0.8 s after the
+    /// first and 0.8 s before the last. The arrival bounds leave room for
+    /// latency differences between the messages.
     async fn shaping(&mut self) -> Result<(), String> {
         let f = framework("grammy");
         let bot = f.poll();
@@ -947,9 +947,9 @@ impl Suite {
             fourth - first,
             last - first
         );
-        ensure(last - first >= 1800, || {
+        ensure((1800..=3000).contains(&(last - first)), || {
             format!(
-                "the 5th message came {} ms after the first, under 1.8 s",
+                "the 5th message came {} ms after the first, not within 1.8 s to 3 s",
                 last - first
             )
         })?;
