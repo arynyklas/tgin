@@ -102,7 +102,7 @@ pub async fn poll(consumer: &PullConsumer, req: Request, trusted_proxies: &[IpNe
         Err(description) => return bad_request(description),
     };
     let Ok(body) = axum::body::to_bytes(body, PULL_BODY_LIMIT).await else {
-        return bad_request("the request body could not be read");
+        return body_unreadable();
     };
     let content_type = parts
         .headers
@@ -394,6 +394,12 @@ impl<'de> Visitor<'de> for Integer {
 
 fn bad_request(detail: &str) -> Response {
     errors::error(StatusCode::BAD_REQUEST, &format!("Bad Request: {detail}"))
+}
+
+/// `400 Bad Request: the request body could not be read`: a body that
+/// failed or is over the 64 KiB limit.
+pub(crate) fn body_unreadable() -> Response {
+    bad_request("the request body could not be read")
 }
 
 /// `{"ok":true,"result":[…]}` around the payloads, which are sent as they

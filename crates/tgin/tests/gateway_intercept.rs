@@ -92,6 +92,7 @@ fn intercept_config(api: &str, hooks_extra: &str) -> String {
     format!(
         r#"version: 1
 runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+reload: {{ watch: false }}
 server: {{ listen: ["127.0.0.1:0"] }}
 admin: {{ listen: ["127.0.0.1:0"] }}
 bots:
@@ -1221,7 +1222,7 @@ async fn scoped_intercepts_follow_the_feeding_bot_across_reloads() {
         format!(
             r#"version: 1
 runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
-reload: {{ drain_timeout: 30s }}
+reload: {{ watch: false, drain_timeout: 30s }}
 server: {{ listen: ["127.0.0.1:0"] }}
 admin: {{ listen: ["127.0.0.1:0"] }}
 bots:
@@ -1313,17 +1314,38 @@ async fn wait_token(tgin: &Tgin, token: &str) {
 }
 
 /// Opens `POST path` with a JSON `body` and sends only its first 4 bytes.
+/// The head asks `Expect: 100-continue`, and the `100 Continue` is read
+/// before any body byte: hyper writes it only once the handler polls the
+/// body, which proves the gateway routed the request (and matched its
+/// token) before this returns.
 async fn stalled_post(tgin: &Tgin, path: &str, body: &[u8]) -> TcpStream {
+    stalled_post_announcing(tgin, path, body.len(), &body[..4]).await
+}
+
+/// As [`stalled_post`], announcing `length` bytes and sending `part`.
+async fn stalled_post_announcing(tgin: &Tgin, path: &str, length: usize, part: &[u8]) -> TcpStream {
     let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
     let head = format!(
-        "POST {path} HTTP/1.1\r\nHost: tgin\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
+        "POST {path} HTTP/1.1\r\nHost: tgin\r\nConnection: close\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: {length}\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
-    stream
-        .write_all(&body[..4])
-        .await
-        .expect("part of the body");
+    let read = async {
+        let mut interim = Vec::new();
+        while !interim.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            let n = stream.read(&mut byte).await.expect("read");
+            assert!(n > 0, "connection closed before 100 Continue");
+            interim.push(byte[0]);
+        }
+        interim
+    };
+    let interim = timeout(PATIENCE, read).await.expect("100 Continue in time");
+    assert!(
+        interim.starts_with(b"HTTP/1.1 100"),
+        "{}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(part).await.expect("part of the body");
     stream
 }
 
@@ -1493,5 +1515,40 @@ async fn stalled_intercept_body_ends_at_idle_bound() {
         ));
     }
     assert_eq!(tgin.consumer("hooks").await["endpoints"], json!([]));
+    tgin.stop().await;
+}
+
+/// A consumer-scoped `getUpdates` announcing a body over 64 KiB is refused
+/// at once, as `/c/<consumer>/getUpdates` refuses it, without waiting for
+/// a body that may never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_limit_scoped_get_updates_is_refused_at_once() {
+    let telegram = telegram().await;
+    let yaml = intercept_config(&telegram.uri(), "").replace(
+        "    ingress:",
+        "    gateway: { upstream_idle_timeout: 30s }\n    ingress:",
+    );
+    let tgin = start(&yaml).await;
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST /c/workers/bot{TOKEN}/getUpdates HTTP/1.1\r\nHost: tgin\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{{\"offset\":"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("head and 10 bytes");
+    let started = Instant::now();
+    assert_eq!(
+        raw_response(&mut stream).await,
+        (
+            400,
+            telegram_error(400, "Bad Request: the request body could not be read")
+        )
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "answered without waiting: {:?}",
+        started.elapsed()
+    );
     tgin.stop().await;
 }

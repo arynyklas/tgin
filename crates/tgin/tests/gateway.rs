@@ -821,11 +821,13 @@ async fn file_route_streams_with_range() {
 }
 
 /// A webhook bot `hooked` (path `/hook`) feeding `workers`, polled through
-/// the alias `/bot1/getUpdates`.
+/// the alias `/bot1/getUpdates`. Reloaded by SIGHUP only: no config watch,
+/// whose own reload of a rewrite would race the signal.
 fn hooked_config(api: &str, extra_bot: &str) -> String {
     format!(
         r#"version: 1
 runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+reload: {{ watch: false }}
 server: {{ listen: ["127.0.0.1:0"] }}
 admin: {{ listen: ["127.0.0.1:0"] }}
 bots:

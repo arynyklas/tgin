@@ -154,13 +154,17 @@ impl Call<'_> {
             Some((_, Some(pull))) => pull,
         };
         let (parts, body) = req.into_parts();
-        // A body over the limit goes on to `poll`, which refuses it as on
-        // the consumer's own path.
         let body = match self.read_body(body).await {
-            Ok(Bounded::Complete(body)) => Body::from(body),
-            Ok(Bounded::Over(partial)) => partial.into_body(),
+            Ok(Bounded::Complete(body)) => body,
+            // As `poll` refuses it on the consumer's own path, without
+            // waiting for the rest.
+            Ok(Bounded::Over(_)) => {
+                self.count(Outcome::Local);
+                return pull::body_unreadable();
+            }
             Err(abandoned) => return abandoned.response(),
         };
+        let body = Body::from(body);
         self.count(Outcome::Local);
         pull::poll(
             &pull,
