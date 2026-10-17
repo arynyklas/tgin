@@ -555,9 +555,9 @@ pub struct Push {
     pub accept_set_webhook: bool,
     #[serde(default = "defaults::webhook_reply")]
     pub webhook_reply: WebhookReply,
-    /// Let `deleteWebhook` with `drop_pending_updates: true`, sent on this
-    /// consumer's gateway path, empty the consumer's queue. Off, the flag
-    /// is ignored.
+    /// Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with
+    /// `drop_pending_updates: true`, sent on this consumer's gateway path,
+    /// empty the consumer's queue. Off, the flag is ignored.
     #[serde(default)]
     pub honor_drop_pending: bool,
 }

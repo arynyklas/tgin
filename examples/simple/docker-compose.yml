@@ -14,32 +14,35 @@ services:
       - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
       - TGIN_ADMIN_TOKEN=${TGIN_ADMIN_TOKEN:?set TGIN_ADMIN_TOKEN}
 
+  # Every bot's Bot API is tgin's gateway, http://tgin:8080/c/<consumer>, so
+  # the bots start once tgin is ready (the image's health check).
   bot1:
     build: .
     depends_on:
-      - tgin
+      tgin:
+        condition: service_healthy
     environment:
       - TOKEN=${TOKEN}
-      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
-      - TGIN_ENDPOINT=http://tgin:8080/c/bot1/getUpdates
+      - TGIN_BASE=http://tgin:8080/c/bot1
 
   bot2:
     build: .
     command: ["uv", "run", "bot1.py"]
     depends_on:
-      - tgin
+      tgin:
+        condition: service_healthy
     environment:
       - TOKEN=${TOKEN}
       - REPLY=hello from bot 2
-      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
-      - TGIN_ENDPOINT=http://tgin:8080/c/bot2/getUpdates
+      - TGIN_BASE=http://tgin:8080/c/bot2
 
   bot3:
     build: .
     command: ["uv", "run", "bot3.py"]
     depends_on:
-      - tgin
+      tgin:
+        condition: service_healthy
     environment:
       - TOKEN=${TOKEN}
-      - TELEGRAM_API_URL=${TELEGRAM_API_URL:-https://api.telegram.org}
+      - TGIN_BASE=http://tgin:8080/c/bot3
       - PORT=3001

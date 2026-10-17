@@ -706,7 +706,7 @@
         },
         "honor_drop_pending": {
           "default": false,
-          "description": "Let `deleteWebhook` with `drop_pending_updates: true`, sent on this\nconsumer's gateway path, empty the consumer's queue. Off, the flag\nis ignored.",
+          "description": "Let `deleteWebhook`, or a `setWebhook` this consumer accepts, with\n`drop_pending_updates: true`, sent on this consumer's gateway path,\nempty the consumer's queue. Off, the flag is ignored.",
           "type": "boolean"
         },
         "max_in_flight": {

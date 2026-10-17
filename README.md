@@ -45,14 +45,17 @@ tgin began as a fork of [chesnokpeter/tgin](https://github.com/chesnokpeter/tgin
 ```mermaid
 graph LR
     Telegram[Telegram Bot API] -->|long poll or webhook| TGIN[tgin]
-    TGIN -->|rules| Pull[pull consumer: bots poll /c/name/getUpdates]
+    TGIN -->|rules| Pull[pull consumer: bots poll getUpdates on tgin]
     TGIN -->|rules| Push[push consumer: tgin POSTs to your service]
+    Bots[your bots' Bot API calls] -->|gateway: rate limits, intercepts| TGIN
+    TGIN -->|forwarded| Telegram
 ```
 
 - **Many bots, one process.** Each bot has its own token, ingress (long poll or webhook) and rules.
 - **Rules.** Route by update type, chat, chat type, user, command, text or callback data; send an update to one consumer, to several, or to one of a group (round robin, sticky by chat, or weighted).
-- **Pull consumers** speak Telegram's `getUpdates`, so most frameworks only need a different URL. Updates are leased and acknowledged by `offset`; one lost by a crashed bot instance goes to another after its lease times out.
-- **Push consumers** post each update to HTTP endpoints with retries, backoff, per-endpoint circuit breakers and optional per-chat ordering.
+- **A Bot API gateway.** A bot framework points its Bot API base URL at tgin (`http://tgin:8080/c/<consumer>`): its `getUpdates` polls the consumer, and its other calls go through tgin, which forwards them to Telegram (streaming uploads and downloads, holding the bot's sends to Telegram's flood limits, retrying a short `429` once) and answers `getMe`, the webhook methods, `logOut` and `close` itself, so a downstream cannot disturb tgin or the bot's other downstreams through them. aiogram, python-telegram-bot, grammY and Telegraf are tested end to end.
+- **Pull consumers** speak Telegram's `getUpdates`. Updates are leased and acknowledged by `offset`; one lost by a crashed bot instance goes to another after its lease times out.
+- **Push consumers** post each update to HTTP endpoints with retries, backoff, per-endpoint circuit breakers and optional per-chat ordering. An endpoint can answer with a Bot API call (a webhook reply), which tgin makes, and a webhook bot can register its URL with `setWebhook` on tgin.
 - **Bounded queues** per consumer, with backpressure to the source or dropping the oldest updates, your choice per consumer.
 - **Hot reload** of the config file on change, `SIGHUP` or the admin API; only bots whose token, URL or ingress changed restart.
 - **Operations.** An admin plane with `/livez`, `/readyz`, Prometheus `/metrics` and the admin API (`tgin admin` on the command line), JSON logs with secrets masked, and a graceful drain on shutdown.
@@ -97,7 +100,7 @@ consumers:
 TOKEN=123456:ABC ./target/release/tgin            # reads ./tgin.yaml
 ```
 
-Point your bot instances' `getUpdates` at `http://127.0.0.1:8080/c/bots/getUpdates` instead of Telegram; they share the updates. The admin plane listens on `127.0.0.1:9090`:
+Point your bot instances' Bot API base URL at `http://127.0.0.1:8080/c/bots` instead of `https://api.telegram.org` (aiogram: `TelegramAPIServer.from_base("http://127.0.0.1:8080/c/bots")`; other frameworks in [DOCS.md → Framework setup](DOCS.md#framework-setup)). They share the updates, and their other calls reach Telegram through tgin. The admin plane listens on `127.0.0.1:9090`:
 
 ```bash
 ./target/release/tgin admin status
@@ -121,13 +124,12 @@ Releases carry archives for Linux (glibc and static musl), macOS and Windows on 
 
 ## Documentation
 
-- [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, hot reload, admin API, metrics, security, shutdown and deployment.
+- [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, the Bot API gateway, hot reload, admin API, metrics, security, shutdown and deployment.
 - [docs/config-reference.md](docs/config-reference.md) — every config key, generated from the config model.
 - [PERF.md](PERF.md) — benchmark methodology, results and the harness's limits.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release, including breaking ones.
 - [SECURITY.md](SECURITY.md) — supported versions, private vulnerability reporting, release verification.
-- [examples/simple](examples/simple) — a Compose stack: one bot, two polling instances and one webhook service.
-- [integrations/pytgin](integrations/pytgin) — an `aiogram` shim that points `getUpdates` at tgin.
+- [examples/simple](examples/simple) — a Compose stack: one bot, two polling instances and one webhook service, all on the gateway.
 
 ## Performance
 
@@ -161,7 +163,7 @@ tgin 1.0 against the original engine it was forked from ([chesnokpeter/tgin](htt
 - [ ] Analytics collection
 - [ ] Per-bot caching layer
 - [ ] Userbot support
-- [ ] End-to-end bot tests
+- [x] End-to-end bot tests
 
 ## Goal
 

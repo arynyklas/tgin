@@ -1,14 +1,15 @@
 # yaml-language-server: $schema=../../../schema/tgin.v1.schema.json
 #
 # One bot, three downstream instances: two poll tgin (pull), one receives
-# webhooks (push). Updates are shared round robin. From examples/simple,
-# check it with `TOKEN=… TGIN_ADMIN_TOKEN=…
-# TELEGRAM_API_URL=https://api.telegram.org tgin config validate
-# config/tgin.yaml` (every `${env:…}` must be set). docker-compose.yml
-# mounts this directory as /etc/tgin.
+# webhooks (push). Updates are shared round robin. Every instance uses tgin's
+# Bot API gateway as its Bot API: its sends reach Telegram through tgin,
+# within the bot's rate limits. From examples/simple, check it with
+# `TOKEN=… TGIN_ADMIN_TOKEN=… TELEGRAM_API_URL=https://api.telegram.org
+# tgin config validate config/tgin.yaml` (every `${env:…}` must be set).
+# docker-compose.yml mounts this directory as /etc/tgin.
 version: 1
 
-# The data plane: the pull endpoints the polling bots call.
+# The data plane: the gateway, which the bots use as their Bot API.
 server:
   listen: ["0.0.0.0:8080"]
 
@@ -35,8 +36,8 @@ bots:
               among: [bot1, bot3, bot2]
 
 consumers:
-  # bot1 and bot2 call http://tgin:8080/c/<name>/getUpdates instead of
-  # Telegram's getUpdates.
+  # bot1 and bot2 use http://tgin:8080/c/<name> as their Bot API base URL:
+  # their getUpdates polls this consumer.
   bot1:
     pull:
       # When a bot is stopped, its queue drops its oldest updates instead of
@@ -51,6 +52,9 @@ consumers:
     push:
       endpoints:
         - url: http://bot3:3001/bot
+      # bot3 answers each message with a sendMessage in its response body;
+      # tgin makes that call (the default, webhook_reply: execute).
+      webhook_reply: execute
       # A full queue drops its oldest updates, so a stopped bot3 never stalls
       # bot1 and bot2. bot3 starts after tgin; the default retries (backoff
       # from 1 s) deliver the updates that arrive before it listens.

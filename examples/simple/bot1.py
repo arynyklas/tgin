@@ -1,4 +1,4 @@
-"""A polling bot that takes its updates from tgin instead of Telegram."""
+"""A polling bot whose Bot API is tgin's gateway."""
 
 import asyncio
 import logging
@@ -11,20 +11,11 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import Message
 
 TOKEN = os.environ["TOKEN"]
-# tgin's pull endpoint, e.g. http://tgin:8080/c/bot1/getUpdates.
-TGIN_ENDPOINT = os.environ["TGIN_ENDPOINT"]
-TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "https://api.telegram.org")
+# The gateway path of this bot's pull consumer, e.g. http://tgin:8080/c/bot1:
+# getUpdates there polls the consumer, and every other call goes to Telegram
+# through tgin.
+TGIN_BASE = os.environ["TGIN_BASE"]
 REPLY = os.getenv("REPLY", "hello from bot 1")
-
-
-class TginServer(TelegramAPIServer):
-    """getUpdates goes to tgin; every other method goes to the Bot API."""
-
-    def api_url(self, token: str, method: str) -> str:
-        if method == "getUpdates":
-            return TGIN_ENDPOINT
-        return super().api_url(token, method)
-
 
 dp = Dispatcher()
 
@@ -35,8 +26,7 @@ async def echo_handler(message: Message) -> None:
 
 
 async def main() -> None:
-    server = TginServer.from_base(TELEGRAM_API_URL)
-    bot = Bot(token=TOKEN, session=AiohttpSession(api=server))
+    bot = Bot(token=TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(TGIN_BASE)))
     await dp.start_polling(bot)
 
 
