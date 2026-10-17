@@ -8,14 +8,20 @@
 //! polls the journal (or tgin's metrics) every 100 ms for at most 30 s; there
 //! are no fixed sleeps. A count that must stay exact ("exactly one
 //! sendMessage") is checked when the scenario sees it and once more after
-//! the last scenario, so a late duplicate fails the run too. On failure the
-//! compose logs and the journal's tail are printed. The stack is always taken
-//! down with `docker compose down -v`, unless `--keep`.
+//! the last scenario, so a late duplicate fails the run too. On failure,
+//! Ctrl-C or a panic, the compose logs (and, when the stack is up, the
+//! journal's tail) are printed, and the stack is taken down with
+//! `docker compose down -v`, unless `--keep`.
+//!
+//! The compose project is `tgin-e2e`, or `TGIN_E2E_PROJECT` when set; the
+//! containers, network and images are named after it.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::io;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::pin::{Pin, pin};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,9 +29,11 @@ use reqwest::{Client, Url, multipart};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// The compose project, so every container, network and volume is
-/// `tgin-e2e-…`.
-const PROJECT: &str = "tgin-e2e";
+/// The compose project unless [`PROJECT_VAR`] names another.
+const DEFAULT_PROJECT: &str = "tgin-e2e";
+/// The environment variable naming the compose project; compose.yaml reads
+/// it too, for the image names.
+const PROJECT_VAR: &str = "TGIN_E2E_PROJECT";
 /// How often a check polls.
 const POLL: Duration = Duration::from_millis(100);
 /// How long a check polls before it fails.
@@ -108,74 +116,138 @@ fn framework(name: &str) -> &'static Framework {
 
 pub(crate) fn run(keep: bool) -> ExitCode {
     let started = Instant::now();
-    // A stack left by an earlier `--keep` run would carry its state over.
-    if let Err(err) = compose(&["down", "-v", "--remove-orphans"]).quiet() {
-        eprintln!("e2e: cannot clear an earlier stack: {err}");
-        return ExitCode::FAILURE;
-    }
-    let result = build_and_test();
-    if let Err(err) = &result {
-        eprintln!("\ne2e FAILED: {err}\n\n--- docker compose logs ---");
-        let _ = compose(&["logs", "--no-color", "--timestamps"]).status();
-    }
-    if keep {
-        println!(
-            "e2e: --keep: the stack stays up; remove it with `docker compose -p {PROJECT} down -v`"
-        );
-    } else if let Err(err) = compose(&["down", "-v", "--remove-orphans"]).quiet() {
-        eprintln!("e2e: docker compose down failed: {err}");
-    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("e2e: cannot start a tokio runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        // From here on Ctrl-C no longer kills the runner: a compose child it
+        // interrupts fails its step, and the scenarios stop at the signal,
+        // so either way the logs are printed and the stack is taken down.
+        let mut interrupt = pin!(tokio::signal::ctrl_c());
+        listen(interrupt.as_mut()).await?;
+        // A stack left by an earlier `--keep` run would carry its state over.
+        compose(&["down", "-v", "--remove-orphans"])
+            .quiet()
+            .map_err(|err| format!("cannot clear an earlier stack: {err}"))?;
+        let teardown = Teardown { keep };
+        let result = build_and_test(interrupt.as_mut()).await;
+        if let Err(err) = &result {
+            eprintln!("\ne2e FAILED: {err}");
+            print_logs();
+        }
+        drop(teardown);
+        result
+    });
     let elapsed = started.elapsed().as_secs_f64();
     match result {
         Ok(()) => {
             println!("e2e: all scenarios passed in {elapsed:.1} s");
             ExitCode::SUCCESS
         }
-        Err(_) => {
-            eprintln!("e2e: failed after {elapsed:.1} s");
+        Err(err) => {
+            eprintln!("e2e: failed after {elapsed:.1} s: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn build_and_test() -> Result<(), String> {
+/// The pending Ctrl-C wait.
+type Interrupt<'a> = Pin<&'a mut (dyn Future<Output = io::Result<()>> + 'a)>;
+
+/// Polls the Ctrl-C wait once, which installs the handler.
+async fn listen(interrupt: Interrupt<'_>) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        result = interrupt => match result {
+            Ok(()) => Err("interrupted (Ctrl-C)".to_owned()),
+            Err(err) => Err(format!("cannot listen for Ctrl-C: {err}")),
+        },
+        () = std::future::ready(()) => Ok(()),
+    }
+}
+
+/// Takes the stack down when dropped, also while a panic unwinds (then it
+/// prints the compose logs first), unless `--keep`.
+struct Teardown {
+    keep: bool,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("\ne2e: the runner panicked");
+            print_logs();
+        }
+        if self.keep {
+            println!(
+                "e2e: --keep: the stack stays up; remove it with `docker compose -p {} down -v`",
+                project()
+            );
+        } else if let Err(err) = compose(&["down", "-v", "--remove-orphans"]).quiet() {
+            eprintln!("e2e: docker compose down failed: {err}");
+        }
+    }
+}
+
+fn print_logs() {
+    eprintln!("\n--- docker compose logs ---");
+    let _ = compose(&["logs", "--no-color", "--timestamps"]).status();
+}
+
+async fn build_and_test(mut interrupt: Interrupt<'_>) -> Result<(), String> {
     let build = Instant::now();
     compose(&["build"]).checked()?;
     println!(
         "e2e: images built in {:.1} s",
         build.elapsed().as_secs_f64()
     );
+    listen(interrupt.as_mut()).await?;
     let up = Instant::now();
     compose(&["up", "-d", "--wait", "--wait-timeout", UP_TIMEOUT]).checked()?;
     println!("e2e: stack up in {:.1} s", up.elapsed().as_secs_f64());
-    let stack = Stack::discover()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("cannot start a tokio runtime: {err}"))?;
-    runtime.block_on(async {
-        let mut suite = Suite::new(stack);
-        let outcome = suite.scenarios().await;
-        if outcome.is_err() {
-            suite.print_journal_tail().await;
-        }
-        outcome
-    })
+    listen(interrupt.as_mut()).await?;
+    let mut suite = Suite::new(Stack::discover()?);
+    let outcome = tokio::select! {
+        outcome = suite.scenarios() => outcome,
+        _ = interrupt => Err("interrupted (Ctrl-C)".to_owned()),
+    };
+    if outcome.is_err() {
+        suite.print_journal_tail().await;
+    }
+    outcome
+}
+
+/// The compose project: [`PROJECT_VAR`] if set, else [`DEFAULT_PROJECT`].
+fn project() -> String {
+    std::env::var(PROJECT_VAR)
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROJECT.to_owned())
 }
 
 fn compose_file() -> PathBuf {
     crate::repo_path(&["tests", "e2e", "compose.yaml"])
 }
 
-/// `docker compose -f tests/e2e/compose.yaml -p tgin-e2e <args>`.
+/// `docker compose -f tests/e2e/compose.yaml -p <project> <args>`, with
+/// [`PROJECT_VAR`] set for compose.yaml's image names.
 fn compose(args: &[&str]) -> Command {
+    let project = project();
     let mut command = Command::new("docker");
     command
         .arg("compose")
         .arg("-f")
         .arg(compose_file())
-        .args(["-p", PROJECT])
-        .args(args);
+        .args(["-p", &project])
+        .args(args)
+        .env(PROJECT_VAR, &project);
     command
 }
 
@@ -275,6 +347,14 @@ struct FilePart {
     name: String,
     filename: String,
     size: usize,
+    fnv1a64: String,
+}
+
+/// A file stored at the fake for the file scenario.
+struct StoredFile {
+    file_id: String,
+    file_unique_id: String,
+    file_path: String,
 }
 
 impl Call {
@@ -361,6 +441,15 @@ fn unix_now() -> u64 {
 /// The document the file scenario sends: deterministic, not all one byte.
 fn document_bytes() -> Vec<u8> {
     (0..DOCUMENT_SIZE).map(|i| (i * 31 % 251) as u8).collect()
+}
+
+/// The 64-bit FNV-1a hash of `data` as 16 lowercase hex digits, as the
+/// fake journals it for each file part (`fnv1a64`).
+fn fnv1a64(data: &[u8]) -> String {
+    let hash = data.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{hash:016x}")
 }
 
 impl Suite {
@@ -455,7 +544,9 @@ impl Suite {
 
     /// Scenario 2: a polling bot stopped and started again: no update it handled
     /// before the stop is echoed twice (aiogram, which does not confirm on
-    /// stop, may get its last batch again).
+    /// stop, may get its last batch again). grammY and Telegraf hold the
+    /// `before restart` handler 3 s after its echo, so the stop lands before
+    /// their next poll and their shutdown confirm is the only ack.
     async fn restart(&mut self, f: &'static Framework) -> Result<(), String> {
         let chat = self.chat();
         let before = format!("before restart {}", f.name);
@@ -485,14 +576,17 @@ impl Suite {
     /// Scenario 3: a document update: the bot calls getFile, downloads through the
     /// gateway's file route (PTB with `%3A` for the token's colon) and sends
     /// the bytes back with sendDocument, as multipart, chunked where the
-    /// framework chunks.
+    /// framework chunks. The echoed part's checksum equals the original's, and
+    /// the runner's own download through the file route is byte-exact.
     async fn files(&mut self, f: &'static Framework) -> Result<(), String> {
         let chat = self.chat();
         let filename = format!("e2e-{}.bin", f.name);
         let data = document_bytes();
-        let (file_id, file_unique_id) = self
+        let checksum = fnv1a64(&data);
+        let stored = self
             .store_file(f.poll_token, chat, &filename, &data)
             .await?;
+        let (file_id, file_unique_id) = (stored.file_id.clone(), stored.file_unique_id);
         let mark = self.mark(f.poll_token).await?;
         let mut update = self.message(chat);
         update["message"]["document"] = json!({
@@ -524,9 +618,10 @@ impl Suite {
             .await?;
         let upload = &uploads[0];
         let part = upload.files.iter().find(|p| p.filename == echo_name);
-        ensure(part.is_some_and(|p| p.size == size), || {
-            format!("sendDocument carried {part:?}, not {size} bytes")
-        })?;
+        ensure(
+            part.is_some_and(|p| p.size == size && p.fnv1a64 == checksum),
+            || format!("sendDocument carried {part:?}, not {size} bytes with fnv1a64 {checksum}"),
+        )?;
         ensure(
             upload
                 .content_type
@@ -570,7 +665,18 @@ impl Suite {
                 || "PTB's download path did not carry %3A".to_owned(),
             )?;
         }
-        Ok(())
+        let url = format!(
+            "{}/c/{bot}/file/bot{}/{}",
+            self.stack.gateway, f.poll_token, stored.file_path
+        );
+        let fetched = self.get_bytes(&url).await?;
+        ensure(fetched == data, || {
+            format!(
+                "the file route served {} bytes (fnv1a64 {}), not the {size} stored",
+                fetched.len(),
+                fnv1a64(&fetched)
+            )
+        })
     }
 
     /// Scenario 4: updates reach the webhook bots. aiogram, PTB and grammY registered
@@ -615,19 +721,25 @@ impl Suite {
         self.echo(f.hook_token, "sendMessage", chat, &text, 1..=1)
             .await?;
         let endpoint = if f.registers_hook { "runtime" } else { "0" };
-        let delivered = self
-            .metric(
-                "tgin_delivery_attempts_total",
-                &[
-                    ("consumer", &hook),
-                    ("endpoint", endpoint),
-                    ("outcome", "delivered"),
-                ],
-            )
-            .await?;
-        ensure(delivered >= 1.0, || {
-            format!("no delivery counted on {hook}'s {endpoint} endpoint")
-        })
+        // tgin counts the delivery once the reply ran and the update is
+        // acked, which can trail the echo.
+        eventually(
+            &format!("a delivery counted on {hook}'s {endpoint} endpoint"),
+            || async {
+                let delivered = self
+                    .metric(
+                        "tgin_delivery_attempts_total",
+                        &[
+                            ("consumer", &hook),
+                            ("endpoint", endpoint),
+                            ("outcome", "delivered"),
+                        ],
+                    )
+                    .await?;
+                Ok((delivered >= 1.0).then_some(()))
+            },
+        )
+        .await
     }
 
     /// Scenario 5: a webhook reply is executed once: aiogram's as multipart, grammY's
@@ -764,9 +876,13 @@ impl Suite {
         })
     }
 
-    /// Scenario 7: shaping: grammY sends 5 messages to one chat at once; with the
-    /// default per-chat limit (burst 3, 1/s) the last reaches Telegram at
-    /// least 2 s after the first, and tgin counts the 4th and 5th delayed.
+    /// Scenario 7: shaping: grammY sends 5 messages to one chat at once. Under
+    /// the default per-chat limit (burst 3, 1/s) tgin delays exactly the 4th
+    /// and 5th (the gate: its own count), and the fake sees the 1/s pacing:
+    /// the last arrival at least 1.8 s after the first, and the 4th at least
+    /// 0.8 s after the first and 0.8 s before the last. The arrival bounds
+    /// leave room for latency differences between the messages; the exact
+    /// 2 s holds only at tgin's limiter.
     async fn shaping(&mut self) -> Result<(), String> {
         let f = framework("grammy");
         let bot = f.poll();
@@ -795,18 +911,34 @@ impl Suite {
                 5..=5,
             )
             .await?;
-        let first = sent.iter().map(|c| c.time_ms).min().unwrap_or_default();
-        let last = sent.iter().map(|c| c.time_ms).max().unwrap_or_default();
-        let spread = last - first;
-        println!("     burst spread {spread} ms");
-        ensure(spread >= 2000, || {
-            format!("the 5th message came {spread} ms after the first, under 2 s")
-        })?;
         let after = self
             .metric("tgin_gateway_ratelimited_total", &delayed)
             .await?;
         ensure(after - before == 2.0, || {
             format!("tgin delayed {} of the 5 messages, not 2", after - before)
+        })?;
+        let mut arrivals: Vec<u64> = sent.iter().map(|c| c.time_ms).collect();
+        arrivals.sort_unstable();
+        let (first, fourth, last) = (arrivals[0], arrivals[3], arrivals[4]);
+        println!(
+            "     burst arrivals +{} +{} +{} +{} ms",
+            arrivals[1] - first,
+            arrivals[2] - first,
+            fourth - first,
+            last - first
+        );
+        ensure(last - first >= 1800, || {
+            format!(
+                "the 5th message came {} ms after the first, under 1.8 s",
+                last - first
+            )
+        })?;
+        ensure(fourth - first >= 800 && last - fourth >= 800, || {
+            format!(
+                "the 4th message came {} ms after the first and {} ms before the 5th, not 1/s",
+                fourth - first,
+                last - fourth
+            )
         })
     }
 
@@ -867,15 +999,16 @@ impl Suite {
         self.post_json(&url, &update).await.map(drop)
     }
 
-    /// Stores a file at the fake (its own sendDocument, the bot's token) and
-    /// returns its `file_id` and `file_unique_id`.
+    /// Stores a file at the fake (its own sendDocument with the bot's token)
+    /// and reads its `file_path` with the fake's getFile; both happen before
+    /// the scenario's journal mark.
     async fn store_file(
         &self,
         token: &str,
         chat: i64,
         filename: &str,
         data: &[u8],
-    ) -> Result<(String, String), String> {
+    ) -> Result<StoredFile, String> {
         let url = format!("{}/bot{token}/sendDocument", self.stack.fake);
         let part = multipart::Part::bytes(data.to_vec()).file_name(filename.to_owned());
         let form = multipart::Form::new()
@@ -894,13 +1027,26 @@ impl Suite {
             .await
             .map_err(|err| format!("storing {filename}: {err}"))?;
         let document = &body["result"]["document"];
-        match (
+        let (Some(file_id), Some(file_unique_id)) = (
             document["file_id"].as_str(),
             document["file_unique_id"].as_str(),
-        ) {
-            (Some(id), Some(unique)) => Ok((id.to_owned(), unique.to_owned())),
-            _ => Err(format!("the fake stored no document: {body}")),
-        }
+        ) else {
+            return Err(format!("the fake stored no document: {body}"));
+        };
+        let info = self
+            .post_json(
+                &format!("{}/bot{token}/getFile", self.stack.fake),
+                &json!({"file_id": file_id}),
+            )
+            .await?;
+        let Some(file_path) = info["result"]["file_path"].as_str() else {
+            return Err(format!("the fake's getFile gave no file_path: {info}"));
+        };
+        Ok(StoredFile {
+            file_id: file_id.to_owned(),
+            file_unique_id: file_unique_id.to_owned(),
+            file_path: file_path.to_owned(),
+        })
     }
 
     /// The journal entries of `token` (all bots when empty), filtered by
@@ -1050,6 +1196,26 @@ impl Suite {
         .await
     }
 
+    /// The body of a 200 answer to `GET url`.
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+        let response = self
+            .stack
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("GET {}: {err}", redact(url)))?;
+        let status = response.status();
+        ensure(status.is_success(), || {
+            format!("GET {} answered {status}", redact(url))
+        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| format!("GET {}: {err}", redact(url)))?;
+        Ok(body.to_vec())
+    }
+
     async fn get_json(&self, url: &str) -> Result<Value, String> {
         let response = self
             .stack
@@ -1132,6 +1298,14 @@ mod tests {
                 assert!(compose.contains(&anchor), "compose.yaml lacks `{anchor}`");
             }
         }
+    }
+
+    /// The fake's published FNV-1a 64 vectors (`journal::fnv1a64`).
+    #[test]
+    fn fnv1a64_matches_the_fake() {
+        assert_eq!(fnv1a64(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a64(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(fnv1a64(b"hello"), "a430d84680aabd0b");
     }
 
     #[test]

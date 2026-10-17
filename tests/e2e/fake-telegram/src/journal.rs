@@ -43,6 +43,17 @@ pub struct FileEntry {
     pub name: String,
     pub filename: String,
     pub size: usize,
+    /// [`fnv1a64`] of the part's bytes, so tests can compare contents.
+    pub fnv1a64: String,
+}
+
+/// The 64-bit FNV-1a hash of `data` as 16 lowercase hex digits: a content
+/// check for tests, not a cryptographic digest.
+pub fn fnv1a64(data: &[u8]) -> String {
+    let hash = data.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{hash:016x}")
 }
 
 /// One journal line. Calls are recorded when they arrive, so `status` is
@@ -106,6 +117,7 @@ impl Entry {
                 name: part.name.clone(),
                 filename: part.filename.clone(),
                 size: part.data.len(),
+                fnv1a64: fnv1a64(&part.data),
             })
             .collect();
         self
@@ -230,4 +242,18 @@ pub fn unix_millis() -> u64 {
 
 pub fn unix_seconds() -> i64 {
     i64::try_from(unix_millis() / 1000).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fnv1a64;
+
+    /// The published FNV-1a 64 vectors, and the ones the tests use.
+    #[test]
+    fn fnv1a64_vectors() {
+        assert_eq!(fnv1a64(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a64(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(fnv1a64(b"hello"), "a430d84680aabd0b");
+        assert_eq!(fnv1a64(b"abc"), "e71fa2190541574b");
+    }
 }

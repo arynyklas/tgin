@@ -68,18 +68,21 @@ def main() -> None:
     secret = os.environ["HOOK_SECRET"]
 
     @web.middleware
-    async def require_via(request: web.Request, handler):
+    async def guard(request: web.Request, handler):
         # tgin marks its pushes with `Via: 1.1 tgin-<pseudonym>` (RFC 9110).
         if not request.headers.get("Via", "").startswith("1.1 tgin-"):
             return web.Response(status=400, text="no tgin Via header")
+        # Checked here too, so the suite does not rest on aiogram's own check.
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+            return web.Response(status=401, text="wrong secret token")
         return await handler(request)
 
     async def on_startup(bot: Bot) -> None:
         await bot.set_webhook(os.environ["HOOK_URL"], secret_token=secret)
 
     dp.startup.register(on_startup)
-    app = web.Application(middlewares=[require_via])
-    # The secret is checked by aiogram: a missing or wrong header gets 401.
+    app = web.Application(middlewares=[guard])
+    # aiogram checks the secret as well (401).
     SimpleRequestHandler(
         dispatcher=dp, bot=bot, handle_in_background=False, secret_token=secret
     ).register(app, path="/hook")

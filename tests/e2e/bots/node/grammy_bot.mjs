@@ -11,8 +11,11 @@
 // Polling: echoes text with sendMessage, "burst" sends five messages to the
 // chat at once, and a document is fetched (getFile, then a download from the
 // gateway's file route, which grammY's core leaves to the bot) and sent back
-// with sendDocument. Webhook: text is answered with the sendMessage as the
-// webhook reply (canUseWebhookReply), which grammY writes as JSON.
+// with sendDocument. grammY handles updates one by one, so a text starting
+// with "before restart" is held for HOLD_MS after its echo: a stop then lands
+// before the next getUpdates, and the shutdown confirm is the only ack.
+// Webhook: text is answered with the sendMessage as the webhook reply
+// (canUseWebhookReply), which grammY writes as JSON.
 
 import { createServer } from "node:http";
 import { Bot, InputFile, webhookCallback } from "grammy";
@@ -20,6 +23,7 @@ import { Bot, InputFile, webhookCallback } from "grammy";
 const token = process.env.BOT_TOKEN;
 const base = process.env.TGIN_BASE;
 const hook = process.env.MODE === "hook";
+const HOLD_MS = 3000;
 
 const bot = new Bot(token, {
   client: {
@@ -36,6 +40,9 @@ bot.on("message:text", async (ctx) => {
     return;
   }
   await ctx.api.sendMessage(chat, ctx.message.text);
+  if (ctx.message.text.startsWith("before restart")) {
+    await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+  }
 });
 
 bot.on("message:document", async (ctx) => {
@@ -49,12 +56,18 @@ bot.on("message:document", async (ctx) => {
 
 if (hook) {
   const secret = process.env.HOOK_SECRET;
-  // grammY checks the secret: a missing or wrong header gets 401.
+  // grammY checks the secret as well (401).
   const handle = webhookCallback(bot, "http", { secretToken: secret });
   const server = createServer((req, res) => {
     // tgin marks its pushes with `Via: 1.1 tgin-<pseudonym>` (RFC 9110).
     if (req.url !== "/hook" || !(req.headers.via ?? "").startsWith("1.1 tgin-")) {
       res.statusCode = 400;
+      res.end();
+      return;
+    }
+    // Checked here too, so the suite does not rest on grammY's own check.
+    if (req.headers["x-telegram-bot-api-secret-token"] !== secret) {
+      res.statusCode = 401;
       res.end();
       return;
     }

@@ -757,7 +757,7 @@ async fn webhook_delivery_and_reply_journaled() {
     assert_eq!(replies[1]["args"]["chat_id"], "7");
     assert_eq!(
         replies[1]["files"],
-        json!([{"name": "document", "filename": "r.txt", "size": 5}])
+        json!([{"name": "document", "filename": "r.txt", "size": 5, "fnv1a64": "a430d84680aabd0b"}])
     );
     assert_eq!(replies[1]["status"], 200);
     // Refused replies never ran: the webhook is still set.
@@ -1020,7 +1020,7 @@ async fn chunked_and_multipart_bodies_accepted() {
     );
     assert_eq!(
         documents[0]["files"],
-        json!([{"name": "f1", "filename": "x.bin", "size": 3}])
+        json!([{"name": "f1", "filename": "x.bin", "size": 3, "fnv1a64": "e71fa2190541574b"}])
     );
 
     // DELETE clears the journal.
