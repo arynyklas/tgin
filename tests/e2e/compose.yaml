@@ -1,0 +1,190 @@
+# The end-to-end stack of `cargo xtask e2e`: the fake Telegram, tgin built
+# from the repository, and per framework one polling bot and one webhook bot,
+# each with its own token. Every token and secret here is a fake value.
+#
+# Host ports are ephemeral on 127.0.0.1; the runner asks `docker compose port`.
+name: tgin-e2e
+
+x-tokens:
+  aiogram-poll: &aiogram-poll-token "700001:e2e_fake_aiogram_poll"
+  aiogram-hook: &aiogram-hook-token "700002:e2e_fake_aiogram_hook"
+  ptb-poll: &ptb-poll-token "700003:e2e_fake_ptb_poll"
+  ptb-hook: &ptb-hook-token "700004:e2e_fake_ptb_hook"
+  grammy-poll: &grammy-poll-token "700005:e2e_fake_grammy_poll"
+  grammy-hook: &grammy-hook-token "700006:e2e_fake_grammy_hook"
+  telegraf-poll: &telegraf-poll-token "700007:e2e_fake_telegraf_poll"
+  telegraf-hook: &telegraf-hook-token "700008:e2e_fake_telegraf_hook"
+
+x-python-bot: &python-bot
+  build: bots/python
+  image: tgin-e2e-bots-python:local
+  init: true
+  stop_grace_period: 30s
+  depends_on:
+    tgin:
+      condition: service_healthy
+
+x-node-bot: &node-bot
+  build: bots/node
+  image: tgin-e2e-bots-node:local
+  init: true
+  stop_grace_period: 30s
+  depends_on:
+    tgin:
+      condition: service_healthy
+
+x-python-hook-health: &python-hook-health
+  test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8081), 1)"]
+  interval: 1s
+  timeout: 2s
+  retries: 60
+
+x-node-hook-health: &node-hook-health
+  test: ["CMD", "node", "-e", "require('net').connect(8081, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1))"]
+  interval: 1s
+  timeout: 2s
+  retries: 60
+
+services:
+  fake:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/fake-telegram/Dockerfile
+    image: tgin-e2e-fake:local
+    stop_grace_period: 30s
+    ports: ["127.0.0.1::8081"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fake-telegram", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  tgin:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: tgin-e2e-tgin:local
+    stop_grace_period: 30s
+    environment:
+      ADMIN_TOKEN: e2e-fake-admin-token
+      AIOGRAM_POLL_TOKEN: *aiogram-poll-token
+      AIOGRAM_HOOK_TOKEN: *aiogram-hook-token
+      PTB_POLL_TOKEN: *ptb-poll-token
+      PTB_HOOK_TOKEN: *ptb-hook-token
+      GRAMMY_POLL_TOKEN: *grammy-poll-token
+      GRAMMY_HOOK_TOKEN: *grammy-hook-token
+      TELEGRAF_POLL_TOKEN: *telegraf-poll-token
+      TELEGRAF_HOOK_TOKEN: *telegraf-hook-token
+      TELEGRAF_HOOK_SECRET: e2e-fake-secret-telegraf
+    volumes:
+      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+    ports: ["127.0.0.1::8080", "127.0.0.1::9090"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/tgin", "admin", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    depends_on:
+      fake:
+        condition: service_healthy
+
+  # Polling bots get fixed addresses: tgin tells pollers apart by client
+  # address, and the restart scenario needs the restarted bot to be the same
+  # poller.
+  aiogram-poll:
+    <<: *python-bot
+    command: ["python", "aiogram_bot.py"]
+    environment:
+      MODE: poll
+      BOT_TOKEN: *aiogram-poll-token
+      TGIN_BASE: http://tgin:8080/c/aiogram-poll
+    networks:
+      default:
+        ipv4_address: 10.231.77.11
+
+  ptb-poll:
+    <<: *python-bot
+    command: ["python", "ptb_bot.py"]
+    environment:
+      MODE: poll
+      BOT_TOKEN: *ptb-poll-token
+      TGIN_BASE: http://tgin:8080/c/ptb-poll
+    networks:
+      default:
+        ipv4_address: 10.231.77.12
+
+  grammy-poll:
+    <<: *node-bot
+    command: ["node", "grammy_bot.mjs"]
+    environment:
+      MODE: poll
+      BOT_TOKEN: *grammy-poll-token
+      TGIN_BASE: http://tgin:8080/c/grammy-poll
+    networks:
+      default:
+        ipv4_address: 10.231.77.13
+
+  telegraf-poll:
+    <<: *node-bot
+    command: ["node", "telegraf_bot.mjs"]
+    environment:
+      MODE: poll
+      BOT_TOKEN: *telegraf-poll-token
+      TGIN_BASE: http://tgin:8080/c/telegraf-poll
+    networks:
+      default:
+        ipv4_address: 10.231.77.14
+
+  aiogram-hook:
+    <<: *python-bot
+    command: ["python", "aiogram_bot.py"]
+    environment:
+      MODE: hook
+      BOT_TOKEN: *aiogram-hook-token
+      TGIN_BASE: http://tgin:8080/c/aiogram-hook
+      HOOK_URL: http://aiogram-hook:8081/hook
+      HOOK_SECRET: e2e-fake-secret-aiogram
+    healthcheck: *python-hook-health
+
+  ptb-hook:
+    <<: *python-bot
+    command: ["python", "ptb_bot.py"]
+    environment:
+      MODE: hook
+      BOT_TOKEN: *ptb-hook-token
+      TGIN_BASE: http://tgin:8080/c/ptb-hook
+      HOOK_URL: http://ptb-hook:8081/hook
+      HOOK_SECRET: e2e-fake-secret-ptb
+    healthcheck: *python-hook-health
+
+  grammy-hook:
+    <<: *node-bot
+    command: ["node", "grammy_bot.mjs"]
+    environment:
+      MODE: hook
+      BOT_TOKEN: *grammy-hook-token
+      TGIN_BASE: http://tgin:8080/c/grammy-hook
+      HOOK_URL: http://grammy-hook:8081/hook
+      HOOK_SECRET: e2e-fake-secret-grammy
+    healthcheck: *node-hook-health
+
+  # tgin pushes to this one from its configured endpoint (tgin.yaml), so the
+  # bot registers nothing; it answers on the proxy-only base (no consumer).
+  telegraf-hook:
+    <<: *node-bot
+    command: ["node", "telegraf_bot.mjs"]
+    environment:
+      MODE: hook
+      BOT_TOKEN: *telegraf-hook-token
+      TGIN_BASE: http://tgin:8080
+      HOOK_SECRET: e2e-fake-secret-telegraf
+    healthcheck: *node-hook-health
+
+networks:
+  default:
+    name: tgin-e2e-net
+    ipam:
+      config:
+        # Dynamic addresses stay in the upper half, clear of the fixed ones.
+        - subnet: 10.231.77.0/24
+          ip_range: 10.231.77.128/25

@@ -3252,8 +3252,11 @@ dependencies = [
 name = "xtask"
 version = "1.0.0-dev"
 dependencies = [
+ "reqwest",
+ "serde",
  "serde_json",
  "tgin-core",
+ "tokio",
 ]
 
 [[package]]

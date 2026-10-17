@@ -29,6 +29,9 @@ updates:
       - "/tests/performance/benchmark"
       - "/tests/performance/bot"
       - "/examples/simple"
+      - "/tests/e2e/fake-telegram"
+      - "/tests/e2e/bots/python"
+      - "/tests/e2e/bots/node"
     schedule:
       interval: weekly
     groups:
@@ -41,6 +44,7 @@ updates:
     directories:
       - "/examples/simple"
       - "/tests/performance/diagram"
+      - "/tests/e2e/bots/python"
     schedule:
       interval: weekly
     groups:
@@ -55,6 +59,16 @@ updates:
       interval: weekly
     groups:
       pip:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: npm
+    directory: "/tests/e2e/bots/node"
+    schedule:
+      interval: weekly
+    groups:
+      npm:
         patterns: ["*"]
     commit-message:
       prefix: "chore(deps)"
