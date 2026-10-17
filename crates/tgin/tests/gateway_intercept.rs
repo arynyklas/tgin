@@ -1818,3 +1818,58 @@ async fn drain_not_held_open_by_a_poller() {
         .expect("the poller stops with the data plane")
         .expect("the poller does not panic");
 }
+
+/// A removed push consumer's `tgin_webhook_replies_total` series stay
+/// while its retired instance drains, and go when the drain ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_series_follow_the_drain_of_a_removed_consumer() {
+    let telegram = telegram().await;
+    let (capture, mut pushes, release) = holder().await;
+    let yaml = intercept_config(&telegram.uri(), ", webhook_reply: execute").replace(
+        "reload: { watch: false }",
+        "reload: { watch: false, drain_timeout: 30s }",
+    );
+    let tgin = start(&yaml).await;
+    let set = format!("/c/hooks/bot{TOKEN}/setWebhook");
+    let url = format!("{capture}/in");
+    assert_eq!(tgin.post_json(&set, &json!({ "url": url })).await.0, 200);
+    // Telegram answers every call but getMe with 500: each reply fails.
+    release.send_replace(true);
+    tgin.admit(1).await;
+    let failed =
+        |n: u32| format!(r#"tgin_webhook_replies_total{{consumer="hooks",outcome="failed"}} {n}"#);
+    wait_metric(&tgin, &failed(1)).await;
+    release.send_replace(false);
+    tgin.admit(2).await;
+    for _ in 1..=2 {
+        timeout(PATIENCE, pushes.recv())
+            .await
+            .expect("pushed in time")
+            .expect("open");
+    }
+
+    let removed: String = yaml
+        .replace("[workers, keep, hooks]", "[workers, keep]")
+        .lines()
+        .filter(|line| !line.starts_with("  hooks:"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    tgin.reload(&removed, 2).await;
+    wait_token(&tgin, TOKEN).await;
+    tgin.assert_metric(&failed(1));
+    release.send_replace(true);
+    wait_metric(&tgin, &failed(2)).await;
+    let started = Instant::now();
+    while tgin
+        .metrics
+        .encode()
+        .contains(r#"tgin_webhook_replies_total{consumer="hooks""#)
+    {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the series outlived the drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tgin.stop().await;
+}

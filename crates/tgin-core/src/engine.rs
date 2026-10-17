@@ -610,6 +610,9 @@ impl Shared {
         let in_use = current.is_some() || self.retired.lock().iter().any(|s| s.name == slot.name);
         if !in_use {
             self.metrics.remove_consumer(&slot.name);
+            if let Some(executor) = self.rt.reply.get() {
+                executor.forget(&slot.name);
+            }
         }
         if let Some(current) = current {
             current.slot.consumer.update_depth();
@@ -668,6 +671,13 @@ impl Engine {
     pub fn consumer(&self, name: &str) -> Option<Consumer> {
         let state = self.shared.state.load();
         state.target(name).map(|t| t.slot.consumer.clone())
+    }
+
+    /// Whether the consumer `name` exists: in the current config, or as a
+    /// removed instance that still drains.
+    pub fn knows_consumer(&self, name: &str) -> bool {
+        self.shared.state.load().target(name).is_some()
+            || self.shared.retired.lock().iter().any(|s| *s.name == *name)
     }
 
     /// The pull consumer `name` to poll: the current instance, else an

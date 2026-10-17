@@ -61,11 +61,13 @@ impl Gateway {
         metrics
     }
 
-    /// Forgets the reply series of consumers the engine no longer has.
+    /// Forgets the reply series of consumers the engine no longer has, a
+    /// removed one's once its drain has ended (see
+    /// [`ReplyExecutor::forget`]).
     pub(super) fn retain_reply_metrics(&self) {
         let mut replies = self.replies.lock();
         replies.retain(|consumer, _| {
-            let kept = self.engine.consumer(consumer).is_some();
+            let kept = self.engine.knows_consumer(consumer);
             if !kept {
                 self.metrics.remove_replies(consumer);
             }
@@ -273,6 +275,12 @@ impl ReplyExecutor for Gateway {
             .map_or("?", |bot| &*bot.name);
         tracing::warn!(bot = %bot, consumer = %consumer, limit = MAX_REPLY_BYTES, "webhook reply over the size limit; it is not executed");
     }
+
+    fn forget(&self, consumer: &str) {
+        if self.replies.lock().remove(consumer).is_some() {
+            self.metrics.remove_replies(consumer);
+        }
+    }
 }
 
 /// [`Gateway::reply_executor`]: the gateway, held weakly.
@@ -295,6 +303,12 @@ impl ReplyExecutor for Replies {
     fn too_large(&self, consumer: &str, source: SourceId) {
         if let Some(gateway) = self.0.upgrade() {
             gateway.too_large(consumer, source);
+        }
+    }
+
+    fn forget(&self, consumer: &str) {
+        if let Some(gateway) = self.0.upgrade() {
+            gateway.forget(consumer);
         }
     }
 }

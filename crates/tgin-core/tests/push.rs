@@ -1255,6 +1255,8 @@ impl ReplyExecutor for Recorder {
         assert_eq!(consumer, "hooks");
         self.too_large.fetch_add(1, AtomicOrdering::SeqCst);
     }
+
+    fn forget(&self, _consumer: &str) {}
 }
 
 /// A consumer delivering one update at a time to `endpoints`, whose
@@ -1447,6 +1449,8 @@ impl ReplyExecutor for Gate {
     }
 
     fn too_large(&self, _consumer: &str, _source: SourceId) {}
+
+    fn forget(&self, _consumer: &str) {}
 }
 
 /// R26: a delivery gives its endpoint's in-flight claim back before its

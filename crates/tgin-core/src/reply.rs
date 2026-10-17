@@ -51,6 +51,10 @@ pub trait ReplyExecutor: Send + Sync + 'static {
     /// The endpoint answered `consumer`'s update with a reply body longer
     /// than [`MAX_REPLY_BYTES`], which is not executed.
     fn too_large(&self, consumer: &str, source: SourceId);
+
+    /// The consumer `consumer` is gone, its drain included: whatever the
+    /// executor keeps for it (its reply metric series) can go too.
+    fn forget(&self, consumer: &str);
 }
 
 /// The executor push consumers use, set once when it exists: the gateway
