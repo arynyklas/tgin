@@ -75,6 +75,9 @@ fn allocations<R>(f: impl FnOnce() -> R) -> (u64, R) {
 const BUDGET_PER_UPDATE: f64 = 2.0;
 /// Rounds over the fixture before the measured one.
 const WARM_UP_ROUNDS: usize = 3;
+/// The updates each consumer holds after one round over a fixture: 1751
+/// placements of 1000 updates.
+const PENDING: [(&str, usize); 3] = [("workers", 813), ("analytics", 818), ("hooks", 120)];
 
 #[test]
 fn counter_sees_this_threads_allocations() {
@@ -104,6 +107,8 @@ fn per_update(updates: &str) -> f64 {
         let bodies: Vec<Bytes> = raw.iter().map(|b| Bytes::from(b.clone())).collect();
         let (n, admitted) = allocations(|| bodies.iter().map(|b| hot.ingest(b)).sum::<usize>());
         assert_eq!(admitted, count, "every update is admitted");
+        // The same routing for every fixture, so their budgets compare.
+        assert_eq!(hot.pending_by_consumer(), PENDING, "updates per consumer");
         drop(bodies);
         hot.drain();
         n

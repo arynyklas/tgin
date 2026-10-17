@@ -223,6 +223,14 @@ impl HotPath {
             .count()
     }
 
+    /// The updates each consumer holds, `PULL` then `PUSH`.
+    pub fn pending_by_consumer(&self) -> [(&'static str, usize); 3] {
+        [PULL[0], PULL[1], PUSH].map(|name| {
+            let consumer = self.engine.consumer(name).expect("a consumer of CONFIG");
+            (name, consumer.pending())
+        })
+    }
+
     /// Empties every queue: pull consumers are polled and acked as their
     /// clients would, the push consumer, whose dispatcher never runs, is
     /// purged.

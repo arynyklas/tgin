@@ -979,6 +979,27 @@ mod tests {
     }
 
     #[test]
+    fn unescape_reserves_up_front() {
+        // Each input decodes to far less than its length, so growing the
+        // buffer by its output alone would leave less room than this.
+        for (inner, limit) in [
+            (r"\u00e9".repeat(100), usize::MAX),
+            (r"\u00e9".repeat(100), 500),
+            (r"\ud83d\ude00".repeat(50), 400),
+        ] {
+            let mut out = String::new();
+            let text = unescape(&inner, limit, &mut out);
+            assert!(matches!(text, Text::Decoded(_)), "{inner} has escapes");
+            let reserved = inner.len().min(limit);
+            assert!(
+                out.capacity() >= reserved,
+                "{} bytes reserved, {reserved} expected",
+                out.capacity()
+            );
+        }
+    }
+
+    #[test]
     fn extract_text_capped_4k() {
         // 3-byte chars: 4096 is not a char boundary, so the cut lands at 4095.
         let long = "€".repeat(2000);
