@@ -434,6 +434,11 @@ A bot's `api_url` may point at a self-hosted [telegram-bot-api](https://github.c
 
 Never expose the server itself: it has no authentication of its own, and its statistics port (`--http-stat-port`) shows the bots' tokens. Keep it on a network only tgin reaches.
 
+Two more caveats hold for this version:
+
+- **`--local` and untrusted downstreams.** With `--local`, the server reads a `file://` URI or an absolute path given for a file as a file on its own disk. tgin passes such parameters through unchanged, in gateway calls and in executed [webhook replies](#webhook-replies), so whoever holds a configured bot's token can make the server read and upload any file it can read; a private network for the server does not prevent that. Do not run a `--local` server behind tgin with downstreams you do not trust.
+- **Large uploads.** `gateway.upstream_idle_timeout` (`1m`) also runs while the server, having received the whole upload, sends it on to Telegram before it answers. A large `--local` upload can then get `502 Bad Gateway: Telegram is unreachable` while the server still sends it, and a client that retries sends it twice. Raise the bot's `gateway.upstream_idle_timeout` above the longest upload the server must forward.
+
 ### Checking against real Telegram
 
 Before a release, a maintainer runs `tests/smoke/real_telegram.py` (Python 3, standard library only) against the real Bot API with a test bot. It starts tgin with [its own config](tests/smoke/real_telegram.yaml) and the [webhook downstream](tests/smoke/hook.py), and reads the token from `TGIN_SMOKE_TOKEN` or from a file given as its argument; it never prints the token. Phase A needs no chat: identity, intercepts, proxied calls, unknown tokens, a capture and metrics. Phase B asks a person to send the bot a message containing `tgin-smoke-reply`, then checks the long poll, the pull consumer, the pushes, a webhook reply, per-chat shaping and a multipart upload with its download. CI never runs it; `--help` lists its options.
