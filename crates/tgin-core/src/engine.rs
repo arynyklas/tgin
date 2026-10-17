@@ -10,6 +10,7 @@
 //! name, for as long as it stays configured, and an id is never given to
 //! another bot. Sources must admit with [`Engine::source_id`].
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -499,6 +500,18 @@ pub(crate) struct Shared {
     pub(crate) retired: Mutex<Vec<Arc<Slot>>>,
     /// Set by [`Engine::begin_drain`]; instances started later drain too.
     pub(crate) draining: AtomicBool,
+    /// Random per process: keys the token fingerprints of runtime
+    /// endpoints, so no fingerprint reveals or outlives a token.
+    pub(crate) token_keys: RandomState,
+}
+
+impl Shared {
+    /// The keyed fingerprint of the bot `source`'s token in `state`.
+    pub(crate) fn token_fingerprint(&self, state: &EngineState, source: SourceId) -> Option<u64> {
+        let info = state.source(source)?;
+        let bot = state.config.bots.iter().find(|b| *b.name == *info.name)?;
+        Some(self.token_keys.hash_one(bot.token.expose().as_str()))
+    }
 }
 
 /// A retired instance's dispatcher, to forget once it has stopped.
@@ -585,6 +598,7 @@ impl Engine {
                 write: Mutex::new(()),
                 retired: Mutex::new(Vec::new()),
                 draining: AtomicBool::new(false),
+                token_keys: RandomState::new(),
             }),
             scratch: Mutex::new(Vec::new()),
             client,
@@ -748,7 +762,7 @@ impl Engine {
         if !accepts || !state.feeds(source, consumer) {
             return None;
         }
-        let had = push.runtime_endpoint_source().is_some();
+        let had = push.runtime_endpoint_owner().is_some();
         let Some((url, secret_token)) = endpoint else {
             if !had {
                 return Some(WebhookChange::AlreadyDeleted);
@@ -761,6 +775,7 @@ impl Engine {
             url,
             secret_token,
             source,
+            token_fingerprint: self.shared.token_fingerprint(&state, source)?,
         };
         if push.has_runtime_endpoint(&endpoint) {
             return Some(WebhookChange::Unchanged);

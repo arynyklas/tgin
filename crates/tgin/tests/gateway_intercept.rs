@@ -457,6 +457,22 @@ async fn get_updates_consumer_scoped_serves_queue() {
     assert_eq!(status, 200, "{body}");
     assert!(update_ids(&body).is_empty());
     tgin.wait_held("workers", 0).await;
+    // Review Focus 6: on an empty queue, grammY's and Telegraf's shutdown
+    // confirm (no `timeout`) still answers at once, not after a long poll.
+    let started = Instant::now();
+    let confirm = timeout(
+        Duration::from_secs(1),
+        tgin.http
+            .post(tgin.url(&scoped))
+            .json(&json!({ "offset": 4, "limit": 1 }))
+            .send(),
+    )
+    .await
+    .expect("the confirm answers within 1 s")
+    .expect("response");
+    let (status, body) = json_of(confirm).await;
+    assert_eq!((status, update_ids(&body).len()), (200, 0), "{body}");
+    assert!(started.elapsed() < Duration::from_secs(1));
 
     // The consumer's own path still needs its bearer token.
     let (status, _) = tgin.get("/c/workers/getUpdates?timeout=0").await;
@@ -481,7 +497,7 @@ async fn get_updates_consumer_scoped_serves_queue() {
         "getUpdates never goes upstream"
     );
     tgin.assert_metric(
-        r#"tgin_gateway_requests_total{bot="hooked",method="getUpdates",outcome="local"} 5"#,
+        r#"tgin_gateway_requests_total{bot="hooked",method="getUpdates",outcome="local"} 6"#,
     );
     tgin.stop().await;
 }
@@ -691,16 +707,36 @@ async fn set_webhook_never_reaches_upstream() {
     tgin.wait_held("workers", 1).await;
     tgin.wait_held("keep", 1).await;
     tgin.wait_held("hooks", 0).await;
+    // A URL without a scheme is https, as telegram-bot-api reads it.
+    // Nothing is pending, so nothing is pushed there.
+    assert_eq!(
+        tgin.post_raw(
+            &format!("/c/hooks/bot{TOKEN}/setWebhook"),
+            "application/x-www-form-urlencoded",
+            b"url=bot.example/hook".to_vec()
+        )
+        .await,
+        (200, was_set.clone())
+    );
+    let (_, info) = tgin
+        .get(&format!("/c/hooks/bot{TOKEN}/getWebhookInfo"))
+        .await;
+    assert_eq!(info["result"]["url"], "https://bot.example/hook", "{info}");
+    assert_eq!(
+        tgin.get(&format!("/c/hooks/bot{TOKEN}/deleteWebhook"))
+            .await,
+        (200, was_deleted.clone())
+    );
     assert_eq!(
         upstream_paths(&telegram).await,
         [format!("/bot{TOKEN}/getMe")],
         "no setWebhook or deleteWebhook went upstream"
     );
     tgin.assert_metric(
-        r#"tgin_gateway_requests_total{bot="hooked",method="setWebhook",outcome="local"} 7"#,
+        r#"tgin_gateway_requests_total{bot="hooked",method="setWebhook",outcome="local"} 8"#,
     );
     tgin.assert_metric(
-        r#"tgin_gateway_requests_total{bot="hooked",method="deleteWebhook",outcome="local"} 3"#,
+        r#"tgin_gateway_requests_total{bot="hooked",method="deleteWebhook",outcome="local"} 4"#,
     );
     tgin.stop().await;
 }
@@ -1169,5 +1205,77 @@ async fn runtime_endpoint_never_reaches_tgin_itself() {
         "the refusal names the bot"
     );
     assert!(!logs.contains("/v1/consumers/keep/purge"));
+    tgin.stop().await;
+}
+
+/// The scoped intercepts reach only the consumer instance the calling bot
+/// feeds: after `p1` moves from a pull consumer of `hooked` to a push
+/// consumer of `other`, `other` cannot poll `hooked`'s draining updates,
+/// and `hooked` still can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_intercepts_follow_the_feeding_bot_across_reloads() {
+    let telegram = telegram().await;
+    let config = |hooked_to: &str, other_to: &str, p1: &str| {
+        format!(
+            r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+reload: {{ drain_timeout: 30s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+bots:
+  - name: hooked
+    token: "{TOKEN}"
+    api_url: "{api}"
+    ingress: {{ webhook: {{ path: /hook, secret_token: "{HOOK_SECRET}" }} }}
+    routes: [{{ to: [{hooked_to}] }}]
+  - name: other
+    token: "{OTHER_TOKEN}"
+    api_url: "{api}"
+    routes: [{{ to: [{other_to}] }}]
+consumers:
+  p1: {p1}
+  keep: {{ pull: {{}} }}
+"#,
+            api = telegram.uri()
+        )
+    };
+    let tgin = start(&config("p1", "keep", "{ pull: {} }")).await;
+    tgin.admit(1).await;
+    tgin.wait_held("p1", 1).await;
+    tgin.reload(
+        &config("keep", "p1", "{ push: { accept_set_webhook: true } }"),
+        2,
+    )
+    .await;
+
+    // `other` feeds the push consumer `p1` now: no getUpdates for it.
+    let (status, body) = tgin
+        .get(&format!("/c/p1/bot{OTHER_TOKEN}/getUpdates?timeout=0"))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        body,
+        telegram_error(409, "Conflict: p1 is not a pull consumer of this bot")
+    );
+    // Its webhook info is its push consumer's, empty: not the draining
+    // pull instance's update.
+    let (status, body) = tgin
+        .get_raw(&format!("/c/p1/bot{OTHER_TOKEN}/getWebhookInfo"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        String::from_utf8(body).expect("UTF-8"),
+        r#"{"ok":true,"result":{"url":"","has_custom_certificate":false,"pending_update_count":0}}"#
+    );
+    // `hooked` fed the draining pull instance and still drains it.
+    let (status, body) = tgin
+        .get(&format!("/c/p1/bot{TOKEN}/getUpdates?timeout=0"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(update_ids(&body), [1]);
+    let (status, body) = tgin
+        .get(&format!("/c/p1/bot{TOKEN}/getUpdates?offset=2&timeout=0"))
+        .await;
+    assert_eq!((status, update_ids(&body).len()), (200, 0), "{body}");
     tgin.stop().await;
 }

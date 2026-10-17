@@ -70,6 +70,7 @@ fn runtime(server: &MockServer, route: &str, secret: Option<&str>) -> RuntimeEnd
         url: format!("{}{route}", server.uri()).parse().expect("url"),
         secret_token: secret.map(|s| Secret::new(s.to_owned())),
         source: SourceId(0),
+        token_fingerprint: 7,
     }
 }
 
@@ -1023,7 +1024,7 @@ async fn runtime_endpoint_receives_updates_with_secret() {
     let url = set.url.clone();
     h.consumer.set_runtime_endpoint(Some(set));
     assert_eq!(h.consumer.runtime_endpoint_url(), Some(url));
-    assert_eq!(h.consumer.runtime_endpoint_source(), Some(SourceId(0)));
+    assert_eq!(h.consumer.runtime_endpoint_owner(), Some((SourceId(0), 7)));
     h.admit(1, None);
     h.settled().await;
     let got = requests(&server).await;

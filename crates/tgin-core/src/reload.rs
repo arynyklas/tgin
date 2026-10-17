@@ -416,9 +416,11 @@ pub(crate) fn commit(
         }
     }
     if let Some(state) = state {
+        // Before the swap: no update the new state admits may reach an
+        // endpoint it no longer allows.
+        keep_runtime_endpoints(shared, &state);
         shared.state.store(Arc::new(state));
     }
-    keep_runtime_endpoints(&shared.state.load());
     for slot in changes.started.iter().chain(&changes.revived) {
         slot.consumer.update_depth();
     }
@@ -454,17 +456,18 @@ pub(crate) fn compile(
     RouteTable::compile(&rules, &usernames)
 }
 
-/// Clears the runtime endpoint of every current push consumer that no
-/// longer accepts one, or that the bot whose `setWebhook` set it no longer
-/// feeds (R37): a token holder never redirects another bot's updates, not
-/// even across reloads. Draining instances keep theirs to deliver what they
-/// hold.
-fn keep_runtime_endpoints(state: &EngineState) {
+/// Clears the runtime endpoint of every push consumer of `state` that no
+/// longer accepts one, that the bot whose `setWebhook` set it no longer
+/// feeds (R37), or whose bot's token changed since: a token holder never
+/// redirects another bot's updates, not even across reloads, and rotating a
+/// leaked token evicts what its holder set. Draining instances keep theirs
+/// to deliver what they hold.
+fn keep_runtime_endpoints(shared: &Shared, state: &EngineState) {
     for target in &state.targets {
         let Consumer::Push(push) = &target.slot.consumer else {
             continue;
         };
-        let Some(source) = push.runtime_endpoint_source() else {
+        let Some((source, fingerprint)) = push.runtime_endpoint_owner() else {
             continue;
         };
         let accepts = state.config.consumers.iter().any(|c| {
@@ -475,6 +478,8 @@ fn keep_runtime_endpoints(state: &EngineState) {
             "accept_set_webhook is off"
         } else if !state.feeds(source, &target.slot.name) {
             "the bot whose setWebhook set it no longer feeds the consumer"
+        } else if shared.token_fingerprint(state, source) != Some(fingerprint) {
+            "the token of the bot whose setWebhook set it changed"
         } else {
             continue;
         };

@@ -1526,3 +1526,34 @@ async fn runtime_endpoint_cleared_when_feeding_bot_changes() {
             .is_none()
     );
 }
+
+/// A reload that gives the setting bot another token clears its runtime
+/// endpoint: rotating a leaked token evicts what the old token's holder
+/// set, and the bot's new holder sets its own.
+#[tokio::test(start_paused = true)]
+async fn runtime_endpoint_cleared_when_token_changes() {
+    let h = Harness::new(CAPTURE);
+    let a = SourceId(0);
+    let url = "http://127.0.0.1:9/in";
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None)),
+        Some(WebhookChange::Set)
+    );
+    let rotated = CAPTURE.replace("token: \"1:aaa\"", "token: \"9:zzz\"");
+    h.engine.apply(&load(&rotated)).expect("apply");
+    assert_eq!(h.engine.source_id("a"), Some(a), "same bot name, same id");
+    assert_eq!(runtime_url(&h, "hooks"), None, "the token changed");
+    assert_eq!(
+        LOGS.count(&["runtime endpoint cleared", "consumer=hooks", "token"]),
+        1
+    );
+    // The new token's holder sets it again; the same token keeps it.
+    assert_eq!(
+        h.engine
+            .set_runtime_endpoint("hooks", a, webhook(url, None)),
+        Some(WebhookChange::Set)
+    );
+    h.engine.apply(&load(&rotated)).expect("apply");
+    assert_eq!(runtime_url(&h, "hooks").as_deref(), Some(url));
+}

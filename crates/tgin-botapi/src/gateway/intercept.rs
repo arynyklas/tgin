@@ -276,17 +276,13 @@ fn to_bool(value: &str) -> bool {
 }
 
 /// The URL and secret token of a `setWebhook` as a runtime endpoint,
-/// refused as telegram-bot-api refuses them (`Client::do_set_webhook`). The
-/// URL must be absolute `http` or `https` with a host. An empty secret
-/// token is none.
+/// refused as telegram-bot-api refuses them (`Client::do_set_webhook`). An
+/// empty secret token is none.
 fn runtime_endpoint(
     url: &str,
     secret_token: Option<&str>,
 ) -> Result<(Url, Option<Secret<String>>), &'static str> {
-    let url = Url::parse(url)
-        .ok()
-        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
-        .ok_or(INVALID_WEBHOOK_URL)?;
+    let url = webhook_url(url).ok_or(INVALID_WEBHOOK_URL)?;
     let secret_token = secret_token.unwrap_or_default();
     if secret_token.len() > MAX_SECRET_TOKEN_LEN {
         return Err(SECRET_TOKEN_TOO_LONG);
@@ -299,6 +295,29 @@ fn runtime_endpoint(
     }
     let secret_token = (!secret_token.is_empty()).then(|| Secret::new(secret_token.to_owned()));
     Ok((url, secret_token))
+}
+
+/// A webhook URL as tdlib's `parse_url(url, Protocol::Https)` reads it: the
+/// text before the first of `:/?#@[]` is the scheme when `://` follows it,
+/// and must be `http` or `https` in any case; otherwise the whole text is
+/// `[userinfo@]host[:port][/…]` over https. The host may not be empty.
+fn webhook_url(url: &str) -> Option<Url> {
+    let end = url
+        .find([':', '/', '?', '#', '@', '[', ']'])
+        .unwrap_or(url.len());
+    let (scheme, rest) = match url[end..].strip_prefix("://") {
+        Some(rest) => (url[..end].to_ascii_lowercase(), rest),
+        None => ("https".to_owned(), url),
+    };
+    if !matches!(scheme.as_str(), "http" | "https")
+        || rest.is_empty()
+        || rest.starts_with(['/', '?', '#'])
+    {
+        return None;
+    }
+    Url::parse(&format!("{scheme}://{rest}"))
+        .ok()
+        .filter(|url| url.host().is_some())
 }
 
 #[cfg(test)]
@@ -355,13 +374,25 @@ mod tests {
             "not a url",
             "/relative",
             "http://",
-            "mailto:a@b.c",
+            "http:///x",
+            "://a.example",
+            "",
         ] {
             assert_eq!(
                 runtime_endpoint(url, None).err(),
                 Some(INVALID_WEBHOOK_URL),
                 "{url}"
             );
+        }
+        // No scheme: https, as tdlib's `parse_url` defaults it.
+        for (url, parsed) in [
+            ("bot.example/hook", "https://bot.example/hook"),
+            ("bot.example:8443", "https://bot.example:8443/"),
+            ("HTTP://bot.example/x", "http://bot.example/x"),
+            ("Https://bot.example", "https://bot.example/"),
+        ] {
+            let (got, _) = runtime_endpoint(url, None).expect(url);
+            assert_eq!(got.as_str(), parsed, "{url}");
         }
         assert_eq!(
             runtime_endpoint("https://a.example", Some(&"a".repeat(257))).err(),

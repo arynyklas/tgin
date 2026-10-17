@@ -88,12 +88,16 @@ pub struct RuntimeEndpoint {
     pub secret_token: Option<Secret<String>>,
     /// The bot whose `setWebhook` set it.
     pub source: SourceId,
+    /// A keyed, process-local hash of that bot's token when it set it, so a
+    /// reload that changes the token can tell (never the token itself).
+    pub token_fingerprint: u64,
 }
 
 impl RuntimeEndpoint {
     fn same(&self, other: &RuntimeEndpoint) -> bool {
         self.url == other.url
             && self.source == other.source
+            && self.token_fingerprint == other.token_fingerprint
             && self.secret_token.as_ref().map(Secret::expose)
                 == other.secret_token.as_ref().map(Secret::expose)
     }
@@ -261,9 +265,14 @@ impl PushConsumer {
         self.targets.load().runtime.as_ref().map(|r| r.url.clone())
     }
 
-    /// The bot whose `setWebhook` set the runtime endpoint.
-    pub fn runtime_endpoint_source(&self) -> Option<SourceId> {
-        self.targets.load().runtime.as_ref().map(|r| r.source)
+    /// The bot whose `setWebhook` set the runtime endpoint, and the
+    /// fingerprint of its token then.
+    pub fn runtime_endpoint_owner(&self) -> Option<(SourceId, u64)> {
+        self.targets
+            .load()
+            .runtime
+            .as_ref()
+            .map(|r| (r.source, r.token_fingerprint))
     }
 
     /// Whether the runtime endpoint is `endpoint`: same URL, secret and bot.
