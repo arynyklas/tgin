@@ -642,12 +642,19 @@ mod tests {
     /// Sources over an engine that knows no bot, so every bot fails to be
     /// prepared.
     fn sources() -> (Sources, Arc<Supervisor>, Arc<Health>) {
+        let (sources, supervisor, health, _) = sources_for(&load("version: 1\n"));
+        (sources, supervisor, health)
+    }
+
+    /// Sources over an engine of `cfg`, whose gateway serves `cfg`'s bots;
+    /// cancelling the returned token stops their sources.
+    fn sources_for(cfg: &Config) -> (Sources, Arc<Supervisor>, Arc<Health>, CancellationToken) {
         let mut registry = MetricsRegistry::new("test", "test");
         let core = CoreMetrics::register(registry.registry_mut());
         let supervisor = Arc::new(Supervisor::new());
         let force = CancellationToken::new();
         let engine = Engine::new(
-            &load("version: 1\n"),
+            cfg,
             core,
             reqwest::Client::new(),
             EngineRuntime {
@@ -663,16 +670,147 @@ mod tests {
             Arc::clone(&engine),
             GatewayMetrics::register(registry.registry_mut()),
         ));
+        gateway.set_bots(crate::app::gateway_bots(cfg, &engine), Vec::new());
+        let ingest = CancellationToken::new();
         let sources = Sources::new(
             engine,
             Arc::clone(&supervisor),
             Arc::clone(&health),
-            reqwest::Client::new(),
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client"),
             gateway,
-            CancellationToken::new(),
+            ingest.clone(),
             force,
         );
-        (sources, supervisor, health)
+        (sources, supervisor, health, ingest)
+    }
+
+    /// A fake Bot API whose `getMe` for `token` fails `failures` times with
+    /// a 500, then answers `username`; `getUpdates` idles, the webhook
+    /// methods succeed.
+    async fn telegram(token: &str, username: &str, failures: u64) -> wiremock::MockServer {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let at = |m: &str| format!("/bot{token}/{m}");
+        if failures > 0 {
+            Mock::given(path(at("getMe")))
+                .respond_with(ResponseTemplate::new(500).set_body_raw(
+                    r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+                    "application/json",
+                ))
+                .up_to_n_times(failures)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path(at("getMe")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    r#"{{"ok":true,"result":{{"id":1,"is_bot":true,"username":"{username}"}}}}"#
+                ),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        for m in ["deleteWebhook", "setWebhook"] {
+            Mock::given(path(at(m)))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(r#"{"ok":true,"result":true}"#, "application/json"),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(path(at("getUpdates")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"ok":true,"result":[]}"#, "application/json")
+                    .set_delay(Duration::from_secs(3600)),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Waits until the gateway knows `bot`'s username.
+    async fn identity_of(sources: &Sources, bot: &str) -> Option<String> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(identity) = sources.gateway.identity(bot) {
+                return identity.user.username.clone();
+            }
+            assert!(started.elapsed() < WAIT, "no identity for {bot} in time");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A webhook bot's `getMe` at start records its identity in the gateway.
+    #[tokio::test]
+    async fn identify_records_webhook_identity() {
+        let token = "1:hook";
+        let tg = telegram(token, "hook_bot", 0).await;
+        let cfg = load(&format!(
+            "version: 1\nserver: {{}}\nbots:\n  - {{ name: hook, token: \"{token}\", api_url: \"{}\", ingress: {{ webhook: {{}} }} }}\n",
+            tg.uri()
+        ));
+        let (sources, _, _, ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        sources.identify(&[prepared]).await;
+        let identity = sources.gateway.identity("hook").expect("recorded");
+        assert_eq!(identity.user.username.as_deref(), Some("hook_bot"));
+        assert_eq!(
+            &identity.raw[..],
+            br#"{"id":1,"is_bot":true,"username":"hook_bot"}"#
+        );
+        ingest.cancel();
+    }
+
+    /// A webhook bot whose first `getMe` fails gets its identity recorded
+    /// by the background retry.
+    #[tokio::test]
+    async fn retried_get_me_records_webhook_identity() {
+        let token = "1:late";
+        let tg = telegram(token, "late_bot", 1).await;
+        let cfg = load(&format!(
+            "version: 1\nserver: {{}}\nbots:\n  - {{ name: late, token: \"{token}\", api_url: \"{}\", ingress: {{ webhook: {{}} }} }}\n",
+            tg.uri()
+        ));
+        let (sources, _, _, ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        sources.identify(&[prepared]).await;
+        assert!(
+            sources.gateway.identity("late").is_none(),
+            "the first call failed"
+        );
+        assert_eq!(
+            identity_of(&sources, "late").await.as_deref(),
+            Some("late_bot")
+        );
+        ingest.cancel();
+    }
+
+    /// A long-poll bot's identity is recorded once its source has started.
+    #[tokio::test]
+    async fn long_poll_records_identity() {
+        let token = "1:poll";
+        let tg = telegram(token, "poll_bot", 0).await;
+        let cfg = load(&format!(
+            "version: 1\nbots:\n  - {{ name: poll, token: \"{token}\", api_url: \"{}\", ingress: {{ long_poll: {{}} }} }}\n",
+            tg.uri()
+        ));
+        let (sources, _, _, ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        assert!(sources.gateway.identity("poll").is_none());
+        sources.start_long_poll(prepared);
+        assert_eq!(
+            identity_of(&sources, "poll").await.as_deref(),
+            Some("poll_bot")
+        );
+        ingest.cancel();
     }
 
     async fn failed(supervisor: &Supervisor, task: &str) -> String {

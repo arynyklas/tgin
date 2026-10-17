@@ -11,7 +11,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -100,6 +100,16 @@ pub(super) async fn forward(
         .send();
     let response = match await_headers(send, &progress, idle).await {
         Waited::Ready(Ok(response)) => response,
+        Waited::Ready(Err(_)) if progress.client_failed() => {
+            // The downstream went away mid-body: not Telegram's failure,
+            // and nobody reads the answer.
+            tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request abandoned: the client closed the request body early");
+            handles.count(Outcome::ClientClosed);
+            return errors::error(
+                StatusCode::BAD_REQUEST,
+                "Bad Request: the request body ended early",
+            );
+        }
         Waited::Ready(Err(err)) => {
             tracing::warn!(bot = %bot.name, method = label.as_str(), error = %describe_error(&err), "gateway request failed: Telegram is unreachable");
             return unreachable(handles);
@@ -119,7 +129,7 @@ pub(super) async fn forward(
     let download = Download {
         body,
         idle,
-        sleep: Box::pin(sleep_until(Instant::now() + idle)),
+        sleep: Box::pin(sleep_until(deadline(Instant::now(), idle))),
         tally: Some(Tally {
             name: Arc::clone(&bot.name),
             bot: bot.metrics.clone(),
@@ -187,11 +197,22 @@ fn unreachable(handles: &MethodMetrics) -> Response {
     )
 }
 
-/// When the request body last moved.
+/// `idle` after `from`; for an `idle` past any representable instant, 30
+/// years after `from` (as tokio's own far future), which never comes.
+fn deadline(from: Instant, idle: Duration) -> Instant {
+    const FAR: Duration = Duration::from_secs(30 * 365 * 86_400);
+    from.checked_add(idle)
+        .or_else(|| from.checked_add(FAR))
+        .unwrap_or(from)
+}
+
+/// When the request body last moved, and whether it failed.
 struct Progress {
     origin: Instant,
     /// Nanoseconds after `origin`.
     last: AtomicU64,
+    /// Reading the downstream's body failed: the client went away.
+    client_failed: AtomicBool,
 }
 
 impl Progress {
@@ -199,6 +220,7 @@ impl Progress {
         Progress {
             origin: Instant::now(),
             last: AtomicU64::new(0),
+            client_failed: AtomicBool::new(false),
         }
     }
 
@@ -209,6 +231,10 @@ impl Progress {
 
     fn last(&self) -> Instant {
         self.origin + Duration::from_nanos(self.last.load(Ordering::Relaxed))
+    }
+
+    fn client_failed(&self) -> bool {
+        self.client_failed.load(Ordering::Relaxed)
     }
 }
 
@@ -228,12 +254,12 @@ async fn await_headers<F: Future>(
 ) -> Waited<F::Output> {
     tokio::pin!(send);
     loop {
-        let deadline = progress.last() + idle;
+        let at = deadline(progress.last(), idle);
         tokio::select! {
             biased;
             output = &mut send => return Waited::Ready(output),
-            () = sleep_until(deadline) => {
-                if progress.last() + idle <= Instant::now() {
+            () = sleep_until(at) => {
+                if deadline(progress.last(), idle) <= Instant::now() {
                     return Waited::Idle;
                 }
             }
@@ -263,6 +289,9 @@ impl HttpBody for Upload {
         let polled = Pin::new(this.body.get_mut()).poll_frame(cx);
         if polled.is_ready() {
             this.progress.stamp();
+        }
+        if let Poll::Ready(Some(Err(_))) = &polled {
+            this.progress.client_failed.store(true, Ordering::Relaxed);
         }
         polled
     }
@@ -332,8 +361,9 @@ impl HttpBody for Download {
         let this = self.get_mut();
         match Pin::new(&mut this.body).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                let deadline = Instant::now() + this.idle;
-                this.sleep.as_mut().reset(deadline);
+                this.sleep
+                    .as_mut()
+                    .reset(deadline(Instant::now(), this.idle));
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(err))) => this.fail(DownloadError::Upstream(describe_error(&err))),

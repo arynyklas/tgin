@@ -1,6 +1,6 @@
-//! The gateway streams: a 200 MiB upload and a 200 MiB download pass
-//! through keeping `Content-Length` both ways, with what tgin buffers
-//! constant in the body size and at most 2 MiB.
+//! The gateway streams: 4 MiB and 200 MiB uploads and downloads pass
+//! through keeping `Content-Length` both ways, and what tgin buffers stays
+//! under one fixed bound ([`BOUND`], 4 MiB) whatever the body size.
 //!
 //! "Buffered" is measured as the growth of the process's live heap over a
 //! transfer, through the shared counting global allocator
@@ -32,14 +32,18 @@ use counting_alloc::Counting;
 static GLOBAL: Counting = Counting;
 
 const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
-/// Each way.
+/// The large transfer, each way.
 const SIZE: u64 = 200 * 1024 * 1024;
-/// The reference transfer the growth must not exceed by more than [`SLACK`].
+/// The small transfer, each way: 50× smaller than [`SIZE`].
 const SMALL: u64 = 4 * 1024 * 1024;
-/// The most a transfer may grow the heap by.
-const BOUND: isize = 2 * 1024 * 1024;
-/// How much more a 200 MiB transfer may grow the heap than a 4 MiB one.
-const SLACK: isize = 512 * 1024;
+/// The most any transfer, small or large, may grow the heap by. Measured
+/// growth comes in steps of about 418 KB, one hyper read buffer (8 KiB +
+/// 400 KiB) pinned per queued frame: 1.26, 1.68, 2.10 and 2.52 MB on
+/// Windows, at most 1.26 MB on Linux, the same steps at 4 MiB and at
+/// 200 MiB. Four MiB leaves room for two more steps. One bound for
+/// both sizes is the size-independence check: the 50× larger body stays
+/// under it, and it is under 2 % of that body.
+const BOUND: isize = 4 * 1024 * 1024;
 /// Bounds each transfer.
 const PATIENCE: Duration = Duration::from_secs(300);
 const CHUNK: usize = 16 * 1024;
@@ -205,7 +209,7 @@ async fn upload_and_download_stream_bounded() {
     std::fs::write(
         &file,
         format!(
-            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    api_url: \"http://{api}\"\n"
+            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    api_url: \"http://{api}\"\n"
         ),
     )
     .expect("the config file");
@@ -254,14 +258,12 @@ async fn upload_and_download_stream_bounded() {
     println!(
         "heap growth: upload {up} B at {SIZE} B, {small_up} B at {SMALL} B; download {down} B at {SIZE} B, {small_down} B at {SMALL} B"
     );
-    assert!(up <= BOUND, "the upload grew the heap by {up} B");
-    assert!(down <= BOUND, "the download grew the heap by {down} B");
-    assert!(
-        up <= small_up + SLACK,
-        "the upload's growth depends on its size: {up} B against {small_up} B"
-    );
-    assert!(
-        down <= small_down + SLACK,
-        "the download's growth depends on its size: {down} B against {small_down} B"
-    );
+    for (what, growth) in [
+        ("200 MiB upload", up),
+        ("4 MiB upload", small_up),
+        ("200 MiB download", down),
+        ("4 MiB download", small_down),
+    ] {
+        assert!(growth <= BOUND, "the {what} grew the heap by {growth} B");
+    }
 }

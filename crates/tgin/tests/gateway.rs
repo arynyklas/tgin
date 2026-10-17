@@ -684,6 +684,98 @@ async fn upstream_unreachable_is_502_shaped() {
     tgin.stop().await;
 }
 
+/// A downstream that sends 100 of 1000 announced bytes and closes is not a
+/// Telegram failure: counted `client_closed`, never `unreachable`, and no
+/// warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_closing_mid_upload_is_client_closed() {
+    let telegram = trickling_telegram().await;
+    // A bot name of its own, for its log lines; a long idle timeout, so only
+    // the client's close can end the request.
+    let config = gateway_config(&format!("http://{telegram}"))
+        .replace("name: gw", "name: aborter")
+        .replace("upstream_idle_timeout: 1s", "upstream_idle_timeout: 30s");
+    let tgin = start(&config).await;
+
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    stream
+        .write_all(&[b'x'; 100])
+        .await
+        .expect("part of the body");
+    drop(stream);
+
+    let line = r#"tgin_gateway_requests_total{bot="aborter",method="sendDocument",outcome="client_closed"} 1"#;
+    let started = Instant::now();
+    while !tgin.metrics.encode().lines().any(|l| l == line) {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "never counted client_closed:\n{}",
+            tgin.metrics.encode()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="aborter",method="sendDocument",outcome="unreachable"} 0"#,
+    );
+    let logs = LOGS.text();
+    assert!(
+        !logs
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("bot=aborter")),
+        "a client's close is no warning"
+    );
+    tgin.stop().await;
+}
+
+/// The largest `upstream_idle_timeout` the config accepts serves requests:
+/// its deadlines saturate instead of overflowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn huge_idle_timeout_serves() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"ok":true,"result":true}"#, "application/json"),
+        )
+        .mount(&telegram)
+        .await;
+    Mock::given(path(format!("/file/bot{TOKEN}/f.bin")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("bytes", "application/octet-stream"))
+        .mount(&telegram)
+        .await;
+    let config = gateway_config(&telegram.uri()).replace(
+        "upstream_idle_timeout: 1s",
+        "upstream_idle_timeout: 18446744073709551615s",
+    );
+    let tgin = start(&config).await;
+
+    let response = tgin
+        .http
+        .post(tgin.url(&format!("/bot{TOKEN}/sendMessage")))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("a response, not a dropped connection");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        &response.bytes().await.expect("body")[..],
+        br#"{"ok":true,"result":true}"#
+    );
+    let response = tgin
+        .http
+        .get(tgin.url(&format!("/file/bot{TOKEN}/f.bin")))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(&response.bytes().await.expect("body")[..], b"bytes");
+    tgin.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_route_streams_with_range() {
     let telegram = MockServer::start().await;

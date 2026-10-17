@@ -28,6 +28,7 @@ label_enum!(
         UpstreamError => "upstream_error",
         Unreachable => "unreachable",
         Local => "local",
+        ClientClosed => "client_closed",
     }
 );
 

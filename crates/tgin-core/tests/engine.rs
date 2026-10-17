@@ -1227,3 +1227,28 @@ async fn routes_to_keeps_draining_retired_pull_feeder() {
     assert!(h.engine.pull_consumer("p1").is_none());
     assert!(!h.engine.routes_to(a, "p1"), "the drain ended");
 }
+
+/// A kept pull consumer moved from bot `a` to bot `b`, then removed while
+/// it still holds `b`'s update: it drains for `b`, not for `a`, which fed
+/// it when it was built.
+#[tokio::test(start_paused = true)]
+async fn routes_to_follows_feeder_of_moved_then_retired_pull() {
+    let h = Harness::new(FEEDERS);
+    let (a, b) = (SourceId(0), SourceId(1));
+    let moved = FEEDERS
+        .replace("to: [{ all: [p1, q] }]", "to: [q]")
+        .replace("to: [p2]", "to: [{ all: [p2, p1] }]");
+    h.engine.apply(&load(&moved)).expect("apply");
+    assert_eq!(admit_to(&h.engine, b, "message", 1), Admit::Admitted);
+    let without = moved
+        .replace("to: [{ all: [p2, p1] }]", "to: [p2]")
+        .replace("  p1: { pull: {} }\n", "");
+    h.engine.apply(&load(&without)).expect("apply");
+    assert!(h.engine.consumer("p1").is_none());
+    assert!(h.engine.pull_consumer("p1").is_some(), "still draining");
+    assert!(
+        !h.engine.routes_to(a, "p1"),
+        "a fed it only before the move"
+    );
+    assert!(h.engine.routes_to(b, "p1"));
+}
