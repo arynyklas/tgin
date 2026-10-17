@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tgin_botapi::gateway::Gateway;
 use tgin_botapi::{ApiError, BotClient, Identity, LongPollOptions, LongPollSource, SetWebhook};
 use tgin_core::config::{Bot, Ingress, LongPoll, Webhook};
 use tgin_core::engine::Engine;
@@ -56,6 +57,8 @@ pub(crate) struct Sources {
     supervisor: Arc<Supervisor>,
     health: Arc<Health>,
     client: reqwest::Client,
+    /// Records each bot's identity from every successful `getMe`.
+    gateway: Arc<Gateway>,
     ingest: CancellationToken,
     force: CancellationToken,
     registry: Arc<Mutex<Registry>>,
@@ -110,13 +113,15 @@ impl Prepared {
 
 impl Sources {
     /// Sources fed to `engine`, supervised by `supervisor`, calling the
-    /// Bot API with `client`. Every source stops when `ingest` is cancelled;
-    /// `force` aborts their tasks.
+    /// Bot API with `client` and recording each bot's identity in
+    /// `gateway`. Every source stops when `ingest` is cancelled; `force`
+    /// aborts their tasks.
     pub(crate) fn new(
         engine: Arc<Engine>,
         supervisor: Arc<Supervisor>,
         health: Arc<Health>,
         client: reqwest::Client,
+        gateway: Arc<Gateway>,
         ingest: CancellationToken,
         force: CancellationToken,
     ) -> Self {
@@ -125,6 +130,7 @@ impl Sources {
             supervisor,
             health,
             client,
+            gateway,
             ingest,
             force,
             registry: Arc::default(),
@@ -243,7 +249,10 @@ impl Sources {
         for (bot, identity) in webhooks.into_iter().zip(identities) {
             match identity {
                 None => {}
-                Some(Ok(identity)) => self.engine.set_username(bot.id, identity.user.username),
+                Some(Ok(identity)) => {
+                    self.gateway.set_identity(&bot.name, &identity);
+                    self.engine.set_username(bot.id, identity.user.username);
+                }
                 Some(Err(err)) => {
                     tracing::warn!(
                         source = %bot.name,
@@ -307,6 +316,8 @@ impl Sources {
             ..
         } = &bot;
         let identity_engine = Arc::clone(&self.engine);
+        let identity_gateway = Arc::clone(&self.gateway);
+        let identity_name = Arc::clone(name);
         let source = Arc::new(LongPollSource::new(
             *id,
             Arc::clone(name),
@@ -315,6 +326,7 @@ impl Sources {
             Arc::clone(&self.engine),
             metrics.clone(),
             Arc::new(move |id: SourceId, identity: &Identity| {
+                identity_gateway.set_identity(&identity_name, identity);
                 identity_engine.set_username(id, identity.user.username.clone());
             }),
         ));
@@ -482,8 +494,9 @@ impl Sources {
             return;
         }
         let (id, name) = (bot.id, Arc::clone(&bot.name));
-        let (engine, client, stop) = (
+        let (engine, gateway, client, stop) = (
             Arc::clone(&self.engine),
+            Arc::clone(&self.gateway),
             bot.client.clone(),
             bot.stop.clone(),
         );
@@ -497,8 +510,9 @@ impl Sources {
             ),
             self.force.clone(),
             move || {
-                let (engine, client, stop, name) = (
+                let (engine, gateway, client, stop, name) = (
                     Arc::clone(&engine),
+                    Arc::clone(&gateway),
                     client.clone(),
                     stop.clone(),
                     Arc::clone(&name),
@@ -521,6 +535,7 @@ impl Sources {
                             None => return Exit::Done,
                             Some(Ok(identity)) => {
                                 tracing::info!(source = %name, "getMe succeeded; commands addressed to this bot by @username match");
+                                gateway.set_identity(&name, &identity);
                                 engine.set_username(id, identity.user.username);
                                 return Exit::Done;
                             }
@@ -609,6 +624,7 @@ async fn register(bot: &Prepared, hook: &Webhook) {
 mod tests {
     use std::path::Path;
 
+    use tgin_botapi::gateway::GatewayMetrics;
     use tgin_core::config::{self, Config};
     use tgin_core::engine::EngineRuntime;
     use tgin_core::metrics::CoreMetrics;
@@ -642,11 +658,17 @@ mod tests {
         )
         .expect("engine");
         let health = Arc::new(Health::default());
+        let engine = Arc::new(engine);
+        let gateway = Arc::new(Gateway::new(
+            Arc::clone(&engine),
+            GatewayMetrics::register(registry.registry_mut()),
+        ));
         let sources = Sources::new(
-            Arc::new(engine),
+            engine,
             Arc::clone(&supervisor),
             Arc::clone(&health),
             reqwest::Client::new(),
+            gateway,
             CancellationToken::new(),
             force,
         );

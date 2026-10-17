@@ -2441,6 +2441,7 @@ dependencies = [
 name = "tgin-botapi"
 version = "1.0.0-dev"
 dependencies = [
+ "arc-swap",
  "aws-lc-rs",
  "axum",
  "base64 0.23.1",
@@ -2448,6 +2449,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "gungraun",
+ "http-body",
  "ipnet",
  "multer",
  "parking_lot",

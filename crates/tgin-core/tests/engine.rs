@@ -1159,3 +1159,71 @@ consumers:
         ])
     );
 }
+
+/// Bot `a` feeds `p1` and `q` (inside an `all`), bot `b` feeds `p2`.
+const FEEDERS: &str = r#"version: 1
+server: {}
+reload: { drain_timeout: 2s }
+bots:
+  - name: a
+    token: "1:aaa"
+    routes:
+      - match: { update_types: [callback_query] }
+        to: [{ all: [p1, q] }]
+  - name: b
+    token: "2:bbb"
+    routes:
+      - to: [p2]
+consumers:
+  p1: { pull: {} }
+  q: { pull: {} }
+  p2: { pull: {} }
+"#;
+
+/// `routes_to` follows the rules in effect: nested targets count, other
+/// bots' consumers and unknown names do not, and a reload that moves a
+/// consumer to another bot moves the answer with it.
+#[tokio::test(start_paused = true)]
+async fn routes_to_follows_current_rules() {
+    let h = Harness::new(FEEDERS);
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert!(h.engine.routes_to(a, "p1"));
+    assert!(h.engine.routes_to(a, "q"));
+    assert!(!h.engine.routes_to(a, "p2"));
+    assert!(h.engine.routes_to(b, "p2"));
+    assert!(!h.engine.routes_to(b, "p1"));
+    assert!(!h.engine.routes_to(a, "nope"));
+    assert!(!h.engine.routes_to(SourceId(7), "p1"));
+
+    let moved = FEEDERS
+        .replace("to: [{ all: [p1, q] }]", "to: [q]")
+        .replace("to: [p2]", "to: [{ all: [p2, p1] }]");
+    h.engine.apply(&load(&moved)).expect("apply");
+    assert!(!h.engine.routes_to(a, "p1"), "kept instance, now b's");
+    assert!(h.engine.routes_to(b, "p1"));
+    assert!(h.engine.routes_to(a, "q"));
+}
+
+/// A removed pull consumer still draining is routed to by the bot that fed
+/// it, and by no other, until its drain ends.
+#[tokio::test(start_paused = true)]
+async fn routes_to_keeps_draining_retired_pull_feeder() {
+    let h = Harness::new(FEEDERS);
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert_eq!(h.admit("callback_query", 1), Admit::Admitted);
+    let without = FEEDERS
+        .replace("to: [{ all: [p1, q] }]", "to: [q]")
+        .replace("  p1: { pull: {} }\n", "");
+    h.engine.apply(&load(&without)).expect("apply");
+    assert!(h.engine.consumer("p1").is_none());
+    assert!(h.engine.routes_to(a, "p1"), "draining, fed by a");
+    assert!(!h.engine.routes_to(b, "p1"));
+
+    let draining = h.engine.pull_consumer("p1").expect("still draining");
+    assert_eq!(poll(&draining, "i", 0).await, [1]);
+    assert!(poll(&draining, "i", 2).await.is_empty());
+    drop(draining);
+    sleep(Duration::from_millis(300)).await;
+    assert!(h.engine.pull_consumer("p1").is_none());
+    assert!(!h.engine.routes_to(a, "p1"), "the drain ended");
+}

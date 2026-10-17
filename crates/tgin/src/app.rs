@@ -11,6 +11,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tgin_botapi::ApiError;
+use tgin_botapi::gateway::{Gateway, GatewayBot, GatewayMetrics};
 use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
@@ -165,6 +166,8 @@ pub(crate) struct Shared {
     pub(crate) redactor: Arc<ArcSwap<Redactor>>,
     /// The config in effect; a reload swaps it once the engine applied it.
     pub(crate) config: ArcSwap<Config>,
+    /// The Bot API gateway; a reload gives it the new bots.
+    pub(crate) gateway: Arc<Gateway>,
     pub(crate) sources: Sources,
     pub(crate) reloads: ReloadQueue,
     /// Whether an admin listener is bound to a non-loopback address. The
@@ -244,6 +247,7 @@ impl App {
 
         let mut registry = MetricsRegistry::new(VERSION, commit().unwrap_or("unknown"));
         let core = CoreMetrics::register(registry.registry_mut());
+        let gateway_metrics = GatewayMetrics::register(registry.registry_mut());
         let metrics = Arc::new(registry);
         let client = http::client(&ClientOptions::default());
         let supervisor = Arc::clone(&handles.supervisor);
@@ -262,6 +266,9 @@ impl App {
         // Set once, here: the slot is new with `handles`.
         let _ = handles.engine.set((Arc::clone(&engine), core.clone()));
         health.set(ENGINE, Readiness::Ready);
+        // Before the sources, which record each bot's identity in it.
+        let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics));
+        gateway.set_bots(gateway_bots(&cfg, &engine), trusted_proxies(&cfg));
 
         let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
         let cfg = Arc::new(cfg);
@@ -274,11 +281,13 @@ impl App {
             supervisor: Arc::clone(&supervisor),
             redactor,
             config: ArcSwap::new(Arc::clone(&cfg)),
+            gateway: Arc::clone(&gateway),
             sources: Sources::new(
                 Arc::clone(&engine),
                 Arc::clone(&supervisor),
                 Arc::clone(&health),
                 client,
+                Arc::clone(&gateway),
                 ingest.clone(),
                 force,
             ),
@@ -317,7 +326,7 @@ impl App {
 
         let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
-                let routes = Arc::new(DataRoutes::new(&cfg, server, &engine, &ingest));
+                let routes = Arc::new(DataRoutes::new(&cfg, server, &engine, &ingest, gateway));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
                     key: tls.key_file.expose().clone(),
@@ -656,6 +665,35 @@ pub fn secrets(cfg: &Config) -> Vec<String> {
         }
     }
     secrets
+}
+
+/// The bots of `cfg` as the gateway serves them, with the engine's ids;
+/// `engine` has applied `cfg`.
+pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
+    cfg.bots
+        .iter()
+        .filter_map(|bot| {
+            let Some(source) = engine.source_id(&bot.name) else {
+                tracing::error!(bot = %bot.name, "the engine has no source for this bot; the gateway does not serve it");
+                return None;
+            };
+            Some(GatewayBot {
+                name: Arc::from(bot.name.as_str()),
+                source,
+                token: bot.token.clone(),
+                api_url: bot.api_url.expose().clone(),
+                gateway: bot.gateway.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The proxies whose forwarding headers the data plane trusts.
+pub(crate) fn trusted_proxies(cfg: &Config) -> Vec<tgin_botapi::IpNet> {
+    cfg.server
+        .as_ref()
+        .map(|server| server.trusted_proxies.clone())
+        .unwrap_or_default()
 }
 
 /// The secret Telegram must send with each update of `bot`'s webhook.

@@ -379,15 +379,20 @@ pub(crate) fn commit(
         }
     }
     // Registered before the swap, so that `pending` and `begin_drain` never
-    // miss them.
+    // miss them. The state still in effect is the one they were current in.
+    let previous = shared.state.load();
     let mut drains = Vec::with_capacity(changes.retiring.len());
     for slot in changes.retiring {
+        if slot.mode() == Mode::Pull {
+            *slot.fed_by.lock() = previous.feeder(&slot.name);
+        }
         let drain = CancellationToken::new();
         *slot.drain.lock() = Some(drain.clone());
         slot.consumer.begin_drain();
         shared.retired.lock().push(Arc::clone(&slot));
         drains.push((slot, drain));
     }
+    drop(previous);
     {
         // A draining instance leaves the gauges of a name in use to the
         // current instance.

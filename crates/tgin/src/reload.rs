@@ -270,6 +270,12 @@ impl Reloader {
         }
         self.loaded = text.into_bytes();
 
+        // Before the sources restart: their `getMe` records identities in
+        // the gateway's new entries.
+        self.shared.gateway.set_bots(
+            app::gateway_bots(&cfg, &self.shared.engine),
+            app::trusted_proxies(&cfg),
+        );
         self.restart_sources(&cfg, &report).await;
         self.reload_tls(&cfg).await;
         if !report.restart_required.is_empty() {

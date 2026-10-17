@@ -27,13 +27,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::envelope::Envelope;
-use crate::ids::SourceId;
+use crate::ids::{ConsumerId, SourceId};
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, CoreMetrics, SourceMetrics};
 use crate::reload::{self, Plan};
-use crate::rules::{MatchScratch, RouteTable, RuleError};
+use crate::rules::{MatchScratch, RouteTable, RuleError, TargetSpec};
 
 /// What the engine's background tasks run under.
 #[derive(Clone, Debug)]
@@ -232,6 +232,51 @@ impl EngineState {
     pub(crate) fn source_named(&self, name: &str) -> Option<&SourceInfo> {
         self.sources.iter().flatten().find(|s| &*s.name == name)
     }
+
+    /// Whether a rule of the bot `source` targets the consumer `consumer`.
+    pub(crate) fn feeds(&self, source: SourceId, consumer: &str) -> bool {
+        let Some(info) = self.source(source) else {
+            return false;
+        };
+        let Some(id) = self
+            .config
+            .consumers
+            .iter()
+            .find(|c| c.name == consumer)
+            .map(|c| c.id)
+        else {
+            return false;
+        };
+        self.config
+            .bots
+            .iter()
+            .find(|bot| *bot.name == *info.name)
+            .is_some_and(|bot| bot_targets(bot, id))
+    }
+
+    /// The first bot whose rules target the consumer `consumer`; a pull
+    /// consumer has exactly one.
+    pub(crate) fn feeder(&self, consumer: &str) -> Option<SourceId> {
+        self.sources
+            .iter()
+            .flatten()
+            .map(|info| info.id)
+            .find(|&id| self.feeds(id, consumer))
+    }
+}
+
+fn bot_targets(bot: &config::Bot, consumer: ConsumerId) -> bool {
+    fn reaches(spec: &TargetSpec, consumer: ConsumerId) -> bool {
+        match spec {
+            TargetSpec::Consumer(id) => *id == consumer,
+            TargetSpec::All(among) | TargetSpec::Split { among, .. } => {
+                among.iter().any(|spec| reaches(spec, consumer))
+            }
+        }
+    }
+    bot.rules
+        .iter()
+        .any(|rule| rule.targets.iter().any(|spec| reaches(spec, consumer)))
 }
 
 /// A consumer as admission sees it in one generation.
@@ -266,6 +311,9 @@ pub(crate) struct Slot {
     /// While the instance drains after a reload: cancelling it calls the
     /// drain off.
     pub(crate) drain: Mutex<Option<CancellationToken>>,
+    /// The bot that fed a pull instance when a reload retired it, so that
+    /// [`Engine::routes_to`] keeps answering for it while it drains.
+    pub(crate) fed_by: Mutex<Option<SourceId>>,
 }
 
 impl Slot {
@@ -286,6 +334,7 @@ impl Slot {
             stop: rt.stop.child_token(),
             kill: rt.force.child_token(),
             drain: Mutex::new(None),
+            fed_by: Mutex::new(None),
         }
     }
 
@@ -576,6 +625,20 @@ impl Engine {
                 Consumer::Pull(c) => Some(Arc::clone(c)),
                 Consumer::Push(_) => None,
             })
+    }
+
+    /// Whether the bot `source` routes to the consumer `consumer`: a rule of
+    /// the current config targets it, or it is a pull instance a reload
+    /// removed or replaced that still drains and that `source` fed.
+    pub fn routes_to(&self, source: SourceId, consumer: &str) -> bool {
+        if self.shared.state.load().feeds(source, consumer) {
+            return true;
+        }
+        self.shared.retired.lock().iter().any(|slot| {
+            *slot.name == *consumer
+                && slot.mode() == Mode::Pull
+                && *slot.fed_by.lock() == Some(source)
+        })
     }
 
     /// Sets the username of a bot of the current generation, so that its

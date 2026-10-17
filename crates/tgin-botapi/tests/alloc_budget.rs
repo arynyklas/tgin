@@ -2,73 +2,31 @@
 //! extracting facts and admitting into the engine allocates at most twice per
 //! update once warm.
 //!
-//! This binary installs a counting global allocator. Its counter is
-//! thread-local, so libtest's other threads do not disturb a measurement, and
-//! the engine's runtime is never driven, so its tasks never run on this
-//! thread during one.
-#![allow(unsafe_code)]
+//! This binary installs the shared counting global allocator
+//! (`support/counting_alloc.rs`). Its allocation counter is thread-local,
+//! so libtest's other threads do not disturb a measurement, and the
+//! engine's runtime is never driven, so its tasks never run on this thread
+//! during one.
 
 #[path = "../benches/common/mod.rs"]
 mod common;
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+mod support {
+    pub mod counting_alloc;
+}
 
 use bytes::Bytes;
 
 use common::HotPath;
-
-/// Forwards to [`System`], counting the calling thread's allocations,
-/// zeroed allocations and reallocations.
-struct Counting;
-
-thread_local! {
-    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
-}
-
-fn count() {
-    // `try_with`: the allocator may run while the thread's locals are torn down.
-    let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-}
-
-// SAFETY: every method forwards its arguments unchanged to `System`, which
-// upholds the `GlobalAlloc` contract; counting touches only a const-initialized
-// thread-local `Cell`, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        // SAFETY: the caller upholds `alloc`'s contract (non-zero size).
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count();
-        // SAFETY: the caller upholds `alloc_zeroed`'s contract.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count();
-        // SAFETY: the caller upholds `realloc`'s contract: `ptr` came from this
-        // allocator (hence from `System`) with `layout`.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: the caller upholds `dealloc`'s contract: `ptr` came from this
-        // allocator (hence from `System`) with `layout`.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
+use support::counting_alloc::{Counting, thread_allocations};
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
 /// The allocations this thread makes while `f` runs.
 fn allocations<R>(f: impl FnOnce() -> R) -> (u64, R) {
-    let before = ALLOCATIONS.with(Cell::get);
+    let before = thread_allocations();
     let out = f();
-    (ALLOCATIONS.with(Cell::get) - before, out)
+    (thread_allocations() - before, out)
 }
 
 /// Most allocations per update on the warm hot path.

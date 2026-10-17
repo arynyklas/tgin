@@ -109,7 +109,7 @@ struct Answer {
 fn client_options(timeout: Duration) -> ClientOptions {
     ClientOptions {
         connect_timeout: timeout,
-        request_timeout: timeout,
+        request_timeout: Some(timeout),
         no_proxy: true,
         ..ClientOptions::default()
     }

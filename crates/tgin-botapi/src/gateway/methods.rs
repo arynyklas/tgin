@@ -196,6 +196,9 @@ static METHODS: [&str; 185] = [
 /// The metric label for a method missing from the table.
 pub const OTHER_LABEL: &str = "other";
 
+/// How many methods the table holds; [`MethodId::index`] is below it.
+pub const METHOD_COUNT: usize = METHODS.len();
+
 /// A Bot API method of the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MethodId(u16);
@@ -207,6 +210,11 @@ impl MethodId {
             .get(usize::from(self.0))
             .copied()
             .unwrap_or(OTHER_LABEL)
+    }
+
+    /// The method's position in the table, below [`METHOD_COUNT`].
+    pub fn index(self) -> usize {
+        usize::from(self.0)
     }
 }
 

@@ -20,6 +20,9 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
+/// A metric label enum: `ALL` variants in declaration order and `as_str`,
+/// the exported value. Exported for the other crates' metric families.
+#[macro_export]
 macro_rules! label_enum {
     ($(#[$doc:meta])* $name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
         $(#[$doc])*

@@ -1,5 +1,6 @@
-//! The data plane's routes: webhook ingress and the Bot-API-shaped pull
-//! endpoints (`/c/{consumer}/getUpdates` and each alias).
+//! The data plane's routes: webhook ingress, the Bot-API-shaped pull
+//! endpoints (`/c/{consumer}/getUpdates` and each alias), and the Bot API
+//! gateway as the fallback for every other path.
 //!
 //! The listeners serve [`DataRoutes::service`], which hands every request to
 //! the router current in an `ArcSwap`, so a reload can change the routes
@@ -24,6 +25,7 @@ use axum::routing::{MethodRouter, get};
 use http_body::{Frame, SizeHint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tgin_botapi::gateway::Gateway;
 use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
 use tgin_core::consumer::pull::PollRequest;
@@ -67,22 +69,27 @@ struct Served {
 pub(crate) struct DataRoutes {
     routes: Arc<ArcSwap<Router>>,
     served: Mutex<Served>,
+    /// Every router's fallback; rebuilds keep it.
+    gateway: Arc<Gateway>,
 }
 
 impl DataRoutes {
-    /// The routes of `cfg`, served by `engine`. Webhook routes answer 503
-    /// once `ingest` is cancelled.
+    /// The routes of `cfg`, served by `engine`, with `gateway` serving
+    /// every path they do not. Webhook routes answer 503 once `ingest` is
+    /// cancelled.
     pub(crate) fn new(
         cfg: &Config,
         server: &Server,
         engine: &Arc<Engine>,
         ingest: &CancellationToken,
+        gateway: Arc<Gateway>,
     ) -> Self {
         let served = served(cfg, &Served::default(), engine);
-        let router = router(cfg, server, engine, ingest, served.clone());
+        let router = router(cfg, server, engine, ingest, served.clone(), &gateway);
         Self {
             routes: Arc::new(ArcSwap::from_pointee(router)),
             served: Mutex::new(served),
+            gateway,
         }
     }
 
@@ -94,7 +101,7 @@ impl DataRoutes {
 
     /// Builds the routes of `cfg` against the engine as it is now and serves
     /// them from the next request on; requests already running finish on
-    /// the old routes.
+    /// the old routes. The gateway stays the fallback.
     ///
     /// A pull consumer that `cfg` no longer has is still served while the
     /// engine drains it, on `/c/<name>/getUpdates` and on its aliases (a
@@ -116,6 +123,7 @@ impl DataRoutes {
             engine,
             ingest,
             served.clone(),
+            &self.gateway,
         )));
         *current = served;
     }
@@ -163,13 +171,16 @@ fn served(cfg: &Config, previous: &Served, engine: &Engine) -> Served {
     served
 }
 
-/// The routes of `cfg` and of the pull consumers `served` lists.
+/// The routes of `cfg` and of the pull consumers `served` lists, with
+/// `gateway` as the fallback. Only webhook routes have a request timeout:
+/// gateway transfers last as long as their bytes keep flowing.
 fn router(
     cfg: &Config,
     server: &Server,
     engine: &Arc<Engine>,
     ingest: &CancellationToken,
     served: Served,
+    gateway: &Arc<Gateway>,
 ) -> Router {
     let mut router = Router::new();
     for bot in &cfg.bots {
@@ -220,7 +231,11 @@ fn router(
     for (path, name) in aliases {
         router = router.route(&path, alias(&pull, name));
     }
-    router
+    let gateway = Arc::clone(gateway);
+    router.fallback(move |req: Request| {
+        let gateway = Arc::clone(&gateway);
+        async move { gateway.handle(req).await }
+    })
 }
 
 /// A router that hands every request to the router current in `routes`;

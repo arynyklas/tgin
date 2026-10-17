@@ -38,7 +38,7 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true
 wiremock.workspace = true
 
