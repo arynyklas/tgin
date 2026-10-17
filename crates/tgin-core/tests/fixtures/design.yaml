@@ -1,0 +1,48 @@
+# Design §12 example config with the M2 gateway, setWebhook-capture and
+# webhook-reply fields written out:
+# - `data_dir` and `accounts` (with `support-workers`, which only an account feeds) removed (M3)
+# - `allowed_updates: all` replaced by an explicit list (the v1 model takes a list)
+# - `callback_data: { prefix: "pay:" }` written as a list (the v1 model takes a list)
+# - a `hooks` push consumer that receives its endpoint from `setWebhook`
+version: 1
+runtime: { worker_threads: auto, shutdown_grace: 20s }
+log: { level: info, format: text }
+server:
+  listen: ["0.0.0.0:8080"]
+  tls: { cert_file: /tls/tls.crt, key_file: /tls/tls.key }
+  trusted_proxies: [10.0.0.0/8]
+admin:
+  listen: ["127.0.0.1:9090"]
+  token: ${file:/run/secrets/tgin-admin-token}
+
+bots:
+  - name: shop
+    token: ${env:SHOP_BOT_TOKEN}
+    api_url: https://api.telegram.org
+    ingress:
+      long_poll: { timeout: 30s, limit: 100, allowed_updates: [message, callback_query] }
+      # webhook: { public_url: https://bot.example.com, path: /webhook/shop, secret_token: auto, register: true }
+    gateway:
+      upstream_idle_timeout: 90s
+      rate_limit:
+        mode: shape
+        max_delay: 5s
+        methods: ["send*", "copyMessage*", "forwardMessage*", editMessageText]
+        global:    { count: 30, per: 1s, burst: 30 }
+        per_chat:  { count: 1,  per: 1s, burst: 5 }
+        per_group: { count: 20, per: 1m, burst: 20 }
+      retry_429: { max_wait: 20s }
+    routes:
+      - match: { commands: [admin], chat_types: [private] }
+        to: [admin]
+      - match: { update_types: [callback_query], callback_data: { prefix: ["pay:"] } }
+        to: [{ split: { strategy: hash_chat, among: [pay-a, pay-b] } }]
+      - to: [workers, analytics, hooks]
+
+consumers:
+  workers:   { pull: { capacity: 10000, on_full: backpressure, lease_timeout: 120s, ordering: per_chat, honor_drop_pending: true } }
+  analytics: { push: { endpoints: [{ url: "http://analytics:8000/tg" }], on_full: drop_oldest } }
+  admin:     { push: { endpoints: [{ url: "http://admin:8080/hook", secret_token: "${env:ADMIN_HOOK_SECRET}" }], ordering: per_chat } }
+  pay-a:     { push: { endpoints: [{ url: "http://pay-a:8080/hook" }] } }
+  pay-b:     { push: { endpoints: [{ url: "http://pay-b:8080/hook" }] } }
+  hooks:     { push: { endpoints: [], accept_set_webhook: true, webhook_reply: ignore, honor_drop_pending: true } }

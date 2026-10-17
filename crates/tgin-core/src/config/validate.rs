@@ -9,7 +9,8 @@ use tgin_runtime::config::{ConfigError, Located};
 use url::Url;
 
 use super::model::{
-    At, Consumer, HumanDuration, Ingress, Name, Push, RawConfig, Split, SplitStrategy, Target,
+    At, Consumer, Gateway, HumanDuration, Ingress, Name, Push, RateMode, RawConfig, Split,
+    SplitStrategy, Target,
 };
 
 /// Paths that tgin itself serves or will serve: a configured path must not
@@ -22,6 +23,11 @@ const MIN_DEBOUNCE: Duration = Duration::from_millis(10);
 /// The shortest pull `lease_timeout`: leases are expired by a check that
 /// runs once a second.
 const MIN_LEASE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The shortest gateway `upstream_idle_timeout`.
+const MIN_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest gateway `max_delay` and `retry_429.max_wait`: a client
+/// waits that long for its request.
+const MAX_GATEWAY_WAIT: Duration = Duration::from_secs(60);
 
 /// Errors and warnings found so far.
 #[derive(Debug, Default)]
@@ -41,7 +47,12 @@ impl Diagnostics {
             .push(ConfigError::new(message).at(located(path, location)));
     }
 
-    fn warning(&mut self, path: impl Into<String>, location: Location, message: impl Into<String>) {
+    pub(super) fn warning(
+        &mut self,
+        path: impl Into<String>,
+        location: Location,
+        message: impl Into<String>,
+    ) {
         self.warnings
             .push(ConfigError::warning(message).at(located(path, location)));
     }
@@ -169,11 +180,14 @@ fn consumers(raw: &RawConfig, diag: &mut Diagnostics) {
 }
 
 fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
-    if push.endpoints.value.is_empty() {
-        diag.error(
-            format!("{path}.endpoints"),
-            known(push.endpoints.location, location),
-            "a push consumer needs at least one endpoint",
+    if push.endpoints.value.is_empty() && !push.accept_set_webhook {
+        diag.errors.push(
+            ConfigError::new("a push consumer needs at least one endpoint")
+                .at(located(
+                    format!("{path}.endpoints"),
+                    known(push.endpoints.location, location),
+                ))
+                .hint("or set `accept_set_webhook: true` to take its endpoint from the bot's `setWebhook`"),
         );
     }
     for (k, endpoint) in push.endpoints.value.iter().enumerate() {
@@ -236,8 +250,8 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
 
 fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
     let mut names: HashMap<&str, usize> = HashMap::new();
-    // The bot that first targets each pull consumer.
-    let mut pull_owner: HashMap<usize, &str> = HashMap::new();
+    // The bot that first targets each consumer that serves one bot.
+    let mut owners: HashMap<usize, &str> = HashMap::new();
     for (i, bot) in raw.bots.iter().enumerate() {
         let path = format!("bots[{i}]");
         let name = bot.name.value.as_str();
@@ -255,6 +269,12 @@ fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
         if let Some(ingress) = &bot.ingress {
             self::ingress(raw, diag, &path, ingress);
         }
+        self::gateway(
+            diag,
+            &format!("{path}.gateway"),
+            &bot.gateway,
+            bot.name.location,
+        );
 
         let mut reached = Vec::new();
         for (j, route) in bot.routes.iter().enumerate() {
@@ -284,32 +304,121 @@ fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
         }
 
         for (consumer, location, target_path) in reached {
-            let Some((
-                consumer_name,
-                At {
-                    value: Consumer::Pull(_),
-                    ..
-                },
-            )) = raw.consumers.get_index(consumer)
-            else {
+            let Some((consumer_name, consumer_value)) = raw.consumers.get_index(consumer) else {
                 continue;
             };
-            match pull_owner.get(&consumer) {
+            let (kind, rule) = match &consumer_value.value {
+                Consumer::Pull(_) => ("pull", "a pull consumer serves one bot"),
+                // A bot's token holder must never redirect another bot's
+                // updates with `setWebhook`.
+                Consumer::Push(push) if push.accept_set_webhook => (
+                    "push",
+                    "with `accept_set_webhook: true`, a push consumer serves one bot",
+                ),
+                Consumer::Push(_) => continue,
+            };
+            match owners.get(&consumer) {
                 None => {
-                    pull_owner.insert(consumer, name);
+                    owners.insert(consumer, name);
                 }
                 Some(owner) if *owner == name => {}
                 Some(owner) => diag.error(
                     target_path,
                     location,
                     format!(
-                        "pull consumer `{}` is targeted by bots `{owner}` and `{name}`; a pull consumer serves one bot",
+                        "{kind} consumer `{}` is targeted by bots `{owner}` and `{name}`; {rule}",
                         consumer_name.as_str()
                     ),
                 ),
             }
         }
     }
+}
+
+/// A bot's `gateway` block. Values left out are defaults, which are valid,
+/// so every error points at a written value.
+fn gateway(diag: &mut Diagnostics, path: &str, gateway: &Gateway, fallback: Location) {
+    let idle = &gateway.upstream_idle_timeout;
+    duration(diag, format!("{path}.upstream_idle_timeout"), idle);
+    if idle.value.get() < MIN_UPSTREAM_IDLE_TIMEOUT {
+        diag.errors.push(
+            ConfigError::new(format!(
+                "`{}` is shorter than the minimum of 1s",
+                idle.value.as_str()
+            ))
+            .at(located(
+                format!("{path}.upstream_idle_timeout"),
+                known(idle.location, fallback),
+            ))
+            .hint("a slow but steady Bot API answer would be cut; 1m is the default"),
+        );
+    }
+
+    let limit = &gateway.rate_limit;
+    let path_limit = format!("{path}.rate_limit");
+    let max_delay = &limit.max_delay;
+    duration(diag, format!("{path_limit}.max_delay"), max_delay);
+    at_most(
+        diag,
+        format!("{path_limit}.max_delay"),
+        max_delay,
+        MAX_GATEWAY_WAIT,
+        "a client waits this long for its request to start; 5s is the default, and 0s answers 429 at once",
+    );
+    for (k, method) in limit.methods.value.iter().enumerate() {
+        if !valid_method_pattern(&method.value) {
+            diag.errors.push(
+                ConfigError::new(format!("invalid method pattern `{}`", method.value))
+                    .at(located(format!("{path_limit}.methods[{k}]"), method.location))
+                    .hint("use a method name such as `sendMessage`, or a prefix followed by one `*`, such as `send*`"),
+            );
+        }
+    }
+    if limit.methods.value.is_empty() && limit.mode != RateMode::Off {
+        diag.errors.push(
+            ConfigError::new("the rate limit needs at least one method")
+                .at(located(
+                    format!("{path_limit}.methods"),
+                    known(limit.methods.location, fallback),
+                ))
+                .hint("list the methods to limit, or set `mode: off`"),
+        );
+    }
+    for (block, rate) in [
+        ("global", limit.global.rate()),
+        ("per_chat", limit.per_chat.rate()),
+        ("per_group", limit.per_group.rate()),
+    ] {
+        let path = format!("{path_limit}.{block}");
+        at_least_one(diag, format!("{path}.count"), rate.count);
+        duration(diag, format!("{path}.per"), rate.per);
+        positive(
+            diag,
+            format!("{path}.per"),
+            rate.per,
+            "0 would leave no time between requests; give the period `count` requests are spread over",
+        );
+        at_least_one(diag, format!("{path}.burst"), rate.burst);
+    }
+
+    let max_wait = &gateway.retry_429.max_wait;
+    duration(diag, format!("{path}.retry_429.max_wait"), max_wait);
+    at_most(
+        diag,
+        format!("{path}.retry_429.max_wait"),
+        max_wait,
+        MAX_GATEWAY_WAIT,
+        "the client waits this long for the retry; 10s is the default, and 0s turns the retry off",
+    );
+}
+
+/// Whether `method` is a gateway method pattern, [`METHOD_PATTERN`]: ASCII
+/// letters, optionally followed by one `*`.
+///
+/// [`METHOD_PATTERN`]: super::schema::METHOD_PATTERN
+fn valid_method_pattern(method: &str) -> bool {
+    let name = method.strip_suffix('*').unwrap_or(method);
+    !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphabetic())
 }
 
 fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ingress>) {
@@ -523,6 +632,28 @@ fn positive(
             ConfigError::new(format!("`{}` must be longer than 0", value.value.as_str()))
                 .at(located(path, value.location))
                 .hint(hint),
+        );
+    }
+}
+
+/// Rejects a duration longer than `limit`; `hint` says what the value
+/// does. A month or year unit is [`duration`]'s to report, once.
+fn at_most(
+    diag: &mut Diagnostics,
+    path: impl Into<String>,
+    value: &At<HumanDuration>,
+    limit: Duration,
+    hint: &str,
+) {
+    if value.value.calendar_unit().is_none() && value.value.get() > limit {
+        diag.errors.push(
+            ConfigError::new(format!(
+                "`{}` is longer than the maximum of {}",
+                value.value.as_str(),
+                HumanDuration::from(limit).as_str()
+            ))
+            .at(located(path, value.location))
+            .hint(hint),
         );
     }
 }

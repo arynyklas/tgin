@@ -156,19 +156,17 @@ impl PushConsumer {
         self.changed.notify_waiters();
     }
 
-    /// Replaces the source names reported in `X-Tgin-Source` and logs,
-    /// keeping the endpoints with their breakers and in-flight counts.
-    pub fn set_source_names(&self, source_names: Arc<[Arc<str>]>) {
+    /// Replaces the options (source names, and what a change of
+    /// `webhook_reply` gives), keeping the endpoints with their breakers and
+    /// in-flight counts.
+    pub fn set_options(&self, opts: PushOptions) {
         let current = self.targets.load();
-        let opts = PushOptions {
-            source_names,
-            ..current.opts.clone()
-        };
         self.targets.store(Arc::new(Targets {
             slots: Arc::clone(&current.slots),
             source_headers: source_headers(&opts.source_names),
             opts,
         }));
+        self.changed.notify_waiters();
     }
 
     /// Deliveries in flight, counting those waiting to retry.

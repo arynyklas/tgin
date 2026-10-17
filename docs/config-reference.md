@@ -42,10 +42,93 @@ One Telegram bot.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `api_url` | string (not empty) | `https://api.telegram.org` | Bot API base URL. Supports `${env:…}` and `${file:…}`. |
+| `gateway` | [Gateway](#gateway) | `{"rate_limit":{"global":{"burst":30,"count":30,"per":"1s"},"max_delay":"5s","methods":["send*","copyMessage*","forwardMessage*"],"mode":"shape","per_chat":{"burst":3,"count":1,"per":"1s"},"per_group":{"burst":20,"count":20,"per":"1m"}},"retry_429":{"max_wait":"10s"},"upstream_idle_timeout":"1m"}` | The Bot API gateway for this bot's downstream clients. Changes apply live. |
 | `ingress` | [Ingress](#ingress) |  | How updates arrive; at most one. Omitted, the bot receives none. |
 | `name` | string (matching `^[a-z0-9][a-z0-9-]{0,62}$`) | **required** | Unique bot name, used in metrics and logs. |
 | `routes` | list of [Route](#route) | `[]` | Rules in order; the first match wins. |
-| `token` | [Secret](#secret) | **required** | The bot token: only ASCII letters, digits, `:`, `_` and `-`. |
+| `token` | [Secret](#secret) | **required** | The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot API gateway serves only tokens shaped `<digits>:<secret>`. |
+
+## `Gateway`
+
+The Bot API gateway: how tgin forwards the bot's requests from downstream clients to the Bot API.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `rate_limit` | [RateLimit](#ratelimit) | `{"global":{"burst":30,"count":30,"per":"1s"},"max_delay":"5s","methods":["send*","copyMessage*","forwardMessage*"],"mode":"shape","per_chat":{"burst":3,"count":1,"per":"1s"},"per_group":{"burst":20,"count":20,"per":"1m"}}` | Telegram's flood limits, applied before a request goes upstream. |
+| `retry_429` | [Retry429](#retry429) | `{"max_wait":"10s"}` | The transparent retry of a request the Bot API answered with 429. |
+| `upstream_idle_timeout` | [Duration](#duration) | `1m` | Longest wait for the Bot API to accept or send the next bytes of a request; at least 1s. A transfer that keeps moving is never cut. |
+
+## `RateLimit`
+
+Telegram's flood limits, applied before a request goes upstream.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `global` | [GlobalRate](#globalrate) | `{"burst":30,"count":30,"per":"1s"}` | Requests of the bot, over all chats. |
+| `max_delay` | [Duration](#duration) | `5s` | Longest delay `shape` adds before it answers 429 instead; at most 1m. `0s` behaves like `reject`. |
+| `methods` | list of string (matching `^[A-Za-z]+\*?$`) | `["send*","copyMessage*","forwardMessage*"]` | The methods limited, ignoring case: a method name, or a prefix followed by `*`. At least one unless `mode: off`. |
+| `mode` | [RateMode](#ratemode) | `shape` | What a request beyond the limits gets. |
+| `per_chat` | [ChatRate](#chatrate) | `{"burst":3,"count":1,"per":"1s"}` | Requests per chat. |
+| `per_group` | [GroupRate](#grouprate) | `{"burst":20,"count":20,"per":"1m"}` | Requests per group, supergroup or channel (a negative `chat_id` or an `@username`), on top of `per_chat`. |
+
+## `GlobalRate`
+
+Requests of the bot, over all chats.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `burst` | integer (at least 1) | `30` | Requests let through at once before the rate applies; at least 1. |
+| `count` | integer (at least 1) | `30` | Requests per `per`; at least 1. |
+| `per` | [Duration](#duration) | `1s` | The period `count` requests are spread over; above 0. |
+
+## `Duration`
+
+A duration such as `500ms`, `1.5s`, `5m` or `1h 30m`, or `0`. Month (`M`) and year (`y`) units are rejected.
+
+One of:
+
+- string
+- `0`
+
+Examples: `30s`, `1.5s`, `5m`.
+
+## `RateMode`
+
+What a request beyond the limits gets.
+
+One of:
+
+- `shape` — Delayed until the limits admit it, up to `max_delay`; a longer wait is answered with 429 at once.
+- `reject` — Answered with 429 at once.
+- `off` — No limits.
+
+## `ChatRate`
+
+Requests per chat.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `burst` | integer (at least 1) | `3` | Requests let through at once before the rate applies; at least 1. |
+| `count` | integer (at least 1) | `1` | Requests per `per`; at least 1. |
+| `per` | [Duration](#duration) | `1s` | The period `count` requests are spread over; above 0. |
+
+## `GroupRate`
+
+Requests per group, supergroup or channel (a negative `chat_id` or an `@username`), on top of `per_chat`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `burst` | integer (at least 1) | `20` | Requests let through at once before the rate applies; at least 1. |
+| `count` | integer (at least 1) | `20` | Requests per `per`; at least 1. |
+| `per` | [Duration](#duration) | `1m` | The period `count` requests are spread over; above 0. |
+
+## `Retry429`
+
+The transparent retry of a request the Bot API answered with 429.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `max_wait` | [Duration](#duration) | `10s` | Longest `retry_after` waited out before the one retry; at most 1m. A longer one passes the 429 through; `0s` turns the retry off. |
 
 ## `Ingress`
 
@@ -64,17 +147,6 @@ Long polling: tgin calls `getUpdates` on the Bot API.
 | `delete_webhook_on_start` | boolean | `true` | Call `deleteWebhook` (keeping pending updates) before polling, and again when a poll finds a webhook set. Off, an active webhook stops the polling until something else deletes it. |
 | `limit` | integer (at least 1, at most 100) | `100` | Updates per `getUpdates` call, 1 to 100. |
 | `timeout` | [Duration](#duration) | `30s` | `getUpdates` long-poll timeout; at least 1 s. |
-
-## `Duration`
-
-A duration such as `500ms`, `1.5s`, `5m` or `1h 30m`, or `0`. Month (`M`) and year (`y`) units are rejected.
-
-One of:
-
-- string
-- `0`
-
-Examples: `30s`, `1.5s`, `5m`.
 
 ## `Webhook`
 
@@ -206,6 +278,7 @@ Bots fetch updates from tgin with `getUpdates` on `/c/<consumer>/getUpdates` and
 | `auth_token` | [Secret](#secret) |  | Bearer token pollers must send. |
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |
 | `capacity_bytes` | [ByteSize](#bytesize) | `64MiB` | Most queued bytes. |
+| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook` with `drop_pending_updates: true`, sent on this consumer's gateway path, empty the consumer's queue. Off, the flag is ignored. |
 | `lease_timeout` | [Duration](#duration) | `2m` | How long a fetched update waits for its acknowledgement before another poll may receive it; at least 1s. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |
@@ -245,15 +318,18 @@ tgin posts each update to HTTP endpoints, with retries and a circuit breaker per
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `accept_set_webhook` | boolean | `false` | Let `setWebhook`, sent on this consumer's gateway path, add its URL as an endpoint until tgin restarts, instead of answering it without effect. Only for a consumer fed by one bot. |
 | `balance` | [Balance](#balance) | `round_robin` | How a push consumer picks the endpoint for each attempt, among those whose circuit breaker admits a request. |
 | `breaker` | [Breaker](#breaker) | `{"failure_threshold":5,"open_for":"30s"}` | Per-endpoint circuit breaker. |
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |
 | `capacity_bytes` | [ByteSize](#bytesize) | `64MiB` | Most queued bytes. |
-| `endpoints` | list of [Endpoint](#endpoint) | **required** | Where updates are posted; at least one. |
+| `endpoints` | list of [Endpoint](#endpoint) | `[]` | Where updates are posted. Empty only with `accept_set_webhook: true`; updates then queue until a `setWebhook` gives an endpoint. |
+| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook` with `drop_pending_updates: true`, sent on this consumer's gateway path, empty the consumer's queue. Off, the flag is ignored. |
 | `max_in_flight` | integer (at least 1) | `32` | Most deliveries at once over all endpoints, counting those waiting to retry. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |
 | `retry` | [Retry](#retry) | `{"initial":"1s","max":"1m","max_age":"1h","max_attempts":10}` | Retries of failed deliveries. |
+| `webhook_reply` | [WebhookReply](#webhookreply) | `execute` | What tgin does with a Bot API method call in an endpoint's response body, the way Telegram handles a webhook reply. |
 
 ## `Balance`
 
@@ -294,6 +370,15 @@ Retries of failed deliveries.
 | `max` | [Duration](#duration) | `1m` | Longest backoff; above 0. |
 | `max_age` | [Duration](#duration) | `1h` | Age after which the update is dead-lettered, counted from when it was queued; above 0. |
 | `max_attempts` | integer (at least 1) | `10` | Attempts before the update is dead-lettered; at least 1. |
+
+## `WebhookReply`
+
+What tgin does with a Bot API method call in an endpoint's response body, the way Telegram handles a webhook reply.
+
+One of:
+
+- `execute` — Call the method through the gateway, once, before the update is acknowledged.
+- `ignore` — Ignore the response body.
 
 ## `Log`
 

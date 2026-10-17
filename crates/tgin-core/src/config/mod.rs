@@ -14,9 +14,9 @@ use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
 pub use self::model::RawConfig;
 pub use self::resolve::{
-    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Ingress, IpAllowlist, Log,
-    LogFormat, LogLevel, LongPoll, Pull, Push, Reload, Retry, Runtime, Server, Tls, Webhook,
-    WebhookSecret,
+    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Gateway, Ingress, IpAllowlist,
+    Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit, RateMode, Reload, Retry,
+    Runtime, Server, Tls, Webhook, WebhookReply, WebhookSecret,
 };
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
@@ -29,6 +29,22 @@ pub fn valid_bot_token(token: &str) -> bool {
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
+/// Whether the Bot API gateway can serve `token`: `<digits>:<secret>`,
+/// `^[0-9]+:[A-Za-z0-9_-]{1,128}$`, as Telegram issues them. The loader
+/// warns about any other bot token, and the gateway path parser applies
+/// this one rule to the token segment after percent-decoding it.
+pub fn gateway_token(token: &str) -> bool {
+    let Some((id, secret)) = token.split_once(':') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && (1..=128).contains(&secret.len())
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 /// Parses, validates and resolves a config file. `origin` names the file in
