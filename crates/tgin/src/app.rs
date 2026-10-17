@@ -41,6 +41,10 @@ use crate::sources::{Kind, Sources, source_task};
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// How often shutdown checks whether the queues have drained.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
+/// How long the drain waits, once nothing is pending, for the downstreams'
+/// calls through the gateway: a bot answers an update after acknowledging
+/// it, so its call can come in after the queues have emptied.
+const GATEWAY_QUIET: Duration = Duration::from_secs(1);
 /// How often the sources are checked for having all failed.
 const SOURCES_CHECK: Duration = Duration::from_secs(1);
 /// The readiness component of the engine.
@@ -527,15 +531,35 @@ impl App {
         lifecycle.ingest_token().cancel();
         self.shared.sources.webhooks_stopped();
         engine.begin_drain();
+        let gateway = &self.shared.gateway;
+        // Until nothing is pending and, for `GATEWAY_QUIET` since then, no
+        // call has been forwarded to Telegram; calls the gateway answers
+        // itself, polls included, do not count. Without a data plane no
+        // call can come.
+        let quiet = if serving {
+            GATEWAY_QUIET
+        } else {
+            Duration::ZERO
+        };
         let drained = tokio::time::timeout(timing.grace, async {
-            while engine.pending() > 0 {
+            let mut busy = Instant::now();
+            loop {
+                let now = Instant::now();
+                if engine.pending() > 0 {
+                    busy = now;
+                } else if let Some(forwarded) = gateway.upstream_busy_at(now) {
+                    busy = busy.max(forwarded);
+                }
+                if now.saturating_duration_since(busy) >= quiet {
+                    return;
+                }
                 tokio::time::sleep(DRAIN_POLL).await;
             }
         })
         .await
         .is_ok();
         if !drained {
-            tracing::warn!(pending = engine.pending(), grace = ?timing.grace, "the queues did not drain within the shutdown grace");
+            tracing::warn!(pending = engine.pending(), grace = ?timing.grace, "the queues and the gateway's calls did not settle within the shutdown grace");
         }
 
         self.handles.stop.cancel();

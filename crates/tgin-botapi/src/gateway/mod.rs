@@ -21,6 +21,7 @@ mod reply;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ use tgin_core::engine::Engine;
 use tgin_core::ids::SourceId;
 use tgin_runtime::http::{ClientOptions, Via, client};
 use tgin_runtime::secret::{Secret, secret_eq};
+use tokio::time::Instant;
 
 use self::limit::BotLimiter;
 pub use self::metrics::GatewayMetrics;
@@ -69,6 +71,36 @@ pub struct Gateway {
     table: ArcSwap<Table>,
     /// `tgin_webhook_replies_total` handles by push consumer.
     replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
+    /// The requests forwarded to Telegram, for the shutdown's drain.
+    upstreams: Upstreams,
+}
+
+/// The gateway's requests forwarded to Telegram: how many are in flight,
+/// and when one last started or ended (`None` before the first).
+#[derive(Default)]
+struct Upstreams {
+    in_flight: AtomicUsize,
+    last: Mutex<Option<Instant>>,
+}
+
+/// One request on its way to Telegram, counted in [`Upstreams`] until it
+/// is dropped.
+struct Forwarding<'a>(&'a Upstreams);
+
+impl<'a> Forwarding<'a> {
+    fn new(upstreams: &'a Upstreams) -> Forwarding<'a> {
+        upstreams.in_flight.fetch_add(1, Ordering::SeqCst);
+        *upstreams.last.lock() = Some(Instant::now());
+        Forwarding(upstreams)
+    }
+}
+
+impl Drop for Forwarding<'_> {
+    fn drop(&mut self) {
+        // Stamped first: whoever sees nothing in flight sees this end.
+        *self.0.last.lock() = Some(Instant::now());
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The bots the gateway serves, swapped whole by [`Gateway::set_bots`].
@@ -193,6 +225,7 @@ impl Gateway {
             via: via.header_value().clone(),
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
+            upstreams: Upstreams::default(),
         }
     }
 
@@ -329,14 +362,31 @@ impl Gateway {
             };
             return match call.route(req).await {
                 intercept::Routed::Answered(response) => response,
-                intercept::Routed::Proxy(req) => proxy::forward(bot, upstream, label, req).await,
+                intercept::Routed::Proxy(req) => {
+                    let _forwarding = Forwarding::new(&self.upstreams);
+                    proxy::forward(bot, upstream, label, req).await
+                }
                 intercept::Routed::ProxyAndLearn(req) => {
+                    let _forwarding = Forwarding::new(&self.upstreams);
                     let response = proxy::forward(bot, upstream, label, req).await;
                     intercept::learn_identity(bot, response).await
                 }
             };
         }
+        let _forwarding = Forwarding::new(&self.upstreams);
         proxy::forward(bot, upstream, label, req).await
+    }
+
+    /// When the gateway last forwarded a request to Telegram: `now` while
+    /// one is in flight, else when the last one started or ended, `None`
+    /// before the first. Requests the gateway answers itself (`getUpdates`
+    /// and the other intercepts) do not count, so pollers never hold the
+    /// shutdown's drain open.
+    pub fn upstream_busy_at(&self, now: Instant) -> Option<Instant> {
+        if self.upstreams.in_flight.load(Ordering::SeqCst) > 0 {
+            return Some(now);
+        }
+        *self.upstreams.last.lock()
     }
 }
 

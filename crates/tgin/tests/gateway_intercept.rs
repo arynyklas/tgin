@@ -1676,3 +1676,145 @@ async fn over_limit_scoped_get_updates_is_refused_at_once() {
     );
     tgin.stop().await;
 }
+
+/// Bot `hooked` (webhook ingress at `/hook`) feeds only the pull consumer
+/// `keep`; no lame duck and a `grace` shutdown.
+fn drain_config(api: &str, grace: &str) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: {grace} }}
+reload: {{ watch: false }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+bots:
+  - name: hooked
+    token: "{TOKEN}"
+    api_url: "{api}"
+    ingress: {{ webhook: {{ path: /hook, secret_token: "{HOOK_SECRET}" }} }}
+    routes: [{{ to: [keep] }}]
+consumers:
+  keep: {{ pull: {{}} }}
+"#
+    )
+}
+
+/// Telegram for the drain tests: `sendMessage` answers after `delay`.
+async fn telegram_sending(delay: Duration) -> MockServer {
+    let telegram = telegram().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "ok": true, "result": { "message_id": 1 } }))
+                .set_delay(delay),
+        )
+        .with_priority(1)
+        .mount(&telegram)
+        .await;
+    telegram
+}
+
+impl Tgin {
+    /// Starts the shutdown, then polls `keep` once and acknowledges what it
+    /// got, as a polling bot does before its handlers run: the drain has
+    /// nothing pending afterwards.
+    async fn shut_down_after_the_ack(&self) {
+        self.signals
+            .send(SignalKind::Terminate)
+            .await
+            .expect("the app listens");
+        let polled = format!("/c/keep/bot{TOKEN}/getUpdates?timeout=0");
+        let (status, body) = self.get(&polled).await;
+        assert_eq!((status, update_ids(&body)), (200, vec![1]), "{body}");
+        let (status, body) = self
+            .get(&format!("/c/keep/bot{TOKEN}/getUpdates?offset=2&timeout=0"))
+            .await;
+        assert_eq!((status, update_ids(&body).len()), (200, 0), "{body}");
+    }
+
+    /// Waits for the app to exit by itself.
+    async fn stopped(self) {
+        let outcome = timeout(PATIENCE, self.run)
+            .await
+            .expect("the app exits in time")
+            .expect("the app does not panic");
+        assert_eq!(outcome, Outcome::Clean);
+    }
+}
+
+/// A bot answers an update after acknowledging it (aiogram and
+/// python-telegram-bot poll again before their handlers run): its
+/// `sendMessage` still goes through during the drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_serves_an_answer_sent_after_the_ack() {
+    let telegram = telegram_sending(Duration::ZERO).await;
+    let tgin = start(&drain_config(&telegram.uri(), "5s")).await;
+    tgin.admit(1).await;
+    tgin.wait_held("keep", 1).await;
+    tgin.shut_down_after_the_ack().await;
+    // The bot's handler runs for a while after the acknowledgement.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, body) = tgin
+        .post_json(
+            &format!("/c/keep/bot{TOKEN}/sendMessage"),
+            &json!({ "chat_id": 5, "text": "answer" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let metrics = Arc::clone(&tgin.metrics);
+    tgin.stopped().await;
+    assert!(
+        metrics.encode().lines().any(|l| l
+            == r#"tgin_gateway_requests_total{bot="hooked",method="sendMessage",outcome="ok"} 1"#),
+        "the answer reached Telegram"
+    );
+}
+
+/// A call Telegram takes 3 s to answer is not cut when the queues have
+/// drained: the drain waits for it, within the grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_waits_for_an_upstream_call_in_flight() {
+    let telegram = telegram_sending(Duration::from_secs(3)).await;
+    let tgin = start(&drain_config(&telegram.uri(), "5s")).await;
+    tgin.admit(1).await;
+    tgin.wait_held("keep", 1).await;
+    tgin.shut_down_after_the_ack().await;
+    let started = Instant::now();
+    let (status, body) = tgin
+        .post_json(
+            &format!("/c/keep/bot{TOKEN}/sendMessage"),
+            &json!({ "chat_id": 5, "text": "slow" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    tgin.stopped().await;
+}
+
+/// Only calls that go to Telegram keep the drain open: a poller that polls
+/// again every 500 ms, answered by tgin itself, does not stretch the
+/// shutdown to the whole grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_not_held_open_by_a_poller() {
+    let telegram = telegram().await;
+    let tgin = start(&drain_config(&telegram.uri(), "10s")).await;
+    let poll = tgin.url(&format!("/c/keep/bot{TOKEN}/getUpdates?timeout=0"));
+    let http = tgin.http.clone();
+    let poller = tokio::spawn(async move {
+        // Polls until the data plane closes.
+        while http.get(&poll).send().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    let signalled = Instant::now();
+    tgin.signals
+        .send(SignalKind::Terminate)
+        .await
+        .expect("the app listens");
+    tgin.stopped().await;
+    let took = signalled.elapsed();
+    assert!(took < Duration::from_secs(5), "the shutdown took {took:?}");
+    timeout(PATIENCE, poller)
+        .await
+        .expect("the poller stops with the data plane")
+        .expect("the poller does not panic");
+}
