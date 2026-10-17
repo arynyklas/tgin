@@ -40,9 +40,10 @@ const SMALL: u64 = 4 * 1024 * 1024;
 /// growth comes in steps of about 418 KB, one hyper read buffer (8 KiB +
 /// 400 KiB) pinned per queued frame: 1.26, 1.68, 2.10 and 2.52 MB on
 /// Windows, at most 1.26 MB on Linux, the same steps at 4 MiB and at
-/// 200 MiB. Four MiB leaves room for two more steps. One bound for
-/// both sizes is the size-independence check: the 50× larger body stays
-/// under it, and it is under 2 % of that body.
+/// 200 MiB. Four MiB leaves room for three more steps above the largest
+/// growth measured (a fourth reaches the bound). One bound for both sizes
+/// is the size-independence check: the 50× larger body stays under it,
+/// and it is under 2 % of that body.
 const BOUND: isize = 4 * 1024 * 1024;
 /// Bounds each transfer.
 const PATIENCE: Duration = Duration::from_secs(300);
