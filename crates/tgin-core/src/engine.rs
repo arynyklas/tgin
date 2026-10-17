@@ -766,8 +766,9 @@ impl Engine {
     /// [`Engine::purge`] counts) when a rule of `source` targets it and it
     /// has `honor_drop_pending: true`; otherwise `None` and nothing is
     /// dropped. As on Telegram, only the caller's updates go: another bot
-    /// feeding the same consumer keeps its own. Serialized with reloads, so
-    /// another bot's consumer is never purged.
+    /// feeding the same consumer, or one that fed it before a reload, keeps
+    /// its own. Serialized with reloads, so another bot's consumer is never
+    /// purged.
     ///
     /// # Errors
     ///
@@ -795,19 +796,11 @@ impl Engine {
         let Some(target) = state.target(name) else {
             return Ok(None);
         };
-        // Fed by the caller alone, the consumer holds the caller's updates,
-        // and at most some a reload left from a bot that fed it before.
-        let others_feed = state
-            .sources
-            .iter()
-            .flatten()
-            .any(|info| info.id != source && state.feeds(info.id, name));
-        Ok(Some(if others_feed {
-            let queue = target.slot.consumer.queue();
-            purged(&target.slot, queue.purge_where(|e| e.source == source))
-        } else {
-            purge_slot(&target.slot)
-        }))
+        let queue = target.slot.consumer.queue();
+        Ok(Some(purged(
+            &target.slot,
+            queue.purge_where(|e| e.source == source),
+        )))
     }
 
     /// Whether `token` is still the bot's token that `binding` was made

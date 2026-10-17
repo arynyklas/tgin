@@ -1492,6 +1492,45 @@ consumers:
     assert_eq!(h.stats("shared").available, 0);
 }
 
+/// A consumer that one bot feeds after a reload still holds updates of the
+/// bot that fed it before: the new feeder's `drop_pending_updates` keeps
+/// them, as it drops only its own.
+#[tokio::test(start_paused = true)]
+async fn drop_pending_keeps_a_former_feeders_leftovers() {
+    let config = |a_to: &str, x_to: &str| {
+        format!(
+            r#"version: 1
+server: {{}}
+bots:
+  - name: a
+    token: "1:aaa"
+    routes: [{{ to: [{a_to}] }}]
+  - name: x
+    token: "2:xxx"
+    routes: [{{ to: [{x_to}] }}]
+consumers:
+  shared: {{ push: {{ endpoints: [{{ url: "http://127.0.0.1:9/x" }}], honor_drop_pending: true }} }}
+  other: {{ pull: {{}} }}
+"#
+        )
+    };
+    let h = Harness::new(&config("other", "shared"));
+    let (a, x) = (SourceId(0), SourceId(1));
+    // Paused, so the updates stay queued.
+    assert!(h.engine.pause("shared"));
+    assert_eq!(admit_to(&h.engine, x, "message", 1), Admit::Admitted);
+    h.engine
+        .apply(&load(&config("shared", "other")))
+        .expect("apply");
+    assert_eq!(admit_to(&h.engine, a, "message", 2), Admit::Admitted);
+    assert_eq!(h.stats("shared").available, 2);
+    assert_eq!(
+        h.engine.drop_pending(a, &tok("1:aaa"), "shared"),
+        Ok(Some(1))
+    );
+    assert_eq!(h.stats("shared").available, 1, "x's leftover stays");
+}
+
 /// A runtime endpoint belongs to the bot whose `setWebhook` set it (R37):
 /// a reload that keeps the consumer and its bot keeps it; one that moves
 /// the consumer to another bot, leaves it with none, or turns
