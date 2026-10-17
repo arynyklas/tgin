@@ -548,7 +548,12 @@ impl Suite {
     /// before the stop is echoed twice (aiogram, which does not confirm on
     /// stop, may get its last batch again). grammY and Telegraf hold the
     /// `before restart` handler 3 s after its echo, so the stop lands before
-    /// their next poll and their shutdown confirm is the only ack.
+    /// their next poll and their shutdown confirm (`getUpdates {offset,
+    /// limit: 1}`) is the only ack; that confirm must return at once, so
+    /// their stop is timed. python-telegram-bot polls again as soon as a
+    /// batch arrives, so its shutdown confirm (`timeout=0`) is never the
+    /// only ack here; only the in-process test
+    /// `get_updates_consumer_scoped_serves_queue` covers it.
     async fn restart(&mut self, f: &'static Framework) -> Result<(), String> {
         let chat = self.chat();
         let before = format!("before restart {}", f.name);
@@ -558,7 +563,20 @@ impl Suite {
         self.echo(f.poll_token, "sendMessage", chat, &before, allowed.clone())
             .await?;
         let service = f.poll();
+        let stopping = std::time::Instant::now();
         compose(&["stop", "-t", "30", &service]).quiet()?;
+        let stopped = stopping.elapsed();
+        // The 3 s hold plus margin; a shutdown getUpdates that tgin parked
+        // instead of answering at once runs into the 30 s kill.
+        ensure(
+            !matches!(f.name, "grammy" | "telegraf")
+                || stopped < std::time::Duration::from_secs(15),
+            || {
+                format!(
+                    "{service} took {stopped:?} to stop: its shutdown getUpdates did not return at once"
+                )
+            },
+        )?;
         compose(&["start", &service]).quiet()?;
         let after = format!("after restart {}", f.name);
         self.inject(f.poll_token, self.text_update(chat, &after))
@@ -945,7 +963,11 @@ impl Suite {
     }
 
     /// Every exact count still holds, and no downstream ever reached
-    /// setWebhook, close or logOut on Telegram (tgin calls none of them).
+    /// setWebhook, close or logOut on Telegram (tgin calls none of them):
+    /// the runner itself calls close and logOut on a consumer-scoped base
+    /// and on the proxy-only base first. Each bot's only getMe and
+    /// deleteWebhook are tgin's own, made once at start: the frameworks'
+    /// startup calls, restarts included, stay local.
     async fn finally(&mut self) -> Result<(), String> {
         for exact in &self.exact {
             let n = self
@@ -961,11 +983,41 @@ impl Suite {
                 )
             })?;
         }
+        let f = &FRAMEWORKS[0];
+        let bases = [
+            format!("{}/c/{}", self.stack.gateway, f.poll()),
+            self.stack.gateway.clone(),
+        ];
+        for base in &bases {
+            for method in ["close", "logOut"] {
+                let url = format!("{base}/bot{}/{method}", f.poll_token);
+                let response = self
+                    .stack
+                    .http
+                    .post(&url)
+                    .send()
+                    .await
+                    .map_err(|err| format!("{method} through tgin: {err}"))?;
+                ensure(response.status().is_success(), || {
+                    format!("{method} through tgin answered {}", response.status())
+                })?;
+            }
+        }
         for method in ["setWebhook", "close", "logOut"] {
             let calls = self.calls("", method, "").await?;
             ensure(calls.is_empty(), || {
                 format!("{method} reached Telegram: {calls:?}")
             })?;
+        }
+        for f in &FRAMEWORKS {
+            for (bot, token) in [(f.poll(), f.poll_token), (f.hook(), f.hook_token)] {
+                for method in ["getMe", "deleteWebhook"] {
+                    let n = self.calls(token, method, "").await?.len();
+                    ensure(n == 1, || {
+                        format!("{bot}: {n} {method} calls reached Telegram, not only tgin's own")
+                    })?;
+                }
+            }
         }
         Ok(())
     }
