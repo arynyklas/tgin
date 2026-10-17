@@ -10,6 +10,9 @@
 //
 // Polling: echoes text with sendMessage, and a document is fetched
 // (getFileLink, under the same prefix) and sent back with sendDocument.
+// Telegraf waits for a batch's handlers before the next getUpdates, so a text
+// starting with "before restart" is held for HOLD_MS after its echo: a stop
+// then lands before the next poll, and the shutdown confirm is the only ack.
 // Webhook: tgin pushes to a configured endpoint (Telegraf would register an
 // https URL); text gets sendChatAction as the webhook reply (on Telegraf's
 // allowlist) and the echo over HTTP (sendMessage is not on it).
@@ -19,6 +22,7 @@ import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 
 const hook = process.env.MODE === "hook";
+const HOLD_MS = 3000;
 const bot = new Telegraf(process.env.BOT_TOKEN, {
   telegram: { apiRoot: `${process.env.TGIN_BASE}/`, webhookReply: hook },
 });
@@ -26,6 +30,9 @@ const bot = new Telegraf(process.env.BOT_TOKEN, {
 bot.on(message("text"), async (ctx) => {
   if (hook) await ctx.sendChatAction("typing");
   await ctx.telegram.sendMessage(ctx.chat.id, ctx.message.text);
+  if (ctx.message.text.startsWith("before restart")) {
+    await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+  }
 });
 
 bot.on(message("document"), async (ctx) => {
@@ -38,12 +45,19 @@ bot.on(message("document"), async (ctx) => {
 });
 
 if (hook) {
-  // Telegraf checks the secret: a missing or wrong header gets 403.
-  const handle = bot.webhookCallback("/hook", { secretToken: process.env.HOOK_SECRET });
+  const secret = process.env.HOOK_SECRET;
+  // Telegraf checks the secret as well (403).
+  const handle = bot.webhookCallback("/hook", { secretToken: secret });
   const server = createServer((req, res) => {
     // tgin marks its pushes with `Via: 1.1 tgin-<pseudonym>` (RFC 9110).
     if (!(req.headers.via ?? "").startsWith("1.1 tgin-")) {
       res.statusCode = 400;
+      res.end();
+      return;
+    }
+    // Checked here too, so the suite does not rest on Telegraf's own check.
+    if (req.headers["x-telegram-bot-api-secret-token"] !== secret) {
+      res.statusCode = 401;
       res.end();
       return;
     }

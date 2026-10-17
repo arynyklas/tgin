@@ -3,7 +3,9 @@
 # each with its own token. Every token and secret here is a fake value.
 #
 # Host ports are ephemeral on 127.0.0.1; the runner asks `docker compose port`.
-name: tgin-e2e
+# The project name, and with it every container, network and image name, is
+# TGIN_E2E_PROJECT (default `tgin-e2e`); the runner passes it.
+name: ${TGIN_E2E_PROJECT:-tgin-e2e}
 
 x-tokens:
   aiogram-poll: &aiogram-poll-token "700001:e2e_fake_aiogram_poll"
@@ -17,7 +19,7 @@ x-tokens:
 
 x-python-bot: &python-bot
   build: bots/python
-  image: tgin-e2e-bots-python:local
+  image: ${TGIN_E2E_PROJECT:-tgin-e2e}-bots-python:local
   init: true
   stop_grace_period: 30s
   depends_on:
@@ -26,7 +28,7 @@ x-python-bot: &python-bot
 
 x-node-bot: &node-bot
   build: bots/node
-  image: tgin-e2e-bots-node:local
+  image: ${TGIN_E2E_PROJECT:-tgin-e2e}-bots-node:local
   init: true
   stop_grace_period: 30s
   depends_on:
@@ -50,7 +52,7 @@ services:
     build:
       context: ../..
       dockerfile: tests/e2e/fake-telegram/Dockerfile
-    image: tgin-e2e-fake:local
+    image: ${TGIN_E2E_PROJECT:-tgin-e2e}-fake:local
     stop_grace_period: 30s
     ports: ["127.0.0.1::8081"]
     healthcheck:
@@ -63,7 +65,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: tgin-e2e-tgin:local
+    image: ${TGIN_E2E_PROJECT:-tgin-e2e}-tgin:local
     stop_grace_period: 30s
     environment:
       ADMIN_TOKEN: e2e-fake-admin-token
@@ -180,9 +182,10 @@ services:
       HOOK_SECRET: e2e-fake-secret-telegraf
     healthcheck: *node-hook-health
 
+# A fixed subnet: a second stack on the same host fails to start (pool
+# overlap) instead of mixing with this one.
 networks:
   default:
-    name: tgin-e2e-net
     ipam:
       config:
         # Dynamic addresses stay in the upper half, clear of the fixed ones.
