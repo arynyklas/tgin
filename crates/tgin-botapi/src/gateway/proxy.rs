@@ -116,6 +116,7 @@ pub(super) async fn forward(
         handles: bot.metrics.method(label),
         method: parts.method,
         limited,
+        counted: AtomicBool::new(false),
     };
     if !buffered {
         return match call.send(url, headers, body).await {
@@ -244,7 +245,9 @@ struct Again {
 }
 
 /// One gateway request to Telegram: what each of its upstream attempts
-/// shares.
+/// shares. Dropped before its outcome was counted, it counts
+/// `client_closed`: hyper drops a request's future when its client goes
+/// away, while it waits for Telegram's headers, a shaping delay or a 429.
 struct Call<'a> {
     bot: &'a Bot,
     label: MethodLabel,
@@ -253,9 +256,27 @@ struct Call<'a> {
     /// Whether the bot's limits apply to the method; without them `admit`
     /// books nothing.
     limited: bool,
+    /// Whether the request's outcome is counted, or left to its response
+    /// body's [`Tally`].
+    counted: AtomicBool,
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        if !*self.counted.get_mut() {
+            tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request abandoned: the client went away");
+            self.handles.count(Outcome::ClientClosed);
+        }
+    }
 }
 
 impl Call<'_> {
+    /// Counts the request's outcome, its one count.
+    fn count(&self, outcome: Outcome) {
+        self.counted.store(true, Ordering::Relaxed);
+        self.handles.count(outcome);
+    }
+
     /// Books the request on the bot's limits and waits out the delay they
     /// give; where the limits do not apply (mode `off`), books nothing.
     async fn admit(&self, chat: Option<&ChatKey>) -> Result<(), Limited> {
@@ -279,7 +300,7 @@ impl Call<'_> {
         self.bot
             .metrics
             .ratelimited(limited.scope, RateAction::Rejected);
-        self.handles.count(Outcome::RateLimited);
+        self.count(Outcome::RateLimited);
         tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), scope = limited.scope.as_str(), retry_after = ?limited.retry_after, "gateway request refused by the rate limits");
     }
 
@@ -326,15 +347,19 @@ impl Call<'_> {
             Failed::ClientClosed => {
                 // Not Telegram's failure, and nobody reads the answer.
                 tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request abandoned: the client closed the request body early");
-                self.handles.count(Outcome::ClientClosed);
+                self.count(Outcome::ClientClosed);
                 errors::error(
                     StatusCode::BAD_REQUEST,
                     "Bad Request: the request body ended early",
                 )
             }
-            Failed::Unreachable => unreachable(self.handles),
+            Failed::Unreachable => {
+                self.counted.store(true, Ordering::Relaxed);
+                unreachable(self.handles)
+            }
             Failed::Idle => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
+                self.counted.store(true, Ordering::Relaxed);
                 unreachable(self.handles)
             }
         }
@@ -342,6 +367,7 @@ impl Call<'_> {
 
     /// Telegram's answer, streamed to the client and counted once it ends.
     fn relay(&self, response: reqwest::Response) -> Response {
+        self.counted.store(true, Ordering::Relaxed);
         let status = response.status();
         let headers = response_headers(&response);
         tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), status = status.as_u16(), "gateway request proxied");
@@ -375,12 +401,12 @@ impl Call<'_> {
             Ok(Bounded::Over(partial)) => {
                 // Telegram's 429s are small: this one streams through, and
                 // counts as relayed.
-                self.handles.count(Outcome::RateLimited);
+                self.count(Outcome::RateLimited);
                 return answer(status, headers, partial.into_body());
             }
             Err(err) => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %err, "gateway response aborted");
-                self.handles.count(Outcome::UpstreamError);
+                self.count(Outcome::UpstreamError);
                 return errors::error(
                     StatusCode::BAD_GATEWAY,
                     "Bad Gateway: Telegram is unreachable",
@@ -390,7 +416,7 @@ impl Call<'_> {
         let max_wait = self.bot.gateway.retry_429_max_wait;
         let Some(wait) = retry_after(&flood).filter(|wait| !wait.is_zero() && *wait <= max_wait)
         else {
-            self.handles.count(Outcome::RateLimited);
+            self.count(Outcome::RateLimited);
             return answer(status, headers, Body::from(flood));
         };
         sleep_until(deadline(at, wait)).await;

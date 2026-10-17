@@ -1507,6 +1507,121 @@ async fn upstream_429_retried_once_when_buffered() {
     tgin.stop().await;
 }
 
+/// Telegram that never answers `getChat`, answers a body containing
+/// `flood` with a 429 (`retry_after` 2) and anything else with [`SENT`].
+/// Every request is stamped and sent to the returned channel.
+async fn slow_telegram() -> (SocketAddr, mpsc::UnboundedReceiver<Arrival>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let router = axum::Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+        let at = tokio::time::Instant::now();
+        let flooded = body.windows(5).any(|w| w == b"flood");
+        let _ = tx.send(Arrival { at, body });
+        async move {
+            if uri.path().ends_with("/getChat") {
+                std::future::pending::<()>().await;
+            }
+            let (status, answer) = if flooded {
+                (429, flood(2))
+            } else {
+                (200, SENT.to_owned())
+            };
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(answer))
+                .expect("response")
+        }
+    });
+    (serve(router).await, rx)
+}
+
+/// Sends a whole JSON `method` call to the gateway on a connection of its
+/// own; dropping the stream leaves.
+async fn leaving_client(addr: SocketAddr, method: &str, body: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST /bot{TOKEN}/{method} HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("request");
+    stream
+}
+
+/// A client that leaves after its request arrived whole counts
+/// `client_closed`, whether tgin was waiting for Telegram's response
+/// headers, out a shaping delay or out Telegram's 429; and what it left
+/// never goes to Telegram later.
+#[tokio::test(start_paused = true)]
+async fn client_leaving_mid_request_is_client_closed() {
+    let frozen = freeze();
+    let (api, mut arrivals) = slow_telegram().await;
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let closed = |method: &str, n: u32| {
+        format!(
+            r#"tgin_gateway_requests_total{{bot="gw",method="{method}",outcome="client_closed"}} {n}"#
+        )
+    };
+
+    // Waiting for Telegram's response headers.
+    let client = leaving_client(tgin.addr, "getChat", r#"{"chat_id":7}"#).await;
+    let arrival = within("getChat upstream", arrivals.recv())
+        .await
+        .expect("open");
+    assert_eq!(&arrival.body[..], br#"{"chat_id":7}"#);
+    drop(client);
+    until("getChat counted", || tgin.has_metric(&closed("getChat", 1))).await;
+
+    // Waiting out a shaping delay: the chat's fourth message.
+    let body = json!({ "chat_id": 42, "text": "hi" });
+    for _ in 0..3 {
+        let sent = status_and_body(call(&tgin.http, tgin.addr, "sendMessage", &body).await).await;
+        assert_eq!(sent, (200, SENT.to_owned()));
+        within("a message upstream", arrivals.recv())
+            .await
+            .expect("open");
+    }
+    let client = leaving_client(tgin.addr, "sendMessage", &body.to_string()).await;
+    until("the fourth message's delay", || {
+        tgin.has_metric(
+            r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="delayed"} 1"#,
+        )
+    })
+    .await;
+    drop(client);
+    until("the delayed message counted", || {
+        tgin.has_metric(&closed("sendMessage", 1))
+    })
+    .await;
+
+    // Waiting out Telegram's 429.
+    let client = leaving_client(tgin.addr, "sendMessage", r#"{"chat_id":43,"text":"flood"}"#).await;
+    within("the flooded message upstream", arrivals.recv())
+        .await
+        .expect("open");
+    until("the 429's arrival", || {
+        tgin.has_metric(r#"tgin_gateway_upstream_seconds_count{bot="gw",method="sendMessage"} 4"#)
+    })
+    .await;
+    drop(client);
+    until("the flooded message counted", || {
+        tgin.has_metric(&closed("sendMessage", 2))
+    })
+    .await;
+
+    // What the clients left never goes later.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    quiet("an abandoned request", &mut arrivals).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="ok"} 3"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rate_limited"} 0"#,
+    );
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 0"#);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_429_longer_than_max_wait_passes_through() {
     let telegram = MockServer::start().await;
