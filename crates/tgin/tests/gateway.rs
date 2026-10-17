@@ -1593,7 +1593,9 @@ async fn client_leaving_mid_request_is_client_closed() {
     })
     .await;
 
-    // Waiting out Telegram's 429.
+    // Waiting out Telegram's 429, once the global slot the abandoned
+    // message kept at 1 s has passed.
+    tokio::time::advance(Duration::from_secs(2)).await;
     let client = leaving_client(tgin.addr, "sendMessage", r#"{"chat_id":43,"text":"flood"}"#).await;
     within("the flooded message upstream", arrivals.recv())
         .await

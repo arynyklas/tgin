@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use tgin_core::config::{self, RateMode};
-use tgin_runtime::limit::{Denied, KeyedLimiter, Quota, QuotaError};
+use tgin_runtime::limit::{Admit, Denied, KeyedLimiter, Quota, QuotaError};
 use tokio::time::Instant;
 
 use super::Gateway;
@@ -106,45 +106,108 @@ impl BotLimiter {
         self.mode != RateMode::Off && self.covers(method)
     }
 
-    /// Books one request at `now`: on the global quota, then on `chat`'s,
-    /// then on its group's when the chat is a group. All or none: a quota
-    /// that refuses undoes the bookings made before it, each on its own
-    /// quota and key.
+    /// Books one request: on the global quota, on `chat`'s, and on its
+    /// group's when the chat is a group, each at the instant the request
+    /// really leaves. A first pass books every quota at `now`; the longest
+    /// delay `D` is when the request leaves, so every quota booked for an
+    /// earlier slot is booked again at `now + D` (cancelled, then booked
+    /// there), until `D` stops growing. A quota charged for a slot before
+    /// the request leaves would let its key's later requests go too soon.
+    /// All or none: a quota that refuses undoes every booking made.
     ///
     /// # Errors
     ///
     /// A quota cannot start the request within `max_delay`.
     pub fn acquire(&self, chat: Option<&ChatKey>, now: Instant) -> Result<Admitted, Limited> {
-        let global = self
-            .global
-            .acquire(&(), now, self.max_delay)
-            .map_err(|denied| Limited::by(Scope::Global, denied))?;
+        let buckets = [
+            Some(Bucket::Global),
+            chat.map(Bucket::Chat),
+            chat.filter(|chat| chat.is_group()).map(Bucket::Group),
+        ];
+        let mut booked: [Option<Booked<'_>>; 3] = [None; 3];
         let mut admitted = Admitted {
-            delay: global.delay,
+            delay: Duration::ZERO,
             scope: Scope::Global,
         };
-        let Some(chat) = chat else {
-            return Ok(admitted);
-        };
-        let per_chat = match self.chat.acquire(chat, now, self.max_delay) {
-            Ok(booked) => booked,
-            Err(denied) => {
-                self.global.cancel(&(), global);
-                return Err(Limited::by(Scope::Chat, denied));
-            }
-        };
-        admitted.raise(Scope::Chat, per_chat.delay);
-        if chat.is_group() {
-            match self.group.acquire(chat, now, self.max_delay) {
-                Ok(booked) => admitted.raise(Scope::Group, booked.delay),
+        for (index, bucket) in buckets.into_iter().enumerate() {
+            let Some(bucket) = bucket else {
+                continue;
+            };
+            match self.book(bucket, now, self.max_delay) {
+                Ok(admit) => {
+                    admitted.raise(bucket.scope(), admit.delay);
+                    booked[index] = Some(Booked {
+                        bucket,
+                        admit,
+                        delay: admit.delay,
+                    });
+                }
                 Err(denied) => {
-                    self.chat.cancel(chat, per_chat);
-                    self.global.cancel(&(), global);
-                    return Err(Limited::by(Scope::Group, denied));
+                    self.undo(&booked);
+                    return Err(Limited::by(bucket.scope(), denied));
                 }
             }
         }
-        Ok(admitted)
+        loop {
+            let start = admitted.delay;
+            // `start` is at most `max_delay`, which validation bounds.
+            let Some(at) = now.checked_add(start) else {
+                return Ok(admitted);
+            };
+            for index in 0..booked.len() {
+                let Some(early) = booked[index].filter(|b| b.delay < start) else {
+                    continue;
+                };
+                self.unbook(early.bucket, early.admit);
+                booked[index] = None;
+                match self.book(early.bucket, at, self.max_delay.saturating_sub(start)) {
+                    Ok(admit) => {
+                        let delay = start.saturating_add(admit.delay);
+                        admitted.raise(early.bucket.scope(), delay);
+                        booked[index] = Some(Booked {
+                            bucket: early.bucket,
+                            admit,
+                            delay,
+                        });
+                    }
+                    Err(denied) => {
+                        self.undo(&booked);
+                        return Err(Limited {
+                            scope: early.bucket.scope(),
+                            retry_after: start.saturating_add(denied.retry_after),
+                        });
+                    }
+                }
+            }
+            if admitted.delay == start {
+                return Ok(admitted);
+            }
+        }
+    }
+
+    /// Books one slot of `bucket` at `at`.
+    fn book(&self, bucket: Bucket<'_>, at: Instant, max_delay: Duration) -> Result<Admit, Denied> {
+        match bucket {
+            Bucket::Global => self.global.acquire(&(), at, max_delay),
+            Bucket::Chat(chat) => self.chat.acquire(chat, at, max_delay),
+            Bucket::Group(chat) => self.group.acquire(chat, at, max_delay),
+        }
+    }
+
+    /// Cancels `admit`, a booking of `bucket`.
+    fn unbook(&self, bucket: Bucket<'_>, admit: Admit) {
+        match bucket {
+            Bucket::Global => self.global.cancel(&(), admit),
+            Bucket::Chat(chat) => self.chat.cancel(chat, admit),
+            Bucket::Group(chat) => self.group.cancel(chat, admit),
+        }
+    }
+
+    /// Cancels every booking of `booked`, the latest first.
+    fn undo(&self, booked: &[Option<Booked<'_>>]) {
+        for booked in booked.iter().rev().flatten() {
+            self.unbook(booked.bucket, booked.admit);
+        }
     }
 
     /// Forgets the keys whose quota is back to a fresh key's at `now`.
@@ -163,6 +226,33 @@ impl Admitted {
             self.scope = scope;
         }
     }
+}
+
+/// One quota a request books, with its key.
+#[derive(Clone, Copy)]
+enum Bucket<'a> {
+    Global,
+    Chat(&'a ChatKey),
+    Group(&'a ChatKey),
+}
+
+impl Bucket<'_> {
+    fn scope(self) -> Scope {
+        match self {
+            Bucket::Global => Scope::Global,
+            Bucket::Chat(_) => Scope::Chat,
+            Bucket::Group(_) => Scope::Group,
+        }
+    }
+}
+
+/// A request's booking on one quota.
+#[derive(Clone, Copy)]
+struct Booked<'a> {
+    bucket: Bucket<'a>,
+    admit: Admit,
+    /// When the booked slot starts, from the request's `now`.
+    delay: Duration,
 }
 
 impl Gateway {
@@ -250,15 +340,46 @@ mod tests {
                 scope: Scope::Chat
             }
         );
-        // Another chat: global's 1 s is the longest.
+        // Another chat: global booked the second request at 2 s, when it
+        // leaves, so global's burst has room again only there.
         let third = limiter.acquire(Some(&ChatKey::Id(8)), now).unwrap();
         assert_eq!(
             third,
             Admitted {
-                delay: Duration::from_secs(1),
+                delay: Duration::from_secs(2),
                 scope: Scope::Global
             }
         );
+    }
+
+    /// Under a global backlog every quota is still charged when the request
+    /// leaves: one chat gets at most 3 sends, then 1 per second, as
+    /// `per_chat`'s defaults allow, however long global delays them.
+    #[tokio::test(start_paused = true)]
+    async fn chat_quota_holds_under_global_backlog() {
+        // The defaults: 30/s burst 30, per chat 1/s burst 3, per group 20/min burst 20.
+        let limiter = limiter(rate(30, 1, 30), rate(1, 1, 3), rate(20, 60, 20));
+        let now = Instant::now();
+        for chat in 0..146 {
+            limiter
+                .acquire(Some(&ChatKey::Id(1_000 + chat)), now)
+                .expect("within max_delay");
+        }
+        let starts: Vec<Duration> = (0..8)
+            .filter_map(|_| limiter.acquire(Some(&ChatKey::Id(7)), now).ok())
+            .map(|admitted| admitted.delay)
+            .collect();
+        assert!(starts.len() >= 4, "{starts:?}");
+        // GCRA with burst 3 and 1 s: sends i < j are at least j - i - 2 s apart.
+        for (i, a) in starts.iter().enumerate() {
+            for (j, b) in starts.iter().enumerate().skip(i + 1) {
+                let gap = Duration::from_secs(u64::try_from(j - i).unwrap().saturating_sub(2));
+                assert!(
+                    b.saturating_sub(*a) >= gap,
+                    "sends {i} and {j} at {a:?} and {b:?}: {starts:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
