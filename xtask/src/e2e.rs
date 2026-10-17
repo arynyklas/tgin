@@ -163,6 +163,8 @@ type Interrupt<'a> = Pin<&'a mut (dyn Future<Output = io::Result<()>> + 'a)>;
 
 /// Polls the Ctrl-C wait once, which installs the handler.
 async fn listen(interrupt: Interrupt<'_>) -> Result<(), String> {
+    // A Unix signal reaches the wait only once the driver turns.
+    tokio::task::yield_now().await;
     tokio::select! {
         biased;
         result = interrupt => match result {
