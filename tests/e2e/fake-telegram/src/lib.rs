@@ -14,6 +14,19 @@
 //! - `POST /fake/faults`: `{token, method, status, retry_after?, count,
 //!   delay_ms?, description?}`; the next `count` calls answer `status`.
 //! - `GET /fake/health`.
+//!
+//! Journal entries carry `local_file: true` when an `InputFile` parameter
+//! (or a string anywhere in JSON carried by a parameter) starts with
+//! `file:`, in either mode.
+//!
+//! [`Options::local_mode`] (`--local-mode` / `FAKE_TELEGRAM_LOCAL_MODE`,
+//! with `--files-dir` / `FAKE_TELEGRAM_FILES_DIR`) imitates
+//! `telegram-bot-api --local`: uploads are written to
+//! `{files_dir}/{token with ':' → '~'}/documents/file_N[.ext]` and `getFile`
+//! answers that absolute path; `/file/bot…` answers 404; `sendDocument`
+//! accepts a `file:` reference; `logOut` drops the pending updates and the
+//! webhook (`close` only answers `true`). In the default mode `logOut` and
+//! `close` only answer `true`.
 
 mod api;
 mod journal;
@@ -21,7 +34,7 @@ mod params;
 mod state;
 mod webhook;
 
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -40,6 +53,18 @@ use crate::{
     state::{Fault, Shared, bot_id},
 };
 
+/// How the fake behaves; the default is the cloud Bot API.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Behave like `telegram-bot-api --local`: uploads are written under
+    /// `{files_dir}/{token with ':' → '~'}/`, `getFile` answers absolute
+    /// paths, `/file/bot…` is 404, `file:` references are accepted, and
+    /// `logOut` drops the pending updates and the webhook.
+    pub local_mode: bool,
+    /// The server's `--dir`; required in local mode.
+    pub files_dir: Option<PathBuf>,
+}
+
 /// A running fake server.
 pub struct Server {
     addr: SocketAddr,
@@ -48,11 +73,29 @@ pub struct Server {
 }
 
 impl Server {
-    /// Serve on `listener` until [`Server::stop`].
+    /// Serve on `listener` with the default (cloud) behaviour until
+    /// [`Server::stop`].
     pub fn start(listener: TcpListener) -> io::Result<Self> {
+        Self::start_with(listener, Options::default())
+    }
+
+    /// Serve on `listener` with `options` until [`Server::stop`].
+    pub fn start_with(listener: TcpListener, options: Options) -> io::Result<Self> {
         let addr = listener.local_addr()?;
+        let files_root = if options.local_mode {
+            let dir = options.files_dir.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "local mode needs a files directory",
+                )
+            })?;
+            std::fs::create_dir_all(&dir)?;
+            Some(std::path::absolute(dir)?)
+        } else {
+            None
+        };
         let cancel = CancellationToken::new();
-        let shared = Arc::new(Shared::new(cancel.clone()).map_err(io::Error::other)?);
+        let shared = Arc::new(Shared::new(cancel.clone(), files_root).map_err(io::Error::other)?);
         let stop = cancel.clone();
         let task = tokio::spawn(async move {
             axum::serve(listener, router(shared))

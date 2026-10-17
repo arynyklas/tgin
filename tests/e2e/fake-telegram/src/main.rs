@@ -1,9 +1,9 @@
 //! `fake-telegram`: serve the fake Bot API, or check that one is healthy.
 
-use std::{net::SocketAddr, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Parser, Subcommand};
-use tgin_fake_telegram::Server;
+use tgin_fake_telegram::{Options, Server};
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
@@ -12,6 +12,14 @@ struct Cli {
     /// Address to listen on.
     #[arg(long, env = "FAKE_TELEGRAM_LISTEN", default_value = "0.0.0.0:8081")]
     listen: SocketAddr,
+    /// Behave like `telegram-bot-api --local`: uploads go under
+    /// `--files-dir`, `getFile` answers absolute paths, `/file/bot…` is 404,
+    /// `file:` references are accepted, and `logOut` drops pending updates.
+    #[arg(long, env = "FAKE_TELEGRAM_LOCAL_MODE", requires = "files_dir")]
+    local_mode: bool,
+    /// The files directory (the server's `--dir`); used in local mode.
+    #[arg(long, env = "FAKE_TELEGRAM_FILES_DIR")]
+    files_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -35,11 +43,17 @@ async fn main() -> ExitCode {
         .init();
     match cli.command {
         Some(Command::Health) => health(cli.listen.port()).await,
-        None => serve(cli.listen).await,
+        None => {
+            let options = Options {
+                local_mode: cli.local_mode,
+                files_dir: cli.files_dir,
+            };
+            serve(cli.listen, options).await
+        }
     }
 }
 
-async fn serve(listen: SocketAddr) -> ExitCode {
+async fn serve(listen: SocketAddr, options: Options) -> ExitCode {
     let listener = match TcpListener::bind(listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -47,7 +61,7 @@ async fn serve(listen: SocketAddr) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let server = match Server::start(listener) {
+    let server = match Server::start_with(listener, options) {
         Ok(server) => server,
         Err(error) => {
             tracing::error!(%error, "cannot start");

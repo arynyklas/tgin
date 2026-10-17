@@ -134,6 +134,7 @@ impl Call {
         entry.via = Some(self.via);
         entry.content_type.clone_from(&self.content_type);
         entry.transfer_encoding.clone_from(&self.transfer_encoding);
+        entry.local_file = self.params.names_local_file();
         entry
     }
 }
@@ -243,7 +244,8 @@ fn dispatch(shared: &Shared, bot: &Bot, method: &str, params: &Params) -> Answer
         "setwebhook" => return set_webhook(bot, params),
         "deletewebhook" => return delete_webhook(bot, params),
         "getwebhookinfo" => Ok(webhook_info(&bot.state.lock())),
-        "close" | "logout" => Ok(Value::Bool(true)),
+        "close" => Ok(Value::Bool(true)),
+        "logout" => Ok(log_out(shared, bot)),
         "getfile" => get_file(&bot.state.lock(), params),
         "senddocument" => send_document(shared, bot, params),
         "sendmediagroup" => send_media_group(bot, params),
@@ -324,9 +326,12 @@ fn send_document(shared: &Shared, bot: &Bot, params: &Params) -> Result<Value, A
     let chat = chat(params)?;
     let mut state = bot.state.lock();
     let file_id = match params.file("document") {
-        Some(part) => store(shared, &mut state, part),
+        Some(part) => store(shared, bot, &mut state, part)?,
         None => match params.get("document") {
             Some(id) if state.files.contains_key(id) => id.to_owned(),
+            Some(reference) if shared.files_root.is_some() && reference.starts_with("file:") => {
+                local_reference(shared, &mut state, reference)
+            }
             Some(_) => {
                 return Err(Answer::bad_request(
                     "Bad Request: wrong file identifier/HTTP URL specified",
@@ -355,8 +360,15 @@ fn send_document(shared: &Shared, bot: &Bot, params: &Params) -> Result<Value, A
     Ok(message)
 }
 
-/// Keep an uploaded part under a new `file_id`; returns the id.
-fn store(shared: &Shared, state: &mut BotState, part: &FilePart) -> String {
+/// Keep an uploaded part under a new `file_id`; returns the id. In local
+/// mode the bytes are also written to `{files_root}/{token~}/{file_path}`
+/// and `file_path` is that absolute path, as the real server answers.
+fn store(
+    shared: &Shared,
+    bot: &Bot,
+    state: &mut BotState,
+    part: &FilePart,
+) -> Result<String, Answer> {
     let number = shared.next_file();
     let extension = part
         .filename
@@ -369,17 +381,80 @@ fn store(shared: &Shared, state: &mut BotState, part: &FilePart) -> String {
         })
         .map(|extension| format!(".{extension}"))
         .unwrap_or_default();
+    let relative = format!("documents/file_{number}{extension}");
+    let file_path = match &shared.files_root {
+        None => relative,
+        Some(root) => {
+            let path = root
+                .join(bot.token.replace(':', "~"))
+                .join("documents")
+                .join(format!("file_{number}{extension}"));
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, &part.data));
+            if let Err(error) = written {
+                tracing::error!(path = %path.display(), %error, "cannot store the upload");
+                return Err(Answer::error(
+                    500,
+                    "Internal Server Error: cannot save file",
+                    None,
+                ));
+            }
+            path.to_string_lossy().into_owned()
+        }
+    };
     let file = StoredFile {
         file_id: format!("FAKEDOC{number}"),
         file_unique_id: format!("FAKEUNIQUE{number}"),
-        file_path: format!("documents/file_{number}{extension}"),
+        file_path,
         file_name: part.filename.clone(),
         mime_type: part.content_type.clone(),
         data: part.data.clone(),
     };
     let file_id = file.file_id.clone();
     state.files.insert(file_id.clone(), file);
+    Ok(file_id)
+}
+
+/// Local mode: a `file:` reference becomes a stored file named after the
+/// path's last segment. The fake never reads the path (it names a file on
+/// the bot's side of a real deployment), so the file is empty and its
+/// `file_path` is the referenced path.
+fn local_reference(shared: &Shared, state: &mut BotState, reference: &str) -> String {
+    let number = shared.next_file();
+    let path = reference
+        .strip_prefix("file://")
+        .or_else(|| reference.strip_prefix("file:"))
+        .unwrap_or(reference);
+    let file = StoredFile {
+        file_id: format!("FAKEDOC{number}"),
+        file_unique_id: format!("FAKEUNIQUE{number}"),
+        file_path: path.to_owned(),
+        file_name: path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned(),
+        mime_type: None,
+        data: Bytes::new(),
+    };
+    let file_id = file.file_id.clone();
+    state.files.insert(file_id.clone(), file);
     file_id
+}
+
+/// `logOut`: in local mode the bot's pending updates and webhook are
+/// dropped, as a server forgets a logged-out bot; the cloud fake only
+/// answers `true`.
+fn log_out(shared: &Shared, bot: &Bot) -> Value {
+    if shared.files_root.is_some() {
+        let mut state = bot.state.lock();
+        state.queue.clear();
+        if state.webhook.take().is_some() {
+            state.webhook_generation += 1;
+        }
+        state.last_error = None;
+        drop(state);
+        bot.changed.notify_waiters();
+    }
+    Value::Bool(true)
 }
 
 fn send_media_group(bot: &Bot, params: &Params) -> Result<Value, Answer> {
@@ -628,6 +703,11 @@ fn download(shared: &Arc<Shared>, http_method: &str, rest: &str) -> Response {
     let mut entry = Entry::new(token, id, Kind::File, http_method);
     entry.args.insert("file_path".to_owned(), path.to_owned());
     let seq = shared.journal.record(entry);
+    if shared.files_root.is_some() {
+        // A local-mode server has no file route.
+        shared.journal.finish(seq, 404);
+        return Answer::error(404, "Not Found", None).into_response();
+    }
     let data = bot.state.lock().file_by_path(path).map(|f| f.data.clone());
     match data {
         Some(data) => {

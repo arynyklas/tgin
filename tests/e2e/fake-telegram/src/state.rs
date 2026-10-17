@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,10 +40,12 @@ pub(crate) struct Shared {
     pub client: reqwest::Client,
     pub cancel: CancellationToken,
     next_file: AtomicU64,
+    /// Local mode: the absolute files directory (the server's `--dir`).
+    pub files_root: Option<PathBuf>,
 }
 
 impl Shared {
-    pub fn new(cancel: CancellationToken) -> reqwest::Result<Self> {
+    pub fn new(cancel: CancellationToken, files_root: Option<PathBuf>) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
@@ -54,6 +57,7 @@ impl Shared {
             client,
             cancel,
             next_file: AtomicU64::new(1),
+            files_root,
         })
     }
 

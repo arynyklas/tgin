@@ -34,6 +34,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json", "multipart"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
