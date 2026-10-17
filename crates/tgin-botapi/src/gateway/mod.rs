@@ -1,6 +1,7 @@
 //! The Bot API gateway: request paths, the Bot API method table, request
 //! parameters and chat keys, Telegram-shaped responses, and [`Gateway`],
-//! which checks each request's bot token and streams it to Telegram.
+//! which checks each request's bot token and streams it to Telegram, and
+//! makes the method calls push endpoints answer updates with (`reply`).
 //!
 //! Gateway request paths and upstream URLs carry bot tokens: nothing here
 //! logs, traces or reports them. Logs and metrics name the bot and the
@@ -15,7 +16,9 @@ pub mod metrics;
 pub mod params;
 pub mod path;
 mod proxy;
+mod reply;
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -29,6 +32,7 @@ use axum::response::Response;
 use bytes::BytesMut;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use ipnet::IpNet;
+use parking_lot::Mutex;
 use reqwest::Url;
 use tgin_core::config;
 use tgin_core::engine::Engine;
@@ -38,7 +42,7 @@ use tgin_runtime::secret::{Secret, secret_eq};
 
 use self::limit::BotLimiter;
 pub use self::metrics::GatewayMetrics;
-use self::metrics::{BotMetrics, MethodLabel, Outcome};
+use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics};
 use self::path::GatewayPath;
 use self::proxy::Upstream;
 use crate::client::Identity;
@@ -56,11 +60,13 @@ pub struct GatewayBot {
 }
 
 /// The Bot API gateway: the data plane's fallback for paths no configured
-/// route serves.
+/// route serves, and the executor of push consumers' webhook replies.
 pub struct Gateway {
     engine: Arc<Engine>,
     metrics: GatewayMetrics,
     table: ArcSwap<Table>,
+    /// `tgin_webhook_replies_total` handles by push consumer.
+    replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
 }
 
 /// The bots the gateway serves, swapped whole by [`Gateway::set_bots`].
@@ -176,13 +182,15 @@ impl Gateway {
             engine,
             metrics,
             table: ArcSwap::from_pointee(Table::default()),
+            replies: Mutex::new(HashMap::new()),
         }
     }
 
     /// Replaces the bot table. An entry whose token, `api_url` and gateway
     /// config are unchanged keeps its state (client, identity, limiter); a
     /// bot whose token stays keeps its identity, and its limiter too while
-    /// its rate limits stay. A removed bot's metric series go.
+    /// its rate limits stay. A removed bot's metric series go, and so do
+    /// the webhook-reply series of consumers the engine no longer has.
     pub fn set_bots(&self, bots: Vec<GatewayBot>, trusted_proxies: Vec<IpNet>) {
         let old = self.table.load_full();
         let mut entries = Vec::with_capacity(bots.len());
@@ -231,6 +239,7 @@ impl Gateway {
             bots: entries,
             trusted_proxies,
         }));
+        self.retain_reply_metrics();
     }
 
     /// Records the identity `getMe` returned for the bot `bot`.
@@ -508,6 +517,7 @@ mod tests {
                 stop: CancellationToken::new(),
                 force: CancellationToken::new(),
                 via: tgin_runtime::http::Via::generate(),
+                reply: Default::default(),
             },
         )
         .expect("engine");

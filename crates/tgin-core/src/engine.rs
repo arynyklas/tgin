@@ -10,6 +10,7 @@
 //! name, for as long as it stays configured, and an id is never given to
 //! another bot. Sources must admit with [`Engine::source_id`].
 
+use std::fmt;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,10 +38,11 @@ use crate::envelope::Envelope;
 use crate::ids::{ConsumerId, SourceId};
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, CoreMetrics, SourceMetrics};
 use crate::reload::{self, Plan};
+use crate::reply::ReplyHandle;
 use crate::rules::{MatchScratch, RouteTable, RuleError, TargetSpec};
 
 /// What the engine's background tasks run under.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EngineRuntime {
     /// Supervises every push dispatcher, as `push:<consumer>`.
     pub supervisor: Arc<Supervisor>,
@@ -51,6 +53,22 @@ pub struct EngineRuntime {
     pub force: CancellationToken,
     /// This process's `Via` pseudonym, sent with every push.
     pub via: Via,
+    /// What executes webhook replies, set once after the engine is built
+    /// and before any source starts. Push consumers with
+    /// `webhook_reply: execute` read it on every delivery.
+    pub reply: ReplyHandle,
+}
+
+impl fmt::Debug for EngineRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EngineRuntime")
+            .field("supervisor", &self.supervisor)
+            .field("stop", &self.stop)
+            .field("force", &self.force)
+            .field("via", &self.via)
+            .field("reply", &self.reply.get().map(|_| "set"))
+            .finish()
+    }
 }
 
 /// Why a config could not be turned into an engine state. Nothing changed.

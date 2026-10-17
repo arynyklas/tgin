@@ -265,6 +265,17 @@ impl GatewayMetrics {
             })
         }))
     }
+
+    /// Removes the `tgin_webhook_replies_total` series of `consumer`.
+    pub fn remove_replies(&self, consumer: &str) {
+        let consumer: Arc<str> = Arc::from(consumer);
+        for outcome in ReplyOutcome::ALL {
+            self.webhook_replies.remove(&ReplyLabels {
+                consumer: Arc::clone(&consumer),
+                outcome: outcome.as_str(),
+            });
+        }
+    }
 }
 
 /// One bot's handles. Cloning shares them.
@@ -421,5 +432,10 @@ mod tests {
         metrics.remove_bot(&bot);
         let out = exported(&reg);
         assert!(!out.contains(r#"bot="shop""#), "{out}");
+        assert!(out.contains(r#"consumer="hooks""#), "{out}");
+
+        metrics.remove_replies("hooks");
+        let out = exported(&reg);
+        assert!(!out.contains(r#"consumer="hooks""#), "{out}");
     }
 }

@@ -169,6 +169,7 @@ impl HotPath {
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
             via: tgin_runtime::http::Via::generate(),
+            reply: Default::default(),
         };
         let engine = {
             let _enter = rt.enter();

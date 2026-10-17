@@ -12,6 +12,10 @@
 //! endpoint, which a bot's `setWebhook` set through the gateway. A consumer
 //! with no endpoint at all leases nothing: its updates wait in the queue
 //! until an endpoint arrives.
+//!
+//! With `webhook_reply: execute`, a 2xx answer may carry a Bot API method
+//! call, as a webhook answer may for Telegram. The delivery reads it
+//! ([`crate::reply`]) and has it executed before it acks the update.
 
 use std::fmt;
 use std::pin::pin;
@@ -20,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, VIA};
@@ -38,6 +43,7 @@ pub use crate::config::{Balance, Retry as RetryPolicy};
 use crate::envelope::Envelope;
 use crate::ids::SourceId;
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, DeliveryOutcome, EndpointMetrics};
+use crate::reply::{MAX_REPLY_BYTES, Reply, ReplyExecutor, ReplyHandle, carries_parameters};
 
 /// Lease timeout of a push queue (see [`crate::config::Push::queue`]): long
 /// enough never to pass, since the push queue is never expired.
@@ -65,7 +71,7 @@ pub struct Endpoint {
     pub breaker: Breaker,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PushOptions {
     /// Most deliveries at once, counting those waiting to retry.
     pub max_in_flight: usize,
@@ -78,6 +84,37 @@ pub struct PushOptions {
     /// Bound on one request to a runtime endpoint, from connecting to the
     /// end of the response: [`crate::config::DEFAULT_ENDPOINT_TIMEOUT`].
     pub runtime_timeout: Duration,
+    /// What executes the method calls endpoints answer with
+    /// (`webhook_reply: execute`); `None` ignores answer bodies unread.
+    pub reply: Option<ReplyHandle>,
+}
+
+impl fmt::Debug for PushOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reply = self.reply.as_ref().map(|handle| {
+            if handle.get().is_some() {
+                "set"
+            } else {
+                "unset"
+            }
+        });
+        f.debug_struct("PushOptions")
+            .field("max_in_flight", &self.max_in_flight)
+            .field("balance", &self.balance)
+            .field("retry", &self.retry)
+            .field("source_names", &self.source_names)
+            .field("breaker", &self.breaker)
+            .field("runtime_timeout", &self.runtime_timeout)
+            .field("reply", &reply)
+            .finish()
+    }
+}
+
+impl PushOptions {
+    /// The reply executor, when replies are executed and it is set.
+    fn executor(&self) -> Option<&Arc<dyn ReplyExecutor>> {
+        self.reply.as_ref().and_then(|handle| handle.get())
+    }
 }
 
 /// The endpoint a bot's `setWebhook` gave a consumer that accepts one. It
@@ -418,12 +455,26 @@ impl PushConsumer {
             let result = self.send(&sent, &envelope, attempt).await;
             let now = Instant::now();
             match result {
-                Ok(()) => {
+                Ok(reply) => {
                     sent.report(true, now);
-                    held.ack();
-                    sent.slot().metrics.attempt(DeliveryOutcome::Delivered);
                     let latency = now.saturating_duration_since(envelope.received_at);
                     self.metrics.latency(latency.as_secs_f64());
+                    // The endpoint is done with: its in-flight claim goes
+                    // before the reply runs. The update stays leased until
+                    // the reply has run, so under per-chat ordering the
+                    // chat's next update waits for it too.
+                    let targets = Arc::clone(&sent.targets);
+                    let index = sent.index;
+                    drop(sent);
+                    if let Some(reply) = reply
+                        && let Some(executor) = targets.opts.executor()
+                    {
+                        executor.execute(&self.name, envelope.source, reply).await;
+                    }
+                    held.ack();
+                    targets.slots[index]
+                        .metrics
+                        .attempt(DeliveryOutcome::Delivered);
                     return;
                 }
                 Err(Failure::Permanent(cause)) => {
@@ -563,12 +614,14 @@ impl PushConsumer {
         }
     }
 
+    /// One attempt. A 2xx answer delivers the update, and its body is the
+    /// reply when replies are executed (see [`PushConsumer::reply`]).
     async fn send(
         &self,
         sent: &Sending<'_>,
         envelope: &Envelope,
         attempt: u32,
-    ) -> Result<(), Failure> {
+    ) -> Result<Option<Reply>, Failure> {
         let slot = sent.slot();
         let mut headers = HeaderMap::with_capacity(6);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -606,7 +659,11 @@ impl PushConsumer {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    Ok(())
+                    let executor = sent.targets.opts.executor();
+                    Ok(match executor {
+                        Some(executor) => self.reply(executor, envelope, response).await,
+                        None => None,
+                    })
                 } else if status == StatusCode::LOOP_DETECTED
                     && self.via.seen_in(response.headers())
                 {
@@ -637,6 +694,58 @@ impl PushConsumer {
                 retry_after: None,
             }),
         }
+    }
+
+    /// The method call in a 2xx answer, read the way Telegram reads a
+    /// webhook answer: only when its `Content-Type` names parameters (see
+    /// [`carries_parameters`]). An empty body is no reply. A body longer
+    /// than [`MAX_REPLY_BYTES`] is not read past the limit and counts as
+    /// too large; one that fails to arrive is logged. Neither is executed,
+    /// and the update is delivered all the same.
+    async fn reply(
+        &self,
+        executor: &Arc<dyn ReplyExecutor>,
+        envelope: &Envelope,
+        mut response: reqwest::Response,
+    ) -> Option<Reply> {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .filter(|content_type| carries_parameters(content_type))?
+            .clone();
+        let limit = u64::try_from(MAX_REPLY_BYTES).unwrap_or(u64::MAX);
+        match response.content_length() {
+            Some(0) => return None,
+            Some(length) if length > limit => {
+                executor.too_large(&self.name, envelope.source);
+                return None;
+            }
+            _ => {}
+        }
+        let mut body = Collected::default();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len.saturating_add(chunk.len()) > MAX_REPLY_BYTES {
+                        executor.too_large(&self.name, envelope.source);
+                        return None;
+                    }
+                    body.push(chunk);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        consumer = %self.name,
+                        update_id = envelope.update_id,
+                        error = %describe_error(&err),
+                        "the endpoint's reply did not arrive whole; it is not executed"
+                    );
+                    return None;
+                }
+            }
+        }
+        let body = body.into_bytes();
+        (!body.is_empty()).then_some(Reply { content_type, body })
     }
 
     /// Drops the update for good: acks it, counts it and logs it, without its
@@ -937,6 +1046,37 @@ impl fmt::Display for Cause {
             Self::Error(err) => f.write_str(err),
             Self::InvalidSecret => f.write_str("secret_token is not a valid header value"),
             Self::Expired => f.write_str("no attempt before max_age"),
+        }
+    }
+}
+
+/// A reply's frames read so far; a single frame is kept without copying.
+#[derive(Default)]
+struct Collected {
+    first: Bytes,
+    more: Option<BytesMut>,
+    len: usize,
+}
+
+impl Collected {
+    fn push(&mut self, data: Bytes) {
+        self.len += data.len();
+        if let Some(more) = &mut self.more {
+            more.extend_from_slice(&data);
+        } else if self.first.is_empty() {
+            self.first = data;
+        } else if !data.is_empty() {
+            let mut more = BytesMut::with_capacity(self.len);
+            more.extend_from_slice(&self.first);
+            more.extend_from_slice(&data);
+            self.more = Some(more);
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self.more {
+            Some(more) => more.freeze(),
+            None => self.first,
         }
     }
 }

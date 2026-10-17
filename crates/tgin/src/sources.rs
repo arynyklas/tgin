@@ -662,6 +662,7 @@ mod tests {
                 stop: CancellationToken::new(),
                 force: force.clone(),
                 via: tgin_runtime::http::Via::generate(),
+                reply: Default::default(),
             },
         )
         .expect("engine");

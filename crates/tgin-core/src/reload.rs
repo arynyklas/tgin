@@ -29,7 +29,7 @@ use tgin_runtime::supervisor::TaskState;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{self, Config, ConsumerKind};
+use crate::config::{self, Config, ConsumerKind, WebhookReply};
 use crate::consumer::push::{Endpoint, PushOptions};
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::engine::{
@@ -38,6 +38,7 @@ use crate::engine::{
 };
 use crate::ids::SourceId;
 use crate::metrics::{CoreMetrics, ReloadOutcome};
+use crate::reply::ReplyHandle;
 use crate::rules::{RouteTable, RuleError, RuleSpec};
 
 /// How often a drain looks whether its consumer is empty, and the shortest
@@ -235,6 +236,7 @@ impl Plan {
                         &consumer.kind,
                         names_grew,
                         &source_names,
+                        &rt.reply,
                     ));
                     Arc::clone(&target.slot)
                 }
@@ -254,9 +256,10 @@ impl Plan {
                                 slot: Arc::clone(slot),
                                 queue: Some(queue(&consumer.kind)),
                                 endpoints: match &consumer.kind {
-                                    ConsumerKind::Push(push) => {
-                                        Some((endpoints(push), options(push, &source_names)))
-                                    }
+                                    ConsumerKind::Push(push) => Some((
+                                        endpoints(push),
+                                        options(push, &source_names, &rt.reply),
+                                    )),
                                     ConsumerKind::Pull(_) => None,
                                 },
                                 options: None,
@@ -553,13 +556,15 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 /// The live changes from `old` to `new` of the same mode, if any. A push
 /// consumer gets new endpoints (and breakers) when its delivery settings
 /// change; when only `webhook_reply` changes or new bots appear, it keeps
-/// them and gets new options (the bots' names among them).
+/// them and gets new options (the bots' names and the reply handle among
+/// them).
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
     new: &ConsumerKind,
     names_grew: bool,
     source_names: &Arc<[Arc<str>]>,
+    reply: &ReplyHandle,
 ) -> Option<Live> {
     let (queue, endpoints, opts) = match (old, new) {
         (ConsumerKind::Pull(old), ConsumerKind::Pull(new)) => {
@@ -574,8 +579,8 @@ fn live_change(
             let refresh = names_grew || old.webhook_reply != new.webhook_reply;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
-                delivery.then(|| (endpoints(new), options(new, source_names))),
-                (!delivery && refresh).then(|| options(new, source_names)),
+                delivery.then(|| (endpoints(new), options(new, source_names, reply))),
+                (!delivery && refresh).then(|| options(new, source_names, reply)),
             )
         }
         _ => (None, None, None),
@@ -607,7 +612,7 @@ fn new_slot(
             Arc::clone(&name),
             push.queue(),
             endpoints(push),
-            options(push, source_names),
+            options(push, source_names, &rt.reply),
             client.clone(),
             &rt.via,
             handles.clone(),
@@ -629,7 +634,12 @@ fn endpoints(push: &config::Push) -> Vec<Endpoint> {
         .collect()
 }
 
-fn options(push: &config::Push, source_names: &Arc<[Arc<str>]>) -> PushOptions {
+/// A push consumer's options; `reply` goes with `webhook_reply: execute`.
+fn options(
+    push: &config::Push,
+    source_names: &Arc<[Arc<str>]>,
+    reply: &ReplyHandle,
+) -> PushOptions {
     PushOptions {
         max_in_flight: push.max_in_flight,
         balance: push.balance,
@@ -637,6 +647,7 @@ fn options(push: &config::Push, source_names: &Arc<[Arc<str>]>) -> PushOptions {
         source_names: Arc::clone(source_names),
         breaker: push.breaker,
         runtime_timeout: config::DEFAULT_ENDPOINT_TIMEOUT,
+        reply: (push.webhook_reply == WebhookReply::Execute).then(|| Arc::clone(reply)),
     }
 }
 
@@ -700,6 +711,7 @@ mod tests {
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
             via: tgin_runtime::http::Via::generate(),
+            reply: Default::default(),
         };
         let one = "version: 1\nbots:\n  - { name: a, token: \"1:a\" }\n";
         let build = |cfg: &Config, old: Option<&EngineState>| {
@@ -738,6 +750,7 @@ mod tests {
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
             via: tgin_runtime::http::Via::generate(),
+            reply: Default::default(),
         };
         let build = |cfg: &Config, old: Option<&EngineState>| {
             Plan::build(cfg, old, &[], &metrics, &client, &rt).map(Plan::into_parts)
@@ -764,7 +777,19 @@ mod tests {
         };
         assert_eq!(&*live.slot.name, "h");
         assert!(live.endpoints.is_none(), "breakers reset");
-        assert!(live.options.is_some(), "push options not refreshed");
+        let opts = live.options.as_ref().expect("push options refreshed");
+        assert!(opts.reply.is_none(), "ignore drops the reply handle");
+
+        // Back to `execute`: the options carry the runtime's one handle.
+        let (ignored, _) = build(&load(&ignore), None).expect("build");
+        let (_, changes) = build(&load(base), Some(&ignored)).expect("build");
+        let [live] = changes.live.as_slice() else {
+            panic!("one live change");
+        };
+        assert!(live.endpoints.is_none(), "breakers reset");
+        let opts = live.options.as_ref().expect("push options refreshed");
+        let handle = opts.reply.as_ref().expect("the reply handle");
+        assert!(Arc::ptr_eq(handle, &rt.reply));
 
         let flags = base
             .replace(

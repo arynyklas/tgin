@@ -441,7 +441,7 @@ fn answer(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
 /// `base` with `rest` (a method, or a file path still percent-encoded)
 /// appended to its path, and `query` as the query. Appending keeps the
 /// request under `base` whatever `rest` holds.
-fn url(base: &Url, rest: &str, query: Option<&str>) -> Url {
+pub(super) fn url(base: &Url, rest: &str, query: Option<&str>) -> Url {
     let mut url = base.clone();
     let path = format!("{}{rest}", base.path());
     url.set_path(&path);
@@ -472,7 +472,7 @@ fn hop_by_hop(from: &HeaderMap, name: &HeaderName) -> bool {
 }
 
 /// The outcome of a response with `status`.
-fn outcome(status: StatusCode) -> Outcome {
+pub(super) fn outcome(status: StatusCode) -> Outcome {
     if status == StatusCode::TOO_MANY_REQUESTS {
         Outcome::RateLimited
     } else if status.is_client_error() {
@@ -494,7 +494,7 @@ fn unreachable(handles: &MethodMetrics) -> Response {
 
 /// `idle` after `from`; for an `idle` past any representable instant, 30
 /// years after `from` (as tokio's own far future), which never comes.
-fn deadline(from: Instant, idle: Duration) -> Instant {
+pub(super) fn deadline(from: Instant, idle: Duration) -> Instant {
     const FAR: Duration = Duration::from_secs(30 * 365 * 86_400);
     from.checked_add(idle)
         .or_else(|| from.checked_add(FAR))

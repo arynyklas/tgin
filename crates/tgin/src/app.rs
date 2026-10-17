@@ -15,6 +15,7 @@ use tgin_botapi::gateway::{Gateway, GatewayBot, GatewayMetrics};
 use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
+use tgin_core::reply::ReplyHandle;
 use tgin_runtime::backoff::Backoff;
 use tgin_runtime::config::Env;
 use tgin_runtime::http::{
@@ -263,6 +264,9 @@ impl App {
         // This process's name in the `Via` of its pushes; both planes refuse
         // a request that carries it, so tgin never acts on its own pushes.
         let via = Via::generate();
+        // Push consumers read the reply executor through this handle; the
+        // gateway that executes replies needs the engine first.
+        let reply = ReplyHandle::default();
         let engine = Arc::new(Engine::new(
             &cfg,
             core.clone(),
@@ -272,6 +276,7 @@ impl App {
                 stop: handles.stop.clone(),
                 force: force.clone(),
                 via: via.clone(),
+                reply: Arc::clone(&reply),
             },
         )?);
         // Set once, here: the slot is new with `handles`.
@@ -280,6 +285,8 @@ impl App {
         // Before the sources, which record each bot's identity in it.
         let gateway = Arc::new(Gateway::new(Arc::clone(&engine), gateway_metrics));
         gateway.set_bots(gateway_bots(&cfg, &engine), trusted_proxies(&cfg));
+        // Set once, here, before any source admits an update.
+        let _ = reply.set(gateway.reply_executor());
         spawn_sweep(&supervisor, Arc::clone(&gateway), handles.stop.clone());
 
         let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
