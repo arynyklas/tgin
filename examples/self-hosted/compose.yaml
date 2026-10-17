@@ -1,0 +1,93 @@
+# tgin in front of a self-hosted Telegram Bot API server, with one polling
+# bot behind tgin. README.md explains the setup and the deployment rules.
+#
+# Needs BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH and TGIN_ADMIN_TOKEN,
+# e.g. in a `.env` file next to this one (never commit it). Without Telegram
+# credentials, compose.fake.yaml runs the same stack against tgin's fake
+# Bot API server.
+name: tgin-self-hosted
+
+services:
+  # Reachable only from tgin: it is alone with tgin on the `upstream`
+  # network, and no port is published. Anyone who reaches it with a token
+  # controls that bot.
+  telegram-bot-api:
+    build: ../../docker/telegram-bot-api
+    command:
+      # Local mode: files up to 2000 MB, getFile answers an absolute path.
+      - --local
+      # The state and the files apart: tgin mounts only the files volume,
+      # at the same path, so local-mode file paths mean the same to it.
+      - --dir=/var/lib/telegram-bot-api
+      - --files-dir=/var/lib/telegram-bot-api/files
+      - --http-port=8081
+      # No --http-stat-port: the statistics page is unauthenticated.
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID, from https://my.telegram.org}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH, from https://my.telegram.org}
+    volumes:
+      # The bots' TDLib databases (their Telegram sessions), the update queue
+      # and the webhook settings: the server's alone.
+      - server-state:/var/lib/telegram-bot-api
+      # Downloaded and uploaded files, which tgin reads.
+      - server-files:/var/lib/telegram-bot-api/files
+    networks: [upstream]
+    # The server closes every bot's TDLib client on SIGTERM.
+    stop_grace_period: 30s
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The server has no health endpoint: check that it listens.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8081"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tgin:
+    build: ../..
+    # The server's user: its directories are private to it (mode 0700), and
+    # tgin reads the files volume.
+    user: "10001:10001"
+    # Shutdown drains for up to about 20 s; Docker's default 10 s cuts it short.
+    stop_grace_period: 30s
+    volumes:
+      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+      # The files volume read-only, at the path the server uses.
+      - server-files:/var/lib/telegram-bot-api/files:ro
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN}
+      TGIN_ADMIN_TOKEN: ${TGIN_ADMIN_TOKEN:?set TGIN_ADMIN_TOKEN}
+    # No published ports: the bot reaches the gateway (8080) on `bots`, and
+    # the admin plane stays on the container's loopback.
+    networks: [upstream, bots]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+
+  # Its Bot API is tgin's gateway, http://tgin:8080/c/bot: getUpdates polls
+  # the `bot` consumer and every other call reaches the server through tgin.
+  # It answers each message (examples/simple/bot1.py).
+  bot:
+    build: ../simple
+    command: ["uv", "run", "bot1.py"]
+    environment:
+      TOKEN: ${BOT_TOKEN}
+      TGIN_BASE: http://tgin:8080/c/bot
+      REPLY: hello through a self-hosted Bot API server
+    # Not on `upstream`: the bot cannot reach the server around tgin.
+    networks: [bots]
+    depends_on:
+      tgin:
+        condition: service_healthy
+
+networks:
+  # The server and tgin. Not `internal`: the server talks to Telegram.
+  upstream: {}
+  # tgin and the bots.
+  bots: {}
+
+volumes:
+  server-state: {}
+  server-files: {}

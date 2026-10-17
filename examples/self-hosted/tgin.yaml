@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../../schema/tgin.v1.schema.json
+#
+# One bot whose Bot API is a self-hosted telegram-bot-api server
+# (compose.yaml), long-polled by tgin, and one downstream instance that polls
+# tgin (pull). compose.yaml mounts this file as /etc/tgin/tgin.yaml and sets
+# BOT_TOKEN and TGIN_ADMIN_TOKEN.
+version: 1
+
+# The data plane: the gateway, which the bot uses as its Bot API.
+server:
+  listen: ["0.0.0.0:8080"]
+
+# The admin plane (health, status, metrics) stays on its default loopback
+# listener, 127.0.0.1:9090, inside the container. The image's HEALTHCHECK
+# needs no token; the other admin endpoints need TGIN_ADMIN_TOKEN.
+admin:
+  token: ${env:TGIN_ADMIN_TOKEN}
+
+bots:
+  - name: main
+    token: ${env:BOT_TOKEN}
+    # The server on the private `upstream` network. Plain HTTP: the server
+    # has no TLS, and this traffic never leaves the compose network.
+    # The next change replaces this `api_url` shorthand with an `upstreams:`
+    # entry for the server (a local-mode upstream with its files directory,
+    # /var/lib/telegram-bot-api/files as mounted in compose.yaml), which
+    # serves the bot's files from the shared volume.
+    api_url: http://telegram-bot-api:8081
+    # Long poll: the server is reached only from tgin, and nothing reaches
+    # tgin from outside.
+    ingress:
+      long_poll: {}
+    routes:
+      - to: [bot]
+
+consumers:
+  # The bot polls http://tgin:8080/c/bot.
+  bot:
+    pull:
+      # A stopped bot loses its oldest updates instead of pausing the source.
+      on_full: drop_oldest
