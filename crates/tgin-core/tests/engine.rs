@@ -136,6 +136,7 @@ impl Harness {
             supervisor: Arc::clone(&supervisor),
             stop: CancellationToken::new(),
             force: force.clone(),
+            via: tgin_runtime::http::Via::generate(),
         };
         let engine = Engine::new(&load(yaml), metrics, client(), rt).expect("engine");
         Self {

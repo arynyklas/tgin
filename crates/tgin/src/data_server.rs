@@ -21,11 +21,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use parking_lot::Mutex;
-use tgin_botapi::gateway::Gateway;
+use tgin_botapi::gateway::{Gateway, errors};
 use tgin_botapi::pull::{PullAuth, PullRoutes};
 use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
 use tgin_core::engine::Engine;
+use tgin_runtime::http::{Via, refuse_loops};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -51,6 +52,9 @@ pub(crate) struct DataRoutes {
     served: Mutex<Served>,
     /// Every router's fallback; rebuilds keep it.
     gateway: Arc<Gateway>,
+    /// This process's `Via`: a request carrying it is one of tgin's own
+    /// pushes come back, and is refused.
+    via: Via,
 }
 
 impl DataRoutes {
@@ -63,6 +67,7 @@ impl DataRoutes {
         engine: &Arc<Engine>,
         ingest: &CancellationToken,
         gateway: Arc<Gateway>,
+        via: Via,
     ) -> Self {
         let served = served(cfg, &Served::default(), engine);
         let router = router(cfg, server, engine, ingest, served.clone(), &gateway);
@@ -70,13 +75,21 @@ impl DataRoutes {
             routes: Arc::new(ArcSwap::from_pointee(router)),
             served: Mutex::new(served),
             gateway,
+            via,
         }
     }
 
     /// What the listeners serve: the current routes, swapped in by
-    /// [`DataRoutes::rebuild`].
+    /// [`DataRoutes::rebuild`], behind the loop check: a request whose
+    /// `Via` names this process gets `508 Loop Detected`, Telegram-shaped
+    /// like every data-plane error.
     pub(crate) fn service(&self) -> Router {
-        delegating(Arc::clone(&self.routes))
+        refuse_loops(
+            delegating(Arc::clone(&self.routes)),
+            self.via.clone(),
+            "data",
+            || errors::error(StatusCode::LOOP_DETECTED, "Loop Detected"),
+        )
     }
 
     /// Builds the routes of `cfg` against the engine as it is now and serves

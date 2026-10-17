@@ -22,11 +22,11 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER, VIA};
 use smallvec::SmallVec;
 use tgin_runtime::backoff::{Backoff, honor_retry_after};
 use tgin_runtime::breaker::{Breaker, BreakerConfig, BreakerState};
-use tgin_runtime::http::describe_error;
+use tgin_runtime::http::{Via, describe_error};
 use tgin_runtime::queue::{HolderId, LeaseQueue, QueueConfig};
 use tgin_runtime::secret::Secret;
 use tokio::sync::Notify;
@@ -105,6 +105,9 @@ pub struct PushConsumer {
     queue: LeaseQueue<Envelope>,
     targets: ArcSwap<Targets>,
     client: reqwest::Client,
+    /// `Via: 1.1 <pseudonym>` on every push, so tgin refuses a push that
+    /// comes back to itself (RFC 9110 §7.6.3).
+    via: HeaderValue,
     metrics: ConsumerMetrics,
     /// Round-robin position, shared by every endpoint set.
     cursor: AtomicUsize,
@@ -125,13 +128,15 @@ impl PushConsumer {
     /// `cfg` should come from [`crate::config::Push::queue`]: the push queue
     /// is never expired, so its lease timeout only has to be long. `client`
     /// must not follow redirects (as [`tgin_runtime::http::client`] by
-    /// default): any 3xx dead-letters the update.
+    /// default): any 3xx dead-letters the update. Every push carries `via`'s
+    /// `Via` header.
     pub fn new(
         name: Arc<str>,
         cfg: QueueConfig,
         endpoints: Vec<Endpoint>,
         opts: PushOptions,
         client: reqwest::Client,
+        via: &Via,
         metrics: ConsumerMetrics,
     ) -> Self {
         let targets = Targets {
@@ -146,6 +151,7 @@ impl PushConsumer {
             queue: LeaseQueue::new(cfg),
             targets: ArcSwap::from_pointee(targets),
             client,
+            via: via.header_value().clone(),
             metrics,
             cursor: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
@@ -554,8 +560,9 @@ impl PushConsumer {
         attempt: u32,
     ) -> Result<(), Failure> {
         let slot = sent.slot();
-        let mut headers = HeaderMap::with_capacity(5);
+        let mut headers = HeaderMap::with_capacity(6);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(VIA, self.via.clone());
         headers.insert(
             HeaderName::from_static(ATTEMPT_HEADER),
             HeaderValue::from(attempt),
@@ -590,6 +597,9 @@ impl PushConsumer {
                 let status = response.status();
                 if status.is_success() {
                     Ok(())
+                } else if status == StatusCode::LOOP_DETECTED {
+                    // The endpoint is this process itself: never retried.
+                    Err(Failure::Permanent(Cause::Status(status.as_u16())))
                 } else if status == StatusCode::REQUEST_TIMEOUT
                     || status == StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()

@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tgin_runtime::backoff::Backoff;
 use tgin_runtime::breaker::BreakerState;
+use tgin_runtime::http::Via;
 use tgin_runtime::queue::{LeaseQueue, OnFull};
 use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
 use tokio::sync::watch;
@@ -46,6 +47,8 @@ pub struct EngineRuntime {
     pub stop: CancellationToken,
     /// Aborts in-flight push deliveries (second signal or deadline).
     pub force: CancellationToken,
+    /// This process's `Via` pseudonym, sent with every push.
+    pub via: Via,
 }
 
 /// Why a config could not be turned into an engine state. Nothing changed.

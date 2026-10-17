@@ -484,6 +484,7 @@ mod tests {
                 supervisor: Arc::new(Supervisor::new()),
                 stop: CancellationToken::new(),
                 force: CancellationToken::new(),
+                via: tgin_runtime::http::Via::generate(),
             },
         )
         .expect("engine");

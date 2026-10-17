@@ -604,6 +604,7 @@ fn new_slot(
             endpoints(push),
             options(push, source_names),
             client.clone(),
+            &rt.via,
             handles.clone(),
         ))),
     };
@@ -693,6 +694,7 @@ mod tests {
             supervisor: Arc::new(Supervisor::new()),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            via: tgin_runtime::http::Via::generate(),
         };
         let one = "version: 1\nbots:\n  - { name: a, token: \"1:a\" }\n";
         let build = |cfg: &Config, old: Option<&EngineState>| {
@@ -730,6 +732,7 @@ mod tests {
             supervisor: Arc::new(Supervisor::new()),
             stop: CancellationToken::new(),
             force: CancellationToken::new(),
+            via: tgin_runtime::http::Via::generate(),
         };
         let build = |cfg: &Config, old: Option<&EngineState>| {
             Plan::build(cfg, old, &[], &metrics, &client, &rt).map(Plan::into_parts)

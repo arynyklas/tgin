@@ -63,6 +63,11 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(json!({ "error": message }))).into_response()
 }
 
+/// `508 Loop Detected`: the request is one of this tgin's own pushes.
+pub(crate) fn loop_detected() -> Response {
+    error(StatusCode::LOOP_DETECTED, "loop detected")
+}
+
 fn unauthorized() -> Response {
     let mut response = error(StatusCode::UNAUTHORIZED, "unauthorized");
     response.headers_mut().insert(

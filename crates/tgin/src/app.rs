@@ -16,7 +16,9 @@ use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, Webho
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
 use tgin_runtime::config::Env;
-use tgin_runtime::http::{self, ClientOptions, RunningServer, ServerOptions, TlsFiles};
+use tgin_runtime::http::{
+    self, ClientOptions, RunningServer, ServerOptions, TlsFiles, Via, refuse_loops,
+};
 use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
@@ -253,6 +255,9 @@ impl App {
         let supervisor = Arc::clone(&handles.supervisor);
         let force = handles.lifecycle.force_token();
         let ingest = handles.lifecycle.ingest_token();
+        // This process's name in the `Via` of its pushes; both planes refuse
+        // a request that carries it, so tgin never acts on its own pushes.
+        let via = Via::generate();
         let engine = Arc::new(Engine::new(
             &cfg,
             core.clone(),
@@ -261,6 +266,7 @@ impl App {
                 supervisor: Arc::clone(&supervisor),
                 stop: handles.stop.clone(),
                 force: force.clone(),
+                via: via.clone(),
             },
         )?);
         // Set once, here: the slot is new with `handles`.
@@ -306,9 +312,13 @@ impl App {
                 max_connections: ADMIN_MAX_CONNECTIONS,
                 header_read_timeout: ADMIN_HEADER_TIMEOUT,
             };
-            let running = http::serve(admin::router(Arc::clone(&shared)), &opts)
-                .await
-                .map_err(StartError::Admin)?;
+            let admin = refuse_loops(
+                admin::router(Arc::clone(&shared)),
+                via.clone(),
+                "admin",
+                admin::loop_detected,
+            );
+            let running = http::serve(admin, &opts).await.map_err(StartError::Admin)?;
             let addrs = running.local_addrs.clone();
             *handles.admin.lock() = Some(running);
             tracing::info!(listen = ?addrs, "admin plane listening");
@@ -326,7 +336,9 @@ impl App {
 
         let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
-                let routes = Arc::new(DataRoutes::new(&cfg, server, &engine, &ingest, gateway));
+                let routes = Arc::new(DataRoutes::new(
+                    &cfg, server, &engine, &ingest, gateway, via,
+                ));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
                     key: tls.key_file.expose().clone(),

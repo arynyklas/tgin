@@ -185,8 +185,8 @@ A queue's `capacity` and `capacity_bytes` count leased updates too. While a back
 **Push retries.** A push consumer leases up to `max_in_flight` updates and posts each one to an endpoint chosen by `balance` among those whose breaker admits a request:
 
 - a `2xx` answer delivers it;
-- `408`, `429`, any `5xx`, a timeout or a network error is transient: the update is retried after a backoff, a random delay up to `retry.initial` doubled per attempt and capped at `retry.max`, or the endpoint's `Retry-After` if that is longer (capped at `retry.max`);
-- any other `4xx`, and any `3xx` (tgin never follows redirects), dead-letters it at once.
+- `408`, `429`, any `5xx` but `508`, a timeout or a network error is transient: the update is retried after a backoff, a random delay up to `retry.initial` doubled per attempt and capped at `retry.max`, or the endpoint's `Retry-After` if that is longer (capped at `retry.max`);
+- any other `4xx`, any `3xx` (tgin never follows redirects), and `508 Loop Detected` (the endpoint is this tgin itself) dead-letter it at once.
 
 An update is dead-lettered after `retry.max_attempts` attempts, or when its next attempt would come after `retry.max_age` since tgin queued it (time a long-poll update was held back by backpressure, or a webhook update spent in Telegram's retries, is not counted). A dead-lettered update is dropped: logged as `update dead-lettered` (consumer, bot, `update_id`, update type, endpoint index and last error; never the payload or URL) and counted as `tgin_consumer_dropped_total{reason="dead_letter"}`. There is no dead-letter queue.
 
@@ -216,8 +216,11 @@ Each attempt is a `POST` of the update's JSON to the endpoint `url` with these h
 | `X-Tgin-Source` | The name of the bot the update came from. |
 | `X-Tgin-Update-Type` | The update type, such as `message`. |
 | `X-Telegram-Bot-Api-Secret-Token` | The endpoint's `secret_token`, if set (1 to 256 of `A-Za-z0-9_-`, checked at load). |
+| `Via` | `1.1 tgin-<16 hex digits>`: a pseudonym chosen at random when the process starts. |
 
 Each request is bounded by the endpoint's `timeout` (default 10 s). The endpoint should answer `2xx` once it has taken the update; see [Delivery semantics](#delivery-semantics) for the other answers.
+
+**tgin never acts on its own pushes.** Both planes answer `508 Loop Detected` to a request whose `Via` lists this process's pseudonym (RFC 9110 §7.6.3): the admin plane `{"error":"loop detected"}`, the data plane Telegram's shape. So an endpoint that points back at tgin (its webhook ingress, a pull endpoint, the gateway, or the admin API) is refused, and the update is dead-lettered. The refusal is logged as a warning at most once a minute per plane, with the bot from `X-Tgin-Source`. Another tgin process has another pseudonym, so chained instances still pass updates to each other.
 
 ## Webhook ingress
 

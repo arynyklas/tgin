@@ -1027,3 +1027,147 @@ async fn log_out_and_close_never_forwarded() {
     );
     tgin.stop().await;
 }
+
+/// Waits until the metric line `line` is exported.
+async fn wait_metric(tgin: &Tgin, line: &str) {
+    let started = Instant::now();
+    while !tgin.metrics.encode().lines().any(|l| l == line) {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "missing {line:?} in\n{}",
+            tgin.metrics.encode()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A token holder chooses where tgin posts a consumer's updates, but tgin
+/// never acts on its own pushes: each carries `Via: 1.1 <pseudonym>`, and
+/// both planes answer 508 to a request that carries this process's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_endpoint_never_reaches_tgin_itself() {
+    let telegram = telegram().await;
+    let down = downstream().await;
+    let tgin = start(&intercept_config(&telegram.uri(), "")).await;
+    let set = format!("/c/hooks/bot{TOKEN}/setWebhook");
+
+    // The pseudonym, as a downstream sees it.
+    assert_eq!(
+        tgin.post_json(&set, &json!({ "url": format!("{}/in", down.uri()) }))
+            .await
+            .0,
+        200
+    );
+    tgin.admit(1).await;
+    delivered(&down, 1).await;
+    let pushed = down.received_requests().await.expect("recording");
+    let via = pushed[0]
+        .headers
+        .get("via")
+        .expect("a Via header")
+        .to_str()
+        .expect("ASCII")
+        .to_owned();
+    let pseudonym = via.strip_prefix("1.1 tgin-").expect("1.1 tgin-<hex>");
+    assert!(pseudonym.len() == 16 && pseudonym.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    // The reviewer's probe: the runtime endpoint is the token-less loopback
+    // admin plane's purge of another consumer. The push is refused, counted
+    // as a failure, and `keep` keeps its updates.
+    let purge = format!("http://{}/v1/consumers/keep/purge", tgin.admin);
+    assert_eq!(tgin.post_json(&set, &json!({ "url": purge })).await.0, 200);
+    tgin.admit(2).await;
+    wait_metric(
+        &tgin,
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="runtime",outcome="dead_letter"} 1"#,
+    )
+    .await;
+    tgin.wait_held("keep", 2).await;
+    tgin.assert_metric(r#"tgin_consumer_dropped_total{consumer="keep",reason="purge"} 0"#);
+
+    // The bot's own webhook ingress with its secret: the update is not
+    // admitted again.
+    let ingress = format!("http://{}/hook", tgin.addr);
+    let request = json!({ "url": ingress, "secret_token": HOOK_SECRET });
+    assert_eq!(tgin.post_json(&set, &request).await.0, 200);
+    tgin.admit(3).await;
+    wait_metric(
+        &tgin,
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="runtime",outcome="dead_letter"} 2"#,
+    )
+    .await;
+    tgin.wait_held("workers", 3).await;
+    tgin.wait_held("keep", 3).await;
+    tgin.wait_held("hooks", 0).await;
+
+    // This process's pseudonym is refused on both planes, alone or in a
+    // chain; nothing behind the check runs.
+    let status = format!("http://{}/v1/status", tgin.admin);
+    for value in [via.clone(), format!("1.0 fred, {via} (tgin)")] {
+        let response = tgin
+            .http
+            .get(&status)
+            .header("via", &value)
+            .send()
+            .await
+            .expect("admin");
+        assert_eq!(
+            json_of(response).await,
+            (508, json!({ "error": "loop detected" }))
+        );
+        for request in [
+            tgin.http
+                .post(tgin.url("/hook"))
+                .header("x-telegram-bot-api-secret-token", HOOK_SECRET)
+                .header("content-type", "application/json")
+                .body(r#"{"update_id":9,"message":{"message_id":9,"chat":{"id":5,"type":"private"},"text":"x"}}"#),
+            tgin.http.get(tgin.url(&format!("/bot{TOKEN}/getMe"))),
+            tgin.http.get(tgin.url("/c/keep/getUpdates?timeout=0")),
+        ] {
+            let response = request.header("via", &value).send().await.expect("data");
+            assert_eq!(json_of(response).await, (508, telegram_error(508, "Loop Detected")));
+        }
+    }
+    tgin.wait_held("workers", 3).await;
+
+    // Another tgin's pseudonym (a chained instance) passes.
+    let foreign = "1.1 tgin-0000000000000001";
+    let response = tgin
+        .http
+        .get(&status)
+        .header("via", foreign)
+        .send()
+        .await
+        .expect("admin");
+    assert_eq!(response.status(), 200);
+    let response = tgin
+        .http
+        .post(tgin.url("/hook"))
+        .header("via", foreign)
+        .header("x-telegram-bot-api-secret-token", HOOK_SECRET)
+        .header("content-type", "application/json")
+        .body(r#"{"update_id":4,"message":{"message_id":4,"chat":{"id":5,"type":"private"},"text":"x"}}"#)
+        .send()
+        .await
+        .expect("webhook");
+    assert_eq!(response.status(), 200);
+    tgin.wait_held("workers", 4).await;
+
+    // At most one warning a minute per plane, naming the bot, never a URL.
+    let logs = LOGS.text();
+    let refusals = |plane: &str| {
+        logs.lines()
+            .filter(|l| l.contains("Via loop") && l.contains(&format!("plane=\"{plane}\"")))
+            .count()
+    };
+    assert_eq!(refusals("admin"), 1, "{logs}");
+    assert_eq!(refusals("data"), 1, "{logs}");
+    assert!(
+        logs.lines().any(|l| l.contains("Via loop")
+            && l.contains("plane=\"admin\"")
+            && l.contains("hooked")),
+        "the refusal names the bot"
+    );
+    assert!(!logs.contains("/v1/consumers/keep/purge"));
+    tgin.stop().await;
+}

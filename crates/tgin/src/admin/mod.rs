@@ -24,7 +24,7 @@
 mod api;
 pub mod client;
 
-pub(crate) use api::router;
+pub(crate) use api::{loop_detected, router};
 use serde::{Deserialize, Serialize};
 
 /// `GET /v1/status`.

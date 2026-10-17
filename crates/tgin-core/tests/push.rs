@@ -15,6 +15,7 @@ use tgin_core::envelope::Envelope;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
 use tgin_runtime::breaker::{Breaker, BreakerConfig, BreakerState};
+use tgin_runtime::http::Via;
 use tgin_runtime::queue::{OnFull, Ordering, QueueConfig};
 use tgin_runtime::secret::Secret;
 use tokio::task::JoinHandle;
@@ -116,6 +117,7 @@ fn client() -> reqwest::Client {
 struct Harness {
     reg: Registry,
     consumer: Arc<PushConsumer>,
+    via: Via,
     cancel: CancellationToken,
     force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -126,17 +128,20 @@ impl Harness {
         LazyLock::force(&LOGS);
         let mut reg = Registry::with_prefix("tgin");
         let metrics = CoreMetrics::register(&mut reg).consumer("hooks");
+        let via = Via::generate();
         let consumer = Arc::new(PushConsumer::new(
             Arc::from("hooks"),
             cfg,
             endpoints,
             opts,
             client(),
+            &via,
             metrics,
         ));
         let mut h = Self {
             reg,
             consumer,
+            via,
             cancel: CancellationToken::new(),
             force: CancellationToken::new(),
             task: None,
@@ -334,6 +339,8 @@ async fn delivers_with_headers() {
         assert_eq!(header(req, "x-tgin-source"), Some("bot1"));
         assert_eq!(header(req, "x-tgin-update-type"), Some("message"));
         assert_eq!(header(req, "x-tgin-attempt"), Some("1"));
+        let via = format!("1.1 {}", h.via.pseudonym());
+        assert_eq!(header(req, "via"), Some(via.as_str()));
         let id = update_id(req);
         let key = if id == 2 { "42" } else { "null" };
         assert_eq!(
@@ -1021,6 +1028,10 @@ async fn runtime_endpoint_receives_updates_with_secret() {
     h.settled().await;
     let got = requests(&server).await;
     assert_eq!(got.len(), 1);
+    assert_eq!(
+        header(&got[0], "via"),
+        Some(format!("1.1 {}", h.via.pseudonym()).as_str())
+    );
     assert!(on(&got[0], "/rt"));
     assert_eq!(
         header(&got[0], "x-telegram-bot-api-secret-token"),
@@ -1134,4 +1145,25 @@ fn updates_queued_before_set_webhook_are_delivered() {
             panic!("the dispatcher never idled: a busy loop kept the paused clock still")
         }
     }
+}
+
+/// An endpoint that answers 508 Loop Detected is this tgin itself: the
+/// update is dead-lettered at once, never retried.
+#[tokio::test]
+async fn loop_detected_dead_letters_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(508))
+        .mount(&server)
+        .await;
+    let h = Harness::new(
+        queue(Ordering::None),
+        vec![endpoint(&server, "/self")],
+        options(Balance::RoundRobin, 1, retry(10, 50, 5)),
+    );
+    h.admit(1, None);
+    h.settled().await;
+    assert_eq!(requests(&server).await.len(), 1, "never retried");
+    h.assert_metric(&format!("{} 1", h.attempts(0, "dead_letter")));
+    h.assert_metric(&format!("{} 0", h.attempts(0, "retry")));
 }

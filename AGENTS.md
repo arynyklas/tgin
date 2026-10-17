@@ -106,6 +106,7 @@ The ingest path (getUpdates body → `split_updates` → `extract` → `Engine::
 - Render `reqwest` errors with `tgin_runtime::http::describe_error` (no URL). Config errors never quote secret values or source lines.
 - Every constant-time compare goes through `tgin_runtime::secret::secret_eq`.
 - Outbound HTTP clients come from `tgin_runtime::http::client`, which never follows redirects; `tgin admin` asks it for `no_proxy`, so the admin token never passes a proxy.
+- tgin never acts on its own pushes: every push carries `Via: 1.1 <pseudonym>` (`tgin_runtime::http::Via`, random per process), and both planes' routers are wrapped in `tgin_runtime::http::refuse_loops`, which answers `508 Loop Detected` to a request carrying it. Keep any new listener or router behind it: with `accept_set_webhook`, a bot's token holder chooses push destinations.
 
 ### Config model
 
