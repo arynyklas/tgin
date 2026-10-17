@@ -87,7 +87,8 @@ impl PullRoutes {
 
 /// One `getUpdates` poll of `consumer`, which the caller has authorized.
 /// The parameters come from the query string, then a JSON or urlencoded
-/// body, whose values win; a multipart body gets `400`. The polling
+/// body, which fills in those the query string lacks (telegram-bot-api
+/// reads the query string first); a multipart body gets `400`. The polling
 /// instance is `X-Tgin-Instance` if sent, else the client address (forwarded
 /// only by one of `trusted_proxies`). The poll ends when the client goes
 /// away.
@@ -247,7 +248,9 @@ impl RawParams {
 }
 
 impl Params {
-    /// From the query string, then the body, whose values win: JSON when
+    /// From the query string, then the body for what the query string
+    /// lacks, as telegram-bot-api reads them (`HttpReader` parses the URL
+    /// before the body, and `Query::arg` takes the first match): JSON when
     /// the content type says so, otherwise a form.
     fn parse(query: Option<&str>, content_type: Option<&str>, body: &[u8]) -> Result<Self, String> {
         let mut raw = RawParams::default();
@@ -259,13 +262,17 @@ impl Params {
                 .and_then(|ct| ct.split(';').next())
                 .map(str::trim)
                 .unwrap_or_default();
+            let mut from_body = RawParams::default();
             if media_type.eq_ignore_ascii_case("application/json") {
-                raw.json(body)?;
+                from_body.json(body)?;
             } else if media_type.eq_ignore_ascii_case("multipart/form-data") {
                 return Err("send the parameters as a query string, a form or JSON".to_owned());
             } else {
-                raw.form(body)?;
+                from_body.form(body)?;
             }
+            raw.offset = raw.offset.or(from_body.offset);
+            raw.limit = raw.limit.or(from_body.limit);
+            raw.timeout = raw.timeout.or(from_body.timeout);
         }
         let limit = raw.limit.map_or(MAX_LIMIT, |n| n.clamp(1, MAX_LIMIT));
         let timeout = raw.timeout.map_or(0, |n| n.clamp(0, MAX_TIMEOUT_SECS));
@@ -494,8 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn params_from_form_and_json_bodies_win_over_the_query() {
-        let query = Some("offset=1&limit=2&timeout=3");
+    fn params_from_the_query_win_over_form_and_json_bodies() {
+        let query = Some("offset=1&limit=2");
         assert_eq!(
             params(
                 query,
@@ -503,7 +510,7 @@ mod tests {
                 "offset=10&timeout=30"
             ),
             Params {
-                offset: 10,
+                offset: 1,
                 limit: 2,
                 timeout: secs(30)
             }
@@ -512,12 +519,12 @@ mod tests {
             params(
                 query,
                 Some("application/json; charset=utf-8"),
-                r#"{"offset":"11","limit":5,"allowed_updates":["message"]}"#
+                r#"{"offset":"11","limit":5,"timeout":4,"allowed_updates":["message"]}"#
             ),
             Params {
-                offset: 11,
-                limit: 5,
-                timeout: secs(3)
+                offset: 1,
+                limit: 2,
+                timeout: secs(4)
             }
         );
         // Without a content type a body is read as a form.
