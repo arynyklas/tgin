@@ -645,7 +645,7 @@
         },
         "honor_drop_pending": {
           "default": false,
-          "description": "Let `deleteWebhook` with `drop_pending_updates: true`, sent on this\nconsumer's gateway path, empty the consumer's queue. Off, the flag\nis ignored.",
+          "description": "Let `deleteWebhook` with `drop_pending_updates: true`, sent on this\nconsumer's gateway path, drop the calling bot's queued updates;\nthose another bot left before a reload stay. Off, the flag is\nignored.",
           "type": "boolean"
         },
         "lease_timeout": {

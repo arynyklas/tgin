@@ -278,7 +278,7 @@ Bots fetch updates from tgin with `getUpdates` on `/c/<consumer>/getUpdates` and
 | `auth_token` | [Secret](#secret) |  | Bearer token pollers must send. |
 | `capacity` | integer (at least 1) | `10000` | Most queued updates. |
 | `capacity_bytes` | [ByteSize](#bytesize) | `64MiB` | Most queued bytes. |
-| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook` with `drop_pending_updates: true`, sent on this consumer's gateway path, empty the consumer's queue. Off, the flag is ignored. |
+| `honor_drop_pending` | boolean | `false` | Let `deleteWebhook` with `drop_pending_updates: true`, sent on this consumer's gateway path, drop the calling bot's queued updates; those another bot left before a reload stay. Off, the flag is ignored. |
 | `lease_timeout` | [Duration](#duration) | `2m` | How long a fetched update waits for its acknowledgement before another poll may receive it; at least 1s. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |

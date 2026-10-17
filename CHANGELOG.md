@@ -48,8 +48,8 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `setWebhook` on the consumer's gateway path sets a runtime endpoint
   (`"runtime": true` in `/v1/status`, `endpoint="runtime"` in metrics), and
   a push consumer without endpoints queues until one arrives.
-  `honor_drop_pending` lets `drop_pending_updates` empty the calling
-  consumer.
+  `honor_drop_pending` lets `drop_pending_updates` drop the calling bot's
+  queued updates from the calling consumer; other bots' updates stay.
 - Gateway metrics: `tgin_gateway_requests_total`,
   `tgin_gateway_upstream_seconds`, `tgin_gateway_ratelimited_total`,
   `tgin_gateway_retries_total`, `tgin_gateway_unauthorized_total` and

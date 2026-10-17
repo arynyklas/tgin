@@ -511,8 +511,9 @@ pub struct Pull {
     /// `${file:…}`.
     pub aliases: Vec<Template>,
     /// Let `deleteWebhook` with `drop_pending_updates: true`, sent on this
-    /// consumer's gateway path, empty the consumer's queue. Off, the flag
-    /// is ignored.
+    /// consumer's gateway path, drop the calling bot's queued updates;
+    /// those another bot left before a reload stay. Off, the flag is
+    /// ignored.
     pub honor_drop_pending: bool,
 }
 
