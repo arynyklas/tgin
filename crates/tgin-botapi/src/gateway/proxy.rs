@@ -928,6 +928,7 @@ mod tests {
                 bot: bot.clone(),
                 label: MethodLabel::File,
                 outcome: Outcome::Ok,
+                _forwarding: None,
             }),
         };
         async fn next(d: &mut Download) -> Option<Result<Frame<Bytes>, DownloadError>> {
