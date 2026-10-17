@@ -780,6 +780,13 @@ consumers:
         "version: 1\nbots: [{{ name: {}, token: t }}]\n",
         "a".repeat(63)
     ));
+    // The one rule the gateway path parser applies to `/c/<name>` too.
+    for good in ["a", "0", "ok-1", "a-", &"a".repeat(63)] {
+        assert!(config::valid_name(good), "{good}");
+    }
+    for bad in ["", "Shop", "-dash", "a_b", "a.b", "é", &"a".repeat(64)] {
+        assert!(!config::valid_name(bad), "{bad}");
+    }
 }
 
 #[test]

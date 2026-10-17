@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tgin_botapi::{ApiError, BotClient, BotUser, LongPollOptions, LongPollSource, SetWebhook};
+use tgin_botapi::{ApiError, BotClient, Identity, LongPollOptions, LongPollSource, SetWebhook};
 use tgin_core::config::{Bot, Ingress, LongPoll, Webhook};
 use tgin_core::engine::Engine;
 use tgin_core::ids::SourceId;
@@ -243,7 +243,7 @@ impl Sources {
         for (bot, identity) in webhooks.into_iter().zip(identities) {
             match identity {
                 None => {}
-                Some(Ok(user)) => self.engine.set_username(bot.id, user.username),
+                Some(Ok(identity)) => self.engine.set_username(bot.id, identity.user.username),
                 Some(Err(err)) => {
                     tracing::warn!(
                         source = %bot.name,
@@ -314,8 +314,8 @@ impl Sources {
             long_poll_options(poll),
             Arc::clone(&self.engine),
             metrics.clone(),
-            Arc::new(move |id: SourceId, user: &BotUser| {
-                identity_engine.set_username(id, user.username.clone());
+            Arc::new(move |id: SourceId, identity: &Identity| {
+                identity_engine.set_username(id, identity.user.username.clone());
             }),
         ));
         self.registry.lock().started.insert(
@@ -519,9 +519,9 @@ impl Sources {
                         }
                         match stop.run_until_cancelled(client.get_me()).await {
                             None => return Exit::Done,
-                            Some(Ok(user)) => {
+                            Some(Ok(identity)) => {
                                 tracing::info!(source = %name, "getMe succeeded; commands addressed to this bot by @username match");
-                                engine.set_username(id, user.username);
+                                engine.set_username(id, identity.user.username);
                                 return Exit::Done;
                             }
                             Some(Err(err)) if tgin_botapi::is_fatal(&err) => {

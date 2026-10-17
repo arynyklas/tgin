@@ -568,12 +568,7 @@ fn weights(diag: &mut Diagnostics, path: &str, split: &Split, fallback: Location
 }
 
 fn check_name(diag: &mut Diagnostics, path: &str, name: &str, location: Location) {
-    let bytes = name.as_bytes();
-    let allowed = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
-    let valid = bytes.len() <= 63
-        && bytes.first().is_some_and(allowed)
-        && bytes.iter().all(|c| allowed(c) || *c == b'-');
-    if !valid {
+    if !super::valid_name(name) {
         diag.errors.push(
             ConfigError::new(format!("invalid name `{name}`"))
                 .at(located(path, location))

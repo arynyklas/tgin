@@ -47,6 +47,18 @@ pub fn gateway_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// Whether `name` is a valid bot or consumer name: 1 to 63 lowercase
+/// letters, digits and `-`, starting with a letter or digit. The loader
+/// checks every name, and the gateway path parser every `/c/<name>`
+/// segment, by this one rule.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let allowed = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    bytes.len() <= 63
+        && bytes.first().is_some_and(allowed)
+        && bytes.iter().all(|c| allowed(c) || *c == b'-')
+}
+
 /// Parses, validates and resolves a config file. `origin` names the file in
 /// messages, and relative `${file:…}` references resolve against its
 /// directory.

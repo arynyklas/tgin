@@ -1,13 +1,14 @@
-//! Telegram Bot API client, update facts extraction, and the long-poll and
-//! webhook ingress sources for tgin.
+//! Telegram Bot API client, update facts extraction, the long-poll and
+//! webhook ingress sources, and the Bot API gateway's codec for tgin.
 
 mod client;
 mod facts;
+pub mod gateway;
 mod longpoll;
 mod secret;
 mod webhook;
 
-pub use client::{ApiError, BotClient, BotUser, SetWebhook, split_updates};
+pub use client::{ApiError, BotClient, BotUser, Identity, SetWebhook, split_updates};
 pub use facts::{FactsError, extract};
 /// The network type of [`IpAllowlist`] and [`WebhookOptions::trusted_proxies`].
 pub use ipnet::IpNet;
