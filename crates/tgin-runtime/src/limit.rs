@@ -1,12 +1,17 @@
-//! Keyed GCRA rate limiter that books slots ahead (shaping).
+//! Rate limiters that book slots ahead (shaping).
 //!
-//! Each key stores its theoretical arrival time (TAT): when its next request
-//! would be on schedule. With emission interval `T = per / count` and burst
-//! tolerance `τ = T × (burst − 1)`, a request at `now` may start at
-//! `max(TAT − τ, now)`; booking it moves the TAT one interval past
-//! `max(TAT, now)`.
+//! [`KeyedLimiter`] is a keyed GCRA. Each key stores its theoretical arrival
+//! time (TAT): when its next request would be on schedule. With emission
+//! interval `T = per / count` and burst tolerance `τ = T × (burst − 1)`, a
+//! request at `now` may start at `max(TAT − τ, now)`; booking it moves the
+//! TAT one interval past `max(TAT, now)`.
+//!
+//! [`SlotCalendar`] is one sliding-window log: at most `burst` bookings in
+//! any window of `burst × T`. A booking takes the earliest free instant at
+//! or after the start asked for, so one booked far ahead never takes the
+//! slots before it, as moving a single TAT would.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::num::NonZeroU32;
@@ -38,14 +43,7 @@ impl Quota {
     /// `per / count` is rounded up to the nanosecond: a quota is an upper
     /// bound, so rounding must never raise the rate.
     pub fn new(count: NonZeroU32, per: Duration, burst: NonZeroU32) -> Result<Quota, QuotaError> {
-        if per.is_zero() {
-            return Err(QuotaError::ZeroPeriod);
-        }
-        let floor = per / count.get();
-        let interval = match floor.checked_mul(count.get()) {
-            Some(exact) if exact == per => floor,
-            _ => floor.saturating_add(Duration::from_nanos(1)),
-        };
+        let interval = interval(count, per)?;
         // A tolerance past `Duration::MAX` lets every request start at once,
         // which is what a burst that large means.
         let tolerance = interval
@@ -83,6 +81,19 @@ impl Quota {
         let next = tat.checked_add(self.interval).map_or(Tat::Never, Tat::At);
         Ok((next, wait))
     }
+}
+
+/// `per / count`, rounded up to the nanosecond: a quota is an upper bound,
+/// so rounding must never raise the rate.
+fn interval(count: NonZeroU32, per: Duration) -> Result<Duration, QuotaError> {
+    if per.is_zero() {
+        return Err(QuotaError::ZeroPeriod);
+    }
+    let floor = per / count.get();
+    Ok(match floor.checked_mul(count.get()) {
+        Some(exact) if exact == per => floor,
+        _ => floor.saturating_add(Duration::from_nanos(1)),
+    })
 }
 
 /// A key's theoretical arrival time.
@@ -245,6 +256,157 @@ impl<K> fmt::Debug for KeyedLimiter<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyedLimiter")
             .field("quota", &self.quota)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `count` bookings per `per`, up to `burst` of them at once, as one
+/// sliding-window log: at most `burst` bookings in any window of
+/// `burst × per / count`. A booking takes the earliest instant at or after
+/// the one asked for where that holds, so a booking far ahead leaves the
+/// free instants before it to others. Bookings that can no longer share a
+/// window with a new one are dropped when booking and by
+/// [`SlotCalendar::retain_recent`]: with every booking within `max_delay`
+/// of its `now`, it holds about `count × (max_delay + window) / per`.
+pub struct SlotCalendar {
+    burst: usize,
+    window: Duration,
+    /// The booked instants, sorted.
+    slots: Mutex<VecDeque<Instant>>,
+}
+
+/// A booked instant of a [`SlotCalendar`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Booking {
+    /// How long after the caller's `now` the slot starts.
+    pub delay: Duration,
+    at: Instant,
+}
+
+impl SlotCalendar {
+    /// `count` bookings per `per`, up to `burst` at once.
+    ///
+    /// # Errors
+    ///
+    /// `per` is zero.
+    pub fn new(
+        count: NonZeroU32,
+        per: Duration,
+        burst: NonZeroU32,
+    ) -> Result<SlotCalendar, QuotaError> {
+        let window = interval(count, per)?
+            .checked_mul(burst.get())
+            .unwrap_or(Duration::MAX);
+        Ok(SlotCalendar {
+            burst: usize::try_from(burst.get()).unwrap_or(usize::MAX),
+            window,
+            slots: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Books the earliest free instant at or after `now + from`, if it is
+    /// within `max_delay` of `now`; otherwise books nothing and tells when
+    /// the earliest free instant is, from `now` (`Duration::MAX` past any
+    /// representable instant).
+    ///
+    /// # Errors
+    ///
+    /// No free instant within `max_delay` of `now`.
+    pub fn acquire(
+        &self,
+        now: Instant,
+        from: Duration,
+        max_delay: Duration,
+    ) -> Result<Booking, Denied> {
+        let never = Denied {
+            retry_after: Duration::MAX,
+        };
+        let start = now.checked_add(from).ok_or(never)?;
+        let mut slots = self.slots.lock();
+        self.forget_before(&mut slots, now);
+        let at = if self.fits(&slots, start) {
+            start
+        } else {
+            slots
+                .iter()
+                .filter_map(|slot| slot.checked_add(self.window))
+                .filter(|&after| after > start)
+                .find(|&after| self.fits(&slots, after))
+                .ok_or(never)?
+        };
+        let delay = at.saturating_duration_since(now);
+        if delay > max_delay {
+            return Err(Denied { retry_after: delay });
+        }
+        let index = slots.partition_point(|slot| *slot <= at);
+        slots.insert(index, at);
+        Ok(Booking { delay, at })
+    }
+
+    /// Undoes `booking`, which this calendar's [`SlotCalendar::acquire`]
+    /// returned; nothing if it is already gone.
+    pub fn cancel(&self, booking: Booking) {
+        let mut slots = self.slots.lock();
+        let index = slots.partition_point(|slot| *slot < booking.at);
+        if slots.get(index) == Some(&booking.at) {
+            slots.remove(index);
+        }
+    }
+
+    /// Drops the bookings no booking at or after `now` can share a window
+    /// with.
+    pub fn retain_recent(&self, now: Instant) {
+        let mut slots = self.slots.lock();
+        self.forget_before(&mut slots, now);
+        if slots.len() < slots.capacity() / 4 {
+            slots.shrink_to_fit();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.lock().is_empty()
+    }
+
+    fn forget_before(&self, slots: &mut VecDeque<Instant>, now: Instant) {
+        while slots
+            .front()
+            .and_then(|slot| slot.checked_add(self.window))
+            .is_some_and(|end| end <= now)
+        {
+            slots.pop_front();
+        }
+    }
+
+    /// Whether a booking at `at` keeps every window of `slots` at `burst`
+    /// bookings at most: in the sorted bookings with `at` among them, every
+    /// `burst + 1` consecutive ones that include `at` span `window` or more.
+    fn fits(&self, slots: &VecDeque<Instant>, at: Instant) -> bool {
+        let k = slots.partition_point(|slot| *slot <= at);
+        let with = |i: usize| match i.cmp(&k) {
+            std::cmp::Ordering::Less => slots[i],
+            std::cmp::Ordering::Equal => at,
+            std::cmp::Ordering::Greater => slots[i - 1],
+        };
+        let len = slots.len() + 1;
+        // Runs `lo ..= lo + burst` with `lo <= k <= lo + burst < len`.
+        let first = k.saturating_sub(self.burst);
+        let Some(last) = len.checked_sub(self.burst.saturating_add(1)) else {
+            return true;
+        };
+        (first..=last.min(k))
+            .all(|lo| with(lo + self.burst).saturating_duration_since(with(lo)) >= self.window)
+    }
+}
+
+impl fmt::Debug for SlotCalendar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotCalendar")
+            .field("burst", &self.burst)
+            .field("window", &self.window)
             .finish_non_exhaustive()
     }
 }
@@ -555,5 +717,126 @@ mod tests {
         // Key 1's next slot is `end`: free. Key 2's never is.
         assert_eq!(limiter.len(), 1);
         assert_eq!(delay(limiter.acquire(&1, end, ZERO)), Ok(ZERO));
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use std::num::NonZeroU32;
+    use std::time::Duration;
+
+    use proptest::prelude::*;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+    const SEC: Duration = Duration::from_secs(1);
+    const ZERO: Duration = Duration::ZERO;
+
+    /// 2 per second, 2 at once: at most 2 in any second.
+    fn calendar(count: u32, per: Duration, burst: u32) -> SlotCalendar {
+        let nz = |n| NonZeroU32::new(n).expect("non-zero");
+        SlotCalendar::new(nz(count), per, nz(burst)).expect("valid")
+    }
+
+    fn delay(result: Result<Booking, Denied>) -> Result<Duration, Duration> {
+        result.map(|b| b.delay).map_err(|d| d.retry_after)
+    }
+
+    #[test]
+    fn burst_then_the_next_window() {
+        let c = calendar(2, SEC, 2);
+        let t0 = Instant::now();
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Ok(ZERO));
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Ok(ZERO));
+        // A window is the burst's span: the next fits a whole second later.
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Err(SEC));
+        assert_eq!(delay(c.acquire(t0, ZERO, SEC)), Ok(SEC));
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn a_booking_ahead_leaves_the_earlier_slots_free() {
+        let c = calendar(2, SEC, 2);
+        let t0 = Instant::now();
+        // Booked 4 s ahead.
+        assert_eq!(delay(c.acquire(t0, 4 * SEC, 5 * SEC)), Ok(4 * SEC));
+        // Two now still fit, and a third at 1 s.
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Ok(ZERO));
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Ok(ZERO));
+        assert_eq!(delay(c.acquire(t0, ZERO, 5 * SEC)), Ok(SEC));
+        // 3.5 s shares a window only with 4 s: two, which fits.
+        assert_eq!(delay(c.acquire(t0, 3500 * MS, 5 * SEC)), Ok(3500 * MS));
+        // Now [3.5 s, 4.5 s) holds two: 3.9 s moves to 4.5 s.
+        assert_eq!(delay(c.acquire(t0, 3900 * MS, 5 * SEC)), Ok(4500 * MS));
+    }
+
+    #[test]
+    fn cancel_frees_the_slot_once() {
+        let c = calendar(1, SEC, 1);
+        let t0 = Instant::now();
+        let first = c.acquire(t0, ZERO, ZERO).expect("free");
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Err(SEC));
+        c.cancel(first);
+        c.cancel(first);
+        assert!(c.is_empty());
+        assert_eq!(delay(c.acquire(t0, ZERO, ZERO)), Ok(ZERO));
+    }
+
+    #[test]
+    fn past_bookings_are_forgotten() {
+        let c = calendar(1, SEC, 1);
+        let t0 = Instant::now();
+        c.acquire(t0, ZERO, ZERO).expect("free");
+        c.acquire(t0, 2 * SEC, 2 * SEC).expect("free");
+        c.retain_recent(t0 + 999 * MS);
+        assert_eq!(c.len(), 2, "still shares a window with now");
+        c.retain_recent(t0 + SEC);
+        assert_eq!(c.len(), 1);
+        // Booking forgets too.
+        c.acquire(t0 + 3 * SEC, ZERO, ZERO).expect("free");
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn unrepresentable_start_is_denied() {
+        let c = calendar(1, SEC, 1);
+        assert_eq!(
+            delay(c.acquire(Instant::now(), Duration::MAX, Duration::MAX)),
+            Err(Duration::MAX)
+        );
+    }
+
+    proptest! {
+        /// Whatever the requests and cancellations, the booked instants
+        /// never put more than `burst` in any window.
+        #[test]
+        fn never_more_than_burst_in_a_window(
+            requests in prop::collection::vec((0u64..300, 0u64..2_000, prop::bool::ANY), 1..120),
+            burst in 1u32..5,
+        ) {
+            let per = 100 * MS * burst;
+            let c = calendar(burst, per, burst);
+            let window = per;
+            let mut now = Instant::now();
+            let mut booked: Vec<Booking> = Vec::new();
+            for (gap, from, cancel) in requests {
+                now += Duration::from_millis(gap);
+                if let Ok(b) = c.acquire(now, Duration::from_millis(from), 5 * SEC) {
+                    if cancel {
+                        c.cancel(b);
+                    } else {
+                        booked.push(b);
+                    }
+                }
+            }
+            let mut at: Vec<Instant> = booked.iter().map(|b| b.at).collect();
+            at.sort();
+            let burst = usize::try_from(burst).expect("small");
+            for pair in at.windows(burst + 1) {
+                prop_assert!(pair[burst] - pair[0] >= window, "{at:?}");
+            }
+        }
     }
 }

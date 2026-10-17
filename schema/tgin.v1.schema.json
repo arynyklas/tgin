@@ -338,7 +338,7 @@
     },
     "GlobalRate": {
       "additionalProperties": false,
-      "description": "Requests of the bot, over all chats.",
+      "description": "Requests of the bot, over all chats: at most `burst` in any window\nof `burst × per / count`.",
       "properties": {
         "burst": {
           "default": 30,

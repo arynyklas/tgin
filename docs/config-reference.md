@@ -64,7 +64,7 @@ Telegram's flood limits, applied before a request goes upstream.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `global` | [GlobalRate](#globalrate) | `{"burst":30,"count":30,"per":"1s"}` | Requests of the bot, over all chats. |
+| `global` | [GlobalRate](#globalrate) | `{"burst":30,"count":30,"per":"1s"}` | Requests of the bot, over all chats: at most `burst` in any window of `burst × per / count`. |
 | `max_delay` | [Duration](#duration) | `5s` | Longest delay `shape` adds before it answers 429 instead; at most 1m. `0s` behaves like `reject`. |
 | `methods` | list of string (matching `^[A-Za-z]+\*?$`) | `["send*","copyMessage*","forwardMessage*"]` | The methods limited, ignoring case: a method name, or a prefix followed by `*`. At least one unless `mode: off`. |
 | `mode` | [RateMode](#ratemode) | `shape` | What a request beyond the limits gets. |
@@ -73,7 +73,7 @@ Telegram's flood limits, applied before a request goes upstream.
 
 ## `GlobalRate`
 
-Requests of the bot, over all chats.
+Requests of the bot, over all chats: at most `burst` in any window of `burst × per / count`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

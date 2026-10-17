@@ -1449,13 +1449,14 @@ async fn multipart_uses_global_only_and_is_never_retried() {
     assert_eq!(requests[3].body, long.as_bytes());
 
     // The global quota still applies: the fifth request is tgin's own 429.
+    // Four in any window of 4 × 1 min: the next slot is up to 4 min away.
     let response = document().await.expect("response");
     assert_eq!(response.status(), 429);
     let (_, body) = json_of(response).await;
     let retry_after = body["parameters"]["retry_after"]
         .as_u64()
         .expect("retry_after");
-    assert!((1..=60).contains(&retry_after), "{body}");
+    assert!((1..=240).contains(&retry_after), "{body}");
     assert_eq!(seen(&telegram).await.len(), 4);
     tgin.assert_metric(
         r#"tgin_gateway_ratelimited_total{bot="gw",scope="global",action="rejected"} 1"#,
