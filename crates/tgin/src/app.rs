@@ -730,7 +730,7 @@ pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
                 name: Arc::from(bot.name.as_str()),
                 source,
                 token: bot.token.clone(),
-                api_url: bot.api_url.expose().clone(),
+                upstream: Arc::clone(&bot.upstream),
                 gateway: bot.gateway.clone(),
             })
         })

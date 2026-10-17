@@ -1014,6 +1014,53 @@ async fn reload_reports_restart_required() {
     assert_eq!(report.sources_restarted, ["a"]);
 }
 
+/// Moving a bot to another upstream restarts its source, lists it in
+/// `upstream_changed` and warns about the update split; editing another
+/// bot's upstream leaves it alone.
+#[tokio::test(start_paused = true)]
+async fn upstream_change_reported() {
+    const MOVES: &str = r#"version: 1
+server: {}
+upstreams:
+  local: { kind: local, url: "http://127.0.0.1:8081" }
+  other: { kind: local, url: "http://127.0.0.1:8082" }
+bots:
+  - name: mover
+    token: "1:mover"
+    routes: [{ to: [p] }]
+  - name: stayer
+    token: "2:stayer"
+    upstream: other
+    routes: [{ to: [q] }]
+consumers:
+  p: { pull: {} }
+  q: { pull: {} }
+"#;
+    let h = Harness::new(MOVES);
+    let warned = || LOGS.count(&["mover", "tgin admin bot logout"]);
+    assert_eq!(warned(), 0);
+
+    let moved = MOVES.replace(
+        "token: \"1:mover\"\n",
+        "token: \"1:mover\"\n    upstream: local\n",
+    );
+    let report = h.engine.apply(&load(&moved)).expect("apply");
+    assert_eq!(report.sources_restarted, ["mover"]);
+    assert_eq!(report.upstream_changed, ["mover"]);
+    assert!(report.restart_required.is_empty(), "{report:?}");
+    assert_eq!(warned(), 1);
+
+    let edited = moved.replace("8082", "8083");
+    let report = h.engine.apply(&load(&edited)).expect("apply");
+    assert_eq!(report.sources_restarted, ["stayer"]);
+    assert_eq!(report.upstream_changed, ["stayer"]);
+    assert_eq!(warned(), 1);
+
+    let same = h.engine.apply(&load(&edited)).expect("apply");
+    assert!(same.sources_restarted.is_empty(), "{same:?}");
+    assert!(same.upstream_changed.is_empty(), "{same:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn reload_generation_increments() {
     let h = Harness::new(BASE);

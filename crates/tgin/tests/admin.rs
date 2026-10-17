@@ -583,6 +583,7 @@ async fn reload_applies_and_reports() {
             "sources_added": [],
             "sources_removed": [],
             "sources_restarted": [],
+            "upstream_changed": [],
             "restart_required": [],
         })
     );

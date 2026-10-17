@@ -17,6 +17,7 @@ Each table lists a section's keys with their type and default. A key without a d
 | `reload` | [Reload](#reload) | `{"debounce":"500ms","drain_timeout":"30s","watch":true}` | Hot reload of the config file. |
 | `runtime` | [Runtime](#runtime) | `{"lame_duck":"5s","shutdown_grace":"15s","worker_threads":"auto"}` | Process settings. `worker_threads` takes effect after a restart; a shutdown uses the `lame_duck` and `shutdown_grace` of the config in effect when it begins. |
 | `server` | [Server](#server) |  | The data plane: webhook ingress and pull consumers. Omitted, tgin serves neither. |
+| `upstreams` | map of names matching `^[a-z0-9][a-z0-9-]{0,62}$` to [Upstream](#upstream) |  | Bot API servers, by name, that bots reference with `upstream`. A bot with `api_url`, or with neither field, talks to an unnamed `cloud` upstream instead. |
 | `version` | `1` | **required** | The config format version; must be 1. |
 
 ## `Admin`
@@ -41,12 +42,14 @@ One Telegram bot.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `api_url` | string (not empty) | `https://api.telegram.org` | Bot API base URL. Supports `${env:…}` and `${file:…}`. |
+| `allow_local_files` | boolean | `false` | Let `file:` references (files on the server's own disk) reach an upstream in local mode. Off, the gateway and webhook replies refuse them, so a client cannot read the server's files through tgin. |
+| `api_url` | string (not empty) | `https://api.telegram.org` | Bot API base URL: shorthand for an unnamed `cloud` upstream, which `/v1/config` and metrics call `api_url`. Not with `upstream`. Supports `${env:…}` and `${file:…}`. |
 | `gateway` | [Gateway](#gateway) | `{"rate_limit":{"global":{"burst":30,"count":30,"per":"1s"},"max_delay":"5s","methods":["send*","copyMessage*","forwardMessage*"],"mode":"shape","per_chat":{"burst":3,"count":1,"per":"1s"},"per_group":{"burst":20,"count":20,"per":"1m"}},"retry_429":{"max_wait":"10s"},"upstream_idle_timeout":"1m"}` | The Bot API gateway for this bot's downstream clients. Changes apply live. |
 | `ingress` | [Ingress](#ingress) |  | How updates arrive; at most one. Omitted, the bot receives none. |
 | `name` | string (matching `^[a-z0-9][a-z0-9-]{0,62}$`) | **required** | Unique bot name, used in metrics and logs. |
 | `routes` | list of [Route](#route) | `[]` | Rules in order; the first match wins. |
 | `token` | [Secret](#secret) | **required** | The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot API gateway serves only tokens shaped `<digits>:<secret>`. |
+| `upstream` | string (matching `^[a-z0-9][a-z0-9-]{0,62}$`) |  | The `upstreams` entry this bot talks to. Not with `api_url`. |
 
 ## `Gateway`
 
@@ -158,10 +161,10 @@ Telegram posts updates to the data plane.
 | `certificate_file` | string (not empty) |  | Self-signed certificate to upload with `setWebhook`; needs `register: true`. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
 | `drop_pending_updates` | boolean | `false` | Telegram's `drop_pending_updates` for `setWebhook`. |
 | `ip_address` | IP address |  | Telegram's `ip_address` for `setWebhook`. |
-| `ip_allowlist` | [IpAllowlist](#ipallowlist) | `none` | Who may post updates: `none` (anyone), `telegram` (Telegram's published networks) or a list of networks. |
-| `max_connections` | integer (at least 1, at most 100) |  | Telegram's `max_connections`, 1 to 100. |
+| `ip_allowlist` | [IpAllowlist](#ipallowlist) | `none` | Who may post updates: `none` (anyone), `telegram` (Telegram's published networks; not for a `local` upstream) or a list of networks. |
+| `max_connections` | integer (at least 1, at most 100000) |  | Telegram's `max_connections`: 1 to 100, or to 100000 for an upstream in local mode. |
 | `path` | string (not empty) |  | HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. It is matched as written, so it must be what a URL sends: no `?`, `#`, spaces, control or non-ASCII characters, `.`/`..` segments or `\`. Supports `${env:…}` and `${file:…}`. |
-| `public_url` | string (not empty) |  | The public HTTPS base URL Telegram reaches tgin at; `setWebhook` registers it followed by `path`. Supports `${env:…}` and `${file:…}`. |
+| `public_url` | string (not empty) |  | The public base URL the Bot API server reaches tgin at; `setWebhook` registers it followed by `path`. `https` on port 443, 80, 88 or 8443, except for an upstream in local mode, which takes `http` and any port. Supports `${env:…}` and `${file:…}`. |
 | `register` | boolean | `false` | Call `setWebhook` at start; needs `public_url`. |
 | `secret_token` | [WebhookSecret](#webhooksecret) | `auto` | `auto` (derived from the bot token), `none`, or the secret Telegram must send: 1 to 256 ASCII letters, digits, `_` or `-`. |
 
@@ -453,3 +456,32 @@ The data plane's certificate. Every config reload reads both files again and swa
 |---|---|---|---|
 | `cert_file` | string (not empty) | **required** | PEM certificate chain file; a relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
 | `key_file` | string (not empty) | **required** | PEM private key file; a relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
+
+## `Upstream`
+
+A Bot API server: Telegram's (`cloud`) or a self-hosted `telegram-bot-api` (`local`).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `files` | [Files](#files) |  | How tgin serves the bots' files on `/file/bot<token>/…`. Only with `kind: local`; omitted, it serves none. |
+| `kind` | [UpstreamKind](#upstreamkind) | **required** | `cloud` or `local`: which webhook, file and timeout rules apply. |
+| `local_mode` | boolean | `false` | The server runs with `--local`: it accepts `file:` uploads from its own disk, answers `getFile` with absolute paths, and posts webhooks over `http` to any port. Only with `kind: local`. |
+| `response_timeout` | [Duration](#duration) |  | Longest wait for the server's response once a request was sent; above 0, at most 1h. Omitted, `1m` for `cloud` and `10m` for `local`. |
+| `url` | string (not empty) | **required** | The server's base URL, `http` or `https`; plain `http` to a host that is not loopback warns. Supports `${env:…}` and `${file:…}`. |
+
+## `Files`
+
+Where a local server's files are: `dir` (with `server_dir`) or `url`. The server keeps each bot's files in a directory named after its token, `:` replaced by `~`; tgin serves a bot only its own.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `dir` | string (not empty) |  | The server's `--dir` as mounted in tgin; read-only is enough. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
+| `server_dir` | string (not empty) |  | The same directory as the server sees it, an absolute path; only with `dir`, which it defaults to. Supports `${env:…}` and `${file:…}`. |
+| `url` | string (not empty) |  | An HTTP origin serving the server's `--dir`, `http` or `https`. Supports `${env:…}` and `${file:…}`. |
+
+## `UpstreamKind`
+
+One of:
+
+- `cloud` — Telegram's Bot API, or a server with its rules.
+- `local` — A self-hosted `telegram-bot-api` server.

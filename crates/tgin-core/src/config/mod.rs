@@ -15,9 +15,10 @@ use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
 pub use self::model::RawConfig;
 pub use self::resolve::{
-    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Gateway, Ingress, IpAllowlist,
-    Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit, RateMode, Reload, Retry,
-    Runtime, Server, Tls, Webhook, WebhookReply, WebhookSecret,
+    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Files, Gateway, Ingress,
+    IpAllowlist, Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit, RateMode, Reload,
+    Retry, Runtime, Server, Tls, Upstream, UpstreamKind, Webhook, WebhookReply, WebhookRules,
+    WebhookSecret,
 };
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
@@ -96,10 +97,11 @@ pub fn load(text: &str, origin: &Path, env: &dyn Env) -> Result<Config, Vec<Conf
 /// The config as written, for `/v1/config`, with defaults filled in.
 ///
 /// - Every secret is `"[redacted]"`.
-/// - URL fields (`api_url`, `public_url`, endpoint `url`) show only the
-///   resolved URL's origin, `scheme://host[:port]`, followed by `/…` when a
-///   path, query or fragment was elided; their `${…}` references are not
-///   shown.
+/// - URL fields (`api_url`, an upstream's `url` and `files.url`,
+///   `public_url`, endpoint `url`) show only the resolved URL's origin,
+///   `scheme://host[:port]`, followed by `/…` when a path, query or
+///   fragment was elided; their `${…}` references are not shown. A bot
+///   with neither `api_url` nor `upstream` shows the default `api_url`.
 /// - Every other string is as written, `${…}` references unexpanded, with
 ///   bot tokens and the config's secrets masked as `#####`.
 pub fn redacted_json(cfg: &Config) -> serde_json::Value {
@@ -116,6 +118,11 @@ pub fn redacted_json(cfg: &Config) -> serde_json::Value {
             *value = Value::from("[redacted]");
         }
     }
+    let upstreams = json.get_mut("upstreams").and_then(Value::as_object_mut);
+    for out in upstreams.into_iter().flatten().map(|(_, u)| u) {
+        redact(out.get_mut("url"));
+        redact(out.pointer_mut("/files/url"));
+    }
     let bots = json.get_mut("bots").and_then(Value::as_array_mut);
     for out in bots.into_iter().flatten() {
         redact(out.get_mut("api_url"));
@@ -130,13 +137,27 @@ pub fn redacted_json(cfg: &Config) -> serde_json::Value {
             redact(out.get_mut("url"));
         }
     }
+    for upstream in &cfg.upstreams {
+        let Some(out) = json
+            .get_mut("upstreams")
+            .and_then(|upstreams| upstreams.get_mut(&*upstream.name))
+        else {
+            continue;
+        };
+        out["url"] = Value::from(upstream.url.masked());
+        if let Some(Files::Url(url)) = &upstream.files {
+            out["files"]["url"] = Value::from(url.masked());
+        }
+    }
     // A loaded config resolved every bot and consumer, in document order.
     for (bot, out) in cfg
         .bots
         .iter()
         .zip(json["bots"].as_array_mut().into_iter().flatten())
     {
-        out["api_url"] = Value::from(bot.api_url.masked());
+        if *bot.upstream.name == *Upstream::SHORTHAND {
+            out["api_url"] = Value::from(bot.upstream.url.masked());
+        }
         if let Some(Ingress::Webhook(hook)) = &bot.ingress
             && let Some(url) = &hook.public_url
         {

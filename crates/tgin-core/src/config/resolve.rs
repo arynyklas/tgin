@@ -1,10 +1,13 @@
 //! The resolved config: secrets expanded, URLs parsed, consumer names
 //! replaced by dense ids and rules compile-checked.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -14,16 +17,17 @@ use tgin_runtime::breaker::BreakerConfig;
 use tgin_runtime::config::{ConfigError, Env, InterpError, interpolate};
 use tgin_runtime::queue::{self, QueueConfig};
 use tgin_runtime::secret::Secret;
-use url::Url;
+use url::{Host, Url};
 
+use super::defaults;
 use super::model::{self as raw, At, Name, RawConfig, SecretText, Template};
 use super::sensitive::{Masker, Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
-use super::validate::{Diagnostics, HttpPaths, located, valid_command};
+use super::validate::{Diagnostics, HttpPaths, located, valid_command, webhook_rules};
 use crate::facts::ChatType;
 use crate::ids::{ConsumerId, SourceId};
 use crate::rules::{self, Predicates, RouteTable, RuleError, RuleSpec, TargetSpec};
 
-pub use super::model::{Balance, LogFormat, LogLevel, RateMode, WebhookReply};
+pub use super::model::{Balance, LogFormat, LogLevel, RateMode, UpstreamKind, WebhookReply};
 
 /// A loaded, valid configuration. Its rules compile into a [`RouteTable`].
 ///
@@ -37,6 +41,9 @@ pub struct Config {
     pub server: Option<Server>,
     pub admin: Admin,
     pub reload: Reload,
+    /// The named `upstreams`, in file order; bots share them. A bot's
+    /// `api_url` shorthand is its own and is not listed.
+    pub upstreams: Vec<Arc<Upstream>>,
     /// In file order. The engine gives each bot a [`SourceId`] of its own,
     /// stable by name across reloads: look it up with
     /// [`Engine::source_id`](crate::engine::Engine::source_id), never by
@@ -62,6 +69,7 @@ impl fmt::Debug for Config {
             .field("server", &self.server)
             .field("admin", &self.admin)
             .field("reload", &self.reload)
+            .field("upstreams", &self.upstreams)
             .field("bots", &self.bots)
             .field("consumers", &self.consumers)
             .field("warnings", &self.warnings)
@@ -116,11 +124,92 @@ pub struct Reload {
 pub struct Bot {
     pub name: String,
     pub token: Secret<String>,
-    pub api_url: SensitiveUrl,
+    /// A named upstream, shared with the other bots that use it, or the
+    /// bot's own from its `api_url` shorthand.
+    pub upstream: Arc<Upstream>,
+    /// `file:` references may reach an upstream in local mode.
+    pub allow_local_files: bool,
     pub ingress: Option<Ingress>,
     pub gateway: Gateway,
     /// In order; the first match wins.
     pub rules: Vec<RuleSpec>,
+}
+
+/// A Bot API server bots talk to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    /// The `upstreams` key, or [`Upstream::SHORTHAND`] for a bot's
+    /// `api_url`.
+    pub name: Arc<str>,
+    pub kind: UpstreamKind,
+    /// `http` or `https`.
+    pub url: SensitiveUrl,
+    /// The server runs with `--local`; only for [`UpstreamKind::Local`].
+    pub local_mode: bool,
+    /// Only for [`UpstreamKind::Local`].
+    pub files: Option<Files>,
+    /// The longest wait for the response once a request was sent; above
+    /// zero, at most an hour.
+    pub response_timeout: Duration,
+}
+
+/// Where a local server's files are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Files {
+    /// The server's directory mounted in tgin at `dir`, which the server
+    /// itself sees at `server_dir` (absolute).
+    Dir { dir: PathBuf, server_dir: PathBuf },
+    /// An HTTP origin serving the server's directory.
+    Url(SensitiveUrl),
+}
+
+/// What a webhook registered with an upstream may be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebhookRules {
+    /// `public_url` may be `http`.
+    pub http_allowed: bool,
+    /// `public_url` may use any port, not only 443, 80, 88 and 8443.
+    pub any_port: bool,
+    /// The largest `max_connections`.
+    pub max_connections: u32,
+}
+
+/// The ports Telegram posts webhooks to.
+pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
+
+impl WebhookRules {
+    /// Telegram's rules, unless the server is local and in local mode.
+    pub(super) fn new(kind: UpstreamKind, local_mode: bool) -> WebhookRules {
+        let local = kind == UpstreamKind::Local && local_mode;
+        WebhookRules {
+            http_allowed: local,
+            any_port: local,
+            max_connections: if local { 100_000 } else { 100 },
+        }
+    }
+}
+
+impl Upstream {
+    /// The name of a bot's `api_url` shorthand, which no `upstreams` entry
+    /// can take.
+    pub const SHORTHAND: &str = "api_url";
+
+    /// The name of a bot's directory on the server: its token with `:`
+    /// replaced by `~`. It holds the token: never log it.
+    pub fn token_dir(token: &str) -> String {
+        token.replace(':', "~")
+    }
+
+    pub fn webhook_rules(&self) -> WebhookRules {
+        WebhookRules::new(self.kind, self.local_mode)
+    }
+
+    fn mask(&mut self, redactor: &tgin_runtime::secret::Redactor) {
+        self.url.mask(redactor);
+        if let Some(Files::Url(url)) = &mut self.files {
+            url.mask(redactor);
+        }
+    }
 }
 
 /// The Bot API gateway of one bot.
@@ -290,7 +379,8 @@ pub(super) fn resolve(
         paths: HttpPaths::default(),
     };
     let consumers = r.consumers(&raw.consumers);
-    let bots = r.bots(&raw);
+    let upstreams = r.upstreams(&raw);
+    let bots = r.bots(&raw, &upstreams);
     let server = raw.server.as_ref().map(|server| r.server(server));
     let admin = Admin {
         listen: raw.admin.listen.iter().map(|a| a.value).collect(),
@@ -325,6 +415,7 @@ pub(super) fn resolve(
             debounce: raw.reload.debounce.value.get(),
             drain_timeout: raw.reload.drain_timeout.value.get(),
         },
+        upstreams,
         bots,
         consumers,
         warnings: Vec::new(),
@@ -343,8 +434,20 @@ fn mask(config: &mut Config) {
         tls.cert_file.mask(redactor);
         tls.key_file.mask(redactor);
     }
+    // Named upstreams are shared: each is masked once, then handed back to
+    // its bots. A bot's shorthand is its own.
+    for upstream in &mut config.upstreams {
+        Arc::make_mut(upstream).mask(redactor);
+    }
     for bot in &mut config.bots {
-        bot.api_url.mask(redactor);
+        match config
+            .upstreams
+            .iter()
+            .find(|named| named.name == bot.upstream.name)
+        {
+            Some(named) => bot.upstream = Arc::clone(named),
+            None => Arc::make_mut(&mut bot.upstream).mask(redactor),
+        }
         if let Some(Ingress::Webhook(hook)) = &mut bot.ingress {
             hook.path.mask(redactor);
             if let Some(url) = &mut hook.public_url {
@@ -643,30 +746,130 @@ impl Resolver<'_> {
         }
     }
 
-    fn bots(&mut self, raw: &RawConfig) -> Vec<Bot> {
+    /// The named upstreams. One that fails to resolve is left out, with its
+    /// errors recorded, and so are the bots that use it.
+    fn upstreams(&mut self, raw: &RawConfig) -> Vec<Arc<Upstream>> {
+        let mut out = Vec::with_capacity(raw.upstreams.len());
+        for (name, upstream) in &raw.upstreams {
+            let path = format!("upstreams.{}", name.as_str());
+            let upstream = &upstream.value;
+            let url = self.upstream_url(&format!("{path}.url"), name.as_str(), &upstream.url);
+            let files = match &upstream.files {
+                None => Some(None),
+                Some(files) => self.files(&format!("{path}.files"), &files.value).map(Some),
+            };
+            let kind = upstream.kind.value;
+            let response_timeout = upstream.response_timeout.as_ref().map_or(
+                match kind {
+                    UpstreamKind::Cloud => defaults::CLOUD_RESPONSE_TIMEOUT,
+                    UpstreamKind::Local => defaults::LOCAL_RESPONSE_TIMEOUT,
+                },
+                |timeout| timeout.value.get(),
+            );
+            if let (Some(url), Some(files)) = (url, files) {
+                out.push(Arc::new(Upstream {
+                    name: Arc::from(name.as_str()),
+                    kind,
+                    url,
+                    local_mode: upstream.local_mode.value,
+                    files,
+                    response_timeout,
+                }));
+            }
+        }
+        out
+    }
+
+    /// An upstream's URL. Plain `http` to a host that is not loopback
+    /// warns, naming the upstream and never the URL, which may hold
+    /// credentials.
+    fn upstream_url(&mut self, path: &str, name: &str, text: &Template) -> Option<SensitiveUrl> {
+        let url = self.url(path, text, false)?;
+        if url.expose().scheme() == "http" && !loopback(url.expose()) {
+            self.diag.warnings.push(
+                ConfigError::warning(format!(
+                    "upstream `{name}` sends bot tokens over plain http to a host that is not loopback"
+                ))
+                .at(located(path, text.0.location))
+                .hint("use https, or keep the Bot API server on a network only tgin reaches"),
+            );
+        }
+        Some(url)
+    }
+
+    /// An upstream's `files`; validation reported a shape that is neither
+    /// `dir` nor `url`.
+    fn files(&mut self, path: &str, files: &raw::Files) -> Option<Files> {
+        if let Some(url) = &files.url {
+            return self.url(&format!("{path}.url"), url, false).map(Files::Url);
+        }
+        let dir = self.file(&format!("{path}.dir"), files.dir.as_ref()?)?;
+        let dir = dir.expose().clone();
+        let server_dir = match &files.server_dir {
+            None => dir.clone(),
+            Some(text) => {
+                let path = format!("{path}.server_dir");
+                let server_dir = PathBuf::from(self.template(&path, text)?);
+                // `has_root` keeps `/x` absolute on Windows too.
+                if !server_dir.has_root() {
+                    self.diag.errors.push(
+                        ConfigError::new("`server_dir` must be an absolute path")
+                            .at(located(path, text.0.location))
+                            .hint("it is the directory as the Bot API server sees it, which `getFile` answers absolute paths in"),
+                    );
+                    return None;
+                }
+                server_dir
+            }
+        };
+        Some(Files::Dir { dir, server_dir })
+    }
+
+    fn bots(&mut self, raw: &RawConfig, upstreams: &[Arc<Upstream>]) -> Vec<Bot> {
         let mut out = Vec::with_capacity(raw.bots.len());
+        // Each token, expanded, with the first bot that has it.
+        let mut tokens: HashMap<String, usize> = HashMap::new();
         for (index, bot) in raw.bots.iter().enumerate() {
             let path = format!("bots[{index}]");
             if self.id(index, &path, bot.name.location, "bots").is_none() {
                 break;
             }
             let token = self.bot_token(format!("{path}.token"), &bot.token);
-            let api_url = self.url(&format!("{path}.api_url"), &bot.api_url, false);
+            if let Some(token) = &token {
+                match tokens.entry(token.expose().clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(index);
+                    }
+                    // Never quotes the value: it is the token.
+                    Entry::Occupied(first) => self.diag.errors.push(
+                        ConfigError::new(format!(
+                            "bots[{}] (`{}`) already has this token",
+                            first.get(),
+                            raw.bots[*first.get()].name.value.as_str()
+                        ))
+                        .at(located(format!("{path}.token"), bot.token.0.location))
+                        .hint("Telegram splits a token's updates between everyone who receives them; give each bot its own token"),
+                    ),
+                }
+            }
+            let upstream = self.bot_upstream(&path, bot, upstreams);
+            let rules = webhook_rules(raw, bot);
             let ingress = bot
                 .ingress
                 .as_ref()
-                .map(|ingress| self.ingress(&path, bot.name.value.as_str(), ingress));
+                .map(|ingress| self.ingress(&path, bot.name.value.as_str(), ingress, rules));
             let mut rules = Vec::with_capacity(bot.routes.len());
             for (j, route) in bot.routes.iter().enumerate() {
                 let spec = rule_spec(&route.value, &raw.consumers);
                 self.compile_rule(&format!("{path}.routes[{j}]"), route.location, &spec);
                 rules.push(spec);
             }
-            if let (Some(token), Some(api_url)) = (token, api_url) {
+            if let (Some(token), Some(upstream)) = (token, upstream) {
                 out.push(Bot {
                     name: bot.name.value.as_str().to_owned(),
                     token,
-                    api_url,
+                    upstream,
+                    allow_local_files: bot.allow_local_files,
                     ingress,
                     gateway: gateway(&bot.gateway),
                     rules,
@@ -676,7 +879,66 @@ impl Resolver<'_> {
         out
     }
 
-    fn ingress(&mut self, path: &str, name: &str, ingress: &At<raw::Ingress>) -> Ingress {
+    /// The bot's named upstream, or its own from `api_url` or the default.
+    /// Validation reports an unknown name, and a named upstream that failed
+    /// to resolve reported its own errors.
+    fn bot_upstream(
+        &mut self,
+        path: &str,
+        bot: &raw::Bot,
+        upstreams: &[Arc<Upstream>],
+    ) -> Option<Arc<Upstream>> {
+        if let Some(name) = &bot.upstream {
+            return upstreams
+                .iter()
+                .find(|upstream| *upstream.name == *name.value.as_str())
+                .cloned();
+        }
+        let path = format!("{path}.api_url");
+        let url = match &bot.api_url {
+            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text)?,
+            None => self.url(&path, &defaults::api_url(), false)?,
+        };
+        Some(Arc::new(Upstream {
+            name: Arc::from(Upstream::SHORTHAND),
+            kind: UpstreamKind::Cloud,
+            url,
+            local_mode: false,
+            files: None,
+            response_timeout: defaults::CLOUD_RESPONSE_TIMEOUT,
+        }))
+    }
+
+    /// A webhook's `public_url`, by the rules of the bot's upstream.
+    fn public_url(
+        &mut self,
+        path: &str,
+        text: &Template,
+        rules: WebhookRules,
+    ) -> Option<SensitiveUrl> {
+        let url = self.url(path, text, !rules.http_allowed)?;
+        let port = url.expose().port_or_known_default();
+        if !rules.any_port && !port.is_some_and(|port| WEBHOOK_PORTS.contains(&port)) {
+            let port = port.map_or_else(String::new, |port| format!(" {port}"));
+            self.diag.errors.push(
+                ConfigError::new(format!(
+                    "webhooks are posted only to ports 443, 80, 88 and 8443, not to port{port}"
+                ))
+                .at(located(path, text.0.location))
+                .hint("only a `local` upstream with `local_mode: true` posts webhooks to any port"),
+            );
+            return None;
+        }
+        Some(url)
+    }
+
+    fn ingress(
+        &mut self,
+        path: &str,
+        name: &str,
+        ingress: &At<raw::Ingress>,
+        rules: WebhookRules,
+    ) -> Ingress {
         match &ingress.value {
             raw::Ingress::LongPoll(poll) => Ingress::LongPoll(LongPoll {
                 timeout: poll.timeout.value.get(),
@@ -701,7 +963,7 @@ impl Resolver<'_> {
                     public_url: hook
                         .public_url
                         .as_ref()
-                        .and_then(|url| self.url(&format!("{path}.public_url"), url, true)),
+                        .and_then(|url| self.public_url(&format!("{path}.public_url"), url, rules)),
                     register: hook.register.value,
                     secret_token: match &hook.secret_token {
                         raw::WebhookSecret::Auto => WebhookSecret::Auto,
@@ -718,7 +980,7 @@ impl Resolver<'_> {
                         .certificate_file
                         .as_ref()
                         .and_then(|file| self.file(&format!("{path}.certificate_file"), file)),
-                    ip_allowlist: match &hook.ip_allowlist {
+                    ip_allowlist: match &hook.ip_allowlist.value {
                         raw::IpAllowlist::None => IpAllowlist::None,
                         raw::IpAllowlist::Telegram => IpAllowlist::Telegram,
                         raw::IpAllowlist::Networks(networks) => {
@@ -792,6 +1054,17 @@ impl Resolver<'_> {
                 self.diag.error(path, location, message);
             }
         }
+    }
+}
+
+/// Whether `url`'s host is this machine: a loopback address or
+/// `localhost`.
+fn loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 

@@ -57,7 +57,7 @@ pub struct GatewayBot {
     pub name: Arc<str>,
     pub source: SourceId,
     pub token: Secret<String>,
-    pub api_url: Url,
+    pub upstream: Arc<config::Upstream>,
     pub gateway: config::Gateway,
 }
 
@@ -134,11 +134,11 @@ struct Bot {
     name: Arc<str>,
     source: SourceId,
     token: Secret<String>,
-    api_url: Url,
+    upstream: Arc<config::Upstream>,
     gateway: config::Gateway,
-    /// `{api_url}/bot{token}/`, the `api_url` path kept.
+    /// `{url}/bot{token}/`, the upstream URL's path kept.
     method_base: Url,
-    /// `{api_url}/file/bot{token}/`.
+    /// `{url}/file/bot{token}/`.
     file_base: Url,
     /// The gateway profile: no total timeout, the connect timeout above;
     /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
@@ -163,8 +163,9 @@ impl Bot {
         limiter: Arc<BotLimiter>,
     ) -> Option<Bot> {
         let token = bot.token.expose();
-        let method_base = base(&bot.api_url, &[&format!("bot{token}")])?;
-        let file_base = base(&bot.api_url, &["file", &format!("bot{token}")])?;
+        let url = bot.upstream.url.expose();
+        let method_base = base(url, &[&format!("bot{token}")])?;
+        let file_base = base(url, &["file", &format!("bot{token}")])?;
         let client = client(&ClientOptions {
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: None,
@@ -174,7 +175,7 @@ impl Bot {
             name: bot.name,
             source: bot.source,
             token: bot.token,
-            api_url: bot.api_url,
+            upstream: bot.upstream,
             gateway: bot.gateway,
             method_base,
             file_base,
@@ -189,7 +190,7 @@ impl Bot {
     /// Whether `bot` describes this entry unchanged.
     fn same(&self, bot: &GatewayBot) -> bool {
         self.token.expose() == bot.token.expose()
-            && self.api_url == bot.api_url
+            && self.upstream == bot.upstream
             && self.gateway == bot.gateway
             && self.source == bot.source
     }
@@ -230,7 +231,7 @@ impl Gateway {
         }
     }
 
-    /// Replaces the bot table. An entry whose token, `api_url` and gateway
+    /// Replaces the bot table. An entry whose token, upstream and gateway
     /// config are unchanged keeps its state (client, identity, limiter); a
     /// bot whose token stays keeps its identity, and its limiter too while
     /// its rate limits stay. A removed bot's metric series go, and so do
@@ -270,7 +271,7 @@ impl Gateway {
             match Bot::new(bot, self.via.clone(), metrics, identity, limiter) {
                 Some(entry) => entries.push(Arc::new(entry)),
                 None => {
-                    tracing::error!(bot = %name, "the bot's api_url cannot be a base URL; the gateway does not serve it")
+                    tracing::error!(bot = %name, "the bot's upstream URL cannot be a base URL; the gateway does not serve it")
                 }
             }
         }
@@ -544,7 +545,7 @@ mod tests {
             name: Arc::from(bot.name.as_str()),
             source: SourceId(0),
             token: Secret::new(token.to_owned()),
-            api_url: bot.api_url.expose().clone(),
+            upstream: Arc::clone(&bot.upstream),
             gateway: bot.gateway.clone(),
         }
     }

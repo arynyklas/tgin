@@ -61,9 +61,13 @@ pub struct ReloadReport {
     pub sources_added: Vec<String>,
     /// Bots that are gone: the caller stops them.
     pub sources_removed: Vec<String>,
-    /// Bots whose token, `api_url` or ingress changed: the caller restarts
-    /// them.
+    /// Bots whose token, upstream (by name, kind, URL or local mode) or
+    /// ingress changed: the caller restarts them.
     pub sources_restarted: Vec<String>,
+    /// Bots now on another upstream (another name or URL); also in
+    /// `sources_restarted`. Unless the old server logged the bot out
+    /// first, Telegram may split its updates between the two servers.
+    pub upstream_changed: Vec<String>,
     /// Changed settings that take effect only after a restart:
     /// `server.listen`, `server.max_connections`,
     /// `server.header_read_timeout`, `server.tls` (turned on or off),
@@ -104,6 +108,12 @@ impl Engine {
             changed = report.changed.len(),
             "config applied"
         );
+        for bot in &report.upstream_changed {
+            tracing::warn!(
+                bot = %bot,
+                "the bot now talks to another Bot API server; while the old one still has it logged in, the bot's updates may be split between the two: move bots with `tgin admin bot logout` (or `close`) before changing their upstream"
+            );
+        }
         Ok(report)
     }
 }
@@ -297,8 +307,16 @@ impl Plan {
                         removed_sources.push(bot.name.clone());
                     }
                     Some(new) => {
-                        if new.token.expose() != bot.token.expose()
-                            || new.api_url != bot.api_url
+                        let (old_upstream, new_upstream) = (&bot.upstream, &new.upstream);
+                        let moved = new_upstream.name != old_upstream.name
+                            || new_upstream.url != old_upstream.url;
+                        if moved {
+                            report.upstream_changed.push(new.name.clone());
+                        }
+                        if moved
+                            || new.token.expose() != bot.token.expose()
+                            || new_upstream.kind != old_upstream.kind
+                            || new_upstream.local_mode != old_upstream.local_mode
                             || new.ingress != bot.ingress
                         {
                             report.sources_restarted.push(new.name.clone());
@@ -315,6 +333,7 @@ impl Plan {
             &mut report.sources_added,
             &mut report.sources_removed,
             &mut report.sources_restarted,
+            &mut report.upstream_changed,
             &mut report.restart_required,
         ] {
             list.sort();

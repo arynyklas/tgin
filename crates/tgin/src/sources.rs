@@ -218,7 +218,7 @@ impl Sources {
                 .ok_or_else(|| StartError::NoSource(bot.name.clone()))?;
             info.metrics.clone()
         };
-        let client = BotClient::new(self.client.clone(), bot.api_url.expose(), &bot.token)
+        let client = BotClient::new(self.client.clone(), bot.upstream.url.expose(), &bot.token)
             .map_err(|source| StartError::Bot {
                 bot: bot.name.clone(),
                 source,

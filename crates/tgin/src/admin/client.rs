@@ -276,6 +276,9 @@ struct ReloadSummary {
     sources_added: Vec<String>,
     sources_removed: Vec<String>,
     sources_restarted: Vec<String>,
+    /// Absent from a server older than this client.
+    #[serde(default)]
+    upstream_changed: Vec<String>,
     restart_required: Vec<String>,
 }
 
@@ -307,6 +310,7 @@ fn render(action: &Action, body: &str) -> Result<String, serde_json::Error> {
                 ("sources added", &report.sources_added),
                 ("sources removed", &report.sources_removed),
                 ("sources restarted", &report.sources_restarted),
+                ("upstream changed", &report.upstream_changed),
             ] {
                 if !names.is_empty() {
                     let _ = writeln!(text, "  {label}: {}", names.join(", "));
