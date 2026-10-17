@@ -269,14 +269,24 @@ impl<K> fmt::Debug for KeyedLimiter<K> {
 /// booking takes the earliest instant at or after the one asked for that
 /// keeps the calendar conformant, so a booking far ahead leaves the free
 /// capacity before it to others, and booked in time order it starts when
-/// the GCRA would start it. Bookings no later one can conflict with are
-/// dropped when booking and by [`SlotCalendar::retain_recent`]; with every
-/// booking within `max_delay` of its `now`, it holds about
-/// `burst + count × max_delay / per`.
+/// the GCRA would start it. Bookings before the latest `now` are folded into
+/// a floor (the GCRA's theoretical arrival time after them), which keeps
+/// every answer the same; with every booking within `max_delay` of its
+/// `now`, it holds at most about `burst + count × max_delay / per`
+/// bookings.
 pub struct SlotCalendar {
     quota: Quota,
-    /// The booked instants, sorted.
-    slots: Mutex<VecDeque<Instant>>,
+    state: Mutex<Calendar>,
+}
+
+/// The bookings of a [`SlotCalendar`].
+#[derive(Default)]
+struct Calendar {
+    /// The GCRA's theoretical arrival time after the bookings folded in:
+    /// every booking left must keep its distance to them through it.
+    floor: Option<Instant>,
+    /// The booked instants not folded in, sorted.
+    slots: VecDeque<Instant>,
 }
 
 /// A booked instant of a [`SlotCalendar`].
@@ -300,7 +310,7 @@ impl SlotCalendar {
     ) -> Result<SlotCalendar, QuotaError> {
         Ok(SlotCalendar {
             quota: Quota::new(count, per, burst)?,
-            slots: Mutex::new(VecDeque::new()),
+            state: Mutex::new(Calendar::default()),
         })
     }
 
@@ -322,84 +332,86 @@ impl SlotCalendar {
             retry_after: Duration::MAX,
         };
         let start = now.checked_add(from).ok_or(never)?;
-        let mut slots = self.slots.lock();
-        self.forget_before(&mut slots, now);
-        let at = self.earliest(&slots, start).ok_or(never)?;
+        let mut state = self.state.lock();
+        self.fold_before(&mut state, now);
+        let at = self.earliest(&state, start).ok_or(never)?;
         let delay = at.saturating_duration_since(now);
         if delay > max_delay {
             return Err(Denied { retry_after: delay });
         }
-        let index = slots.partition_point(|slot| *slot <= at);
-        slots.insert(index, at);
+        let index = state.slots.partition_point(|slot| *slot <= at);
+        state.slots.insert(index, at);
         Ok(Booking { delay, at })
     }
 
     /// Undoes `booking`, which this calendar's [`SlotCalendar::acquire`]
-    /// returned; nothing if it is already gone.
+    /// returned; nothing if it is already gone. A booking that started
+    /// before a later `now` is folded into the floor and stays charged, as
+    /// a [`KeyedLimiter::cancel`] after a later booking does: that only
+    /// errs on the strict side.
     pub fn cancel(&self, booking: Booking) {
-        let mut slots = self.slots.lock();
+        let slots = &mut self.state.lock().slots;
         let index = slots.partition_point(|slot| *slot < booking.at);
         if slots.get(index) == Some(&booking.at) {
             slots.remove(index);
         }
     }
 
-    /// Drops the bookings no booking at or after `now` can conflict with.
+    /// Folds the bookings before `now` into the floor.
     pub fn retain_recent(&self, now: Instant) {
-        let mut slots = self.slots.lock();
-        self.forget_before(&mut slots, now);
-        if slots.len() < slots.capacity() / 4 {
-            slots.shrink_to_fit();
+        let mut state = self.state.lock();
+        self.fold_before(&mut state, now);
+        if state.slots.len() < state.slots.capacity() / 4 {
+            state.slots.shrink_to_fit();
         }
     }
 
+    /// The bookings not yet folded into the floor.
     pub fn len(&self) -> usize {
-        self.slots.lock().len()
+        self.state.lock().slots.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.lock().is_empty()
+        self.state.lock().slots.is_empty()
     }
 
-    /// Drops the longest prefix of bookings before `now` whose GCRA state
-    /// (its theoretical arrival time) is no later than the booking after it
-    /// (or than `now`, for every booking before `now`): every later
-    /// booking then keeps its distance to the prefix by keeping its
-    /// distance to that next booking.
-    fn forget_before(&self, slots: &mut VecDeque<Instant>, now: Instant) {
-        let before = slots.partition_point(|slot| *slot < now);
-        let mut tat: Option<Instant> = None;
-        let mut forget = 0;
-        for (k, &slot) in slots.iter().take(before).enumerate() {
-            if tat.is_none_or(|tat| tat <= slot) {
-                forget = k;
-            }
-            let Some(next) = tat
-                .map_or(slot, |tat| tat.max(slot))
+    /// Folds every booking before `now` into the floor: the GCRA's state
+    /// after them, `floor = max(floor, t) + T` for each in order. No new
+    /// booking starts before `now`, so the bookings left keep their
+    /// distance to the folded ones exactly when they keep it to the floor.
+    fn fold_before(&self, state: &mut Calendar, now: Instant) {
+        let before = state.slots.partition_point(|slot| *slot < now);
+        let mut folded = 0;
+        for &slot in state.slots.iter().take(before) {
+            let Some(next) = state
+                .floor
+                .map_or(slot, |floor| floor.max(slot))
                 .checked_add(self.quota.interval)
             else {
-                slots.drain(..forget);
-                return;
+                break;
             };
-            tat = Some(next);
+            state.floor = Some(next);
+            folded += 1;
         }
-        if tat.is_none_or(|tat| tat <= now) {
-            forget = before;
-        }
-        slots.drain(..forget);
+        state.slots.drain(..folded);
     }
 
-    /// The earliest instant at or after `start` whose booking keeps `slots`
-    /// conformant. With `s_k = t_k − k × T`, the sorted starts conform when
-    /// `s_i − s_j ≤ τ` for every `i < j`. Inserting at position `p` shifts
-    /// the later `s` down by `T`, so the booking fits when it keeps that
-    /// with the largest `s` before it, the smallest shifted `s` after it,
-    /// and those two with each other.
-    fn earliest(&self, slots: &VecDeque<Instant>, start: Instant) -> Option<Instant> {
+    /// The earliest instant at or after `start` whose booking keeps the
+    /// calendar conformant. With `s_k = t_k − k × T`, the sorted starts
+    /// conform when `s_i − s_j ≤ τ` for every `i < j`, and the floor asks
+    /// `s_j ≥ floor − τ` of every booking left, as an `s` of `floor` before
+    /// them. Inserting at position `p` shifts the later `s` down by `T`, so
+    /// the booking fits when it keeps that with the largest `s` before it,
+    /// the smallest shifted `s` after it, and those two with each other.
+    fn earliest(&self, state: &Calendar, start: Instant) -> Option<Instant> {
+        let slots = &state.slots;
         let nanos = |d: Duration| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX);
         let interval = nanos(self.quota.interval);
         let tolerance = nanos(self.quota.tolerance);
-        let origin = slots.front().map_or(start, |first| (*first).min(start));
+        let origin = [slots.front().copied(), state.floor]
+            .into_iter()
+            .flatten()
+            .fold(start, Instant::min);
         let offset = |at: Instant| nanos(at.saturating_duration_since(origin));
         let index = |k: usize| i128::try_from(k).unwrap_or(i128::MAX);
         let s: Vec<i128> = slots
@@ -412,7 +424,11 @@ impl SlotCalendar {
             suffix_min[k] = Some(suffix_min[k + 1].map_or(s[k], |m| m.min(s[k])));
         }
         let first = slots.partition_point(|slot| *slot <= start);
-        let mut prefix_max = s[..first].iter().copied().max();
+        let mut prefix_max = s[..first]
+            .iter()
+            .copied()
+            .chain(state.floor.map(offset))
+            .max();
         let start = offset(start);
         for p in first..=s.len() {
             let low = if p == first {
@@ -780,8 +796,11 @@ mod calendar_tests {
     const SEC: Duration = Duration::from_secs(1);
     const ZERO: Duration = Duration::ZERO;
 
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("non-zero")
+    }
+
     fn calendar(count: u32, per: Duration, burst: u32) -> SlotCalendar {
-        let nz = |n| NonZeroU32::new(n).expect("non-zero");
         SlotCalendar::new(nz(count), per, nz(burst)).expect("valid")
     }
 
@@ -843,18 +862,52 @@ mod calendar_tests {
     }
 
     #[test]
-    fn past_bookings_are_forgotten() {
+    fn past_bookings_fold_into_the_floor() {
         let c = calendar(1, SEC, 1);
         let t0 = Instant::now();
         c.acquire(t0, ZERO, ZERO).expect("free");
         c.acquire(t0, 2 * SEC, 2 * SEC).expect("free");
         c.retain_recent(t0 + 999 * MS);
-        assert_eq!(c.len(), 2, "still shares a window with now");
+        assert_eq!(c.len(), 1, "the booking at t0 is folded");
+        // The floor still holds it: the next free instant is t0 + 1 s.
+        assert_eq!(delay(c.acquire(t0 + 999 * MS, ZERO, ZERO)), Err(MS));
         c.retain_recent(t0 + SEC);
         assert_eq!(c.len(), 1);
-        // Booking forgets too.
+        // Booking folds too.
         c.acquire(t0 + 3 * SEC, ZERO, ZERO).expect("free");
         assert_eq!(c.len(), 1);
+    }
+
+    /// A backlog above the rate never lets the calendar grow: 31/s against
+    /// the defaults (30/s, burst 30, max delay 5 s) for 15 minutes keeps at
+    /// most `burst + count × max_delay / per` bookings, and admits and
+    /// refuses exactly what the GCRA does.
+    #[test]
+    fn a_sustained_backlog_stays_bounded() {
+        let c = calendar(30, SEC, 30);
+        let gcra = KeyedLimiter::new(Quota::new(nz(30), SEC, nz(30)).expect("valid"));
+        let max_delay = 5 * SEC;
+        let t0 = Instant::now();
+        let (mut admitted, mut refused, mut most) = (0u32, 0u32, 0usize);
+        for k in 0..31 * 900u32 {
+            let now = t0 + SEC * k / 31;
+            let got = delay(c.acquire(now, ZERO, max_delay));
+            let expected = gcra
+                .acquire(&0u8, now, max_delay)
+                .map(|a| a.delay)
+                .map_err(|d| d.retry_after);
+            assert_eq!(got, expected, "request {k}");
+            match got {
+                Ok(_) => admitted += 1,
+                Err(_) => refused += 1,
+            }
+            most = most.max(c.len());
+        }
+        assert!(most <= 30 + 30 * 5 + 2, "{most} bookings kept");
+        assert!(
+            admitted > 0 && refused > 0,
+            "{admitted} admitted, {refused} refused"
+        );
     }
 
     #[test]
@@ -925,6 +978,34 @@ mod calendar_tests {
             let mut at: Vec<Instant> = booked.iter().map(|b| b.at).collect();
             at.sort();
             prop_assert!(conforms(&at, c.quota.interval, burst), "{at:?}");
+        }
+
+        /// Folding the past into the floor changes no answer: the same
+        /// requests against the whole unfolded history book the same
+        /// instants and are refused alike.
+        #[test]
+        fn folding_changes_no_answer(
+            requests in prop::collection::vec((0u64..300, 0u64..2_000), 1..150),
+            count in 1u32..5,
+            burst in 1u32..5,
+        ) {
+            let c = calendar(count, SEC, burst);
+            let mut history = Calendar::default();
+            let mut now = Instant::now();
+            for (gap, from) in requests {
+                now += Duration::from_millis(gap);
+                let start = now + Duration::from_millis(from);
+                let expected = c
+                    .earliest(&history, start)
+                    .map(|at| at.saturating_duration_since(now))
+                    .filter(|d| *d <= 2 * SEC);
+                let got = c.acquire(now, Duration::from_millis(from), 2 * SEC).ok();
+                prop_assert_eq!(got.map(|b| b.delay), expected);
+                if let Some(b) = got {
+                    let index = history.slots.partition_point(|slot| *slot <= b.at);
+                    history.slots.insert(index, b.at);
+                }
+            }
         }
     }
 }
