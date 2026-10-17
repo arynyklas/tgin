@@ -38,7 +38,7 @@ use crate::envelope::Envelope;
 use crate::ids::{ConsumerId, SourceId};
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, CoreMetrics, SourceMetrics};
 use crate::reload::{self, Plan};
-use crate::reply::ReplyHandle;
+use crate::reply::{Binding, ReplyHandle};
 use crate::rules::{MatchScratch, RouteTable, RuleError, TargetSpec};
 
 /// What the engine's background tasks run under.
@@ -791,6 +791,17 @@ impl Engine {
             return Ok(None);
         }
         Ok(state.target(name).map(|target| purge_slot(&target.slot)))
+    }
+
+    /// Whether `token` is still the bot's token that `binding` was made
+    /// with: the bot's current token in this config, with the fingerprint
+    /// the runtime endpoint was set with. A webhook reply from a runtime
+    /// endpoint runs only then, so rotating a leaked token stops its
+    /// holder's replies too. Serialized with reloads, as `setWebhook` is.
+    pub fn holds_token(&self, binding: Binding, token: &Secret<String>) -> bool {
+        let _write = self.shared.write.lock();
+        let state = self.shared.state.load();
+        self.shared.authenticated(&state, binding.source, token) == Ok(binding.token_fingerprint)
     }
 
     /// Applies the bot `source`'s `setWebhook` (`Some`: URL and secret

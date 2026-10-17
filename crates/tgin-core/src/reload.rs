@@ -422,6 +422,7 @@ pub(crate) fn commit(
         // Before the swap: no update the new state admits may reach an
         // endpoint it no longer allows.
         keep_runtime_endpoints(shared, &state);
+        evict_rotated_captures(shared, &state);
         shared.state.store(Arc::new(state));
     }
     for slot in changes.started.iter().chain(&changes.revived) {
@@ -464,7 +465,8 @@ pub(crate) fn compile(
 /// feeds (R37), or whose bot's token changed since: a token holder never
 /// redirects another bot's updates, not even across reloads, and rotating a
 /// leaked token evicts what its holder set. Draining instances keep theirs
-/// to deliver what they hold.
+/// to deliver what they hold, unless their bot's token changed (see
+/// [`evict_rotated_captures`]).
 fn keep_runtime_endpoints(shared: &Shared, state: &EngineState) {
     for target in &state.targets {
         let Consumer::Push(push) = &target.slot.consumer else {
@@ -488,6 +490,31 @@ fn keep_runtime_endpoints(shared: &Shared, state: &EngineState) {
         };
         push.set_runtime_endpoint(None);
         tracing::info!(consumer = %target.slot.name, reason, "runtime endpoint cleared");
+    }
+}
+
+/// Clears the runtime endpoint of every draining push instance whose bot's
+/// token `state` changes: rotating a leaked token also stops the updates
+/// a removed consumer still holds from reaching its holder's capture.
+fn evict_rotated_captures(shared: &Shared, state: &EngineState) {
+    for slot in shared.retired.lock().iter() {
+        let Consumer::Push(push) = &slot.consumer else {
+            continue;
+        };
+        let Some((source, fingerprint)) = push.runtime_endpoint_owner() else {
+            continue;
+        };
+        if shared
+            .token_fingerprint(state, source)
+            .is_some_and(|current| current != fingerprint)
+        {
+            push.set_runtime_endpoint(None);
+            tracing::info!(
+                consumer = %slot.name,
+                reason = "the token of the bot whose setWebhook set it changed",
+                "runtime endpoint of a draining instance cleared"
+            );
+        }
     }
 }
 

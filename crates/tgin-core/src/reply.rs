@@ -21,6 +21,19 @@ pub struct Reply {
     pub content_type: HeaderValue,
     /// The whole body, at most [`MAX_REPLY_BYTES`].
     pub body: Bytes,
+    /// Set when the runtime endpoint answered: the bot whose `setWebhook`
+    /// set it and the token it did so with. The executor runs the call
+    /// only while that token is still the bot's (see
+    /// [`crate::engine::Engine::holds_token`]).
+    pub bound_to: Option<Binding>,
+}
+
+/// The bot and token a runtime endpoint was set with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub source: SourceId,
+    /// The engine's keyed fingerprint of the token, never the token.
+    pub token_fingerprint: u64,
 }
 
 /// Makes the method call of a webhook reply.

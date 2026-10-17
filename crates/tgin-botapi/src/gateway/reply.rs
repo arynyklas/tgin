@@ -74,7 +74,10 @@ impl Gateway {
     }
 
     /// Makes the call of `reply`, which the push consumer `consumer` got
-    /// for an update of the bot `source`, and counts its outcome.
+    /// for an update of the bot `source`, and counts its outcome. A reply
+    /// from a runtime endpoint runs only with the token that set the
+    /// endpoint, checked once the limits let it go: a reload that rotated
+    /// the token since refuses it.
     async fn run_reply(&self, consumer: &str, source: SourceId, reply: Reply) {
         let counts = self.reply_metrics(consumer);
         let table = self.table.load_full();
@@ -91,6 +94,13 @@ impl Gateway {
         };
         let label = MethodLabel::of(&method);
         if bot.limiter.applies(&method) && !admit(bot, consumer, label, &reply, &counts).await {
+            return;
+        }
+        if let Some(binding) = reply.bound_to
+            && !self.engine.holds_token(binding, &bot.token)
+        {
+            counts.count(ReplyOutcome::Refused);
+            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), "webhook reply refused: the token of the bot whose setWebhook set the endpoint changed");
             return;
         }
         let call = Call {

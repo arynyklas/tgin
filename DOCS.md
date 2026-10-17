@@ -312,7 +312,8 @@ A push consumer with `accept_set_webhook: true` takes its endpoint from a `setWe
 - The `url` is `http` or `https` (`https` when it has no scheme, as on Telegram); a `secret_token`, 1 to 256 of `A-Za-z0-9_-`, is sent as `X-Telegram-Bot-Api-Secret-Token`. The same call again answers `Webhook is already set`.
 - The runtime endpoint comes after the configured ones, with a breaker of its own (the consumer's `breaker` settings) and a 10 s timeout. `/v1/status` lists it with `"runtime": true`, and metrics label it `endpoint="runtime"`.
 - `setWebhook` with an empty `url`, or `deleteWebhook`, removes it.
-- It survives a reload that keeps the consumer, `accept_set_webhook: true`, the bot feeding the consumer and that bot's token. A reload that changes any of them clears it (logged), so rotating a bot's token evicts the endpoint its holder set; a restart forgets it. A `setWebhook` or `deleteWebhook` still in flight when its token is rotated changes nothing and answers `401 Unauthorized`. A removed consumer that still drains keeps its endpoint to deliver what it holds.
+- It survives a reload that keeps the consumer, `accept_set_webhook: true`, the bot feeding the consumer and that bot's token. A reload that changes any of them clears it (logged), so rotating a bot's token evicts the endpoint its holder set; a restart forgets it. A `setWebhook` or `deleteWebhook` still in flight when its token is rotated changes nothing and answers `401 Unauthorized`. A removed consumer that still drains keeps its endpoint to deliver what it holds, unless the reload changed its bot's token.
+- A [webhook reply](#webhook-replies) from the runtime endpoint runs only with the token whose `setWebhook` set the endpoint. Once a reload has changed the bot's token, a reply still on its way is refused (counted `refused`), never sent with the new token.
 - A push consumer with no endpoint at all leases nothing: its updates wait in the queue, bounded by `capacity` and `on_full`, and `retry.max_age` still counts from admission.
 
 **Trust model.** With `accept_set_webhook`, whoever holds the bot's token chooses where tgin posts the consumer's updates: any `http` or `https` URL tgin can reach, from inside your network. Enable it only where every holder of the token is trusted. The one destination tgin refuses is itself ([Loop detection](#loop-detection)): a runtime endpoint pointed at tgin's admin API, webhook ingress, pull endpoints or gateway dead-letters each update instead of acting on it.
@@ -379,7 +380,7 @@ Requests with an unknown token count only in `tgin_gateway_unauthorized_total`, 
 |---|---|
 | `executed` | Telegram answered `2xx`. |
 | `failed` | Telegram answered otherwise or not within 30 s, or the gateway does not serve the consumer's bot. |
-| `refused` | No method, or one that is refused (see above). |
+| `refused` | No method, or one that is refused (see above), or it came from a runtime endpoint whose bot's token changed since its `setWebhook`. |
 | `too_large` | Its body was over 1 MiB. |
 | `rate_limited` | The bot's rate limits refused it. |
 

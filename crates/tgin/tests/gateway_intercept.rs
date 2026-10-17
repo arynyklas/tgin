@@ -17,8 +17,8 @@ use tgin_runtime::config::MapEnv;
 use tgin_runtime::lifecycle::{SignalKind, Signals};
 use tgin_runtime::obs::MetricsRegistry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
@@ -1483,6 +1483,130 @@ async fn stalled_old_token_drop_pending_purges_nothing_after_rotation() {
     );
     tgin.wait_held("workers", 0).await;
     tgin.stop().await;
+}
+
+/// The webhook reply a [`holder`] answers every push with.
+const HELD_REPLY: &str = r#"{"method":"sendMessage","chat_id":5,"text":"as the bot"}"#;
+
+/// A token holder's capture endpoint at `{url}/in`: each push it receives
+/// goes to the returned channel and waits until the sender is set to
+/// `true`, then is answered with [`HELD_REPLY`].
+async fn holder() -> (
+    String,
+    mpsc::UnboundedReceiver<axum::body::Bytes>,
+    watch::Sender<bool>,
+) {
+    let (pushes, received) = mpsc::unbounded_channel();
+    let (release, released) = watch::channel(false);
+    let router = axum::Router::new().route(
+        "/in",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let _ = pushes.send(body);
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|go| *go).await;
+                ([("content-type", "application/json")], HELD_REPLY)
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{addr}"), received, release)
+}
+
+/// Whether Telegram was asked to send a message, with any token.
+async fn sent_messages(telegram: &MockServer) -> Vec<String> {
+    upstream_paths(telegram)
+        .await
+        .into_iter()
+        .filter(|path| path.ends_with("/sendMessage"))
+        .collect()
+}
+
+/// A reply on its way back from a capture when the rotation of its
+/// token evicts the capture is refused: its holder never acts as the bot
+/// with the new token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_from_evicted_capture_never_runs_with_new_token() {
+    let telegram = telegram_with_rotation().await;
+    let (capture, mut pushes, release) = holder().await;
+    let yaml = intercept_config(&telegram.uri(), ", webhook_reply: execute");
+    let tgin = start(&yaml).await;
+    let set = format!("/c/hooks/bot{TOKEN}/setWebhook");
+    let url = format!("{capture}/in");
+    assert_eq!(tgin.post_json(&set, &json!({ "url": url })).await.0, 200);
+    tgin.admit(1).await;
+    timeout(PATIENCE, pushes.recv())
+        .await
+        .expect("pushed in time")
+        .expect("open");
+
+    tgin.reload(&yaml.replace(TOKEN, NEW_TOKEN), 2).await;
+    wait_token(&tgin, NEW_TOKEN).await;
+    let info = format!("/c/hooks/bot{NEW_TOKEN}/getWebhookInfo");
+    assert_eq!(tgin.get(&info).await.1["result"]["url"], "", "evicted");
+    release.send_replace(true);
+    wait_metric(
+        &tgin,
+        r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#,
+    )
+    .await;
+    assert_eq!(sent_messages(&telegram).await, Vec::<String>::new());
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 0"#);
+    tgin.stop().await;
+    assert!(!LOGS.text().contains(NEW_TOKEN));
+}
+
+/// The incident response to a leaked token: a reload rotates it and
+/// removes the consumer its holder captured. The retired instance stops
+/// pushing to the capture, and the reply to the update it had in flight is
+/// refused, so the holder never acts as the bot with the new token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_capture_never_acts_with_new_token() {
+    let telegram = telegram_with_rotation().await;
+    let (capture, mut pushes, release) = holder().await;
+    let yaml = intercept_config(
+        &telegram.uri(),
+        ", webhook_reply: execute, max_in_flight: 1",
+    );
+    let tgin = start(&yaml).await;
+    let set = format!("/c/hooks/bot{TOKEN}/setWebhook");
+    let url = format!("{capture}/in");
+    assert_eq!(tgin.post_json(&set, &json!({ "url": url })).await.0, 200);
+    for id in 1..=4 {
+        tgin.admit(id).await;
+    }
+    timeout(PATIENCE, pushes.recv())
+        .await
+        .expect("pushed in time")
+        .expect("open");
+    tgin.wait_held("hooks", 4).await;
+
+    let removed: String = yaml
+        .replace(TOKEN, NEW_TOKEN)
+        .replace("[workers, keep, hooks]", "[workers, keep]")
+        .lines()
+        .filter(|line| !line.starts_with("  hooks:"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    tgin.reload(&removed, 2).await;
+    wait_token(&tgin, NEW_TOKEN).await;
+    release.send_replace(true);
+    wait_metric(
+        &tgin,
+        r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#,
+    )
+    .await;
+    tgin.stop().await;
+    assert!(
+        pushes.try_recv().is_err(),
+        "the retired instance pushed to the capture after the rotation"
+    );
+    assert_eq!(sent_messages(&telegram).await, Vec::<String>::new());
+    assert!(!LOGS.text().contains(NEW_TOKEN));
 }
 
 /// An intercepted request whose body stalls ends at the bot's

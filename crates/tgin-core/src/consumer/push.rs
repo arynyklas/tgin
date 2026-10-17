@@ -43,7 +43,9 @@ pub use crate::config::{Balance, Retry as RetryPolicy};
 use crate::envelope::Envelope;
 use crate::ids::SourceId;
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, DeliveryOutcome, EndpointMetrics};
-use crate::reply::{MAX_REPLY_BYTES, Reply, ReplyExecutor, ReplyHandle, carries_parameters};
+use crate::reply::{
+    Binding, MAX_REPLY_BYTES, Reply, ReplyExecutor, ReplyHandle, carries_parameters,
+};
 
 /// Lease timeout of a push queue (see [`crate::config::Push::queue`]): long
 /// enough never to pass, since the push queue is never expired.
@@ -661,7 +663,7 @@ impl PushConsumer {
                 if status.is_success() {
                     let executor = sent.targets.opts.executor();
                     Ok(match executor {
-                        Some(executor) => self.reply(executor, envelope, response).await,
+                        Some(executor) => self.reply(executor, sent, envelope, response).await,
                         None => None,
                     })
                 } else if status == StatusCode::LOOP_DETECTED
@@ -701,10 +703,12 @@ impl PushConsumer {
     /// [`carries_parameters`]). An empty body is no reply. A body longer
     /// than [`MAX_REPLY_BYTES`] is not read past the limit and counts as
     /// too large; one that fails to arrive is logged. Neither is executed,
-    /// and the update is delivered all the same.
+    /// and the update is delivered all the same. A reply from the runtime
+    /// endpoint is bound to the bot and token that set it.
     async fn reply(
         &self,
         executor: &Arc<dyn ReplyExecutor>,
+        sent: &Sending<'_>,
         envelope: &Envelope,
         mut response: reqwest::Response,
     ) -> Option<Reply> {
@@ -745,7 +749,20 @@ impl PushConsumer {
             }
         }
         let body = body.into_bytes();
-        (!body.is_empty()).then_some(Reply { content_type, body })
+        let bound_to = sent
+            .targets
+            .runtime
+            .as_ref()
+            .filter(|_| sent.slot().runtime)
+            .map(|runtime| Binding {
+                source: runtime.source,
+                token_fingerprint: runtime.token_fingerprint,
+            });
+        (!body.is_empty()).then_some(Reply {
+            content_type,
+            body,
+            bound_to,
+        })
     }
 
     /// Drops the update for good: acks it, counts it and logs it, without its
