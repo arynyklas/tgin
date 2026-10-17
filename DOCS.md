@@ -100,7 +100,7 @@ Names of bots and consumers are 1 to 63 lowercase letters, digits and `-`, start
 
 `max_in_flight` counts deliveries in progress over all of a consumer's endpoints, retries waiting included. With downstreams that handle requests concurrently, the default, 32, delivered every update at every webhook point of the benchmarks. A downstream that handles one request at a time (a single bot process) can deliver more with a lower value: in benchmarks from an earlier session, before the load generator's 100-connection cap, one aiogram process offered 5 000 updates/s took 1 809 updates/s with 32 and 2 268–2 280 with 8 ([PERF.md → `max_in_flight`](PERF.md#max_in_flight)).
 
-**Gateway flags.** `honor_drop_pending: true` lets `drop_pending_updates` on the consumer's gateway path empty its queue; `accept_set_webhook: true` (push only, and only on a consumer fed by one bot) lets that bot's `setWebhook` give the consumer an endpoint. Both are described under [Bot API gateway](#bot-api-gateway).
+**Gateway flags.** `honor_drop_pending: true` lets `drop_pending_updates` on the consumer's gateway path drop the calling bot's queued updates from it; `accept_set_webhook: true` (push only, and only on a consumer fed by one bot) lets that bot's `setWebhook` give the consumer an endpoint. Both are described under [Bot API gateway](#bot-api-gateway).
 
 ### Example
 

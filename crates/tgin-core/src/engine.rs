@@ -1050,7 +1050,8 @@ pub struct ConsumerSettings {
     pub mode: Mode,
     /// A push consumer takes a runtime endpoint from `setWebhook`.
     pub accept_set_webhook: bool,
-    /// `deleteWebhook(drop_pending_updates=true)` purges the consumer.
+    /// `deleteWebhook(drop_pending_updates=true)` drops the calling bot's
+    /// queued updates from the consumer.
     pub honor_drop_pending: bool,
 }
 
