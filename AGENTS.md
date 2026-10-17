@@ -182,7 +182,7 @@ cargo xtask config-docs --check
 cargo test --workspace --locked                                           # CI: Linux, macOS, Windows
 cargo check --workspace --locked                                          # with the MSRV toolchain (1.89)
 cargo deny --locked check
-cargo build --release --locked --target x86_64-unknown-linux-musl         # musl job; the Docker build runs cargo build --release --locked -p tgin
+cargo build --release --locked -p tgin --target x86_64-unknown-linux-musl  # musl job; the Docker build runs cargo build --release --locked -p tgin
 ```
 
 CI also builds the Docker image on native amd64 and arm64 runners, runs clippy and tests for `tests/performance/benchmark`, runs `bench-gate`: `cargo bench -p tgin-botapi --bench hot_path_ir` on a pinned toolchain under Callgrind (`gungraun/setup-gungraun`), failing past any benchmark's `Ir` limit, and runs the `e2e` job (`cargo xtask e2e`, which needs Docker with Compose).

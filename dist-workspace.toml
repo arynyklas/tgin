@@ -23,6 +23,10 @@ github-attestations = true
 cargo-auditable = true
 # Generate a CycloneDX SBOM with cargo-cyclonedx
 cargo-cyclonedx = true
+# Build only the packages that ship (`-p tgin`), not `--workspace`, so the
+# release never compiles the e2e fake or xtask, and their features never
+# reach the shipped binary.
+precise-builds = true
 # .github/workflows/release.yml carries hand edits that dist cannot express;
 # the header of release.yml lists them. To regenerate after a config change or
 # a dist upgrade:

@@ -113,7 +113,7 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo build --release --locked --target "$TARGET"
+      - run: cargo build --release --locked -p tgin --target "$TARGET"
       - name: Check the binary is statically linked
         run: |
           bin="target/$TARGET/release/tgin"
