@@ -1,12 +1,13 @@
 //! Loading, validating and resolving `tgin.yaml` version 1.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tgin_core::config::{
-    self, Balance, Config, ConsumerKind, Ingress, IpAllowlist, LogFormat, LogLevel, Pull, Push,
-    WebhookSecret,
+    self, Balance, Config, ConsumerKind, Gateway, Ingress, IpAllowlist, LogFormat, LogLevel, Pull,
+    Push, Rate, RateLimit, RateMode, WebhookReply, WebhookSecret,
 };
 use tgin_core::consumer::push::LEASE_TIMEOUT;
 use tgin_core::ids::ConsumerId;
@@ -97,6 +98,10 @@ fn push(cfg: &Config, name: &str) -> Push {
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
+}
+
+fn nz(n: u32) -> NonZeroU32 {
+    NonZeroU32::new(n).unwrap()
 }
 
 #[test]
@@ -264,6 +269,7 @@ fn defaults_applied() {
     assert_eq!(queue.queue.ordering, Ordering::None);
     assert!(queue.auth_token.is_none());
     assert!(queue.aliases.is_empty());
+    assert!(!queue.honor_drop_pending);
 
     let pusher = push(&cfg, "pusher");
     assert_eq!(pusher.endpoints[0].timeout, secs(10));
@@ -280,6 +286,9 @@ fn defaults_applied() {
     assert_eq!(pusher.retry.max_age, secs(3600));
     assert_eq!(pusher.breaker.failure_threshold, 5);
     assert_eq!(pusher.breaker.open_for, secs(30));
+    assert!(!pusher.accept_set_webhook);
+    assert_eq!(pusher.webhook_reply, WebhookReply::Execute);
+    assert!(!pusher.honor_drop_pending);
     assert_eq!(
         pusher.queue(),
         QueueConfig {
@@ -295,6 +304,359 @@ fn defaults_applied() {
     let cfg = loads("version: 1\n");
     assert!(cfg.server.is_none());
     assert!(cfg.bots.is_empty() && cfg.consumers.is_empty());
+}
+
+/// The gateway defaults of the plan's table, with method patterns
+/// lowercased.
+fn default_gateway() -> Gateway {
+    Gateway {
+        upstream_idle_timeout: secs(60),
+        rate_limit: RateLimit {
+            mode: RateMode::Shape,
+            max_delay: secs(5),
+            methods: vec![
+                "send*".to_owned(),
+                "copymessage*".to_owned(),
+                "forwardmessage*".to_owned(),
+            ],
+            global: Rate {
+                count: nz(30),
+                per: secs(1),
+                burst: nz(30),
+            },
+            per_chat: Rate {
+                count: nz(1),
+                per: secs(1),
+                burst: nz(3),
+            },
+            per_group: Rate {
+                count: nz(20),
+                per: secs(60),
+                burst: nz(20),
+            },
+        },
+        retry_429_max_wait: secs(10),
+    }
+}
+
+#[test]
+fn gateway_defaults_exact() {
+    let cfg = loads(&fixture("minimal.yaml"));
+    for bot in &cfg.bots {
+        assert_eq!(bot.gateway, default_gateway(), "{}", bot.name);
+    }
+    // Empty blocks are the same as omitted ones.
+    let cfg = loads(
+        "version: 1\nbots:\n  - name: a\n    token: \"1:a\"\n    gateway: { rate_limit: { global: {}, per_chat: {}, per_group: {} }, retry_429: {} }\n",
+    );
+    assert_eq!(cfg.bots[0].gateway, default_gateway());
+}
+
+/// A rate block's omitted fields take that block's defaults, not another
+/// block's.
+#[test]
+fn rate_block_fields_default_individually() {
+    let cfg = loads(
+        r#"version: 1
+bots:
+  - name: a
+    token: "1:a"
+    gateway:
+      upstream_idle_timeout: 2m
+      rate_limit:
+        mode: reject
+        global: { per: 2s }
+        per_chat: { burst: 5 }
+        per_group: { count: 10 }
+  - name: b
+    token: "2:b"
+    gateway:
+      rate_limit: { max_delay: 0s, per_chat: { count: 2, per: 3s } }
+      retry_429: { max_wait: 0s }
+"#,
+    );
+    let mut a = default_gateway();
+    a.upstream_idle_timeout = secs(120);
+    a.rate_limit.mode = RateMode::Reject;
+    a.rate_limit.global.per = secs(2);
+    a.rate_limit.per_chat.burst = nz(5);
+    a.rate_limit.per_group.count = nz(10);
+    assert_eq!(cfg.bots[0].gateway, a);
+
+    // Zero waits are meaningful: shaping behaves like `reject`, and the
+    // transparent 429 retry is off.
+    let mut b = default_gateway();
+    b.rate_limit.max_delay = Duration::ZERO;
+    b.rate_limit.per_chat.count = nz(2);
+    b.rate_limit.per_chat.per = secs(3);
+    b.retry_429_max_wait = Duration::ZERO;
+    assert_eq!(cfg.bots[1].gateway, b);
+}
+
+#[test]
+fn rate_limit_validation_errors() {
+    let yaml = r#"version: 1
+bots:
+  - name: a
+    token: "1:a"
+    gateway:
+      upstream_idle_timeout: 999ms
+      rate_limit:
+        max_delay: 61s
+        methods: [send*, "get-me", "*", "send**", ""]
+        global: { count: 0 }
+        per_chat: { burst: 0 }
+        per_group: { per: 0s }
+      retry_429: { max_wait: 2m }
+  - name: b
+    token: "2:b"
+    gateway: { rate_limit: { methods: [] } }
+  - name: c
+    token: "3:c"
+    gateway: { rate_limit: { per_chat: { per: 1M } } }
+"#;
+    let errors = errors(yaml);
+    let gw = "bots[0].gateway";
+    let rl = "bots[0].gateway.rate_limit";
+    // (path, text before the value, the value, message)
+    let expected = [
+        (
+            format!("{gw}.upstream_idle_timeout"),
+            "upstream_idle_timeout: ",
+            "999ms",
+            "shorter than the minimum of 1s",
+        ),
+        (
+            format!("{rl}.max_delay"),
+            "max_delay: ",
+            "61s",
+            "longer than the maximum of 1m",
+        ),
+        (
+            format!("{rl}.methods[1]"),
+            "send*, ",
+            "\"get-me\"",
+            "invalid method pattern `get-me`",
+        ),
+        (
+            format!("{rl}.methods[2]"),
+            "\"get-me\", ",
+            "\"*\"",
+            "invalid method pattern `*`",
+        ),
+        (
+            format!("{rl}.methods[3]"),
+            "\"*\", ",
+            "\"send**\"",
+            "invalid method pattern `send**`",
+        ),
+        (
+            format!("{rl}.methods[4]"),
+            "\"send**\", ",
+            "\"\"",
+            "invalid method pattern ``",
+        ),
+        (
+            format!("{rl}.global.count"),
+            "count: ",
+            "0",
+            "must be at least 1",
+        ),
+        (
+            format!("{rl}.per_chat.burst"),
+            "burst: ",
+            "0",
+            "must be at least 1",
+        ),
+        (
+            format!("{rl}.per_group.per"),
+            "per: ",
+            "0s",
+            "must be longer than 0",
+        ),
+        (
+            format!("{gw}.retry_429.max_wait"),
+            "max_wait: ",
+            "2m",
+            "longer than the maximum of 1m",
+        ),
+        (
+            "bots[1].gateway.rate_limit.methods".to_owned(),
+            "methods: ",
+            "[]",
+            "at least one method",
+        ),
+        (
+            "bots[2].gateway.rate_limit.per_chat.per".to_owned(),
+            "per: ",
+            "1M",
+            "a month or year unit",
+        ),
+    ];
+    assert_eq!(errors.len(), expected.len(), "{}", render(&errors));
+    for (err, (path, before, value, message)) in errors.iter().zip(&expected) {
+        let (line, column) = pos(yaml, &format!("{before}{value}"));
+        let column = column + u32::try_from(before.chars().count()).unwrap();
+        assert_at(err, path, (line, column));
+        assert_message(err, message);
+    }
+
+    // The limits themselves are allowed, and `mode: off` needs no methods.
+    let cfg = loads(
+        "version: 1\nbots:\n  - name: a\n    token: \"1:a\"\n    gateway: { upstream_idle_timeout: 1s, rate_limit: { mode: off, max_delay: 60s, methods: [] }, retry_429: { max_wait: 1m } }\n",
+    );
+    let gateway = &cfg.bots[0].gateway;
+    assert_eq!(gateway.upstream_idle_timeout, secs(1));
+    assert_eq!(gateway.rate_limit.mode, RateMode::Off);
+    assert_eq!(gateway.rate_limit.max_delay, secs(60));
+    assert!(gateway.rate_limit.methods.is_empty());
+    assert_eq!(gateway.retry_429_max_wait, secs(60));
+}
+
+#[test]
+fn methods_are_lowercased() {
+    let cfg = loads(
+        "version: 1\nbots:\n  - name: a\n    token: \"1:a\"\n    gateway: { rate_limit: { methods: [SendMessage, \"copyMessage*\", SENDPHOTO] } }\n",
+    );
+    assert_eq!(
+        cfg.bots[0].gateway.rate_limit.methods,
+        ["sendmessage", "copymessage*", "sendphoto"]
+    );
+}
+
+#[test]
+fn push_without_endpoints_needs_accept_set_webhook() {
+    let yaml = "version: 1\nconsumers:\n  p: { push: {} }\n";
+    let err = single_error(yaml);
+    assert_at(&err, "consumers.p.push.endpoints", pos(yaml, "{ push"));
+    assert_message(&err, "at least one endpoint");
+    assert!(
+        err.hint
+            .as_deref()
+            .is_some_and(|h| h.contains("accept_set_webhook: true")),
+        "{err}"
+    );
+
+    let yaml = "version: 1\nconsumers:\n  p: { push: { endpoints: [] } }\n";
+    let err = single_error(yaml);
+    assert_at(&err, "consumers.p.push.endpoints", pos(yaml, "[]"));
+    assert_message(&err, "at least one endpoint");
+
+    let cfg = loads(
+        "version: 1\nbots:\n  - name: a\n    token: \"1:a\"\n    routes: [{ to: [p] }]\nconsumers:\n  p: { push: { accept_set_webhook: true } }\n",
+    );
+    let p = push(&cfg, "p");
+    assert!(p.endpoints.is_empty());
+    assert!(p.accept_set_webhook);
+    // Configured endpoints and setWebhook can be combined.
+    let cfg = loads(
+        "version: 1\nconsumers:\n  p: { push: { endpoints: [{ url: \"http://p/\" }], accept_set_webhook: true } }\n",
+    );
+    assert_eq!(push(&cfg, "p").endpoints.len(), 1);
+}
+
+/// A token holder must never redirect another bot's updates with
+/// `setWebhook`.
+#[test]
+fn accept_set_webhook_needs_one_bot() {
+    let yaml = r#"version: 1
+bots:
+  - name: first
+    token: "1:a"
+    routes: [{ to: [h, h] }]
+  - name: second
+    token: "2:b"
+    routes: [{ to: [{ all: [h] }] }]
+consumers:
+  h: { push: { accept_set_webhook: true, endpoints: [{ url: "http://h/" }] } }
+"#;
+    let err = single_error(yaml);
+    let (line, column) = pos(yaml, "all: [h");
+    assert_at(&err, "bots[1].routes[0].to[0].all[0]", (line, column + 6));
+    assert_message(&err, "push consumer `h`");
+    assert_message(&err, "bots `first` and `second`");
+    assert_message(&err, "accept_set_webhook");
+
+    // Without setWebhook capture, a push consumer serves any number of bots.
+    let cfg = loads(&yaml.replace("accept_set_webhook: true", "accept_set_webhook: false"));
+    assert!(!push(&cfg, "h").accept_set_webhook);
+}
+
+/// The gateway serves only tokens shaped `<digits>:<secret>`; other tokens
+/// still load, with a warning that never quotes them.
+#[test]
+fn token_not_gateway_shaped_warns() {
+    let long = format!("\"1:{}\"", "s".repeat(129));
+    for token in [
+        "plainhush",
+        "\"123:\"",
+        "\":hush\"",
+        "\"12a:hush\"",
+        "\"123:hush:more\"",
+        long.as_str(),
+    ] {
+        let yaml = format!("version: 1\nbots:\n  - name: a\n    token: {token}\n");
+        let cfg = loads(&yaml);
+        let [warning] = cfg.warnings.as_slice() else {
+            panic!("{token}: {}", render(&cfg.warnings));
+        };
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_at(warning, "bots[0].token", pos(&yaml, token));
+        assert_message(warning, "Bot API gateway");
+        for part in ["hush", "plain", "123", "sss"] {
+            assert!(!warning.to_string().contains(part), "{warning}");
+        }
+    }
+    let longest = format!("\"1:{}\"", "s".repeat(128));
+    for token in ["\"123456:AA-bb_CC\"", longest.as_str()] {
+        let cfg = loads(&format!(
+            "version: 1\nbots:\n  - name: a\n    token: {token}\n"
+        ));
+        assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
+    }
+}
+
+/// The design's example config, with every gateway, setWebhook-capture and
+/// webhook-reply field written out, loads without a warning.
+#[test]
+fn design_example_loads() {
+    let mut env = MapEnv::default();
+    env.vars
+        .insert("SHOP_BOT_TOKEN".into(), "123456:shop-token-value".into());
+    env.vars
+        .insert("ADMIN_HOOK_SECRET".into(), "admin-hook-secret".into());
+    env.files.insert(
+        PathBuf::from("/run/secrets/tgin-admin-token"),
+        "admin-api-token\n".into(),
+    );
+    let cfg = config::load(
+        &fixture("design.yaml"),
+        Path::new("fixtures/design.yaml"),
+        &env,
+    )
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
+
+    let [shop] = cfg.bots.as_slice() else {
+        panic!("{:?}", cfg.bots);
+    };
+    let mut gateway = default_gateway();
+    gateway.upstream_idle_timeout = secs(90);
+    gateway
+        .rate_limit
+        .methods
+        .push("editmessagetext".to_owned());
+    gateway.rate_limit.per_chat.burst = nz(5);
+    gateway.retry_429_max_wait = secs(20);
+    assert_eq!(shop.gateway, gateway);
+
+    let hooks = push(&cfg, "hooks");
+    assert!(hooks.endpoints.is_empty());
+    assert!(hooks.accept_set_webhook);
+    assert_eq!(hooks.webhook_reply, WebhookReply::Ignore);
+    assert!(hooks.honor_drop_pending);
+    assert!(pull(&cfg, "workers").honor_drop_pending);
+    assert!(!push(&cfg, "analytics").accept_set_webhook);
 }
 
 #[test]
@@ -724,7 +1086,7 @@ fn rule_last_rule_match_warns() {
     let yaml = r#"version: 1
 bots:
   - name: a
-    token: t
+    token: "1:t"
     routes:
       - to: [p]
       - match: { update_types: [message] }

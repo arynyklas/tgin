@@ -12,6 +12,10 @@ use super::model::{
 /// What [`Name`] accepts; `validate` checks the same rule.
 pub(super) const NAME_PATTERN: &str = "^[a-z0-9][a-z0-9-]{0,62}$";
 
+/// What a gateway `rate_limit.methods` entry may be: a method name, or a
+/// prefix followed by `*`; `validate` checks the same rule.
+pub(super) const METHOD_PATTERN: &str = "^[A-Za-z]+\\*?$";
+
 /// The JSON Schema (draft 2020-12) of the config file, pretty-printed.
 pub fn schema() -> String {
     tgin_runtime::config::schema_json::<RawConfig>()

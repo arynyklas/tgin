@@ -169,7 +169,8 @@ pub struct Reload {
 pub struct Bot {
     /// Unique bot name, used in metrics and logs.
     pub name: At<Name>,
-    /// The bot token: only ASCII letters, digits, `:`, `_` and `-`.
+    /// The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot
+    /// API gateway serves only tokens shaped `<digits>:<secret>`.
     pub token: SecretText,
     /// Bot API base URL. Supports `${env:…}` and `${file:…}`.
     #[serde(default = "defaults::api_url")]
@@ -177,6 +178,10 @@ pub struct Bot {
     /// How updates arrive; at most one. Omitted, the bot receives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<At<Ingress>>,
+    /// The Bot API gateway for this bot's downstream clients. Changes apply
+    /// live.
+    #[serde(default)]
+    pub gateway: Gateway,
     /// Rules in order; the first match wins.
     #[serde(default)]
     pub routes: Vec<At<Route>>,
@@ -257,6 +262,111 @@ pub struct Webhook {
     /// Who may post updates: `none` (anyone), `telegram` (Telegram's
     /// published networks) or a list of networks.
     pub ip_allowlist: IpAllowlist,
+}
+
+/// The Bot API gateway: how tgin forwards the bot's requests from
+/// downstream clients to the Bot API.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+pub struct Gateway {
+    /// Longest wait for the Bot API to accept or send the next bytes of a
+    /// request; at least 1s. A transfer that keeps moving is never cut.
+    pub upstream_idle_timeout: At<HumanDuration>,
+    pub rate_limit: RateLimit,
+    pub retry_429: Retry429,
+}
+
+/// Telegram's flood limits, applied before a request goes upstream.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+pub struct RateLimit {
+    pub mode: RateMode,
+    /// Longest delay `shape` adds before it answers 429 instead; at most
+    /// 1m. `0s` behaves like `reject`.
+    pub max_delay: At<HumanDuration>,
+    /// The methods limited, ignoring case: a method name, or a prefix
+    /// followed by `*`. At least one unless `mode: off`.
+    #[schemars(inner(pattern(super::schema::METHOD_PATTERN)))]
+    pub methods: At<Vec<At<String>>>,
+    pub global: GlobalRate,
+    pub per_chat: ChatRate,
+    pub per_group: GroupRate,
+}
+
+/// What a request beyond the limits gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RateMode {
+    /// Delayed until the limits admit it, up to `max_delay`; a longer wait
+    /// is answered with 429 at once.
+    Shape,
+    /// Answered with 429 at once.
+    Reject,
+    /// No limits.
+    Off,
+}
+
+/// One rate block; each has its own defaults.
+macro_rules! rate_block {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+        #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+        pub struct $name {
+            /// Requests per `per`; at least 1.
+            #[schemars(range(min = 1))]
+            pub count: At<u32>,
+            /// The period `count` requests are spread over; above 0.
+            pub per: At<HumanDuration>,
+            /// Requests let through at once before the rate applies; at
+            /// least 1.
+            #[schemars(range(min = 1))]
+            pub burst: At<u32>,
+        }
+
+        impl $name {
+            /// The block's fields as one shape.
+            pub(super) fn rate(&self) -> Rate<'_> {
+                Rate {
+                    count: &self.count,
+                    per: &self.per,
+                    burst: &self.burst,
+                }
+            }
+        }
+    };
+}
+
+rate_block! {
+    /// Requests of the bot, over all chats.
+    GlobalRate
+}
+
+rate_block! {
+    /// Requests per chat.
+    ChatRate
+}
+
+rate_block! {
+    /// Requests per group, supergroup or channel (a negative `chat_id` or an
+    /// `@username`), on top of `per_chat`.
+    GroupRate
+}
+
+/// The fields of any rate block.
+pub(super) struct Rate<'a> {
+    pub(super) count: &'a At<u32>,
+    pub(super) per: &'a At<HumanDuration>,
+    pub(super) burst: &'a At<u32>,
+}
+
+/// The transparent retry of a request the Bot API answered with 429.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+pub struct Retry429 {
+    /// Longest `retry_after` waited out before the one retry; at most 1m.
+    /// A longer one passes the 429 through; `0s` turns the retry off.
+    pub max_wait: At<HumanDuration>,
 }
 
 /// One routing rule.
@@ -399,6 +509,10 @@ pub struct Pull {
     /// same rules as a webhook `path`. Each supports `${env:…}` and
     /// `${file:…}`.
     pub aliases: Vec<Template>,
+    /// Let `deleteWebhook` with `drop_pending_updates: true`, sent on this
+    /// consumer's gateway path, empty the consumer's queue. Off, the flag
+    /// is ignored.
+    pub honor_drop_pending: bool,
 }
 
 /// tgin posts each update to HTTP endpoints, with retries and a circuit
@@ -406,7 +520,9 @@ pub struct Pull {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Push {
-    /// Where updates are posted; at least one.
+    /// Where updates are posted. Empty only with `accept_set_webhook: true`;
+    /// updates then queue until a `setWebhook` gives an endpoint.
+    #[serde(default = "defaults::endpoints")]
     pub endpoints: At<Vec<Endpoint>>,
     #[serde(default = "defaults::balance")]
     pub balance: Balance,
@@ -430,6 +546,30 @@ pub struct Push {
     pub retry: Retry,
     #[serde(default)]
     pub breaker: Breaker,
+    /// Let `setWebhook`, sent on this consumer's gateway path, add its URL
+    /// as an endpoint until tgin restarts, instead of answering it without
+    /// effect. Only for a consumer fed by one bot.
+    #[serde(default)]
+    pub accept_set_webhook: bool,
+    #[serde(default = "defaults::webhook_reply")]
+    pub webhook_reply: WebhookReply,
+    /// Let `deleteWebhook` with `drop_pending_updates: true`, sent on this
+    /// consumer's gateway path, empty the consumer's queue. Off, the flag
+    /// is ignored.
+    #[serde(default)]
+    pub honor_drop_pending: bool,
+}
+
+/// What tgin does with a Bot API method call in an endpoint's response
+/// body, the way Telegram handles a webhook reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookReply {
+    /// Call the method through the gateway, once, before the update is
+    /// acknowledged.
+    Execute,
+    /// Ignore the response body.
+    Ignore,
 }
 
 /// One downstream URL.

@@ -507,9 +507,9 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 }
 
 /// The live changes from `old` to `new` of the same mode, if any. A push
-/// consumer gets new endpoints (and breakers) when its delivery settings
-/// change; when only new bots appear, it keeps them and learns the bots'
-/// names.
+/// consumer gets new endpoints (and breakers) and options when its delivery
+/// settings or `webhook_reply` change; when only new bots appear, it keeps
+/// them and learns the bots' names.
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
@@ -526,7 +526,8 @@ fn live_change(
                 || old.balance != new.balance
                 || old.max_in_flight != new.max_in_flight
                 || old.retry != new.retry
-                || old.breaker != new.breaker;
+                || old.breaker != new.breaker
+                || old.webhook_reply != new.webhook_reply;
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
                 delivery.then(|| (endpoints(new), options(new, source_names))),
@@ -675,5 +676,58 @@ mod tests {
             build(&load(&two), Some(&old)),
             Err(BuildError::SourceIdsExhausted)
         ));
+    }
+
+    /// Gateway, setWebhook-capture and webhook-reply settings apply live:
+    /// no restart, no source restart, the same consumer instance; a changed
+    /// `webhook_reply` gives the push consumer new options.
+    #[tokio::test]
+    async fn gateway_and_webhook_reply_changes_apply_live() {
+        let metrics = CoreMetrics::register(&mut Registry::default());
+        let client = reqwest::Client::new();
+        let rt = EngineRuntime {
+            supervisor: Arc::new(Supervisor::new()),
+            stop: CancellationToken::new(),
+            force: CancellationToken::new(),
+        };
+        let build = |cfg: &Config, old: Option<&EngineState>| {
+            Plan::build(cfg, old, &[], &metrics, &client, &rt).map(Plan::into_parts)
+        };
+        let base = "version: 1\nserver: {}\nbots:\n  - { name: a, token: \"1:a\", routes: [{ to: [h, q] }] }\nconsumers:\n  h: { push: { endpoints: [{ url: \"http://h/\" }] } }\n  q: { pull: {} }\n";
+        let (old, _) = build(&load(base), None).expect("build");
+
+        let gateway = base.replace(
+            "token: \"1:a\",",
+            "token: \"1:a\", gateway: { upstream_idle_timeout: 5s, rate_limit: { mode: reject } },",
+        );
+        let (_, changes) = build(&load(&gateway), Some(&old)).expect("build");
+        let report = &changes.report;
+        assert!(report.sources_restarted.is_empty(), "{report:?}");
+        assert!(report.restart_required.is_empty(), "{report:?}");
+        assert!(report.changed.is_empty(), "{report:?}");
+
+        let ignore = base.replace("}] } }", "}], webhook_reply: ignore } }");
+        let (_, changes) = build(&load(&ignore), Some(&old)).expect("build");
+        assert_eq!(changes.report.changed, ["h"]);
+        assert!(changes.retiring.is_empty() && changes.started.is_empty());
+        let [live] = changes.live.as_slice() else {
+            panic!("one live change");
+        };
+        assert_eq!(&*live.slot.name, "h");
+        assert!(live.endpoints.is_some(), "push options not refreshed");
+
+        let flags = base
+            .replace(
+                "}] } }",
+                "}], accept_set_webhook: true, honor_drop_pending: true } }",
+            )
+            .replace(
+                "q: { pull: {} }",
+                "q: { pull: { honor_drop_pending: true } }",
+            );
+        let (_, changes) = build(&load(&flags), Some(&old)).expect("build");
+        assert_eq!(changes.report.changed, ["h", "q"]);
+        assert!(changes.retiring.is_empty() && changes.started.is_empty());
+        assert!(changes.report.restart_required.is_empty());
     }
 }
