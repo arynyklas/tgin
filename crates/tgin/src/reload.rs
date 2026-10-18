@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::admin::{BotMove, Moved};
+use crate::admin::{BotMove, MAX_MOVE_TIMEOUT, Moved};
 use crate::app::{self, Shared};
 use crate::cli;
 use crate::data_server::DataRoutes;
@@ -542,7 +542,8 @@ impl Reloader {
 
     /// Moves the bot of `job` off its Bot API server, `how` says with which
     /// call, in these steps; its timeout (`reload.drain_timeout` when
-    /// `None`), counted from the request, bounds steps 1 to 3 together:
+    /// `None`, at most [`MAX_MOVE_TIMEOUT`] either way), counted from the
+    /// request, bounds steps 1 to 3 together:
     /// 1. the server runs dry of the bot's updates, its ingest running on
     ///    ([`crate::sources::Sources::drain_upstream`]); not done by the
     ///    deadline, the move fails ([`MoveError::Undrained`]) and changes
@@ -592,7 +593,10 @@ impl Reloader {
             Ok(client) => client,
             Err(err) => return Some(Err(MoveError::Upstream(err))),
         };
-        let timeout = timeout.unwrap_or(cfg.reload.drain_timeout);
+        // The API and the CLI refuse more; `reload.drain_timeout` has no bound.
+        let timeout = timeout
+            .unwrap_or(cfg.reload.drain_timeout)
+            .min(MAX_MOVE_TIMEOUT);
         let deadline = *requested + timeout;
         if Instant::now() >= deadline {
             tracing::warn!(bot = %name, ?timeout, "the move waited in the queue past its deadline; the bot was not moved");

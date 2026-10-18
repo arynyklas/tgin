@@ -24,7 +24,7 @@
 //!
 //! `POST /v1/bots/{name}/logout|close[?timeout=<duration>]` moves a bot off
 //! its Bot API server, serialized with the reloads. Within the timeout
-//! (`30s`, `2m`…, at most `1h`; `reload.drain_timeout` without one),
+//! (`30s`, `2m`…; `reload.drain_timeout` without one; at most `1h` either way),
 //! counted from the request, the server runs dry of the bot's updates, the
 //! bot's ingest stops, and tgin delivers what it holds of the bot; then the
 //! server is called (`logOut`, or `deleteWebhook` and `close`) and the bot

@@ -3456,6 +3456,27 @@ async fn abandoned_queued_move_makes_no_upstream_call() {
     tgin.stop().await;
 }
 
+/// A move without a timeout takes `reload.drain_timeout`, at most 1h: a
+/// huge one still moves the bot, and reloads still run afterwards (no
+/// deadline overflowed into a panic of the task that runs both).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_with_a_huge_drain_timeout() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let huge = "reload: { watch: false, drain_timeout: 18446744073709551615s }\n";
+    let tgin = start("move_with_a_huge_drain_timeout", &hooked(&telegram, huge)).await;
+    let answer = tgin
+        .admin_post("/v1/bots/hooked/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 1);
+    tgin.rewrite(&with_extra_consumer(&telegram, huge));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    assert_eq!(reload.json()["generation"], 2);
+    tgin.stop().await;
+}
+
 /// When the server cannot be asked whether it still holds updates, the
 /// 504's warning says why (masked), not that updates were held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
