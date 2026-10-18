@@ -168,7 +168,7 @@ pub(super) async fn forward(
         None
     };
     if !resendable && scanned.is_none() {
-        return match call.send(url, headers, body).await {
+        return match call.send(url, headers, body, false).await {
             Ok((response, _)) => call.relay(response),
             Err(failed) => call.failed(failed),
         };
@@ -194,13 +194,18 @@ pub(super) async fn forward(
         return errors::too_many_requests(limited.retry_after_secs());
     }
     match payload {
-        Payload::Streamed(body) => match call.send(url, headers, body).await {
+        Payload::Streamed(body) => match call.send(url, headers, body, false).await {
             Ok((response, _)) => call.relay(response),
             Err(failed) => call.failed(refused_by(failed, verdict)),
         },
         Payload::Buffered(request) => {
             let first = call
-                .send(url.clone(), headers.clone(), Body::from(request.clone()))
+                .send(
+                    url.clone(),
+                    headers.clone(),
+                    Body::from(request.clone()),
+                    false,
+                )
                 .await;
             let (response, at) = match first {
                 Ok(first) => first,
@@ -331,16 +336,23 @@ impl Call<'_> {
     /// `tgin_upstream_up`: any response is an answer; every failure but
     /// the client's own leaves the upstream unanswering. A bot parked since
     /// the call came in sends nothing; the call counts as being sent until
-    /// the answer's headers came, so a move waits for it.
+    /// the answer's headers came, so a move waits for it. `again`, the
+    /// resend after a 429, counts in `tgin_gateway_retries_total` once it
+    /// goes.
     async fn send(
         &self,
         url: Url,
         headers: HeaderMap,
         body: Body,
+        again: bool,
     ) -> Result<(reqwest::Response, Instant), Failed> {
         let Some(_sending) = self.bot.gate.enter() else {
             return Err(Failed::Parked);
         };
+        if again {
+            self.bot.metrics.retried();
+            tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request sent again after the Bot API server's 429");
+        }
         let sent = self.exchange(url, headers, body).await;
         if self.server {
             let up = self.bot.upstream_metrics.up();
@@ -536,10 +548,9 @@ impl Call<'_> {
             self.refuse(limited);
             return answer(status, headers, Body::from(flood));
         }
-        self.bot.metrics.retried();
-        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), retry_after = ?wait, "gateway request sent again after the Bot API server's 429");
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), retry_after = ?wait, "gateway request waited out the Bot API server's 429");
         match self
-            .send(again.url, again.headers, Body::from(again.body))
+            .send(again.url, again.headers, Body::from(again.body), true)
             .await
         {
             Ok((response, _)) => self.relay(response),

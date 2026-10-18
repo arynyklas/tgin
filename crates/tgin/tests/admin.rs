@@ -4091,6 +4091,13 @@ async fn a_429_resend_never_reaches_the_server_left() {
         .expect("no panic");
     assert_parked(response).await;
     assert_eq!(count_calls(&telegram, TOKEN, "sendMessage").await, 1);
+    let metrics = tgin.metrics_text();
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l == r#"tgin_gateway_retries_total{bot="hooked"} 0"#),
+        "a refused resend counted as a retry:\n{metrics}"
+    );
     tgin.stop().await;
 }
 
