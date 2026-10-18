@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Telegram Bot API client and update facts extraction for tgin."
-license.workspace = true
+license = "MIT AND BSL-1.0"
 repository.workspace = true
 publish.workspace = true
 
