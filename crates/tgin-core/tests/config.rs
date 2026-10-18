@@ -2776,7 +2776,7 @@ fn duplicate_tokens_rejected() {
 fn webhook_rules_follow_the_upstream_kind() {
     let yaml = |upstreams: &str, bot: &str, hook: &str| {
         format!(
-            "version: 1\nserver: {{}}\n{upstreams}bots:\n  - name: a\n    token: \"1:t\"\n{bot}    ingress: {{ webhook: {hook} }}\n"
+            "version: 1\nserver: {{ max_connections: 100000 }}\n{upstreams}bots:\n  - name: a\n    token: \"1:t\"\n{bot}    ingress: {{ webhook: {hook} }}\n"
         )
     };
     let cloud_like = [
@@ -2891,6 +2891,52 @@ fn webhook_rules_follow_the_upstream_kind() {
         );
     }
     loads(&yaml("", "", "{ ip_allowlist: telegram }"));
+}
+
+/// A local-mode webhook's `max_connections` above 100 must also fit the
+/// data plane's own `server.max_connections`, which closes connections
+/// beyond it; values in Telegram's 1 to 100 are never checked against it,
+/// so no v1 config changes.
+#[test]
+fn local_webhook_max_connections_fit_the_data_plane() {
+    const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+    let yaml = |upstream: &str, server: &str, max: u32| {
+        format!(
+            "version: 1\nserver: {server}\nupstreams:\n  l: {upstream}\nbots:\n  - name: a\n    token: \"{TOKEN}\"\n    upstream: l\n    ingress: {{ webhook: {{ max_connections: {max} }} }}\n"
+        )
+    };
+    let local = "{ kind: local, url: \"http://127.0.0.1:8081\", local_mode: true }";
+    let text = yaml(local, "{}", 10_001);
+    let err = single_error(&text);
+    assert_at(
+        &err,
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "10001"),
+    );
+    assert_message(&err, "above `server.max_connections` (10000)");
+    let hint = err.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("server.max_connections"), "{err}");
+    assert!(!format!("{err}").contains(TOKEN) && !hint.contains(TOKEN));
+
+    let text = yaml(local, "{ max_connections: 500 }", 501);
+    assert_at(
+        &single_error(&text),
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "501"),
+    );
+    for (upstream, server, max) in [
+        (local, "{ max_connections: 20000 }", 20_000),
+        (local, "{}", 10_000),
+        // Within Telegram's range: never compared.
+        (local, "{ max_connections: 50 }", 100),
+        (
+            "{ kind: cloud, url: \"https://api.telegram.org\" }",
+            "{ max_connections: 50 }",
+            100,
+        ),
+    ] {
+        loads(&yaml(upstream, server, max));
+    }
 }
 
 /// A plain-http upstream off loopback warns once, naming the upstream and

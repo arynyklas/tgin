@@ -180,6 +180,8 @@ pub struct WebhookRules {
 
 /// The ports Telegram posts webhooks to.
 pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
+/// The most connections Telegram opens to a webhook.
+pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
 
 impl WebhookRules {
     /// Telegram's rules, unless the server is local and in local mode.
@@ -188,7 +190,11 @@ impl WebhookRules {
         WebhookRules {
             http_allowed: local,
             any_port: local,
-            max_connections: if local { 100_000 } else { 100 },
+            max_connections: if local {
+                100_000
+            } else {
+                TELEGRAM_MAX_CONNECTIONS
+            },
         }
     }
 }

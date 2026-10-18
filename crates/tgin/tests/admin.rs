@@ -1222,10 +1222,15 @@ async fn max_connections_forwarded() {
         .await;
     let tgin = start(
         "max_connections_forwarded",
+        // The data plane accepts as many connections as the server may open.
         &config(&format!(
             "{}bots:\n  - name: hooked\n    token: \"{TOKEN}\"\n    upstream: tba\n    ingress: {{ webhook: {{ path: /hook, secret_token: {HOOK_SECRET}, public_url: \"http://tgin.internal:8080\", register: true, max_connections: 100000 }} }}\n    routes: [{{ to: [workers] }}]\nconsumers:\n  workers: {{ pull: {{}} }}\n",
             local_upstream(&server, true)
-        )),
+        ))
+        .replace(
+            "server: { listen: [\"127.0.0.1:0\"] }",
+            "server: { listen: [\"127.0.0.1:0\"], max_connections: 100000 }",
+        ),
     )
     .await;
 

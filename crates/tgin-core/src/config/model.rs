@@ -327,7 +327,8 @@ pub struct Webhook {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<Vec<String>>,
     /// Telegram's `max_connections`: 1 to 100, or to 100000 for an
-    /// upstream in local mode.
+    /// upstream in local mode, where a value above 100 must not exceed
+    /// `server.max_connections`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100_000))]
     pub max_connections: Option<At<u32>>,

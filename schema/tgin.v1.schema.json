@@ -1292,7 +1292,7 @@
           "description": "Who may post updates: `none` (anyone), `telegram` (Telegram's\npublished networks; not for a `local` upstream) or a list of\nnetworks."
         },
         "max_connections": {
-          "description": "Telegram's `max_connections`: 1 to 100, or to 100000 for an\nupstream in local mode.",
+          "description": "Telegram's `max_connections`: 1 to 100, or to 100000 for an\nupstream in local mode, where a value above 100 must not exceed\n`server.max_connections`.",
           "format": "uint32",
           "maximum": 100000,
           "minimum": 1,
