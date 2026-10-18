@@ -2573,7 +2573,10 @@ fn api_url_shorthand_unchanged() {
             assert!(!upstream.local_mode, "{}", path.display());
             assert_eq!(upstream.files, None, "{}", path.display());
             assert_eq!(upstream.response_timeout, secs(60), "{}", path.display());
-            assert!(!bot.allow_local_files, "{}", path.display());
+            // The benchmark configs' fake stands in for the cloud, which
+            // tgin does not scan; every other config keeps the default.
+            let benchmark = path.starts_with("tests/performance");
+            assert_eq!(bot.allow_local_files, benchmark, "{}", path.display());
         }
         assert!(
             shorthand > 0,
