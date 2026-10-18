@@ -1678,3 +1678,191 @@ impl http_body::Body for Chunked {
         std::task::Poll::Ready(chunk.map(|chunk| Ok(http_body::Frame::data(chunk.into()))))
     }
 }
+
+/// What [`recorder`] saw of one connection's last request: the path, the
+/// body bytes it got, and whether the body was complete (its whole
+/// `Content-Length`, or a chunked body's last chunk and trailer section).
+#[derive(Clone, Debug)]
+struct Recorded {
+    path: Option<String>,
+    received: usize,
+    complete: bool,
+}
+
+/// A Bot API server over raw TCP that tolerates bodies cut short: each
+/// request read whole is recorded and answered `{"ok":true,"result":true}`
+/// (connections kept alive); a connection that ends mid-request is recorded
+/// incomplete, and one that ends between requests is recorded with no path.
+async fn recorder() -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let seen: Arc<Mutex<Vec<Recorded>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                loop {
+                    let mut record = Recorded {
+                        path: None,
+                        received: 0,
+                        complete: false,
+                    };
+                    let mut line = String::new();
+                    let (mut length, mut chunked) = (0usize, false);
+                    loop {
+                        line.clear();
+                        match read.read_line(&mut line).await {
+                            Ok(0) | Err(_) => {
+                                log.lock().expect("log").push(record);
+                                return;
+                            }
+                            Ok(_) => {}
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if record.path.is_none() {
+                            record.path = line.split(' ').nth(1).map(str::to_owned);
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().expect("a length");
+                        }
+                        chunked |=
+                            lower.starts_with("transfer-encoding:") && lower.contains("chunked");
+                    }
+                    let mut buf = vec![0u8; 64 * 1024];
+                    if chunked {
+                        loop {
+                            line.clear();
+                            if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            let size = usize::from_str_radix(
+                                line.trim().split(';').next().unwrap_or(""),
+                                16,
+                            )
+                            .expect("a chunk size");
+                            if size == 0 {
+                                // The trailer section, up to its empty line.
+                                loop {
+                                    line.clear();
+                                    if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                        break;
+                                    }
+                                    if line == "\r\n" {
+                                        record.complete = true;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            let mut left = size + 2;
+                            while left > 0 {
+                                let want = left.min(buf.len());
+                                match read.read(&mut buf[..want]).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => left -= n,
+                                }
+                            }
+                            if left > 0 {
+                                break;
+                            }
+                            record.received += size;
+                        }
+                    } else {
+                        while record.received < length {
+                            let want = (length - record.received).min(buf.len());
+                            match read.read(&mut buf[..want]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => record.received += n,
+                            }
+                        }
+                        record.complete = record.received == length;
+                    }
+                    let complete = record.complete;
+                    log.lock().expect("log").push(record);
+                    if !complete {
+                        return;
+                    }
+                    let body = br#"{"ok":true,"result":true}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if write.write_all(head.as_bytes()).await.is_err()
+                        || write.write_all(body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Waits until `seen` holds `n` records, for at most [`PATIENCE`].
+async fn recorded(seen: &Mutex<Vec<Recorded>>, n: usize) -> Vec<Recorded> {
+    let started = std::time::Instant::now();
+    loop {
+        let records = seen.lock().expect("log").clone();
+        if records.len() >= n {
+            return records;
+        }
+        assert!(
+            started.elapsed() < PATIENCE,
+            "{n} records never came: {records:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A chunked multipart body without its closing delimiter, ended by a
+/// trailers frame, is refused: the server never gets the last chunk, which
+/// would make the request whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trailers_never_end_a_refused_body_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (api, seen) = recorder().await;
+    let tgin = start(&local_files_config(&api)).await;
+    let part = format!(
+        "--{BOUNDARY}\r\n{}\r\n\r\nno closing delimiter",
+        text_field("caption")
+    );
+    let mut stream = tokio::net::TcpStream::connect(tgin.addr)
+        .await
+        .expect("connect");
+    let request = format!(
+        "POST /bot{TOKEN}/sendDocument?chat_id=1 HTTP/1.1\r\nHost: tgin\r\nContent-Type: {MULTIPART}\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{part}\r\n0\r\nX-T: 1\r\n\r\n",
+        part.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("request");
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !answer.ends_with(b"}") {
+        let n = timeout(PATIENCE, stream.read(&mut buf))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        assert!(n > 0, "closed: {}", String::from_utf8_lossy(&answer));
+        answer.extend_from_slice(&buf[..n]);
+    }
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    assert!(
+        answer.contains("Bad Request: can't parse the request parameters"),
+        "{answer}"
+    );
+    let records = recorded(&seen, 1).await;
+    assert!(records.iter().all(|record| !record.complete), "{records:?}");
+    tgin.stop().await;
+}

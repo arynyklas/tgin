@@ -905,9 +905,10 @@ impl HttpBody for Upload {
             .client_pending
             .store(polled.is_pending(), Ordering::Relaxed);
         match &polled {
-            Poll::Ready(Some(Ok(_))) => {
+            Poll::Ready(Some(Ok(frame))) => {
                 this.progress.stamp();
-                if body.is_end_stream() {
+                // hyper's client polls nothing after a trailers frame.
+                if frame.is_trailers() || body.is_end_stream() {
                     this.progress.finish();
                 }
             }
@@ -1240,6 +1241,36 @@ mod tests {
         assert!(!progress.ended());
         let frame = std::future::poll_fn(|cx| Pin::new(&mut upload).poll_frame(cx)).await;
         assert!(matches!(frame, Some(Ok(_))));
+        assert!(progress.ended());
+    }
+
+    /// A chunked body may end with a trailers frame, after which hyper
+    /// polls nothing more: the body has ended there.
+    #[tokio::test]
+    async fn upload_ends_with_a_trailers_frame() {
+        struct Trailed(Vec<Frame<Bytes>>);
+        impl HttpBody for Trailed {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+                let frames = &mut self.get_mut().0;
+                Poll::Ready((!frames.is_empty()).then(|| Ok(frames.remove(0))))
+            }
+        }
+        let progress = Arc::new(Progress::new());
+        let body = Body::new(Trailed(vec![
+            Frame::data(Bytes::from_static(b"abc")),
+            Frame::trailers(HeaderMap::new()),
+        ]));
+        let mut upload = Upload::new(body, Arc::clone(&progress));
+        let data = std::future::poll_fn(|cx| Pin::new(&mut upload).poll_frame(cx)).await;
+        assert!(matches!(data, Some(Ok(_))));
+        assert!(!progress.ended());
+        let trailers = std::future::poll_fn(|cx| Pin::new(&mut upload).poll_frame(cx)).await;
+        assert!(matches!(trailers, Some(Ok(frame)) if frame.is_trailers()));
         assert!(progress.ended());
     }
 

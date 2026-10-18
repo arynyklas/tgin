@@ -383,10 +383,13 @@ impl Scanner {
 /// completes a local file reference, or passes [`MAX_PARAMETERS`] of JSON
 /// or urlencoded text, never is; nor is the frame that ends the body (by
 /// its length, or the end of a body of unknown length) before the scan of
-/// the whole has come out clean. The body fails instead, which drops the
-/// upstream connection with the request incomplete. Once a multipart scan
-/// has read the closing delimiter, the rest passes unread. The verdict goes
-/// to the receiver the constructor returns as soon as there is one.
+/// the whole has come out clean. A trailers frame ends a body too (hyper's
+/// client writes the last chunk after it): it is the end, the trailers
+/// dropped, as tgin never announces them upstream. The body fails instead,
+/// which drops the upstream connection with the request incomplete. Once a
+/// multipart scan has read the closing delimiter, the rest passes unread.
+/// The verdict goes to the receiver the constructor returns as soon as
+/// there is one.
 pub(super) struct ScanGuard {
     body: Body,
     scan: Scan,
@@ -461,21 +464,32 @@ impl HttpBody for ScanGuard {
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let this = self.get_mut();
         let scan = match &mut this.scan {
-            Scan::Clean => return Pin::new(&mut this.body).poll_frame(cx),
+            Scan::Clean => {
+                return match Pin::new(&mut this.body).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => Poll::Ready(None),
+                    polled => polled,
+                };
+            }
             Scan::Refused => return Poll::Ready(Some(Err(axum::Error::new(Refused)))),
             Scan::Scanning(scan) => scan,
         };
-        let polled = Pin::new(&mut this.body).poll_frame(cx);
+        let mut polled = Pin::new(&mut this.body).poll_frame(cx);
         let verdict = match &polled {
-            Poll::Ready(Some(Ok(frame))) => frame.data_ref().and_then(|data| {
-                let verdict = scan.feed(data);
-                if let Some(remaining) = &mut this.remaining {
-                    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                    *remaining = remaining.saturating_sub(len);
+            Poll::Ready(Some(Ok(frame))) => match frame.data_ref() {
+                Some(data) => {
+                    let verdict = scan.feed(data);
+                    if let Some(remaining) = &mut this.remaining {
+                        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                        *remaining = remaining.saturating_sub(len);
+                    }
+                    let last = this.remaining == Some(0) || this.body.is_end_stream();
+                    verdict.or_else(|| last.then(|| scan.finish()))
                 }
-                let last = this.remaining == Some(0) || this.body.is_end_stream();
-                verdict.or_else(|| last.then(|| scan.finish()))
-            }),
+                None => {
+                    polled = Poll::Ready(None);
+                    Some(scan.finish())
+                }
+            },
             Poll::Ready(None) => Some(scan.finish()),
             Poll::Ready(Some(Err(_))) | Poll::Pending => None,
         };
@@ -1051,6 +1065,78 @@ mod tests {
         assert!(failed);
         assert!(passed.is_empty());
         assert_eq!(verdict.try_recv(), Ok(UNREADABLE));
+    }
+
+    /// `frames`, then a trailers frame, with no length announced.
+    fn trailed(frames: &[&[u8]]) -> Body {
+        struct Trailed(std::collections::VecDeque<Frame<Bytes>>);
+        impl HttpBody for Trailed {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+                Poll::Ready(self.get_mut().0.pop_front().map(Ok))
+            }
+        }
+        let mut queued: std::collections::VecDeque<Frame<Bytes>> = frames
+            .iter()
+            .map(|frame| Frame::data(Bytes::copy_from_slice(frame)))
+            .collect();
+        let mut trailers = axum::http::HeaderMap::new();
+        trailers.insert("x-t", HeaderValue::from_static("1"));
+        queued.push_back(Frame::trailers(trailers));
+        Body::new(Trailed(queued))
+    }
+
+    /// Polls every frame of `guard` until it ends or fails: the data passed
+    /// on, whether it failed, and how many trailers frames it passed on.
+    async fn drain_frames(mut guard: ScanGuard) -> (Vec<u8>, bool, usize) {
+        let (mut passed, mut trailers) = (Vec::new(), 0);
+        while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut guard).poll_frame(cx)).await
+        {
+            match frame {
+                Ok(frame) => match frame.data_ref() {
+                    Some(data) => passed.extend_from_slice(data),
+                    None => trailers += 1,
+                },
+                Err(_) => return (passed, true, trailers),
+            }
+        }
+        (passed, false, trailers)
+    }
+
+    /// A trailers frame ends a chunked body as its end does (hyper's client
+    /// writes the terminal chunk after it): the whole body must scan clean
+    /// first, and the trailers, which tgin never announces, go no further.
+    #[tokio::test]
+    async fn guard_ends_the_body_at_a_trailers_frame() {
+        let head = format!("--{BOUNDARY}\r\n{}\r\n\r\nvalue", text("caption"));
+        let (guard, mut verdict) =
+            ScanGuard::multipart(trailed(&[head.as_bytes()]), BOUNDARY.as_bytes());
+        let (passed, failed, trailers) = drain_frames(guard).await;
+        assert!(failed, "a multipart body without its closing delimiter");
+        assert_eq!(passed, head.as_bytes());
+        assert_eq!(trailers, 0);
+        assert_eq!(verdict.try_recv(), Ok(UNREADABLE));
+
+        // Scanned clean at the closing delimiter, before the trailers.
+        let whole = multipart(&[(&text("caption"), b"value")]);
+        let (guard, mut verdict) = ScanGuard::multipart(trailed(&[&whole]), BOUNDARY.as_bytes());
+        let (passed, failed, trailers) = drain_frames(guard).await;
+        assert!(!failed);
+        assert_eq!(passed, whole);
+        assert_eq!(trailers, 0);
+        assert_eq!(verdict.try_recv(), Ok(Verdict::Clean));
+
+        let json: &[u8] = br#"{"chat_id":1,"text":"x"}"#;
+        let (guard, mut verdict) = ScanGuard::params(trailed(&[json]), Encoding::Json);
+        let (passed, failed, trailers) = drain_frames(guard).await;
+        assert!(!failed);
+        assert_eq!(passed, json);
+        assert_eq!(trailers, 0);
+        assert_eq!(verdict.try_recv(), Ok(Verdict::Clean));
     }
 
     #[tokio::test]
