@@ -2450,7 +2450,6 @@ fn rule_paths_survive_url_encoding() {
 /// `*_URL` to the cloud, anything else to a distinct token-shaped value),
 /// and the upstream URL all its `api_url` shorthand bots have.
 fn repo_configs() -> Vec<(PathBuf, String, MapEnv, &'static str)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let cloud = "https://api.telegram.org/";
     let files = [
         ("crates/tgin-core/tests/fixtures/full.yaml", cloud),
@@ -2479,28 +2478,78 @@ fn repo_configs() -> Vec<(PathBuf, String, MapEnv, &'static str)> {
     files
         .into_iter()
         .map(|(file, url)| {
-            let path = root.join(file);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let mut env = MapEnv::default();
-            env.files.insert(
-                PathBuf::from("/run/secrets/tgin-admin-token"),
-                "admin-api-token\n".into(),
-            );
-            for (i, reference) in text.split("${env:").skip(1).enumerate() {
-                let name = reference.split('}').next().unwrap_or_default();
-                let value = if name.ends_with("_URL") {
-                    "https://api.telegram.org".to_owned()
-                } else {
-                    format!("value-{i}")
-                };
-                env.vars.insert(name.to_owned(), value);
-            }
-            // A relative origin, so that an absolute `${file:…}` path
-            // resolves as written on every platform.
-            (PathBuf::from(file), text, env, url)
+            let (path, text, env) = repo_config(file);
+            (path, text, env, url)
         })
         .collect()
+}
+
+/// The repository config `file`, with every `${env:…}` it uses set as
+/// [`repo_configs`] sets them: its path (relative, so that an absolute
+/// `${file:…}` path resolves as written on every platform), text and
+/// environment.
+fn repo_config(file: &str) -> (PathBuf, String, MapEnv) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(file);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut env = MapEnv::default();
+    env.files.insert(
+        PathBuf::from("/run/secrets/tgin-admin-token"),
+        "admin-api-token\n".into(),
+    );
+    for (i, reference) in text.split("${env:").skip(1).enumerate() {
+        let name = reference.split('}').next().unwrap_or_default();
+        let value = if name.ends_with("_URL") {
+            "https://api.telegram.org".to_owned()
+        } else {
+            format!("value-{i}")
+        };
+        env.vars.insert(name.to_owned(), value);
+    }
+    (PathBuf::from(file), text, env)
+}
+
+/// The self-hosted example loads, its one bot on the `local` upstream in
+/// local mode with files from the server's `--files-dir`, its `file:`
+/// references refused; its only warning is the plain http to the server,
+/// named by the upstream.
+#[test]
+fn self_hosted_example_loads() {
+    let (path, text, mut env) = repo_config("examples/self-hosted/config/tgin.yaml");
+    // A bot token as Telegram shapes it, which the gateway needs to serve
+    // the bot (`value-…` would warn).
+    env.vars
+        .insert("BOT_TOKEN".to_owned(), "123456:example-token".to_owned());
+    let cfg = config::load(&text, &path, &env)
+        .unwrap_or_else(|errors| panic!("{}: {}", path.display(), render(&errors)));
+    let [bot] = cfg.bots.as_slice() else {
+        panic!("{} bots", cfg.bots.len());
+    };
+    let upstream = &bot.upstream;
+    assert_eq!(&*upstream.name, "tba");
+    assert_eq!(upstream.kind, UpstreamKind::Local);
+    assert_eq!(
+        upstream.url.expose().as_str(),
+        "http://telegram-bot-api:8081/"
+    );
+    assert!(upstream.local_mode);
+    let Some(Files::Dir { dir, server_dir }) = &upstream.files else {
+        panic!("{:?}", upstream.files);
+    };
+    let files = std::path::absolute("/var/lib/telegram-bot-api/files").unwrap();
+    assert_eq!((dir.expose(), server_dir.expose()), (&files, &files));
+    assert_eq!(upstream.response_timeout, secs(600));
+    assert!(!bot.allow_local_files);
+    assert!(upstream.refuses_local_files(bot.allow_local_files));
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_at(
+        warning,
+        "upstreams.tba.url",
+        pos(&text, "http://telegram-bot-api"),
+    );
 }
 
 /// `api_url`, written or left out, is an unnamed cloud upstream named
