@@ -14,7 +14,7 @@ Telegram ── telegram-bot-api ◄── tgin ◄─────────�
   `upstream` network with tgin only, and publishes no port.
 - tgin long-polls the server and queues the updates for the `bot` consumer.
   The server is the upstream `tba` in `config/tgin.yaml`: `kind: local`,
-  `local_mode: true`, and `files.dir`, the server's files directory as
+  `local_mode: true`, and `files.dir`, the server's `--files-dir` as
   mounted in tgin. Its gateway is the bot's Bot API: the bot's calls reach
   the server through tgin, and the bot's files come from tgin's disk.
 - The bot (`examples/simple/bot1.py`) is on the `bots` network with tgin, so
