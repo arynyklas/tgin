@@ -345,7 +345,7 @@ fn scanned_encoding(url: &Url, headers: &HeaderMap) -> Result<Option<Encoding>, 
 ///   refused as too large), refused when it carries a local file
 ///   reference, else buffered, its chat read from it;
 /// - multipart, it streams through a [`MultipartGuard`], whose verdict
-///   comes back.
+///   comes back; an empty one, with no parameters, goes as it is.
 async fn prepare_scanned(
     scanned: Encoding,
     content_type: Option<&HeaderValue>,
@@ -355,13 +355,19 @@ async fn prepare_scanned(
     limited: bool,
 ) -> Result<(Payload, Option<ChatKey>, Option<oneshot::Receiver<Verdict>>), Failed> {
     if scanned == Encoding::Multipart {
+        let chat = limited.then(|| query_chat(query)).flatten();
+        // An empty body carries no parameters; wrapped, its end would be
+        // hidden until the guard read it, which hyper never does for a
+        // zero length.
+        if body.is_end_stream() {
+            return Ok((Payload::Streamed(body), chat, None));
+        }
         let Some(boundary) =
             content_type.and_then(|content_type| boundary(content_type.as_bytes()))
         else {
             return Err(Failed::Refused(Refusal::Unreadable));
         };
         let (guard, verdict) = MultipartGuard::new(body, boundary);
-        let chat = limited.then(|| query_chat(query)).flatten();
         return Ok((Payload::Streamed(Body::new(guard)), chat, Some(verdict)));
     }
     let Bounded::Complete(bytes) = read_within(body, MAX_PARAMETERS, idle).await? else {

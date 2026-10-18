@@ -1538,3 +1538,54 @@ consumers:
     );
     tgin.stop().await;
 }
+
+/// An empty multipart body carries no parameters: it goes upstream as it
+/// is, its end known at once, so the wait for the answer is bounded by
+/// `response_timeout`, not by `upstream_idle_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_multipart_body_waits_for_the_answer() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"ok":true,"result":true}"#, JSON)
+                .set_delay(Duration::from_millis(2500)),
+        )
+        .mount(&server)
+        .await;
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true, response_timeout: 8s }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    gateway: {{ upstream_idle_timeout: 1s, rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [a] }}]
+consumers:
+  a: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+    );
+    let tgin = start(&yaml).await;
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendDocument?chat_id=1"),
+            MULTIPART,
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].body.is_empty());
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="ok"} 1"#,
+    );
+    tgin.stop().await;
+}
