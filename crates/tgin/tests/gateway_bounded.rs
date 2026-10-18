@@ -526,9 +526,9 @@ async fn json_upload(tgin: SocketAddr, token: &'static str, size: usize) -> Stri
 }
 
 /// [`CONCURRENT`] JSON uploads of `size` bytes for `token` at once, each
-/// held by the server until all have arrived; the heap's growth over the
-/// batch.
-async fn json_batch(tgin: SocketAddr, token: &'static str, size: usize) -> isize {
+/// held by the server until all have arrived: the heap's growth over the
+/// batch, and the largest single allocation made during it.
+async fn json_batch(tgin: SocketAddr, token: &'static str, size: usize) -> (isize, usize) {
     let batch = Box::pin(async move {
         let uploads: Vec<_> = (0..CONCURRENT)
             .map(|_| tokio::spawn(json_upload(tgin, token, size)))
@@ -538,17 +538,23 @@ async fn json_batch(tgin: SocketAddr, token: &'static str, size: usize) -> isize
             assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         }
     });
-    growth(batch).await.0
+    counting_alloc::reset_largest();
+    let (grew, ()) = growth(batch).await;
+    (grew, counting_alloc::largest())
 }
 
 /// JSON bodies to a self-hosted server are scanned for local file
-/// references while they stream, so tgin keeps no copy of them:
-/// [`CONCURRENT`] 1 MiB bodies in flight at once grow the heap about as
-/// much as as many to a bot that allows local files, which stream unscanned (hyper's
-/// per-connection read buffers, up to 408 KiB each, are most of it), and
-/// far less than a copy of each would. Measured on Windows: 5 to 18 MB
-/// scanned, 10 to 18 MB unscanned; reading each body whole, as tgin once
-/// did, 71 to 81 MB.
+/// references while they stream, so tgin keeps no copy of them. A copy of
+/// a 1 MiB body takes one allocation of at least its size; streamed, the
+/// largest one is a connection buffer, as large for unscanned bodies
+/// (measured: 500 736 B on Linux, 679 936 B on Windows). So while
+/// [`CONCURRENT`] such bodies are in flight at once, no single allocation
+/// may reach a body's size, whatever the scheduling. A loose bound on the
+/// heap's growth, a copy of each body at most, checks the total too. The
+/// batches to a bot that allows local files, which stream unscanned, are
+/// measured alongside and printed, not asserted: how much of the buffers
+/// they keep at once depends on the machine (2.5 MB on one CI runner, 12
+/// to 18 MB on others).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scanned_json_held_flat_across_concurrent_requests() {
     const SIZE_1M: usize = 1024 * 1024 - 64;
@@ -571,18 +577,21 @@ async fn scanned_json_held_flat_across_concurrent_requests() {
 
     let mut batches = 0;
     let mut batch = async |token| {
-        let grew = json_batch(tgin, token, SIZE_1M).await;
+        let measured = json_batch(tgin, token, SIZE_1M).await;
         expected.fetch_add(CONCURRENT as u64, Ordering::SeqCst);
         batches += 1;
-        grew
+        measured
     };
     // Warm: connections, tasks, metric handles and buffers.
     batch(TOKEN).await;
     batch(PLAIN_TOKEN).await;
-    let (mut scanned, mut plain) = (0, 0);
+    let (mut scanned, mut scanned_largest) = (0, 0);
+    let (mut plain, mut plain_largest) = (0, 0);
     for _ in 0..3 {
-        scanned = scanned.max(batch(TOKEN).await);
-        plain = plain.max(batch(PLAIN_TOKEN).await);
+        let (grew, largest) = batch(TOKEN).await;
+        (scanned, scanned_largest) = (scanned.max(grew), scanned_largest.max(largest));
+        let (grew, largest) = batch(PLAIN_TOKEN).await;
+        (plain, plain_largest) = (plain.max(grew), plain_largest.max(largest));
     }
     assert_eq!(
         read.load(Ordering::SeqCst),
@@ -590,15 +599,15 @@ async fn scanned_json_held_flat_across_concurrent_requests() {
         "every body reached the server whole"
     );
     println!(
-        "heap growth for {CONCURRENT} x {SIZE_1M} B in flight: {scanned} B scanned, {plain} B unscanned"
+        "for {CONCURRENT} x {SIZE_1M} B in flight: heap growth {scanned} B scanned, {plain} B unscanned; largest allocation {scanned_largest} B scanned, {plain_largest} B unscanned"
+    );
+    assert!(
+        scanned_largest < SIZE_1M,
+        "an allocation of {scanned_largest} B while scanned bodies of {SIZE_1M} B were in flight: a copy"
     );
     let one_each = (CONCURRENT * SIZE_1M) as isize;
     assert!(
-        scanned <= 2 * plain + BOUND,
-        "scanned bodies grew the heap by {scanned} B, unscanned ones by {plain} B"
-    );
-    assert!(
-        scanned <= one_each * 3 / 4,
+        scanned <= one_each,
         "{scanned} B for {one_each} B in flight"
     );
 }
