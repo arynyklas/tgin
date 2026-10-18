@@ -18,7 +18,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -816,9 +816,15 @@ struct Progress {
     end: Notify,
     /// Reading the downstream's body failed: the client went away.
     client_failed: AtomicBool,
-    /// The downstream's body answered its last poll with `Pending`: it had
-    /// nothing to send, so a stall since is the client's, not the server's.
+    /// The downstream's body answered its last poll with `Pending` and has
+    /// not woken since: it had nothing to send, so a stall since is the
+    /// client's, not the server's. Its waker clears it (see the [`Wake`]
+    /// impl): a body ready again while the connection stops polling it (an
+    /// HTTP/2 stream whose window closed) is the server's stall.
     client_pending: AtomicBool,
+    /// The waker of the last poll of the downstream's body, woken through
+    /// this [`Progress`].
+    waker: Mutex<Option<Waker>>,
 }
 
 impl Progress {
@@ -830,6 +836,7 @@ impl Progress {
             end: Notify::new(),
             client_failed: AtomicBool::new(false),
             client_pending: AtomicBool::new(false),
+            waker: Mutex::new(None),
         }
     }
 
@@ -863,6 +870,21 @@ impl Progress {
 
     fn client_pending(&self) -> bool {
         self.client_pending.load(Ordering::Relaxed)
+    }
+}
+
+/// The downstream's body is polled with this waker, so that its readiness
+/// clears `client_pending` before the connection's own waker runs.
+impl Wake for Progress {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.client_pending.store(false, Ordering::Relaxed);
+        if let Some(waker) = self.waker.lock().as_ref() {
+            waker.wake_by_ref();
+        }
     }
 }
 
@@ -946,11 +968,23 @@ impl HttpBody for Upload {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let this = self.get_mut();
+        {
+            let mut slot = this.progress.waker.lock();
+            if !slot
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                *slot = Some(cx.waker().clone());
+            }
+        }
+        // Set before the poll: a wake during or after it clears it.
+        this.progress.client_pending.store(true, Ordering::Relaxed);
+        let waker = Waker::from(Arc::clone(&this.progress));
         let body = this.body.get_mut();
-        let polled = Pin::new(&mut *body).poll_frame(cx);
-        this.progress
-            .client_pending
-            .store(polled.is_pending(), Ordering::Relaxed);
+        let polled = Pin::new(&mut *body).poll_frame(&mut Context::from_waker(&waker));
+        if polled.is_ready() {
+            this.progress.client_pending.store(false, Ordering::Relaxed);
+        }
         match &polled {
             Poll::Ready(Some(Ok(frame))) => {
                 this.progress.stamp();
@@ -1292,6 +1326,37 @@ mod tests {
         let frame = std::future::poll_fn(|cx| Pin::new(&mut upload).poll_frame(cx)).await;
         assert!(matches!(frame, Some(Ok(_))));
         assert!(progress.ended());
+    }
+
+    /// A downstream body that had nothing to send is the client's stall
+    /// only until it wakes: ready again, it is not, though the connection
+    /// has not polled it since (an HTTP/2 stream whose window closed), and
+    /// the connection's own waker still runs.
+    #[tokio::test]
+    async fn upload_ready_again_is_no_client_stall() {
+        struct Counted(AtomicU64);
+        impl Wake for Counted {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let progress = Arc::new(Progress::new());
+        let mut upload = Upload::new(Body::from_stream(stream), Arc::clone(&progress));
+        let woken = Arc::new(Counted(AtomicU64::new(0)));
+        let waker = Waker::from(Arc::clone(&woken));
+        let polled = Pin::new(&mut upload).poll_frame(&mut Context::from_waker(&waker));
+        assert!(polled.is_pending());
+        assert!(progress.client_pending());
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("open");
+        assert!(!progress.client_pending(), "ready again, not polled");
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        let polled = Pin::new(&mut upload).poll_frame(&mut Context::from_waker(&waker));
+        assert!(matches!(polled, Poll::Ready(Some(Ok(_)))));
+        assert!(!progress.client_pending());
     }
 
     /// A chunked body may end with a trailers frame, after which hyper
