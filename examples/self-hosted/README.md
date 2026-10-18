@@ -12,9 +12,11 @@ Telegram ── telegram-bot-api ◄── tgin ◄─────────�
 - `telegram-bot-api` is built from `docker/telegram-bot-api` (flags, volumes
   and security notes in its README). It runs in local mode, shares the
   `upstream` network with tgin only, and publishes no port.
-- tgin long-polls the server (`ingress: long_poll`) and queues the updates
-  for the `bot` consumer. Its gateway is the bot's Bot API: the bot's calls
-  reach the server through tgin.
+- tgin long-polls the server and queues the updates for the `bot` consumer.
+  The server is the upstream `tba` in `config/tgin.yaml`: `kind: local`,
+  `local_mode: true`, and `files.dir`, the server's files directory as
+  mounted in tgin. Its gateway is the bot's Bot API: the bot's calls reach
+  the server through tgin, and the bot's files come from tgin's disk.
 - The bot (`examples/simple/bot1.py`) is on the `bots` network with tgin, so
   it cannot reach the server around tgin. It answers every message.
 - The server keeps its state (the bots' TDLib databases, the update queue)
@@ -42,11 +44,16 @@ A bot that has used `api.telegram.org` must log out of it first: while it
 is logged in on two servers, neither is sure to get all of its updates.
 Once logged out, it cannot log back in to `api.telegram.org` for 10
 minutes, and its pending updates there are dropped. Call `logOut` there
-once, directly (tgin's gateway does not forward it):
+once, directly (tgin's gateway refuses it from downstreams):
 
 ```sh
 curl "https://api.telegram.org/bot$BOT_TOKEN/logOut"
 ```
+
+If tgin already runs the bot against `api.telegram.org`,
+`tgin admin bot logout <bot> --yes` does this for you after the bot's
+pending updates are delivered ([DOCS.md → Moving a bot between
+servers](../../DOCS.md#moving-a-bot-between-servers)).
 
 Then, from this directory:
 
@@ -86,6 +93,13 @@ docker compose --env-file fake.env -f compose.yaml -f compose.fake.yaml down -v 
 The last call lists one `sendMessage` to chat 42 with the text "hello
 through a self-hosted Bot API server".
 
+The fake runs in local mode (`--local-mode`) on the same files volume, so
+tgin serves the bot's files here as it would the real server's: a
+`getFile` through tgin answers a path relative to the bot's directory, such
+as `documents/file_1.bin`, and `/file/bot<token>/documents/file_1.bin` on
+tgin streams the file from the volume. The fake writes as root there, as
+the volumes are made for the real server's paths (see `compose.fake.yaml`).
+
 ## Deployment rules
 
 - **Never expose the server.** It has no authentication beyond the bot token
@@ -105,9 +119,9 @@ through a self-hosted Bot API server".
   times.
 - **Local mode trusts its callers.** A `file:` path in a request makes the
   server upload any file it can read, other bots' databases included, and
-  webhooks may target private addresses. Only tgin reaches the server here.
-  At this revision tgin forwards such requests from the bot unchanged, so
-  run only bots you trust behind it.
+  webhooks may target private addresses. Only tgin reaches the server here,
+  and tgin refuses a `file:` reference from the bot (`allow_local_files` is
+  off by default); limit the server's egress all the same.
 - **Keep the `server-state` volume.** It holds the bots' Telegram sessions
   and their pending updates; losing it logs every bot out of this server.
 - **Keep the api_id, api_hash and tokens out of images and version
@@ -119,7 +133,8 @@ through a self-hosted Bot API server".
 
 The server stores each bot's files in
 `/var/lib/telegram-bot-api/files/<token>/` (the token with its `:`), and
-tgin has that volume read-only at the same path. With `api_url` alone tgin
-does not serve it yet: `getFile` answers the server's absolute path, and a
-download through tgin's `/file/bot…` route gets the server's 404, as the
-server has no such route.
+tgin has that volume read-only at the same path, which `files.dir` names.
+tgin serves the bot its own directory on `/file/bot<token>/…`, and turns
+the absolute paths `getFile` answers in local mode into paths under that
+directory, so a bot downloads through tgin as it would from
+`api.telegram.org`, without the cloud's 20 MB limit.

@@ -312,7 +312,7 @@
       "description": "Where a local server's files are: `dir` (with `server_dir`) or `url`.\nThe server keeps each bot's files in a directory named after its token\n(`:` replaced by `~` where its filesystem refuses `:`); tgin serves a\nbot only its own.",
       "properties": {
         "dir": {
-          "description": "The server's `--dir` as mounted in tgin; read-only is enough. A\nrelative path is relative to the config file's directory. Supports\n`${env:…}` and `${file:…}`.",
+          "description": "The server's files directory (its `--files-dir`, or `--dir` when\nthat is unset) as mounted in tgin; read-only is enough. A relative\npath is relative to the config file's directory. Supports `${env:…}`\nand `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",
@@ -328,7 +328,7 @@
           ]
         },
         "url": {
-          "description": "An HTTP origin serving the server's `--dir`, `http` or `https`.\nSupports `${env:…}` and `${file:…}`.",
+          "description": "An HTTP origin serving the server's files directory (its\n`--files-dir`, or `--dir` when that is unset), `http` or `https`.\nSupports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",

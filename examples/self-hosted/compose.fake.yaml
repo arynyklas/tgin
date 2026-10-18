@@ -21,9 +21,17 @@ services:
     build: !override
       context: ../..
       dockerfile: tests/e2e/fake-telegram/Dockerfile
-    # The fake takes no server flags and no API credentials.
-    command: !reset []
+    # The fake imitates `telegram-bot-api --local` with the server's files
+    # directory: uploads land under <files-dir>/<token>/ in the files
+    # volume, which tgin reads, and getFile answers absolute paths there. It
+    # takes no API credentials.
+    command: !override ["--local-mode", "--files-dir", "/var/lib/telegram-bot-api/files"]
     environment: !reset {}
+    # The volumes are created at the real server's paths, which the fake's
+    # image does not have, so they belong to root: the fake runs as root to
+    # write there, still with every capability dropped (compose.yaml). Its
+    # files are world-readable, so tgin reads them under its own uid.
+    user: "0:0"
     healthcheck: !override
       test: ["CMD", "/usr/local/bin/fake-telegram", "health"]
       interval: 1s

@@ -11,6 +11,7 @@ This is the manual of tgin 1.0. The key-by-key reference of the config file is [
 - [Push consumers: the requests tgin sends](#push-consumers-the-requests-tgin-sends)
 - [Webhook ingress](#webhook-ingress)
 - [Bot API gateway](#bot-api-gateway)
+- [Self-hosted Bot API servers](#self-hosted-bot-api-servers)
 - [Hot reload](#hot-reload)
 - [Admin API v1](#admin-api-v1)
 - [`tgin admin`](#tgin-admin)
@@ -25,14 +26,15 @@ This is the manual of tgin 1.0. The key-by-key reference of the config file is [
 
 tgin sits between the Telegram Bot API and the processes that handle a bot's updates. One tgin serves any number of bots.
 
-- **Bots** (`bots`). Each bot has a unique name, a token and at most one **ingress**: `long_poll` (tgin calls `getUpdates` on the Bot API) or `webhook` (Telegram posts updates to tgin). A bot without an ingress receives nothing.
+- **Bots** (`bots`). Each bot has a unique name, a token, a Bot API server (its **upstream**: Telegram's, unless `api_url` or `upstream` names another) and at most one **ingress**: `long_poll` (tgin calls `getUpdates` on the Bot API server) or `webhook` (the server posts updates to tgin). A bot without an ingress receives nothing.
+- **Upstreams** (`upstreams`). Named Bot API servers: Telegram's (`kind: cloud`) or a self-hosted `telegram-bot-api` (`kind: local`), whose files tgin can serve ([Self-hosted Bot API servers](#self-hosted-bot-api-servers)).
 - **Consumers** (`consumers`). A named destination for updates, in one of two modes:
   - **pull**: downstream bots fetch updates from tgin with a Telegram-shaped `getUpdates` call on `/c/<consumer>/getUpdates` (and on any alias path), or through the [gateway](#bot-api-gateway) on `/c/<consumer>/bot<token>/getUpdates`. Several processes may poll one pull consumer; they compete for its updates. A pull consumer serves exactly one bot: two bots routing to the same pull consumer is a config error.
   - **push**: tgin posts each update to one or more HTTP endpoints, with retries and a circuit breaker per endpoint. Several bots may route to one push consumer; the `X-Tgin-Source` header names the bot.
   Each consumer has its own bounded queue (`capacity` updates, `capacity_bytes` bytes).
 - **Rules** (`bots[].routes`). Each bot's rules are tried in order; the first rule whose `match` holds decides where the update goes, and a rule without `match` matches everything. An update no rule matches is dropped and counted in `tgin_routes_unmatched_total`; `tgin config validate` warns when a bot's last rule has a `match`.
 - **Targets** (`to`). Every entry of a rule's `to` receives the update. An entry is a consumer name, `{split: {strategy, among, weights?}}` (exactly one child receives it: `round_robin`, `hash_chat` — sticky by chat, else by user, else round robin — or smooth `weighted` round robin) or `{all: […]}` (every child receives it). Targets nest. A consumer reached twice through one rule's targets receives the update once.
-- **Gateway.** The data plane also serves the Bot API to the bots behind tgin, on `/bot<token>/…` and `/c/<consumer>/bot<token>/…`: a downstream points its framework's Bot API base URL at tgin, which forwards its calls to Telegram within the bot's flood limits and answers itself the calls that would disturb tgin or the bot's other downstreams ([Bot API gateway](#bot-api-gateway)).
+- **Gateway.** The data plane also serves the Bot API to the bots behind tgin, on `/bot<token>/…` and `/c/<consumer>/bot<token>/…`: a downstream points its framework's Bot API base URL at tgin, which forwards its calls to the bot's Bot API server within Telegram's flood limits and answers itself the calls that would disturb tgin or the bot's other downstreams ([Bot API gateway](#bot-api-gateway)).
 
 `match` fields: `update_types`, `chat_ids`, `chat_types`, `user_ids`, `commands`, `text` and `callback_data` (each `prefix`, `regex` or `equals`). Values in one list are alternatives; all given fields must hold. `text` is the message text or caption. A command matches when its name equals one of the rule's (ASCII case-insensitive) and an `@bot` suffix, if any, names this bot; until tgin has learned the bot's username from `getMe`, a command with an `@bot` suffix matches no rule.
 
@@ -70,7 +72,7 @@ tgin: tgin.yaml has 1 error
 - `${file:PATH}` is the content of the file, minus one trailing newline. A relative `PATH` is relative to the config file's directory.
 - `$${` is a literal `${`.
 
-File-path fields (`server.tls.cert_file`, `server.tls.key_file`, a webhook's `certificate_file`) are relative to the config file's directory too, never to the working directory.
+File-path fields (`server.tls.cert_file`, `server.tls.key_file`, a webhook's `certificate_file`, an upstream's `files.dir`) are relative to the config file's directory too, never to the working directory.
 
 ### Sections
 
@@ -81,18 +83,19 @@ File-path fields (`server.tls.cert_file`, `server.tls.key_file`, a webhook's `ce
 | `server` | The data plane: `listen`, `tls`, `trusted_proxies`, `max_connections`, `header_read_timeout`. Omitted, tgin serves no webhooks and no pull consumers (both then fail validation). | `["0.0.0.0:8080"]`, none, none, `10000`, `10s` |
 | `admin` | The admin plane: `listen`, `token`, `public_metrics` | `["127.0.0.1:9090"]`, none, `false` |
 | `reload` | `watch` the config file, its `debounce` (at least `10ms`), and the `drain_timeout` of removed consumers | `true`, `500ms`, `30s` |
-| `bots` | Bots with `name`, `token`, `api_url`, `gateway`, `ingress`, `routes` | `api_url: https://api.telegram.org` |
+| `upstreams` | Bot API servers by name: `kind`, `url`, `local_mode`, `files`, `response_timeout` ([Self-hosted Bot API servers](#self-hosted-bot-api-servers)) | none; `local_mode: false`, `response_timeout` `1m` (`cloud`) or `10m` (`local`) |
+| `bots` | Bots with `name`, `token`, `api_url` or `upstream`, `allow_local_files`, `gateway`, `ingress`, `routes` | `api_url: https://api.telegram.org`, `allow_local_files: false` |
 | `consumers` | Pull and push consumers by name | see below |
 
-Names of bots and consumers are 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit.
+Names of bots, consumers and upstreams are 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit.
 
 **Long poll** (`ingress.long_poll`): `timeout` (`30s`, at least `1s`, at most 50 s is sent), `limit` (`100`, 1 to 100), `allowed_updates`, `delete_webhook_on_start` (`true`). tgin sends `allowed_updates` with every `getUpdates`: the configured list, or `[]` when it is omitted, which is Telegram's default (every update type except `chat_member`, `message_reaction` and `message_reaction_count`). A list Telegram stored for the token from an earlier client never decides what arrives; list those three types to receive them.
 
-**Webhook** (`ingress.webhook`): `path` (default `/webhook/<bot name>`), `public_url` (the public `https` base URL; `setWebhook` registers `public_url` followed by `path`), `register` (`false`; `true` calls `setWebhook` when the bot's source starts and needs `public_url`), `secret_token` (`auto`; a configured secret is 1 to 256 ASCII letters, digits, `_` or `-`, as Telegram requires), `ip_allowlist` (`none`), and Telegram's `allowed_updates` (sent with every `setWebhook`, `[]` when omitted, as for long polls), `max_connections`, `drop_pending_updates`, `ip_address` and `certificate_file` for `setWebhook`.
+**Webhook** (`ingress.webhook`): `path` (default `/webhook/<bot name>`), `public_url` (the base URL the Bot API server reaches tgin at; `setWebhook` registers `public_url` followed by `path`; `https` on port 443, 80, 88 or 8443, except on a `local` upstream in local mode, which takes `http` and any port), `register` (`false`; `true` calls `setWebhook` when the bot's source starts and needs `public_url`), `secret_token` (`auto`; a configured secret is 1 to 256 ASCII letters, digits, `_` or `-`, as Telegram requires), `ip_allowlist` (`none`; `telegram` is an error on a `local` upstream), and Telegram's `allowed_updates` (sent with every `setWebhook`, `[]` when omitted, as for long polls), `max_connections` (1 to 100, or to 100 000 on a `local` upstream in local mode), `drop_pending_updates`, `ip_address` and `certificate_file` for `setWebhook`.
 
 **Gateway** (`gateway`, per bot): `upstream_idle_timeout` (`1m`, at least `1s`), `rate_limit` (`mode` `shape`, `max_delay` `5s` (at most `1m`), `methods` `["send*", "copyMessage*", "forwardMessage*"]`, `global` 30 per `1s` with `burst` 30, `per_chat` 1 per `1s` with `burst` 3, `per_group` 20 per `1m` with `burst` 20) and `retry_429` (`max_wait` `10s`, at most `1m`). See [Bot API gateway](#bot-api-gateway).
 
-**Tokens and paths.** A bot token may use only ASCII letters, digits, `:`, `_` and `-`; a token with anything else (a space, quotes, a second trailing newline in a token file) is a config error, at start and on reload alike. Webhook paths and pull aliases are matched byte for byte, so they must reach tgin unchanged inside a URL: no `?`, `#`, spaces, control or non-ASCII characters (write them percent-encoded), no `.` or `..` segments and no `\`.
+**Tokens and paths.** A bot token may use only ASCII letters, digits, `:`, `_` and `-`; a token with anything else (a space, quotes, a second trailing newline in a token file) is a config error, at start and on reload alike. A token two bots share is a config error too, reported at the second bot without quoting the token: Telegram splits a token's updates between everyone who receives them. Webhook paths and pull aliases are matched byte for byte, so they must reach tgin unchanged inside a URL: no `?`, `#`, spaces, control or non-ASCII characters (write them percent-encoded), no `.` or `..` segments and no `\`.
 
 **Pull consumer** (`pull`): `capacity` (`10000`), `capacity_bytes` (`64MiB`, at least `1MiB`), `on_full` (`backpressure`), `lease_timeout` (`2m`, at least `1s`: leases are expired by a check that runs once a second), `ordering` (`none`), `auth_token`, `aliases`, `honor_drop_pending` (`false`).
 
@@ -220,7 +223,7 @@ Each attempt is a `POST` of the update's JSON to the endpoint `url` with these h
 | `X-Tgin-Source` | The name of the bot the update came from. |
 | `X-Tgin-Update-Type` | The update type, such as `message`. |
 | `X-Telegram-Bot-Api-Secret-Token` | The endpoint's `secret_token`, if set (1 to 256 of `A-Za-z0-9_-`, checked at load). |
-| `Via` | `1.1 tgin-<16 hex digits>`: a pseudonym chosen at random when the process starts. |
+| `Via` | `1.1 tgin-<16 hex digits>`: the pseudonym of the tgin instance (one process in 1.0), chosen at random when it starts. |
 
 Each request is bounded by the endpoint's `timeout` (default 10 s). The endpoint should answer `2xx` once it has taken the update; see [Delivery semantics](#delivery-semantics) for the other answers. A `2xx` answer may carry a Bot API call, which tgin makes for the endpoint ([Webhook replies](#webhook-replies)).
 
@@ -233,7 +236,7 @@ A webhook bot's route is `POST <path>` on the data plane (default path `/webhook
 1. `405` for a method other than `POST`;
 2. `403` if the client address is not in `ip_allowlist` (`telegram` means 149.154.160.0/20 and 91.108.4.0/22; the client address is the TCP peer's, or the right-most `X-Forwarded-For` address not in `server.trusted_proxies` when the peer is a trusted proxy);
 3. `401` without the right `X-Telegram-Bot-Api-Secret-Token` (compared in constant time);
-4. `503` with `Retry-After: 5` once ingest has stopped (shutdown);
+4. `503` with `Retry-After: 5` once ingest has stopped (shutdown), and while the bot is [parked](#moving-a-bot-between-servers);
 5. `413` for a body over 1 MiB, `400` for a body the client fails to send;
 6. `400` for a body that is not a JSON object with an integer `update_id`;
 7. `503` with `Retry-After: 5` when a consumer pushes back, or when ingest stopped while the update was being queued;
@@ -241,15 +244,15 @@ A webhook bot's route is `POST <path>` on the data plane (default path `/webhook
 
 Checks 1 to 4 read only the request head; the body is read only for an authorized request. A request still running after 30 s is answered `408`.
 
-`secret_token: auto` (the default) derives the secret from the bot token (HMAC-SHA256 of the token over a fixed context, 43 characters), so it is the same across restarts and replicas. tgin sends it to Telegram only with `register: true`; with `register: false`, set `secret_token` to the secret you register yourself, or `none`. `secret_token: none` checks nothing: anyone who can reach the path can post updates.
+`secret_token: auto` (the default) derives the secret from the bot token (HMAC-SHA256 of the token over a fixed context, 43 characters), so it is the same across restarts and replicas. tgin sends it to the Bot API server only with `register: true`; with `register: false`, set `secret_token` to the secret you register yourself, or `none`. `secret_token: none` checks nothing: anyone who can reach the path can post updates.
 
-`register: true` calls `setWebhook` whenever the bot's source starts (at start and when a reload starts or restarts it). A failure is logged, not fatal: Telegram may still have the webhook from an earlier run.
+`register: true` calls `setWebhook` whenever the bot's source starts (at start and when a reload starts or restarts it). A failed call does not stop the bot, as the server may still have the webhook from an earlier run: tgin retries it in the background as the task `register:<bot>`, backing off from 1 s to 5 min (or for the server's `retry_after`, when longer), until it succeeds or the bot stops. A `401`, `403` or `404` from a `cloud` upstream rejects the token for good: tgin logs one error and calls nothing more until a reload restarts the bot. On a `local` upstream only a `403` is final; a `401` or `404` may come from the server itself (a server whose api_id or api_hash Telegram rejects answers `401`), so it is retried.
 
 A long-poll bot and Telegram's webhook exclude each other: with `delete_webhook_on_start: true` (the default) a long poll calls `deleteWebhook`, keeping pending updates, before its first poll and again when a poll finds a webhook set (but not again within 60 s of deleting it, which means another process keeps setting it).
 
 ## Bot API gateway
 
-The data plane also serves the Bot API to the bots behind tgin. A downstream sets its framework's Bot API base URL to tgin instead of `https://api.telegram.org` ([Framework setup](#framework-setup)) and keeps using the bot's token. tgin forwards each call to the bot's `api_url`, answers itself the calls that would disturb tgin or the bot's other downstreams, holds the bot's sends to Telegram's flood limits, and absorbs short `429`s. The gateway is part of the data plane, so it needs a `server` block.
+The data plane also serves the Bot API to the bots behind tgin. A downstream sets its framework's Bot API base URL to tgin instead of `https://api.telegram.org` ([Framework setup](#framework-setup)) and keeps using the bot's token. tgin forwards each call to the bot's Bot API server (its [upstream](#self-hosted-bot-api-servers): Telegram's, unless the config names another), answers itself the calls that would disturb tgin or the bot's other downstreams, holds the bot's sends to Telegram's flood limits, and absorbs short `429`s. The gateway is part of the data plane, so it needs a `server` block.
 
 ### Routes and auth
 
@@ -257,7 +260,7 @@ The data plane also serves the Bot API to the bots behind tgin. A downstream set
 |---|---|
 | `/bot<token>/<method>` | A Bot API method, for any downstream of the bot. |
 | `/c/<consumer>/bot<token>/<method>` | The same, on behalf of `<consumer>`, which the bot must route to: `getUpdates` there polls that pull consumer, and `setWebhook` may give that push consumer its endpoint. |
-| `/file/bot<token>/<file_path>`, `/c/<consumer>/file/bot<token>/<file_path>` | A file download (the `file_path` of `getFile`). |
+| `/file/bot<token>/<file_path>`, `/c/<consumer>/file/bot<token>/<file_path>` | A file download (the `file_path` of `getFile`), forwarded or served as the bot's upstream says ([File downloads](#file-downloads)). |
 
 Configured routes (webhook paths, `/c/<consumer>/getUpdates` and aliases) are matched first; every other data-plane path goes to the gateway. It serves `GET` and `POST`, and passes the query string on as it came. A path is a gateway path when:
 
@@ -273,20 +276,27 @@ The token in the path is the credential: tgin compares it in constant time with 
 3. `404 Not Found: consumer not found` to `/c/<consumer>/…` when the bot does not route to that consumer (a removed pull consumer the bot fed stays reachable while it drains);
 4. `405 Method Not Allowed` to a method other than `GET` or `POST`.
 
-None of these sends anything to Telegram. Everything tgin answers itself on a gateway path has Telegram's shape: `{"ok":false,"error_code":N,"description":"…"}` with the HTTP status equal to `error_code`, or `{"ok":true,"result":…}`. No gateway path, token or upstream URL reaches a log line, a metric or an error body; logs name the bot and the method. A bot whose token is not shaped `<digits>:<secret>` loads with a warning, and the gateway does not serve it.
+None of these sends anything to the Bot API server. Everything tgin answers itself on a gateway path has Telegram's shape: `{"ok":false,"error_code":N,"description":"…"}` with the HTTP status equal to `error_code`, or `{"ok":true,"result":…}`. No gateway path, token or upstream URL reaches a log line, a metric or an error body; logs name the bot and the method. A bot whose token is not shaped `<digits>:<secret>` loads with a warning, and the gateway does not serve it.
 
 Whoever holds a bot's token can use the gateway as that bot, as with Telegram, and can poll every pull consumer the bot routes to on `/c/<consumer>/bot<token>/getUpdates`, where the bot token is the credential and the consumer's `auth_token` is not asked for.
 
 ### Forwarding
 
-A call that no intercept answers goes to `{api_url}/bot<token>/<method>`, and a download to `{api_url}/file/bot<token>/<file_path>`, keeping the path of `api_url`. Both bodies stream in both directions and keep their `Content-Length` when they have one, so uploads and downloads of any size pass through in constant memory. tgin reads a body whole only where it must, each with a bound: the JSON or urlencoded body of a method in [`rate_limit.methods`](#rate-limits) (its chat, and a possible resend), up to 64 KiB; the parameters of an [intercepted](#intercepts) call, up to 64 KiB; Telegram's `429` answers and the `getMe` answer that fills tgin's cache, up to 64 KiB; Telegram's error answer to a webhook reply, up to 64 KiB; and [webhook replies](#webhook-replies), up to 1 MiB.
+A call that no intercept answers goes to `{url}/bot<token>/<method>`, `url` being the bot's upstream URL (its `api_url` on the shorthand), and a download from a `cloud` upstream to `{url}/file/bot<token>/<file_path>`, keeping the path of `url` (a `local` upstream's files: [File downloads](#file-downloads)). Both bodies stream in both directions and keep their `Content-Length` when they have one, so uploads and downloads of any size pass through in constant memory. tgin reads a body whole only where it must, each with a bound: the JSON or urlencoded body of a method in [`rate_limit.methods`](#rate-limits) (its chat, and a possible resend), up to 64 KiB; for a bot whose `file:` references are refused, any JSON or urlencoded body, up to 1 MiB ([Local mode and `file:` references](#local-mode-and-file-references)); the parameters of an [intercepted](#intercepts) call, up to 64 KiB; the server's `429` answers, the `getMe` answer that fills tgin's cache and a local-mode `getFile` answer that tgin rewrites, up to 64 KiB each; the server's error answer to a webhook reply, up to 64 KiB; and [webhook replies](#webhook-replies), up to 1 MiB.
 
 Only these headers pass, except one that the message's `Connection` header names:
 
-- to Telegram: `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding` and `User-Agent`, and on file paths also `Range`, `If-None-Match` and `If-Modified-Since`;
+- to the Bot API server: `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding` and `User-Agent`, and on file paths also `Range`, `If-None-Match` and `If-Modified-Since`;
 - back to the client: `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Disposition`, `Retry-After`, `Cache-Control`, `ETag`, `Last-Modified`, `Accept-Ranges` and `Content-Range`.
 
-Connecting to Telegram may take 5 s; after that no total timeout applies, and the bot's `gateway.upstream_idle_timeout` (`1m`) bounds the time in which nothing moves. Telegram's response headers must arrive within it of the request body's last bytes, whether the client stopped sending or Telegram stopped reading, and each part of the response body within it of the previous one. A transfer that keeps moving is never cut. A request that gets no response is answered `502 Bad Gateway: Telegram is unreachable`; a response body that fails or stalls after its headers aborts the client's connection, except for the two answers tgin reads whole before it replies (Telegram's `429` to a call whose body tgin holds, and the `getMe` answer that fills its cache), where the client gets `502 Bad Gateway: Telegram is unreachable` instead (counted `upstream_error`). The gateway has no circuit breaker: each request fails on its own. Its requests use the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment if set and never follow redirects.
+Connecting to the Bot API server may take 5 s; after that no total timeout applies, and a transfer that keeps moving is never cut. While the request body is being sent, the bot's `gateway.upstream_idle_timeout` (`1m`) bounds the time in which nothing moves, whether the client stopped sending or the server stopped reading. Once the body has been sent, the server's response headers must arrive within the bot's response wait: its upstream's `response_timeout` (`1m` for `cloud`, `10m` for `local`), or, on the `api_url` shorthand, its `upstream_idle_timeout`. Each part of the response body must arrive within `upstream_idle_timeout` of the previous one. A request that gets no response is answered `502`, with a description that says whether the server may have run the call:
+
+| Description | When | Did the server run the call? |
+|---|---|---|
+| `Bad Gateway: the Bot API server is unreachable` | The connection failed; the upload stalled for `upstream_idle_timeout` or broke off; or the body of the server's `429` to a call whose body tgin holds broke off. | No: the server never had the whole request, or flood control refused it. The client may send it again. |
+| `Bad Gateway: the Bot API server did not answer; the call may have been executed` | The whole request was sent, then the connection was lost or the response wait ran out; or the body of a `getMe` answer, or of a local-mode `getFile` answer, broke off. | Maybe. tgin never sends it again; a client that does may make the call twice. |
+
+A response body that fails or stalls after its headers aborts the client's connection, except for the answers tgin reads whole before it replies (the server's `429` to a call whose body tgin holds, the `getMe` answer that fills its cache, and a local-mode `getFile` answer), where the client gets the `502` above instead (counted `upstream_error`). The gateway has no circuit breaker: each request fails on its own. Its requests use the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment if set and never follow redirects.
 
 tgin knows the methods of Bot API 10.3. A method it does not know is forwarded like any other and counted with the metric label `other`; only known methods are intercepted.
 
@@ -299,11 +309,12 @@ tgin knows the methods of Bot API 10.3. A method it does not know is forwarded l
 | `setWebhook` | `Webhook was set`, or `Webhook was deleted` for an empty `url`; nothing changes. | With `accept_set_webhook: true` on a push consumer, sets its runtime endpoint ([`setWebhook` capture](#setwebhook-capture)); otherwise as on the bot path. |
 | `deleteWebhook` | `Webhook was deleted`; nothing changes. | With `accept_set_webhook: true` on a push consumer, removes its runtime endpoint; otherwise as on the bot path. |
 | `getWebhookInfo` | `{"url":"","has_custom_certificate":false,"pending_update_count":0}` | `url` is the consumer's runtime endpoint, or `""`; `pending_update_count` counts the consumer's updates queued or leased. |
-| `logOut`, `close` | `{"ok":true,"result":true}`, and a warning in the log. | Same. |
+| `getFile` | Forwarded. On a `local` upstream in local mode with `files`, the server's absolute `file_path` becomes the path under the bot's directory ([File downloads](#file-downloads)). | Same. |
+| `logOut`, `close` | `400 Bad Request: logOut and close are disabled by tgin; operators move bots with tgin admin bot logout\|close`, and a warning in the log ([Moving a bot between servers](#moving-a-bot-between-servers)). | Same. |
 
 `drop_pending_updates` on a `deleteWebhook`, or on a `setWebhook` that a consumer accepts, drops the calling bot's queued updates from the calling consumer (as `purge` drops them) when that consumer has `honor_drop_pending: true`, and is ignored otherwise; on the bot path it never drops anything. As Telegram drops only the caller's pending updates, other bots' updates stay: those of another bot feeding the same push consumer, and those a bot left before a reload moved its routes elsewhere.
 
-The answers follow telegram-bot-api's `Client.cpp`: its descriptions (`Webhook is already set`, `Webhook is already deleted`, `Bad Request: invalid webhook URL specified`, `Bad Request: secret token is too long`, `Bad Request: secret token contains illegal characters`), its order of parameters (the query string first, then a JSON, urlencoded or multipart body's text fields) and its booleans (`true`, `yes` or `1`, in any case). Intercepted calls (except a `getMe` before tgin knows the bot's identity) never reach Telegram and count as outcome `local`, so a framework that calls `deleteWebhook` when it starts polling (python-telegram-bot, grammY and Telegraf do), `setWebhook` or `logOut` cannot remove tgin's webhook, drop the updates Telegram holds for it or log the bot out. The body of a `setWebhook`, a `deleteWebhook` or a consumer-scoped `getUpdates` must arrive within the bot's `upstream_idle_timeout` (else `408 Request Timeout`) and whole (else `400 Bad Request: the request body ended early`); a body announced over 64 KiB is refused at once (`413 Request Entity Too Large`, or `400` for `getUpdates`, as on `/c/<consumer>/getUpdates`).
+The answers to the webhook methods follow telegram-bot-api's `Client.cpp`: its descriptions (`Webhook is already set`, `Webhook is already deleted`, `Bad Request: invalid webhook URL specified`, `Bad Request: secret token is too long`, `Bad Request: secret token contains illegal characters`), its order of parameters (the query string first, then a JSON, urlencoded or multipart body's text fields) and its booleans (`true`, `yes` or `1`, in any case). Intercepted calls (except a `getMe` before tgin knows the bot's identity, and `getFile`, which goes on to the server) never reach the Bot API server and count as outcome `local`, so a framework that calls `deleteWebhook` when it starts polling (python-telegram-bot, grammY and Telegraf do), `setWebhook`, `logOut` or `close` cannot remove tgin's webhook, drop the updates the server holds for it or log the bot out. The body of a `setWebhook`, a `deleteWebhook` or a consumer-scoped `getUpdates` must arrive within the bot's `upstream_idle_timeout` (else `408 Request Timeout`) and whole (else `400 Bad Request: the request body ended early`); a body announced over 64 KiB is refused at once (`413 Request Entity Too Large`, or `400` for `getUpdates`, as on `/c/<consumer>/getUpdates`).
 
 ### `setWebhook` capture
 
@@ -312,7 +323,7 @@ A push consumer with `accept_set_webhook: true` takes its endpoint from a `setWe
 - The `url` is `http` or `https` (`https` when it has no scheme, as on Telegram); a `secret_token`, 1 to 256 of `A-Za-z0-9_-`, is sent as `X-Telegram-Bot-Api-Secret-Token`. The same call again answers `Webhook is already set`.
 - The runtime endpoint comes after the configured ones, with a breaker of its own (the consumer's `breaker` settings) and a 10 s timeout. `/v1/status` lists it with `"runtime": true`, and metrics label it `endpoint="runtime"`.
 - `setWebhook` with an empty `url`, or `deleteWebhook`, removes it.
-- It survives a reload that keeps the consumer, `accept_set_webhook: true`, the bot feeding the consumer and that bot's token. A reload that changes any of them clears it (logged), so rotating a bot's token evicts the endpoint its holder set; a restart forgets it. A `setWebhook` or `deleteWebhook` still in flight when its token is rotated changes nothing and answers `401 Unauthorized`. A removed consumer that still drains keeps its endpoint to deliver what it holds, unless the reload changed its bot's token.
+- It survives a reload that keeps the consumer, `accept_set_webhook: true`, the bot feeding the consumer and that bot's token. A reload that changes any of them clears it (logged). Rotating the bot's token is the way to evict an endpoint its holder set; a restart also forgets it. A `setWebhook` or `deleteWebhook` still in flight when its token is rotated changes nothing and answers `401 Unauthorized`. A removed consumer that still drains keeps its endpoint to deliver what it holds, unless the reload changed its bot's token.
 - A [webhook reply](#webhook-replies) from the runtime endpoint runs only with the token whose `setWebhook` set the endpoint. Once a reload has changed the bot's token, a reply still on its way is refused (counted `refused`), never sent with the new token.
 - A push consumer with no endpoint at all leases nothing: its updates wait in the queue, bounded by `capacity` and `on_full`, and `retry.max_age` still counts from admission.
 
@@ -348,7 +359,8 @@ A push endpoint can answer an update with a Bot API call, as a webhook can answe
 
 - refuses it, as Telegram does, when the method is missing or empty, starts with `get`, or is `setWebhook`, `deleteWebhook`, `close` or `logOut`, in any case; it also refuses, on its own, a method name longer than 64 bytes or with a character outside `A-Za-z0-9_`;
 - does not execute a body over 1 MiB (logged);
-- otherwise applies the bot's rate limits (in `shape` mode the call may wait; a call the limits refuse is skipped; a multipart reply counts against `global` only), then POSTs the body unchanged, with its `Content-Type`, to `{api_url}/bot<token>/<method>`. Nothing is re-encoded, multipart files included. The call is made once, never retried, and bounded by 30 s. Nobody sees Telegram's answer, as with Telegram; a failure is logged with Telegram's `description`, tokens masked.
+- refuses it, for a bot whose `file:` references are refused, when one of its parameters carries one ([Local mode and `file:` references](#local-mode-and-file-references));
+- otherwise applies the bot's rate limits (in `shape` mode the call may wait; a call the limits refuse is skipped; a multipart reply counts against `global` only), then POSTs the body unchanged, with its `Content-Type`, to the bot's Bot API server, `{url}/bot<token>/<method>`. Nothing is re-encoded, multipart files included. The call is made once, never retried, and bounded by the upstream's `response_timeout` or 30 s, whichever is shorter (30 s on the `api_url` shorthand). Nobody sees the server's answer, as with Telegram; a failure is logged with the server's `description`, tokens masked.
 
 The reply runs before the update is acknowledged, so under `ordering: per_chat` the chat's next update waits for it. It never fails the delivery: the endpoint has processed the update, so a refused or failed reply still counts the update delivered. tgin never executes the body of a non-`2xx` answer, nor one that fails to arrive whole (logged), and with `webhook_reply: ignore` it reads no answer body. A graceful shutdown waits for a reply in progress. Replies share the delivery's at-least-once guarantee: an update that tgin is stopped by force while its reply runs is not acknowledged, and if the update is delivered again ([Delivery semantics](#delivery-semantics)), so is its reply. Outcomes count in `tgin_webhook_replies_total`.
 
@@ -356,33 +368,33 @@ Frameworks that reply this way: aiogram's `SimpleRequestHandler(handle_in_backgr
 
 ### Loop detection
 
-tgin never acts on its own pushes. Every push carries `Via: 1.1 tgin-<pseudonym>`, 16 hex digits chosen at random when the process starts, and both planes answer `508 Loop Detected` to a request whose `Via` lists the process's own pseudonym (RFC 9110 §7.6.3): the admin plane `{"error":"loop detected"}`, the data plane Telegram's shape, each carrying the process's `Via`. So an endpoint that points back at tgin (its webhook ingress, a pull endpoint, the gateway, or the admin API) is refused, and the pushing dispatcher, seeing its own `Via` on the `508`, dead-letters the update at once. Only that `508` is final: any other `508` is a transient `5xx`, retried. The refusal is logged as a warning at most once a minute per plane, with the bot from `X-Tgin-Source`. Another tgin process has another pseudonym, so chained instances still pass updates to each other.
+tgin never acts on its own pushes. Every push carries `Via: 1.1 tgin-<pseudonym>`, the pseudonym of the tgin instance (one process in 1.0): 16 hex digits chosen at random when it starts. Both planes answer `508 Loop Detected` to a request whose `Via` lists the instance's own pseudonym (RFC 9110 §7.6.3): the admin plane `{"error":"loop detected"}`, the data plane Telegram's shape, each carrying the instance's `Via`. So an endpoint that points back at tgin (its webhook ingress, a pull endpoint, the gateway, or the admin API) is refused, and the pushing dispatcher, seeing its own `Via` on the `508`, dead-letters the update at once. Only that `508` is final: any other `508` is a transient `5xx`, retried. The refusal is logged as a warning at most once a minute per plane, with the bot from `X-Tgin-Source`. Another tgin instance has another pseudonym, so chained instances still pass updates to each other.
 
-The gateway's calls to Telegram and its webhook replies carry the same `Via`, after any `Via` the downstream's request carried. A bot whose `api_url` points at tgin itself therefore gets `508` (counted `upstream_error`) instead of tgin forwarding the call to itself without end.
+The gateway's calls to the Bot API server and its webhook replies carry the same `Via`, after any `Via` the downstream's request carried. A bot whose upstream URL points at tgin itself therefore gets `508` (counted `upstream_error`) instead of tgin forwarding the call to itself without end.
 
 ### Gateway metrics
 
-`tgin_gateway_requests_total{bot,method,outcome}` counts every gateway request of a configured bot once, and every webhook reply that went to Telegram. `method` is the method's canonical name (`sendMessage`, whatever case the client used), `other` for a method tgin does not know, and `file` for downloads; a method's series appear on its first request. `outcome` is one of:
+`tgin_gateway_requests_total{bot,method,outcome}` counts every gateway request of a configured bot once, and every webhook reply that went to the Bot API server. `method` is the method's canonical name (`sendMessage`, whatever case the client used), `other` for a method tgin does not know, and `file` for downloads; a method's series appear on its first request. `outcome` is one of:
 
 | `outcome` | The request |
 |---|---|
-| `ok` | Telegram answered with a status that is not an error. |
-| `rejected` | Telegram answered with a `4xx` other than `429`, or tgin refused it for this bot: `404` for a consumer the bot does not route to, `405`, or `401` for a token rotated while the request was in flight. |
-| `rate_limited` | It got a `429`: from the bot's rate limits, or Telegram's own, passed on. |
-| `upstream_error` | Telegram answered with a `5xx`, or its response body failed, or stalled for `upstream_idle_timeout`, after the headers. |
-| `unreachable` | Telegram gave no response: it could not be reached, or sent no response headers within `upstream_idle_timeout` of the request's last progress (the client stalled its upload, or Telegram stopped reading it). Answered `502`. |
-| `client_closed` | The client went away mid-request: its body broke off or was malformed (`400 Bad Request: the request body ended early`, which nobody reads), it left while tgin waited for Telegram's response headers, a rate-limit delay or Telegram's `retry_after` (no answer; Telegram may have received the call), or the body of an intercepted call did not arrive within `upstream_idle_timeout` (`408`). |
+| `ok` | The Bot API server, or tgin's own file route, answered with a status that is not an error. |
+| `rejected` | The server (or tgin's own file route) answered with a `4xx` other than `429`, or tgin refused it for this bot: `404` for a consumer the bot does not route to, `405`, `401` for a token rotated while the request was in flight, or a `400` or `413` for a [`file:` reference](#local-mode-and-file-references) or parameters tgin cannot check. |
+| `rate_limited` | It got a `429`: from the bot's rate limits, or the server's own, passed on. |
+| `upstream_error` | The server answered with a `5xx`, or its response body failed, or stalled for `upstream_idle_timeout`, after the headers. |
+| `unreachable` | No HTTP answer came: the connection failed, the upload stalled for `upstream_idle_timeout` (the client stopped sending, or the server stopped reading) or broke off, the connection was lost, or no response headers arrived within the response wait. Answered `502` ([Forwarding](#forwarding)). |
+| `client_closed` | The client went away mid-request: its body broke off or was malformed (`400 Bad Request: the request body ended early`, which nobody reads), it left while tgin waited for the server's response headers, a rate-limit delay or the server's `retry_after` (no answer; the server may have received the call), or the body of an intercepted call did not arrive within `upstream_idle_timeout` (`408`). |
 | `local` | An intercept answered it. |
 
-Requests with an unknown token count only in `tgin_gateway_unauthorized_total`, without labels, so no token ever creates a series; paths that are no gateway path are not counted. `tgin_gateway_upstream_seconds{bot,method}` is the time from sending a request (or a reply) to Telegram's response headers. `tgin_gateway_ratelimited_total{bot,scope,action}` counts delays and refusals by the rate limits, `scope` `global`, `chat` or `group` (the quota that decided), `action` `delayed` or `rejected`, for requests and webhook replies alike. `tgin_gateway_retries_total{bot}` counts the second sends after Telegram's `429`.
+Requests with an unknown token count only in `tgin_gateway_unauthorized_total`, without labels, so no token ever creates a series; paths that are no gateway path are not counted. `tgin_gateway_upstream_seconds{bot,method}` is the time from sending a request (or a reply) to the server's response headers. `tgin_gateway_ratelimited_total{bot,scope,action}` counts delays and refusals by the rate limits, `scope` `global`, `chat` or `group` (the quota that decided), `action` `delayed` or `rejected`, for requests and webhook replies alike. `tgin_gateway_retries_total{bot}` counts the second sends after the server's `429`.
 
 `tgin_webhook_replies_total{consumer,outcome}`:
 
 | `outcome` | The reply |
 |---|---|
-| `executed` | Telegram answered `2xx`. |
-| `failed` | Telegram answered otherwise or not within 30 s, or the gateway does not serve the consumer's bot. |
-| `refused` | No method, or one that is refused (see above), or it came from a runtime endpoint whose bot's token changed since its `setWebhook`. |
+| `executed` | The Bot API server answered `2xx`. |
+| `failed` | The server answered otherwise, or not within the reply's bound ([Webhook replies](#webhook-replies)), or the gateway does not serve the consumer's bot. |
+| `refused` | No method, or one that is refused (see above), or it came from a runtime endpoint whose bot's token changed since its `setWebhook`, or it carries a `file:` reference (or parameters tgin cannot check) for a bot whose `file:` references are refused. |
 | `too_large` | Its body was over 1 MiB. |
 | `rate_limited` | The bot's rate limits refused it. |
 
@@ -425,25 +437,130 @@ consumers:
 
 [examples/simple](examples/simple) runs a complete stack.
 
-### Self-hosted Bot API server
-
-A bot's `api_url` may point at a self-hosted [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server instead of `https://api.telegram.org`. Its method calls and tgin's long poll work through it as through Telegram, and so does the gateway's forwarding of method calls. Two things do not work through tgin with such a server:
-
-- **File downloads.** The gateway forwards downloads to `{api_url}/file/bot<token>/<file_path>`, a route the server does not serve; with `--local`, `getFile` answers an absolute path on the server's disk instead of a `file_path` to download.
-- **Webhook ingress from it.** `register: true` registers only an `https` `public_url`, and `ip_allowlist: telegram` names Telegram's networks, not the server's.
-
-Never expose the server itself: it has no authentication of its own, and its statistics port (`--http-stat-port`) shows the bots' tokens. Keep it on a network only tgin reaches.
-
-Two more caveats hold for this version:
-
-- **`--local` and untrusted downstreams.** With `--local`, the server reads a `file://` URI or an absolute path given for a file as a file on its own disk. tgin passes such parameters through unchanged, in gateway calls and in executed [webhook replies](#webhook-replies), so whoever holds a configured bot's token can make the server read and upload any file it can read; a private network for the server does not prevent that. Do not run a `--local` server behind tgin with downstreams you do not trust.
-- **Large uploads.** `gateway.upstream_idle_timeout` (`1m`) also runs while the server, having received the whole upload, sends it on to Telegram before it answers. A large `--local` upload can then get `502 Bad Gateway: Telegram is unreachable` while the server still sends it, and a client that retries sends it twice. Raise the bot's `gateway.upstream_idle_timeout` above the longest upload the server must forward.
-
 ### Checking against real Telegram
 
 Before a release, a maintainer runs `tests/smoke/real_telegram.py` (Python 3, standard library only) against the real Bot API with a test bot. It starts tgin with [its own config](tests/smoke/real_telegram.yaml) and the [webhook downstream](tests/smoke/hook.py), and reads the token from `TGIN_SMOKE_TOKEN` or from a file given as its argument; it never prints the token. Phase A needs no chat: identity, intercepts, proxied calls, unknown tokens, a capture and metrics. Phase B asks a person to send the bot a message containing `tgin-smoke-reply`, then checks the long poll, the pull consumer, the pushes, a webhook reply, per-chat shaping and a multipart upload with its download. CI never runs it; `--help` lists its options.
 
 With `--self-hosted URL --files-dir DIR`, the same phases run against a self-hosted `telegram-bot-api --local` server through an upstream `kind: local, local_mode: true` whose files tgin serves from `DIR` (`--server-dir` names the directory as the server sees it); the server keeps its API credentials, which the script never reads. It also checks that `getFile` answers relative paths through tgin and every download equals the file on the server's disk, that `file:` references are refused, `tgin_bot_info` and `tgin_upstream_up`, a 53 MiB document up and down byte for byte, and webhook ingress over plain HTTP from the server to `--public-url` (a reload switches the bot to it for a second message, containing `tgin-smoke-hook`, and back). `--migrate` starts the bot on the cloud, asks for confirmation, moves it with `tgin admin bot logout` (the bot cannot log in to the cloud again for 10 minutes) and leaves it on the server. tgin must see the server's directory under the server's own names, which keep the token's `:`; on Windows, where Docker Desktop shows a bind-mounted `:` as U+F03A, run the script in a container on the server's network and files volume (its docstring has the command). `--fake` dry-runs any of this against the [fake Bot API](tests/e2e/fake-telegram) (`--local-mode` for the server), injecting the messages through its control API.
+
+## Self-hosted Bot API servers
+
+A bot can use a self-hosted [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server instead of `https://api.telegram.org`. tgin long-polls it or takes its webhooks, forwards the gateway's calls to it, serves the bots' files from its disk, refuses requests that would make it read its own files, and moves bots between servers when an operator asks. Wherever this manual says "the Bot API server", it holds for both kinds.
+
+### Upstreams
+
+`upstreams` names the Bot API servers, and a bot names its own with `upstream`:
+
+```yaml
+upstreams:
+  tba:
+    kind: local                              # a self-hosted telegram-bot-api
+    url: http://telegram-bot-api:8081
+    local_mode: true                         # the server runs with --local
+    files:
+      dir: /var/lib/telegram-bot-api/files   # its --files-dir, as mounted in tgin
+
+bots:
+  - name: shop
+    token: ${env:SHOP_TOKEN}
+    upstream: tba
+    ingress:
+      long_poll: {}
+    routes:
+      - to: [workers]
+```
+
+- `kind` is `cloud` (Telegram's Bot API, or a server that keeps its rules) or `local` (a self-hosted `telegram-bot-api`). It decides the file, webhook and timeout rules below.
+- `url` is the server's base URL, `http` or `https`. Plain `http` to a host that is not loopback works, with a warning that names the upstream (never its URL): the tokens travel in clear, so keep such a server on a network only tgin reaches.
+- `local_mode: true` (only with `kind: local`) says the server runs with `--local`: `getFile` answers absolute paths on its disk, a `file:` parameter is read from its disk, and it posts webhooks over `http` to any port.
+- `files` (only with `kind: local`) says how tgin serves the bots' files: `dir`, with an optional `server_dir`, or `url` ([File downloads](#file-downloads)).
+- `response_timeout` bounds the wait for the server's response once a request was sent: `1m` for `cloud` and `10m` for `local` unless set, above 0 and at most `1h` ([Timeouts](#timeouts)).
+- Upstream names follow the rules for bot names, except `api_url`, which is reserved. A bot has `upstream` or `api_url`, not both: `api_url` (or neither, for `https://api.telegram.org`) is shorthand for an unnamed `cloud` upstream, which `/v1/config`, `/v1/status` and the metrics call `api_url`.
+- Every bot has its own token: a token two bots share is a config error.
+
+### File downloads
+
+| Upstream | `/file/bot<token>/<path>` through tgin | `getFile` through tgin |
+|---|---|---|
+| `cloud`, `api_url` | Forwarded to `{url}/file/bot<token>/<path>`. | As the server answers it. |
+| `local` with `files.dir` | Served from the bot's directory under `dir`. | In local mode, an absolute path under `{server_dir}/<bot's directory>/` becomes the path under that directory; otherwise as the server answers it. |
+| `local` with `files.url` | Forwarded to `{files.url}/<token>/<path>`. | In local mode, an absolute path through the bot's own directory becomes the path under it; otherwise as the server answers it. |
+| `local` without `files` | `404 Not Found: files are not served for this upstream`. | As the server answers it. |
+
+A server in local mode answers `getFile` with the file's absolute path on its disk, `<files directory>/<bot's directory>/documents/file_1.pdf`, and the server's own `/file` route serves no file then. tgin makes such a path relative again, `documents/file_1.pdf`, so a framework downloads through tgin as it would from Telegram, without the cloud's 20 MB limit. The server names each bot's directory after its token, `:` included (`123456:ABC-DEF…`); only when its file system refuses `:` does it write `~` instead (`123456~ABC-DEF…`). tgin tries both, the `:` form first, and serves a bot only its own directory: a path from another bot's directory is never rewritten (it passes unchanged), and no request reaches a file outside the calling bot's directory. tgin asks the server for a `getFile` answer it rewrites without compression, and reads one of at most 64 KiB; a larger answer passes unchanged.
+
+**From disk** (`files.dir`). `dir` is the server's files directory (its `--files-dir`, or `--dir` when that is unset) as mounted in tgin; read-only is enough. `server_dir` is the same directory as the server sees it, an absolute path: give it when the two differ, as when tgin mounts the volume elsewhere; it defaults to `dir`. tgin needs to read the files: the [server image](docker/telegram-bot-api) has them written 0640 in directories 0750 of its group 10001, so give tgin that group (Compose `group_add: ["10001"]`). The request path is percent-decoded once and must be plain relative segments: an empty, `.` or `..` segment, a `\` or a NUL, or a path whose real location (symbolic links followed) leaves the bot's directory, gets `404 Not Found`, and a file that is not there `404 Not Found: file not found`. A file is sent as `application/octet-stream` with its length, `Last-Modified` and a weak `ETag`; `If-None-Match` (else `If-Modified-Since`) can answer `304`, one byte range `206` (or `416` when it lies past the end), and several ranges get the whole file. Files stream in constant memory.
+
+**From an origin** (`files.url`). `url` is an HTTP origin that serves the server's files directory as it is on disk. tgin asks it for `{files.url}/<token>/<path>`, the token with its `:`, percent-encoded as `%3A`; a server that fell back to `~` names (its file system refuses `:`) needs `files.dir` instead. The path is percent-decoded once, checked as above, and sent encoded again, so an encoded traversal (`..%2F`, `%2e%2e%2f`) gets `404` and never reaches the origin. An origin's failures do not count in `tgin_upstream_up`, which is about the Bot API server.
+
+**Windows hosts.** tgin on Windows looks only for the `~` form of a bot's directory, as Windows names cannot hold `:`. A Linux server keeps the `:`, and a Docker Desktop bind mount shows it to Windows as U+F03A, so `files.dir` finds no directory of the bot's. Run tgin in a Linux container that mounts the server's files volume instead.
+
+### Local mode and `file:` references
+
+A server in local mode reads a parameter that begins with `file:/` as a file on its own disk, and uploads whatever it can read there, other bots' databases included. So for a bot on a `local` upstream with `local_mode: true`, tgin refuses a call in which any parameter begins with `file:` (case-sensitive; tgin stops one character short of the server's prefix, a margin against newer servers) with `400 Bad Request: local file uploads are disabled by tgin`, unless the bot has `allow_local_files: true`. It reads every parameter the server reads, decoded as the server decodes it:
+
+- the query string, for every method, `GET` included;
+- JSON bodies at any depth, and JSON carried in string parameters (`media`, `stickers`, `results` and the like);
+- urlencoded values;
+- multipart text fields, parsed as telegram-bot-api's own `HttpReader` parses them, so tgin and the server agree on which part is a file.
+
+JSON and urlencoded bodies are read whole, up to 1 MiB, the server's own limit for parameters; a larger one gets `413 Request Entity Too Large`. A multipart body streams: tgin holds back its closing boundary until the scan is done, and drops the connection to the server when the scan refuses it, so the server never gets a whole request; text fields over 1 MiB in all get `413` too. A body that cannot be checked gets `400 Bad Request: can't parse the request parameters`: a malformed multipart body, or a request with more than one `Content-Type`. JSON carried in strings more than four levels deep is refused as a `file:` reference. Refused calls count as outcome `rejected`. A [webhook reply](#webhook-replies) of such a bot is scanned the same way; a refused reply is not made, and counts as `refused`.
+
+The scan refuses some calls that read no file: a text or caption that begins with `file:`; a caption that begins with `[` or `{` and holds a quoted `"file:…"`; a JSON key that begins with `file:`. `allow_local_files: true` turns it off for the bot: set it only when everyone who holds the bot's token may read the server's disk.
+
+### Timeouts
+
+A local server takes uploads of up to 2000 MB and sends each on to Telegram before it answers, so its response can come minutes after the upload ended. The response wait of a bot on an `upstreams` entry is its `response_timeout` (`10m` for `local`); raise it, up to `1h`, above the longest upload the server must pass on. A bot on the `api_url` shorthand, which has no `response_timeout`, waits its `gateway.upstream_idle_timeout`. Webhook replies wait the smaller of `response_timeout` and 30 s. When the wait runs out the client gets `502 Bad Gateway: the Bot API server did not answer; the call may have been executed` ([Forwarding](#forwarding)): the server may still send the file, and a client that sends it again may send it twice.
+
+### Webhooks from a local server
+
+A bot on a `local` upstream with `local_mode: true` may take its updates as webhooks the server posts over plain `http`, to any port: `public_url: http://tgin:8080` works with `register: true`. Its `max_connections` may go up to 100 000. Every other upstream keeps Telegram's rules, checked at load: `https`, port 443, 80, 88 or 8443, and `max_connections` 1 to 100. `ip_allowlist: telegram` names Telegram's networks, which a local server does not post from, so it is an error on a `local` upstream: list the server's networks instead (`ip_allowlist: [10.0.0.0/8]`).
+
+A long poll on a `local` upstream retries a `401` or `404` with a backoff of up to 5 min instead of stopping, as the server answers them when Telegram rejects its own api_id or api_hash; only a `403` stops it. [Registration](#webhook-ingress) follows the same rule.
+
+### Moving a bot between servers
+
+Telegram gives a bot's updates to the one server the bot is logged in on; logged in on two, it is sure to get them all on neither. A bot leaves a server by `logOut` or `close` there, which tgin refuses from downstreams ([Intercepts](#intercepts)). An operator moves it instead:
+
+```console
+$ tgin admin bot logout shop --yes --timeout 1m
+shop logged out of its Bot API server (api_url); parked until a reload changes its upstream
+```
+
+which runs, for the bot:
+
+1. it waits until the bot's Bot API server holds no update for it, its ingest running on: a long poll polls until it gets an empty batch, a webhook bot asks `getWebhookInfo` until `pending_update_count` is 0;
+2. it stops the bot's ingest, and parks the bot;
+3. it waits until tgin holds no update of the bot, queued or leased;
+4. it calls `logOut` on the server (`bot close`: `deleteWebhook`, then `close`).
+
+One deadline covers steps 1 to 3: `--timeout`, a duration such as `30s`, or `reload.drain_timeout` without it. When step 1 has not finished by then, the command fails with `504` and changes nothing: the bot runs on, and nothing was called on the server (the warning in the log names a failing `getWebhookInfo` when that is why). When step 3 has not, tgin goes on, reports how many updates it still held as `left`, and delivers them still. When the server refuses the call, the bot is unparked and starts again. Without `--yes` the command only prints these steps and exits 64; with `--timeout D` it waits at most `D` plus 60 s for the answer, and without one as long as tgin takes.
+
+The admin API is `POST /v1/bots/<name>/logout` or `/close`, with an optional `?timeout=30s` (the config's duration format, without month or year units; another value gets `400 {"error":"invalid timeout"}`). It answers `200 {"bot":"shop","left":0,"upstream":"api_url","result":…}`, `result` being the server's description of its answer, if any, tokens masked; `404 {"error":"unknown bot"}`; `409 {"error":"draining"}` during shutdown; `409 {"error":"parked"}` for a bot that is parked already; `504 {"error":"upstream not drained"}`; or `502` with the server's description, tokens masked. Moves and reloads run one at a time: a move waits for the one in progress, and moves already waiting run before any reload that has not begun, so a move acts on the config in force when it was asked for. A `SIGHUP` is never dropped meanwhile.
+
+**Parked bots.** A parked bot runs no long poll, and its webhook route answers `503` with `Retry-After: 5`; `/v1/status` shows it with `"parked": true`, and `tgin admin status` with `, parked` after its state. A reload that leaves its upstream's name and URL as they were keeps it parked, with a warning; a reload that changes them starts it on the new upstream. Only removing the bot from the config ends its parking otherwise. While a bot is parked, tgin does not shut down for [every source failing](#shutdown). Parking lives in memory: started again with the old config, tgin starts the bot on its old server, which logs it in there again, so change the config before a restart.
+
+**Runbook.**
+
+- **Cloud → local.** `tgin admin bot logout <bot> --yes`, then set the bot's `upstream` to the local server and reload: the server logs the bot in on its first call. The bot cannot log in to the cloud again for 10 minutes.
+- **Local → local.** `tgin admin bot close <bot> --yes` on the old server, then change the bot's `upstream` and reload. A server that has run for over 10 minutes refuses `close` with `429` within 10 minutes of the bot's start; the command then fails with `502` and the bot runs on.
+- **Local → cloud.** `tgin admin bot logout <bot> --yes` on the local server, then wait before you set the bot back to the cloud (its `api_url`, or a `cloud` upstream) and reload. A cloud long poll whose token is rejected stops for good until a reload restarts it.
+
+### Running a server
+
+- **A workload of its own.** Run the server as its own container or service; tgin neither starts nor supervises it. Keep its `--dir` on persistent storage: it holds the bots' sessions and pending updates, and losing it logs every bot out of the server.
+- **Never one server per tgin replica.** tgin replicas share the server their bots live on; a server per replica would log each bot in several times.
+- **One server per token set.** A bot is logged in on one server, which owns its update queue. Many bots may share a server, or be split across servers with the server's `--filter`.
+- **A private network.** The server has no TLS and no authentication beyond the token in the URL: anyone who reaches it with a token controls that bot, and anyone with any valid token makes it log in as that bot with your api_id. Keep it on a network only tgin reaches, publish no port, and keep the downstream bots off that network, so they reach it only through tgin.
+- **Never expose the statistics port.** Leave `--http-stat-port` off: its page has no authentication, lists bots by token prefix and changes the log level on request.
+- **Local mode trusts its callers.** A `file:` parameter makes it upload any file it can read (tgin refuses them unless `allow_local_files`), and a webhook may point it at any address, private ones included: limit its outgoing traffic.
+- **Its api_id and api_hash** stay with the server: tgin never needs them. Keep them out of images, command lines and version control.
+
+tgin never logs the server's URL or a bot's directory or file path on it; both forms of each bot's directory name are masked in the logs like the token itself.
+
+### Compose example
+
+[examples/self-hosted](examples/self-hosted) runs the server, built from [docker/telegram-bot-api](docker/telegram-bot-api), in local mode next to tgin and one bot: the server shares a network with tgin alone and publishes no port, its files volume is mounted read-only in tgin at the server's own path (`files.dir`), and the bot reaches the server only through tgin's gateway. Its `compose.fake.yaml` runs the same stack against the fake Bot API in local mode, without Telegram.
 
 ## Hot reload
 
@@ -453,7 +570,7 @@ With `--self-hosted URL --files-dir DIR`, the same phases run against a self-hos
 - `POST /v1/reload` on the admin API, or `tgin admin reload`, which answer with the result;
 - a change of the config file while `reload.watch` is on (the default). tgin watches the file's directory, waits `reload.debounce` (500 ms) of quiet, and also re-reads the file every 2 s for file systems that send no change events; a change is a change of the file's bytes. When file events cannot be set up at all (an unreadable directory, the system's watch limit reached), tgin logs `file events unavailable (…); polling every 2 s` and keeps re-reading the file. A ConfigMap volume updates mounted files in place, but a file mounted with `subPath` is never updated by Kubernetes, so tgin cannot see the new version. Likewise, a Docker bind mount of the single file keeps the original inode: an edit saved by renaming over the file (most editors, `sed -i`, Ansible) never reaches the container, though reloads still succeed. Mount the directory instead.
 
-Reloads run one at a time, in order. While tgin shuts down, `POST /v1/reload` answers `503 {"error":"draining"}` and `SIGHUP` is ignored.
+Reloads run one at a time, in order, and so do [bot moves](#moving-a-bot-between-servers), with them: moves already waiting run before any reload that has not begun, and a `SIGHUP` is never dropped. While tgin shuts down, `POST /v1/reload` answers `503 {"error":"draining"}` and `SIGHUP` is ignored.
 
 **Rejection.** A config that cannot be read, fails validation or cannot be applied changes nothing: the running config stays, `tgin_config_reloads_total{outcome="rejected"}` grows, the errors are logged on one line, and `POST /v1/reload` answers `422` with `{"errors":[{"path","line","column","message","hint"}, …]}` (the location fields are `null` for an error without one).
 
@@ -462,7 +579,7 @@ Reloads run one at a time, in order. While tgin shuts down, `POST /v1/reload` an
 ```json
 {"generation":2,"added":["audit"],"removed":[],"changed":["frontdesk"],
  "sources_added":[],"sources_removed":[],"sources_restarted":["shop"],
- "restart_required":[]}
+ "upstream_changed":[],"restart_required":[]}
 ```
 
 - Rules and targets apply to the next update.
@@ -470,9 +587,9 @@ Reloads run one at a time, in order. While tgin shuts down, `POST /v1/reload` an
 - A new consumer starts empty. A consumer whose mode changed (pull ↔ push) is a new, empty instance; the old one drains as if removed.
 - A removed consumer stops receiving updates at once and drains for `reload.drain_timeout` (30 s); what it still holds then is dropped as `tgin_consumer_dropped_total{reason="reload"}`, and its metric series go. A removed pull consumer stays reachable while it drains, on `/c/<name>/getUpdates` and on its aliases (unless the new config gives the path to something else), with its old `auth_token`, so its clients can fetch and acknowledge what it holds.
 - A consumer added back with the same mode while its old instance still drains gets that instance back, with its queue and the new settings; a revived push consumer gets fresh breakers and stays paused if it was paused.
-- A bot whose `token`, `api_url` or `ingress` changed is restarted alone; added bots start, removed bots stop. Webhook paths and pull aliases change without restarting the listeners.
+- A bot whose `token` or `ingress` changed, or whose upstream changed its name, URL, `kind` or `local_mode`, is restarted alone; added bots start, removed bots stop. A bot now on another upstream (another name or URL) is also listed in `upstream_changed`, with a warning that its updates may be split between the two servers unless it was logged out of the old one first ([Moving a bot between servers](#moving-a-bot-between-servers)). A parked bot stays parked through a reload that keeps its upstream's name and URL, with a warning, and starts on its new upstream otherwise. Webhook paths and pull aliases change without restarting the listeners.
 - `log.level`, `admin.token` (a rotated token applies to the next request), `admin.public_metrics`, `server.trusted_proxies`, `reload.*` and `runtime.lame_duck` / `runtime.shutdown_grace` (used when a shutdown begins) apply live.
-- A bot's `gateway` settings apply live, without restarting its source. Its rate-limit quotas keep their state while its token and `rate_limit` stay, and the identity tgin learned from `getMe` while its token stays. A push consumer's `webhook_reply` applies to the next delivery, keeping its endpoints and breakers; `accept_set_webhook` and `honor_drop_pending` apply to the next request. A reload that turns `accept_set_webhook` off, gives the consumer another feeding bot (or none), or changes that bot's token clears the consumer's runtime endpoint ([`setWebhook` capture](#setwebhook-capture)).
+- A bot's `gateway` settings and `allow_local_files`, and an upstream's `files` and `response_timeout`, apply live, without restarting its source. Its rate-limit quotas keep their state while its token and `rate_limit` stay, and the identity tgin learned from `getMe` while its token stays. A push consumer's `webhook_reply` applies to the next delivery, keeping its endpoints and breakers; `accept_set_webhook` and `honor_drop_pending` apply to the next request. A reload that turns `accept_set_webhook` off, gives the consumer another feeding bot (or none), or changes that bot's token clears the consumer's runtime endpoint ([`setWebhook` capture](#setwebhook-capture)).
 - A changed TLS certificate or key file is loaded again on every reload; a certificate that does not load leaves the old one in use.
 - Secrets of removed bots and consumers stay masked in the logs.
 
@@ -496,10 +613,13 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 | `POST /v1/consumers/<name>/resume` | token | `204`; `409 {"error":"draining"}` during shutdown |
 | `POST /v1/consumers/<name>/drain` | token | `204` |
 | `POST /v1/consumers/<name>/purge` | token | `200 {"purged":N}` |
+| `POST /v1/bots/<name>/logout`, `/close` | token | `200 {"bot","left","upstream","result"}`; `400`, `404`, `409`, `502` or `504` ([Moving a bot between servers](#moving-a-bot-between-servers)) |
 
-**Auth.** The token is sent as `Authorization: Bearer <admin.token>` and compared in constant time; a request without it gets `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. Without `admin.token` the API needs no token, which validation allows only when every `admin.listen` address is a loopback address. An unknown consumer answers `404 {"error":"unknown consumer"}`.
+**Auth.** The token is sent as `Authorization: Bearer <admin.token>` and compared in constant time; a request without it gets `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. Without `admin.token` the API needs no token, which validation allows only when every `admin.listen` address is a loopback address. An unknown consumer answers `404 {"error":"unknown consumer"}`, an unknown bot `404 {"error":"unknown bot"}`.
 
-**Readiness.** `/readyz` is `200` while tgin runs and every component is ready: `engine`, `admin_plane`, `data_plane` (with a `server` block) and `source:<bot>` for each bot with an ingress. A source is not ready until it has started, also while a reload restarts it; once shutdown begins, `/readyz` answers `503` with `"phase":"draining"`. A source that later fails does not make tgin unready; watch `tgin_source_state` for that.
+**Readiness.** `/readyz` answers `200` when tgin can serve and `503` when it cannot or is shutting down; that status code and the body's `phase` are the contract. The `components` are informative: today `engine`, `admin_plane`, `data_plane` (with a `server` block) and `source:<bot>` for each bot with an ingress, a source not being ready until it has started, also while a reload restarts it. Once shutdown begins, `/readyz` answers `503` with `"phase":"draining"`. A source that later fails does not make tgin unready; watch `tgin_source_state` for that.
+
+**Compatibility.** Within a major version the admin API, the probe bodies and the metrics only grow: a minor release may add fields, enum values (states, phases, label values), metric families and error codes, and what exists keeps its meaning. Clients must ignore what they do not know, as `tgin admin` does.
 
 **Consumer operations.**
 
@@ -519,7 +639,7 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
   "phase": "running",
   "sources": [
     {"name": "shop", "kind": "bot", "ingress": "long_poll", "state": "running",
-     "updates_total": 120, "errors_total": 0}
+     "updates_total": 120, "errors_total": 0, "upstream": "api_url"}
   ],
   "consumers": [
     {"name": "audit", "mode": "push", "depth": 0, "leased": 1, "in_flight": 1,
@@ -534,11 +654,11 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 ```
 
 - `phase`: `starting`, `running`, `draining` or `stopped`.
-- `sources[]`, one per bot: `ingress` is `long_poll`, `webhook` or `null`; `state` is `starting`, `running`, `backoff`, `failed` or `stopped`. A long poll is `backoff` while it waits out a failed `getMe` or `getUpdates` (its task keeps running); a bot whose source could not be set up is `failed`. `error` (present only when there is one) says why the source backs off or failed, with secrets masked.
+- `sources[]`, one per bot: `ingress` is `long_poll`, `webhook` or `null`; `state` is `starting`, `running`, `backoff`, `failed` or `stopped`. A long poll is `backoff` while it waits out a failed `getMe` or `getUpdates` (its task keeps running); a bot whose source could not be set up is `failed`. `error` (present only when there is one) says why the source backs off or failed, with secrets masked. `upstream` names the bot's upstream (`api_url` for the shorthand), and `"parked": true` is present while the bot is [parked](#moving-a-bot-between-servers) (its state is then `stopped`).
 - `consumers[]`: `depth` (waiting to be leased), `leased`, `in_flight` (push deliveries in progress, retries waiting included), `paused`, and for push consumers each endpoint's origin (`scheme://host[:port]`; path, query and credentials are never shown), breaker (`closed`, `open` or `half_open`) and `runtime`: `true` for the endpoint a bot's `setWebhook` set through the gateway (listed after the configured ones), `false` for a configured one.
-- `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls, and `gateway-sweep`, which forgets idle rate-limit keys) with the supervisor's view of it: its state and, when it is restarted after a panic or failed, its last error, secrets masked. A long poll that backs off by itself stays `running` here; see `sources[]`.
+- `tasks[]`: every supervised task (long-poll sources, push dispatchers, background `getMe` calls, `setWebhook` registrations being retried, as `register:<bot>`, and `gateway-sweep`, which forgets idle rate-limit keys) with the supervisor's view of it: its state and, when it is restarted after a panic or failed, its last error, secrets masked. A long poll that backs off by itself stays `running` here; see `sources[]`.
 
-`GET /v1/config` shows the config as written, with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`): every secret is `"[redacted]"`, URL fields (`api_url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
+`GET /v1/config` shows the config as written, with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`): every secret is `"[redacted]"`, URL fields (`api_url`, an upstream's `url` and `files.url`, `public_url`, endpoint `url`) show only `scheme://host[:port]` (followed by `/…` when something was left out), and other strings keep their `${…}` references unexpanded with bot tokens and the config's secrets masked as `#####`.
 
 ## `tgin admin`
 
@@ -550,6 +670,7 @@ $ tgin admin reload
 $ tgin admin consumers
 $ tgin admin pause <consumer>     # also: resume, drain, purge
 $ tgin admin health
+$ tgin admin bot logout <bot> --yes   # also: bot close; --timeout 1m
 ```
 
 | Option | Environment | Meaning |
@@ -560,11 +681,11 @@ $ tgin admin health
 
 `--url` and `--token-file` go before the subcommand; `--json` may go anywhere after `admin`. The CLI reads the token only from a file — never from an argument or an environment variable — so it does not show up in process listings or shell history. It never uses an HTTP proxy, whatever the proxy environment variables say, so the token goes straight to tgin.
 
-`status` prints the version, generation and phase, then a table of sources and one of consumers; `consumers` prints the consumer table; `reload` prints the new generation and what changed, including settings that need a restart; `purge` prints how many updates it dropped. A request waits at most 60 s (a reload may wait on Telegram).
+`status` prints the version, generation and phase, then a table of sources (its `UPSTREAM` column names each bot's upstream, and a parked bot's state reads `stopped, parked`) and one of consumers; `consumers` prints the consumer table; `reload` prints the new generation and what changed, bots moved to another upstream and settings that need a restart included; `purge` prints how many updates it dropped; `bot logout` and `bot close` print what they did ([Moving a bot between servers](#moving-a-bot-between-servers)). A request waits at most 60 s (a reload may wait on the Bot API server); `bot logout|close --timeout D` waits `D` plus 60 s, and without `--timeout` as long as tgin takes.
 
 `health` asks `GET /readyz`, needs no token (it does not read the token file), waits at most 2 s, prints `ready` or `not ready (…)`, and exits 0 when ready, else 1; when the admin API cannot be reached or does not answer in time, it prints the error on stderr and exits 1. The container image's `HEALTHCHECK` runs it.
 
-Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot be reached or does not answer in time, it answers with an error (printed with the server's `error` or its list of config errors), or `health` finds tgin not ready; 64 for a malformed command line.
+Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot be reached or does not answer in time, it answers with an error (printed with the server's `error` or its list of config errors), or `health` finds tgin not ready; 64 for a malformed command line, and for `bot logout` or `bot close` without `--yes`, which only print the steps they would take.
 
 ## Metrics
 
@@ -588,14 +709,16 @@ Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot b
 | `tgin_config_reloads_total` | counter | `outcome` | Reloads `applied` or `rejected`. |
 | `tgin_config_generation` | gauge | | The config generation in effect. |
 | `tgin_shutdown_abandoned_total` | counter | | Updates still pending when the shutdown ended. |
-| `tgin_gateway_requests_total` | counter | `bot`, `method`, `outcome` | Gateway requests of configured bots, and webhook replies sent to Telegram; `method` is the canonical method name, `other` or `file`; `outcome` `ok`, `rejected`, `rate_limited`, `upstream_error`, `unreachable`, `client_closed` or `local` ([Gateway metrics](#gateway-metrics)). |
-| `tgin_gateway_upstream_seconds` | histogram | `bot`, `method` | From sending a gateway request or webhook reply to Telegram's response headers; buckets as `tgin_delivery_latency_seconds`. |
+| `tgin_gateway_requests_total` | counter | `bot`, `method`, `outcome` | Gateway requests of configured bots, and webhook replies sent to the Bot API server; `method` is the canonical method name, `other` or `file`; `outcome` `ok`, `rejected`, `rate_limited`, `upstream_error`, `unreachable`, `client_closed` or `local` ([Gateway metrics](#gateway-metrics)). |
+| `tgin_gateway_upstream_seconds` | histogram | `bot`, `method` | From sending a gateway request or webhook reply to the Bot API server's response headers; buckets from 1 ms, doubling, 20 of them (the last at about 524 s). |
 | `tgin_gateway_ratelimited_total` | counter | `bot`, `scope`, `action` | Requests and webhook replies the rate limits delayed or refused: `scope` `global`, `chat` or `group`, `action` `delayed` or `rejected`. |
-| `tgin_gateway_retries_total` | counter | `bot` | Requests sent again after Telegram's `429`. |
+| `tgin_gateway_retries_total` | counter | `bot` | Requests sent again after the Bot API server's `429`. |
 | `tgin_gateway_unauthorized_total` | counter | | Gateway requests whose token matches no configured bot. |
 | `tgin_webhook_replies_total` | counter | `consumer`, `outcome` | Webhook replies by `outcome` `executed`, `failed`, `refused`, `too_large` or `rate_limited` ([Gateway metrics](#gateway-metrics)). |
+| `tgin_bot_info` | gauge | `bot`, `upstream` | 1 for each bot; `upstream` is the name of its upstream, or `api_url` for the shorthand. A reload that changes the upstream's name or URL replaces the series. |
+| `tgin_upstream_up` | gauge | `bot` | 1 after any HTTP answer from the bot's Bot API server (to its long poll, `getMe`, `setWebhook` and the like, gateway calls and webhook replies), whatever the status; 0 after a connect failure, a timeout or a lost connection. Absent until the bot's first outcome. A downstream that stalls its own upload, and a `files.url` origin, do not count. Kept across reloads that keep the upstream's name and URL. |
 
-Apart from `tgin_build_info`'s, every label value is a bot or consumer name, an endpoint index, a method name from tgin's table or a fixed word, so no series carries a URL or a token. A bot's series go when a reload removes it; a consumer's when its drain ends.
+Apart from `tgin_build_info`'s, every label value is a bot or consumer name, an upstream name (in `tgin_bot_info` only), an endpoint index, a method name from tgin's table or a fixed word, so no series carries a URL or a token. A bot's series go when a reload removes it; a consumer's when its drain ends. Metrics follow the admin API's [compatibility rule](#admin-api-v1).
 
 ## Logging
 
@@ -605,7 +728,7 @@ Logs go to stdout, as `text` or `json` lines (`log.format`, fixed at start). `lo
 
 **Secrets.** Write secrets as `${env:…}` or `${file:…}` references rather than literally, so the config file can be shared. `${file:…}` suits Docker and Kubernetes secrets mounted as files. An empty secret is an error. Config errors never quote a secret: a malformed reference in a secret or URL field is reported without its text, and YAML errors carry the path, line and column without the source line.
 
-**Redaction.** Every log line is masked before it is written: each secret of every config loaded since start (bot tokens, webhook secrets, `admin.token`, pull `auth_token`s, push `secret_token`s) and anything shaped like a bot token is replaced by `#####`. Secrets shorter than 8 characters are not masked, as they would match ordinary words; use long random secrets. `/v1/status` and `/v1/config` redact as described under [Admin API v1](#admin-api-v1), and metric labels hold no URLs. The gateway never logs a request path or an upstream URL, since both carry the bot token.
+**Redaction.** Every log line is masked before it is written: each secret of every config loaded since start (bot tokens, also with `:` written as `~`, as a self-hosted server may name a bot's directory; webhook secrets, `admin.token`, pull `auth_token`s, push `secret_token`s) and anything shaped like a bot token is replaced by `#####`. Secrets shorter than 8 characters are not masked, as they would match ordinary words; use long random secrets. `/v1/status` and `/v1/config` redact as described under [Admin API v1](#admin-api-v1), and metric labels hold no URLs. The gateway never logs a request path, an upstream URL, or a file's path on a self-hosted server, since all of them carry the bot token.
 
 **Auth model.**
 
@@ -614,14 +737,14 @@ Logs go to stdout, as `text` or `json` lines (`log.format`, fixed at start). `lo
 | Admin plane (`/v1/*`, `/metrics`) | `admin.token` as a bearer token; required unless every admin listener is on loopback. `/metrics` can be opened with `admin.public_metrics`. `/livez` and `/readyz` are always open. |
 | Pull consumers | Optional `auth_token` per consumer, as a bearer token. Without it, anyone who can reach the data plane can take the consumer's updates. |
 | Webhook ingress | `secret_token` (`auto` by default) checked before the body is read; optional `ip_allowlist`; `trusted_proxies` decides whose `X-Forwarded-For` counts. |
-| Bot API gateway | The bot token in the path, compared in constant time with every configured bot's token; an unknown token gets `401` and nothing goes to Telegram. Its holder acts as the bot, polls the pull consumers the bot routes to, and, with `accept_set_webhook`, chooses where a push consumer posts ([trust model](#setwebhook-capture)). |
+| Bot API gateway | The bot token in the path, compared in constant time with every configured bot's token; an unknown token gets `401` and nothing goes to the Bot API server. Its holder acts as the bot, polls the pull consumers the bot routes to, downloads the bot's own files, and, with `accept_set_webhook`, chooses where a push consumer posts ([trust model](#setwebhook-capture)); with `allow_local_files` on a server in local mode, it reads the server's disk ([`file:` references](#local-mode-and-file-references)). |
 | Push endpoints | The endpoint's `secret_token` is sent as `X-Telegram-Bot-Api-Secret-Token`, for the downstream to check. |
 
 Every token compare runs in constant time.
 
 **TLS.** The data plane terminates TLS itself when `server.tls` is set (rustls, HTTP/1.1); the certificate files are read at start (a missing or bad file stops tgin with exit code 1) and again on every reload. The admin plane has no TLS: keep it on loopback or a private network, or put a TLS proxy in front, since the bearer token travels in clear text. Outgoing calls to the Bot API and to push endpoints verify server certificates against the platform's trust store, never follow redirects, and use the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment if set (`tgin admin` never does).
 
-**Telegram webhooks need HTTPS** on 443, 80, 88 or 8443 (Telegram's rule): put tgin behind a TLS-terminating proxy, or give it `server.tls` and a `listen` on one of those ports.
+**Telegram webhooks need HTTPS** on 443, 80, 88 or 8443 (Telegram's rule): put tgin behind a TLS-terminating proxy, or give it `server.tls` and a `listen` on one of those ports. A self-hosted server in local mode posts over plain `http` to any port ([Webhooks from a local server](#webhooks-from-a-local-server)).
 
 ## Shutdown
 
@@ -638,7 +761,7 @@ With the defaults the whole shutdown takes at most about 22 s; set the orchestra
 
 A second `SIGTERM`/`SIGINT` (or Ctrl+C, Ctrl+Break) during the shutdown stops at once with exit code 130, losing what is pending. When the shutdown began because every source failed, the first signal is only logged and a second one forces the exit. A signal while tgin is still starting stops what has started and exits 0. Closing the console on Windows, which kills the process about 5 s later, skips the lame duck and caps the drain at 4 s.
 
-**Every source failing.** A long-poll source fails for good when Telegram rejects its token (`401`, `403` or `404`). When every bot with an ingress uses long poll and all of their sources have failed, tgin shuts down as above and exits with code 2. A webhook bot never fails this way, so a config with one never exits 2.
+**Every source failing.** A long-poll source fails for good when its Bot API server rejects the token: `401`, `403` or `404` from a `cloud` upstream, `403` from a `local` one (whose `401` and `404` are retried, see [Webhooks from a local server](#webhooks-from-a-local-server)). When every bot with an ingress uses long poll, all of their sources have failed and no bot is [parked](#moving-a-bot-between-servers), tgin shuts down as above and exits with code 2. A webhook bot never fails this way, so a config with one never exits 2.
 
 ## Deployment
 
@@ -647,6 +770,7 @@ A second `SIGTERM`/`SIGINT` (or Ctrl+C, Ctrl+Break) during the shutdown stops at
 - **One tgin per long-poll token.** Telegram allows one `getUpdates` poller per token; a second gets `409 Conflict`, and tgin backs off 5 s and logs `another process is polling this bot token`. Replace a tgin that polls with stop-then-start (Kubernetes `strategy: Recreate`, `replicas: 1`), not a rolling update that briefly runs two.
 - **Queues are per process**, and so are the gateway's rate limits. A pull client must poll the tgin that holds its consumer's updates.
 - **Downstream bots go through the gateway.** Bots behind tgin share its token. Through the gateway, their `getUpdates`, `setWebhook`, `deleteWebhook`, `logOut` and `close` are answered by tgin. A bot that calls Telegram directly with that token can still take tgin's updates (`getUpdates`), remove tgin's webhook or drop the updates Telegram holds for it (`deleteWebhook`, as python-telegram-bot, grammY and Telegraf do when they start polling, or aiogram's `delete_webhook(drop_pending_updates=True)`).
+- **A self-hosted Bot API server is a workload of its own**, one per token set and shared by every tgin that serves its bots, on a network only tgin reaches ([Running a server](#running-a-server)).
 
 ### Binaries
 
@@ -772,10 +896,10 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 
 | Code | Meaning |
 |---|---|
-| 0 | Clean shutdown after a signal (also a signal during start-up), or a command that succeeded. |
+| 0 | Clean shutdown, or a command that succeeded. A shutdown signal ends a run this way, also one during start-up. |
 | 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
-| 2 | Every source failed for good: Telegram rejected each long-poll bot's token and no webhook bot exists. |
-| 64 | Malformed command line (unknown command or option, missing argument). |
+| 2 | Every source failed for good: the Bot API server rejected each long-poll bot's token, no webhook bot exists and no bot is parked. |
+| 64 | Malformed command line (unknown command or option, missing argument), or `tgin admin bot logout` or `close` without `--yes`. |
 | 130 | A second shutdown signal cut the drain short. |
 
 Updates lost at the end of a shutdown do not change the exit code; see `tgin_shutdown_abandoned_total` and the log.
@@ -787,4 +911,6 @@ Updates lost at the end of a shutdown do not change the exit code; see `tgin_shu
 - [CHANGELOG.md](CHANGELOG.md) — changes per release.
 - [SECURITY.md](SECURITY.md) — reporting vulnerabilities, verifying releases.
 - [examples/simple](examples/simple) — a Compose stack with pull and push consumers whose bots use the gateway.
+- [examples/self-hosted](examples/self-hosted) — tgin in front of a self-hosted Bot API server in local mode, with Compose, and against the fake Bot API.
+- [docker/telegram-bot-api](docker/telegram-bot-api) — an image of the official Bot API server: its build, flags, volumes and security notes.
 - [tests/e2e](tests/e2e) — the end-to-end suite: aiogram, python-telegram-bot, grammY and Telegraf against tgin and a fake Bot API (`cargo xtask e2e`).

@@ -12,11 +12,11 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 
 ### Added
 
-- Several bots per process, each with its own token, `api_url` and ingress
-  (long poll or webhook), and per-bot routing rules on update type, chat,
-  chat type, user, command, text and callback data. Targets send an update to
-  consumers, to `all` of a group, or to one of a `split` (`round_robin`,
-  sticky `hash_chat`, or `weighted`).
+- Several bots per process, each with its own token, Bot API server and
+  ingress (long poll or webhook), and per-bot routing rules on update type,
+  chat, chat type, user, command, text and callback data. Targets send an
+  update to consumers, to `all` of a group, or to one of a `split`
+  (`round_robin`, sticky `hash_chat`, or `weighted`).
 - Pull consumers: a Telegram-shaped `getUpdates` on `/c/<name>/getUpdates`
   and on alias paths, with leases acknowledged by `offset`, redelivery after
   `lease_timeout`, instances named by `X-Tgin-Instance` or client address,
@@ -28,13 +28,59 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   headers.
 - A Bot API gateway on the data plane for the bots behind tgin:
   `/bot<token>/<method>`, `/file/bot<token>/<file_path>` and the same under
-  `/c/<consumer>/`. Calls and file downloads stream to the bot's `api_url`
-  in both directions with their `Content-Length`, through header
+  `/c/<consumer>/`. Calls and file downloads stream to the bot's Bot API
+  server in both directions with their `Content-Length`, through header
   allowlists, without a total timeout (`gateway.upstream_idle_timeout`
-  bounds the time without progress). `getUpdates`, `getMe`, `setWebhook`,
-  `deleteWebhook`, `getWebhookInfo`, `logOut` and `close` are answered by
-  tgin as telegram-bot-api answers them; on `/c/<consumer>/` `getUpdates`
-  polls that pull consumer.
+  bounds the time without progress while a body moves). `getUpdates`,
+  `getMe`, `setWebhook`, `deleteWebhook` and `getWebhookInfo` are answered
+  by tgin as telegram-bot-api answers them; on `/c/<consumer>/`
+  `getUpdates` polls that pull consumer. `logOut` and `close` are refused
+  with `400 Bad Request: logOut and close are disabled by tgin; operators
+  move bots with tgin admin bot logout|close`.
+- Self-hosted Bot API servers: `upstreams` names Bot API servers (`kind:
+  cloud` or `local`, `url`, `local_mode`, `files`, `response_timeout`), and
+  a bot picks one with `upstream`; `api_url` stays the shorthand for an
+  unnamed `cloud` upstream. An upstream reached over plain `http` on a host
+  that is not loopback loads with a warning.
+- File serving for `local` upstreams: from the server's files directory
+  mounted in tgin (`files.dir`, with `server_dir` for the server's own
+  path) or from an HTTP origin (`files.url`), each bot only from its own
+  directory; in local mode, `getFile`'s absolute paths come back relative,
+  so frameworks download through tgin. A `local` upstream without `files`
+  answers downloads with `404 Not Found: files are not served for this
+  upstream`.
+- Local file references: for a bot on a `local` upstream in local mode,
+  the gateway and webhook replies refuse any parameter that begins with
+  `file:` (query string, JSON at any depth, urlencoded values, multipart
+  text fields read as telegram-bot-api reads them) with `400 Bad Request:
+  local file uploads are disabled by tgin`, unless the bot sets
+  `allow_local_files: true`; such bots' JSON and urlencoded bodies are
+  read up to 1 MiB (`413` above).
+- `response_timeout` per upstream (`1m` for `cloud`, `10m` for `local`, at
+  most `1h`) bounds the wait for the server's answer once a request was
+  sent; on the `api_url` shorthand that wait is the bot's
+  `upstream_idle_timeout`. Webhook replies wait the smaller of
+  `response_timeout` and 30 s.
+- Webhooks from a self-hosted server in local mode: `public_url` may be
+  `http` on any port, and `max_connections` up to 100 000.
+  `ip_allowlist: telegram` on a `local` upstream is a config error.
+- `setWebhook` registration retries in the background (`register:<bot>`,
+  1 s to 5 min, honouring `retry_after`) until it succeeds or the bot
+  stops; a cloud server's `401`, `403` or `404` ends it. On a `local`
+  upstream, a `401` or `404` (the server's own api_id or api_hash
+  rejected) is retried by registration and by the long poll alike.
+- Moving bots between Bot API servers: `tgin admin bot logout|close <bot>
+  --yes [--timeout D]` and `POST /v1/bots/{name}/logout|close` drain the
+  server and tgin's queues of the bot, call `logOut` (or `deleteWebhook`
+  and `close`) on its server and park it until a reload changes its
+  upstream. Moves run with reloads, before any reload that has not begun.
+- `tgin_bot_info{bot,upstream}` and `tgin_upstream_up{bot}` metrics;
+  `upstream` and `parked` in `/v1/status` sources, an `UPSTREAM` column in
+  `tgin admin status`, and `upstream_changed` in the reload report, with a
+  warning about split updates when a bot's upstream changes.
+- The admin API, the probe bodies and the metrics follow a compatibility
+  rule: minor releases only add fields, enum values, metric families and
+  error codes, and clients ignore what they do not know.
 - Per-bot rate limits in the gateway (`gateway.rate_limit`): global,
   per-chat and per-group quotas for `send*`, `copyMessage*` and
   `forwardMessage*`, shaped up to `max_delay` or refused with Telegram's
@@ -51,20 +97,22 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `honor_drop_pending` lets `drop_pending_updates` drop the calling bot's
   queued updates from the calling consumer; other bots' updates stay.
 - Gateway metrics: `tgin_gateway_requests_total`,
-  `tgin_gateway_upstream_seconds`, `tgin_gateway_ratelimited_total`,
-  `tgin_gateway_retries_total`, `tgin_gateway_unauthorized_total` and
-  `tgin_webhook_replies_total`.
+  `tgin_gateway_upstream_seconds` (buckets from 1 ms to about 524 s),
+  `tgin_gateway_ratelimited_total`, `tgin_gateway_retries_total`,
+  `tgin_gateway_unauthorized_total` and `tgin_webhook_replies_total`.
 - An end-to-end suite (`cargo xtask e2e`, run in CI) with aiogram,
   python-telegram-bot, grammY and Telegraf against tgin and a fake Bot
-  API, and a manual check against the real Bot API
-  (`tests/smoke/real_telegram.py`).
+  API, a self-hosted scenario against the fake in local mode (files from
+  disk, webhooks over plain http, `file:` refusals), and a manual check
+  against the real Bot API (`tests/smoke/real_telegram.py`, with
+  `--self-hosted`, `--migrate` and `--fake` for a self-hosted server).
 - Bounded queues per consumer (`capacity`, `capacity_bytes`) with
   `on_full: backpressure` or `drop_oldest`, and `ordering: per_chat`.
 - Webhook ingress with a secret derived from the bot token by default,
   `setWebhook` registration, an IP allowlist (including Telegram's
   networks) and trusted proxies for `X-Forwarded-For`.
 - Hot reload on file change, `SIGHUP` and `POST /v1/reload`: rules,
-  consumers and bots change live; only bots whose token, `api_url` or
+  consumers and bots change live; only bots whose token, Bot API server or
   ingress changed restart; removed consumers drain; settings that need a
   restart are reported.
 - Admin API v1: `/v1/status`, `/v1/config` (secrets redacted),
@@ -99,9 +147,10 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   serves webhooks, pull consumers and the Bot API gateway, the admin plane
   (`admin.listen`, default `127.0.0.1:9090`) serves `/livez`, `/readyz`,
   `/metrics` and the admin API.
-- Exit codes: 2 when every source failed (Telegram rejected the token of
-  every long-poll bot and no webhook bot exists), 64 for a malformed
-  command line, 130 for a second shutdown signal.
+- Exit codes: 2 when every source failed (the Bot API server rejected the
+  token of every long-poll bot, no webhook bot exists and no bot is
+  parked), 64 for a malformed command line, 130 for a second shutdown
+  signal.
 - Long-poll bots delete an active webhook before polling
   (`delete_webhook_on_start`, on by default), keeping pending updates.
 - The container image is a static musl binary on distroless, without a
@@ -120,9 +169,24 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   server (Bot API 10.3), built from a pinned upstream commit on Alpine,
   running as `10001:10001` with no credentials inside; CI builds it on amd64
   and arm64 with an SBOM and provenance, and does not publish it.
-  `examples/self-hosted` runs tgin in front of it with Compose, and with
-  `compose.fake.yaml` against the fake Bot API instead.
+  `examples/self-hosted` runs tgin in front of it with Compose, serving
+  the bot's files from the server's volume, and with `compose.fake.yaml`
+  against the fake Bot API in local mode instead.
 - The minimum supported Rust version is 1.89.
+
+### Changed
+
+- A token shared by two bots is a config error, reported at the second
+  bot without quoting the token.
+- A webhook `public_url` on a `cloud` upstream (or the `api_url`
+  shorthand) on a port other than 443, 80, 88 or 8443 is a config error at
+  load; Telegram never posted to such ports.
+- Downstream `logOut` and `close` answer `400` instead of `true`: moving a
+  bot is the operator's `tgin admin bot logout|close`.
+- A gateway call that gets no answer is answered `502 Bad Gateway: the Bot
+  API server is unreachable` when the server never had the whole request
+  (or flood control refused it), and `502 Bad Gateway: the Bot API server
+  did not answer; the call may have been executed` once it had.
 
 ### Security
 
@@ -146,6 +210,11 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   gets `401`, a malformed one `404`, and neither reaches Telegram. Gateway
   paths and upstream URLs, which carry tokens, are never logged or used as
   metric labels.
+- tgin serves a bot's files only from that bot's own directory on the Bot
+  API server: traversal, encoded traversal and symbolic links that leave
+  it get `404`, and a `getFile` path from another bot's directory is never
+  rewritten. Bot directory names (the token, with `:` or `~`) are masked
+  in logs like the token.
 - tgin never acts on its own pushes: each push carries tgin's `Via`, and
   both planes answer `508 Loop Detected` to a request carrying it, so a
   push endpoint (a `setWebhook` runtime endpoint included) cannot make tgin
@@ -164,9 +233,11 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 
 ### Docs
 
-- README, DOCS and AGENTS describe tgin 1.0, including the Bot API gateway
-  and how to point aiogram, python-telegram-bot, grammY, Telegraf and
-  go-telegram-bot-api at it; generated config reference; PERF.md compares
+- README, DOCS and AGENTS describe tgin 1.0, including the Bot API gateway,
+  self-hosted Bot API servers (upstreams, file modes, `file:` references,
+  moving bots, running a server) and how to point aiogram,
+  python-telegram-bot, grammY, Telegraf and go-telegram-bot-api at it;
+  generated config reference; PERF.md compares
   tgin 1.0 with the original engine (`4f0971a`) and lists the changes
   behind the difference.
 - Added `SECURITY.md` (supported versions, private reporting, verifying

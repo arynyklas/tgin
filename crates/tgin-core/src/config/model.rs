@@ -248,9 +248,10 @@ pub enum UpstreamKind {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Files {
-    /// The server's `--dir` as mounted in tgin; read-only is enough. A
-    /// relative path is relative to the config file's directory. Supports
-    /// `${env:…}` and `${file:…}`.
+    /// The server's files directory (its `--files-dir`, or `--dir` when
+    /// that is unset) as mounted in tgin; read-only is enough. A relative
+    /// path is relative to the config file's directory. Supports `${env:…}`
+    /// and `${file:…}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<Template>,
     /// The same directory as the server sees it, an absolute path; only
@@ -258,7 +259,8 @@ pub struct Files {
     /// `${file:…}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_dir: Option<Template>,
-    /// An HTTP origin serving the server's `--dir`, `http` or `https`.
+    /// An HTTP origin serving the server's files directory (its
+    /// `--files-dir`, or `--dir` when that is unset), `http` or `https`.
     /// Supports `${env:…}` and `${file:…}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<Template>,

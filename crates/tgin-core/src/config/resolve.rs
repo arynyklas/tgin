@@ -853,7 +853,7 @@ impl Resolver<'_> {
                     self.diag.errors.push(
                         ConfigError::new("`server_dir` must be an absolute path")
                             .at(located(path, text.0.location))
-                            .hint("it is the directory as the Bot API server sees it (its `--dir`), whose absolute paths `getFile` answers in local mode"),
+                            .hint("it is the files directory as the Bot API server sees it (its `--files-dir`, or `--dir` when that is unset), whose absolute paths `getFile` answers in local mode"),
                     );
                     return None;
                 }
