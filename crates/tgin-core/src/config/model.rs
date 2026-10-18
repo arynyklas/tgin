@@ -189,11 +189,13 @@ pub struct Bot {
     /// The `upstreams` entry this bot talks to. Not with `api_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<At<Name>>,
-    /// Let `file:` references (files on the server's own disk) reach a
-    /// `local` upstream. Off, the gateway and webhook replies refuse them
-    /// for every `local` upstream, `local_mode` or not (the server may run
-    /// `--local` all the same), so a client cannot read the server's files
-    /// through tgin. Cloud upstreams never read local files.
+    /// Let `file:` references (files on the server's own disk) reach the
+    /// bot's Bot API server. Off, the gateway and webhook replies refuse
+    /// them for every server but the Telegram cloud (a URL whose host is
+    /// `api.telegram.org`): the `api_url` shorthand, `kind: cloud` and
+    /// `kind: local` upstreams alike, `local_mode` or not, as any other
+    /// server may run `--local`. So a client cannot read the server's files
+    /// through tgin.
     #[serde(default)]
     pub allow_local_files: bool,
     /// How updates arrive; at most one. Omitted, the bot receives none.

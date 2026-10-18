@@ -59,7 +59,7 @@
       "properties": {
         "allow_local_files": {
           "default": false,
-          "description": "Let `file:` references (files on the server's own disk) reach a\n`local` upstream. Off, the gateway and webhook replies refuse them\nfor every `local` upstream, `local_mode` or not (the server may run\n`--local` all the same), so a client cannot read the server's files\nthrough tgin. Cloud upstreams never read local files.",
+          "description": "Let `file:` references (files on the server's own disk) reach the\nbot's Bot API server. Off, the gateway and webhook replies refuse\nthem for every server but the Telegram cloud (a URL whose host is\n`api.telegram.org`): the `api_url` shorthand, `kind: cloud` and\n`kind: local` upstreams alike, `local_mode` or not, as any other\nserver may run `--local`. So a client cannot read the server's files\nthrough tgin.",
           "type": "boolean"
         },
         "api_url": {

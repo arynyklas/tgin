@@ -4193,7 +4193,7 @@ async fn upload_in_flight(
         .await
         .expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     stream.write_all(&[b'x'; 100]).await.expect("a part");

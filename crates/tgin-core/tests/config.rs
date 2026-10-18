@@ -2554,6 +2554,54 @@ fn api_url_shorthand_unchanged() {
     assert!(json.get("upstreams").is_none(), "{json}");
 }
 
+/// `file:` references are refused for every server but Telegram's cloud
+/// (`api.telegram.org`, its host in any case), and for every `local`
+/// upstream, unless the bot allows them.
+#[test]
+fn local_files_refused_off_the_telegram_cloud() {
+    let yaml = r#"version: 1
+upstreams:
+  custom: { kind: cloud, url: "https://bot-api.example" }
+  tba: { kind: local, url: "https://api.telegram.org" }
+bots:
+  - { name: default, token: "1:t" }
+  - { name: cloud, token: "2:t", api_url: "https://api.telegram.org" }
+  - { name: cased, token: "3:t", api_url: "https://API.Telegram.ORG:443/x" }
+  - { name: loopback, token: "4:t", api_url: "http://127.0.0.1:8081" }
+  - { name: lookalike, token: "5:t", api_url: "https://api.telegram.org.example" }
+  - { name: sub, token: "6:t", api_url: "https://x.api.telegram.org" }
+  - { name: named, token: "7:t", upstream: custom }
+  - { name: local, token: "8:t", upstream: tba }
+"#;
+    let cfg = loads(yaml);
+    let refused: Vec<(&str, bool, bool)> = cfg
+        .bots
+        .iter()
+        .map(|bot| {
+            (
+                bot.name.as_str(),
+                bot.upstream.refuses_local_files(false),
+                bot.upstream.refuses_local_files(true),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            ("default", false, false),
+            ("cloud", false, false),
+            ("cased", false, false),
+            ("loopback", true, false),
+            ("lookalike", true, false),
+            ("sub", true, false),
+            ("named", true, false),
+            ("local", true, false),
+        ]
+    );
+    assert!(cfg.bots[0].upstream.is_telegram_cloud());
+    assert!(!cfg.bots[6].upstream.is_telegram_cloud());
+}
+
 #[test]
 fn upstream_and_api_url_exclusive() {
     let yaml = r#"version: 1
@@ -2981,7 +3029,7 @@ fn http_upstream_warning() {
     }
 
     // The shorthand is an upstream too, a cloud one: a self-hosted server
-    // behind it would not have tgin refuse `file:` references.
+    // behind it has its `file:` references refused, but no file routes.
     let text = "version: 1\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"http://bot-api:8081\"\n";
     let cfg = loads(text);
     let [warning] = cfg.warnings.as_slice() else {
@@ -2992,9 +3040,10 @@ fn http_upstream_warning() {
     assert!(!warning.to_string().contains("bot-api"), "{warning}");
     let hint = warning.hint.as_deref().unwrap_or_default();
     assert!(
-        hint.contains("upstreams: { <name>: { kind: local") && hint.contains("`file:`"),
+        hint.contains("upstreams: { <name>: { kind: local") && hint.contains("`getFile`"),
         "{warning}"
     );
+    assert!(!hint.contains("only there"), "{warning}");
 }
 
 /// A `files.url` origin is asked for each bot's directory, named after its

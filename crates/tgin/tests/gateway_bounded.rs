@@ -168,11 +168,13 @@ async fn telegram(seen: Arc<Seen>) -> SocketAddr {
     addr
 }
 
-/// Uploads `size` bytes through tgin; returns the response head.
+/// Uploads `size` bytes through tgin, as no parameters
+/// (`application/octet-stream`), which no bot scans; returns the response
+/// head.
 async fn upload(tgin: SocketAddr, size: u64) -> String {
     let mut stream = TcpStream::connect(tgin).await.expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {size}\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     send_zeros(&mut stream, size).await;
@@ -495,7 +497,8 @@ async fn holding_server(expected: Arc<AtomicU64>) -> (SocketAddr, Arc<AtomicU64>
     (addr, read_out)
 }
 
-/// The bot that streams unscanned, on the `api_url` shorthand.
+/// The bot that streams unscanned: it allows local files, as a bot on the
+/// Telegram cloud needs no scan, and a test cannot reach that host.
 const PLAIN_TOKEN: &str = "987654321:BBBBanotherSecretTokenValue_-xyz";
 
 /// Posts a clean JSON `sendMessage` of `size` bytes through tgin for the
@@ -541,7 +544,7 @@ async fn json_batch(tgin: SocketAddr, token: &'static str, size: usize) -> isize
 /// JSON bodies to a self-hosted server are scanned for local file
 /// references while they stream, so tgin keeps no copy of them:
 /// [`CONCURRENT`] 1 MiB bodies in flight at once grow the heap about as
-/// much as as many to a cloud bot, which stream unscanned (hyper's
+/// much as as many to a bot that allows local files, which stream unscanned (hyper's
 /// per-connection read buffers, up to 408 KiB each, are most of it), and
 /// far less than a copy of each would. Measured on Windows: 5 to 18 MB
 /// scanned, 10 to 18 MB unscanned; reading each body whole, as tgin once
@@ -558,7 +561,7 @@ async fn scanned_json_held_flat_across_concurrent_requests() {
     std::fs::write(
         &file,
         format!(
-            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nupstreams:\n  tba: {{ kind: local, url: \"http://{api}\", local_mode: true }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    upstream: tba\n    gateway: {{ rate_limit: {{ mode: off }} }}\n  - name: plain\n    token: \"{PLAIN_TOKEN}\"\n    api_url: \"http://{api}\"\n    gateway: {{ rate_limit: {{ mode: off }} }}\n"
+            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nupstreams:\n  tba: {{ kind: local, url: \"http://{api}\", local_mode: true }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    upstream: tba\n    gateway: {{ rate_limit: {{ mode: off }} }}\n  - name: plain\n    token: \"{PLAIN_TOKEN}\"\n    api_url: \"http://{api}\"\n    allow_local_files: true\n    gateway: {{ rate_limit: {{ mode: off }} }}\n"
         ),
     )
     .expect("the config file");

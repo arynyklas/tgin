@@ -1395,3 +1395,91 @@ async fn multipart_reply_method_read_as_the_server_reads_it() {
     assert!(telegram.calls_to("sendPoll").is_empty());
     tgin.stop().await;
 }
+
+/// The downstream answers update 1 with a `sendDocument` reply carrying a
+/// local file reference and update 2 with a clean `sendMessage`; tgin runs
+/// the base config, its bot named `name` (each test its own, as the log
+/// capture is shared), changed by `adjust`, with `api` as the bot's
+/// server. Asserts `executed` replies executed and the rest refused;
+/// returns the `sendDocument` calls that reached the server, and the reply.
+async fn reply_reference_to(
+    telegram: &Telegram,
+    api: &str,
+    name: &str,
+    adjust: impl Fn(String) -> String,
+    executed: u32,
+) -> (Vec<Call>, String) {
+    let json = "application/json";
+    let reply = r#"{"method":"sendDocument","chat_id":5,"document":"file:///srv/secret/passwd"}"#;
+    let down = MockServer::start().await;
+    answer_update(&down, 1, 200, json, reply).await;
+    let control = r#"{"method":"sendMessage","chat_id":5,"text":"after"}"#;
+    answer_update(&down, 2, 200, json, control).await;
+    let yaml = config(api, &down.uri(), &Extra::default())
+        .replace("name: hooked", &format!("name: {name}"));
+    let tgin = start(&adjust(yaml)).await;
+    tgin.admit(1, 5).await;
+    tgin.admit(2, 5).await;
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(&format!(
+        r#"tgin_webhook_replies_total{{consumer="hooks",outcome="executed"}} {executed}"#
+    ))
+    .await;
+    let refused = 2 - executed;
+    tgin.assert_metric(&format!(
+        r#"tgin_webhook_replies_total{{consumer="hooks",outcome="refused"}} {refused}"#
+    ));
+    assert_eq!(telegram.calls_to("sendMessage").len(), 1);
+    let calls = telegram.calls_to("sendDocument");
+    tgin.stop().await;
+    (calls, reply.to_owned())
+}
+
+/// A bot on the `api_url` shorthand pointed anywhere but `api.telegram.org`
+/// may be on a server running `--local`: a reply carrying a local file
+/// reference is refused, and the next update's reply is executed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_off_the_telegram_cloud_refused_on_the_shorthand() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let (calls, _) = reply_reference_to(&telegram, &api, "short", |yaml| yaml, 1).await;
+    assert!(calls.is_empty(), "the reply reached the server");
+}
+
+/// So may a bot on an upstream of `kind: cloud` whose URL is not
+/// `api.telegram.org`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_off_the_telegram_cloud_refused_on_a_named_cloud_upstream() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let named = |yaml: String| {
+        yaml.replace(
+            &format!("    api_url: \"{api}\"\n"),
+            "    upstream: custom\n",
+        )
+        .replace(
+            "bots:\n",
+            &format!("upstreams:\n  custom: {{ kind: cloud, url: \"{api}\" }}\nbots:\n"),
+        )
+    };
+    let (calls, _) = reply_reference_to(&telegram, &api, "named", named, 1).await;
+    assert!(calls.is_empty(), "the reply reached the server");
+}
+
+/// With `allow_local_files`, the same reply is executed, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_reference_executed_for_a_bot_that_allows_local_files() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let allowed = |yaml: String| {
+        yaml.replace(
+            &format!("    api_url: \"{api}\"\n"),
+            &format!("    api_url: \"{api}\"\n    allow_local_files: true\n"),
+        )
+    };
+    let (calls, reply) = reply_reference_to(&telegram, &api, "allowed", allowed, 2).await;
+    let [call] = &calls[..] else {
+        panic!("one sendDocument, not {}", calls.len());
+    };
+    assert_eq!(&call.body[..], reply.as_bytes());
+}
