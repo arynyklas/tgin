@@ -832,9 +832,13 @@ fn http_error(status: u16) -> ApiError {
 #[tokio::test(start_paused = true)]
 async fn registration_rejected_for_good_on_cloud_only() {
     for status in [401, 403, 404] {
+        // A retry fails the test at once rather than waiting on the paused
+        // clock forever.
         let attempts = Mutex::new(0);
         let outcome = retry_registration("wh", &CancellationToken::new(), false, None, || {
-            *attempts.lock() += 1;
+            let mut n = attempts.lock();
+            *n += 1;
+            assert_eq!(*n, 1, "{status} retried after a rejection");
             std::future::ready(Err(http_error(status)))
         })
         .await;
@@ -869,7 +873,11 @@ async fn registration_rejected_for_good_on_cloud_only() {
         assert_eq!(outcome, Registration::Registered, "{status}");
         assert_eq!(*attempts.lock(), 3, "{status}");
     }
+    let attempts = Mutex::new(0);
     let outcome = retry_registration("wh", &CancellationToken::new(), true, None, || {
+        let mut n = attempts.lock();
+        *n += 1;
+        assert_eq!(*n, 1, "local 403 retried after a rejection");
         std::future::ready(Err(http_error(403)))
     })
     .await;
