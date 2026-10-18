@@ -624,12 +624,13 @@ async fn slow_transfer_not_cut_while_bytes_flow() {
     assert_eq!(response.bytes().await.expect("the whole body").len(), 1000);
     assert!(started.elapsed() > Duration::from_secs(2));
 
-    // An upload idle for longer than 1 s: 502 before any header.
+    // An upload idle for longer than 1 s: 502 before any header. The server
+    // never got the whole request, so it cannot have executed it.
     let stalled = upload(&tgin, 1, Duration::from_millis(10)).await;
     assert_eq!(stalled.status, 502);
     assert_eq!(
         serde_json::from_slice::<Value>(&stalled.body).expect("JSON"),
-        telegram_error(502, "Bad Gateway: Telegram is unreachable")
+        telegram_error(502, UNREACHABLE)
     );
 
     // A download idle for longer than 1 s: the body aborts.
@@ -684,10 +685,7 @@ async fn upstream_unreachable_is_502_shaped() {
     assert_eq!(response.headers()["content-type"], "application/json");
     let (status, body) = json_of(response).await;
     assert_eq!(status, 502);
-    assert_eq!(
-        body,
-        telegram_error(502, "Bad Gateway: Telegram is unreachable")
-    );
+    assert_eq!(body, telegram_error(502, UNREACHABLE));
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="offline",method="sendMessage",outcome="unreachable"} 1"#,
     );
@@ -697,7 +695,7 @@ async fn upstream_unreachable_is_502_shaped() {
     let logs = LOGS.text();
     assert!(
         logs.lines()
-            .any(|l| l.contains("Telegram is unreachable") && l.contains("bot=offline")),
+            .any(|l| l.contains("Bot API server is unreachable") && l.contains("bot=offline")),
         "the failure is logged with the bot's name"
     );
     assert!(!logs.contains(TOKEN), "the token reached a log line");
@@ -2047,5 +2045,430 @@ async fn api_url_pointing_at_tgin_is_refused_not_looped() {
             r#"tgin_gateway_requests_total{{bot="gw",method="{method}",outcome="upstream_error"}} 1"#
         ));
     }
+    tgin.stop().await;
+}
+
+// Waiting for the Bot API server: the upload's idle bound, the response
+// timeout, and what each 502 says.
+
+/// The 502 once the server had the whole request and no answer came.
+const NO_ANSWER: &str =
+    "Bad Gateway: the Bot API server did not answer; the call may have been executed";
+/// The 502 when no whole request reached the server.
+const UNREACHABLE: &str = "Bad Gateway: the Bot API server is unreachable";
+
+/// Bot `name` (`TOKEN`, feeding `workers`) on the `local` upstream `tba`
+/// at `api` with `response_timeout`, and a 1 s `upstream_idle_timeout`.
+fn local_config(api: &str, name: &str, response_timeout: &str) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", response_timeout: {response_timeout} }}
+bots:
+  - name: {name}
+    token: "{TOKEN}"
+    upstream: tba
+    gateway: {{ upstream_idle_timeout: 1s }}
+    routes: [{{ to: [workers] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+"#
+    )
+}
+
+/// A Bot API server in this runtime that reads each request's whole body,
+/// sends it to the returned channel stamped with tokio's clock, and then,
+/// by the query: `mode=late` answers [`SENT`] 3 s later, anything else
+/// never answers.
+async fn waiting_server() -> (SocketAddr, mpsc::UnboundedReceiver<Arrival>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let router = axum::Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+        let at = tokio::time::Instant::now();
+        let late = uri.query() == Some("mode=late");
+        let _ = tx.send(Arrival { at, body });
+        async move {
+            if late {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(SENT))
+                .expect("response")
+        }
+    });
+    (serve(router).await, rx)
+}
+
+/// A Bot API server that sends the length of each request body frame to
+/// the returned channel as it arrives, and never answers.
+async fn reading_server() -> (SocketAddr, mpsc::UnboundedReceiver<usize>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let router = axum::Router::new().fallback(move |body: Body| {
+        let tx = tx.clone();
+        async move {
+            let mut frames = body.into_data_stream();
+            while let Some(Ok(frame)) = futures_util::StreamExt::next(&mut frames).await {
+                let _ = tx.send(frame.len());
+            }
+            std::future::pending::<()>().await;
+        }
+    });
+    (serve(router).await, rx)
+}
+
+/// A Bot API server that reads each request whole (its head, then
+/// `Content-Length` bytes), counts it, and closes the connection without
+/// an answer.
+async fn closing_server() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse().expect("length"));
+                    if buf.len() >= end + 4 + length {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Dropped unanswered.
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, requests)
+}
+
+/// Sends `request` from a task of its own, so the test can step the clock
+/// while it waits.
+fn spawn_call(request: reqwest::RequestBuilder) -> JoinHandle<(u16, Value)> {
+    tokio::spawn(async move { json_of(request.send().await.expect("response")).await })
+}
+
+/// Asserts that `response` has not come after [`QUIET`] of real time: on
+/// the frozen clock, the gateway still waits.
+async fn unanswered<T>(what: &str, response: &JoinHandle<T>) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(QUIET);
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
+    assert!(!response.is_finished(), "{what}: answered already");
+}
+
+/// Once a local server has a large upload whole, its answer is awaited for
+/// the upstream's `response_timeout` (10 s), not `upstream_idle_timeout`
+/// (1 s), which bounds only the upload's stalls. An answer three idle
+/// timeouts later is relayed. No answer gets the "may have been executed"
+/// 502 at exactly `response_timeout` after the upload ended, and the call
+/// is never sent again, a buffered one that a 429 could resend included.
+#[tokio::test(start_paused = true)]
+async fn response_wait_bounded_by_response_timeout_not_idle() {
+    let frozen = freeze();
+    let (api, mut arrivals) = waiting_server().await;
+    let tgin = start(&local_config(&format!("http://{api}"), "gw", "10s")).await;
+    let (content_type, upload) = multipart("7");
+    let document = |mode: &str| {
+        tgin.http
+            .post(tgin.url(&format!("/bot{TOKEN}/sendDocument?mode={mode}")))
+            .header("content-type", content_type)
+            .body(upload.clone())
+    };
+    let millis = Duration::from_millis;
+    let mut requests = 0;
+
+    // Answered three idle timeouts after the upload ended.
+    let late = spawn_call(document("late"));
+    let arrival = within("the upload", arrivals.recv()).await.expect("open");
+    requests += 1;
+    assert_eq!(&arrival.body[..], upload.as_bytes(), "the whole upload");
+    for _ in 0..2 {
+        tokio::time::advance(millis(1_000)).await;
+        unanswered("an upload one more idle timeout on", &late).await;
+    }
+    tokio::time::advance(millis(999)).await;
+    unanswered("an upload before its answer", &late).await;
+    tokio::time::advance(millis(1)).await;
+    let (status, body) = within("the late answer", late).await.expect("sent");
+    assert_eq!((status, body), (200, serde_json::from_str(SENT).unwrap()));
+    assert_eq!(arrival.at.elapsed(), millis(3_000));
+
+    // Never answered: the streamed upload, then a buffered call.
+    let message = tgin
+        .http
+        .post(tgin.url(&format!("/bot{TOKEN}/sendMessage?mode=never")))
+        .json(&json!({ "chat_id": 7, "text": "hi" }));
+    for (what, request) in [
+        ("sendDocument", document("never")),
+        ("sendMessage", message),
+    ] {
+        let response = spawn_call(request);
+        let arrival = within(what, arrivals.recv()).await.expect("open");
+        requests += 1;
+        tokio::time::advance(millis(9_999)).await;
+        unanswered(what, &response).await;
+        tokio::time::advance(millis(1)).await;
+        let (status, body) = tokio::select! {
+            biased;
+            again = arrivals.recv() => {
+                panic!("{what} sent again at {:?}", again.map(|again| again.at - arrival.at));
+            }
+            response = within("the 502", response) => response.expect("sent"),
+        };
+        assert_eq!(status, 502, "{what}");
+        assert_eq!(body, telegram_error(502, NO_ANSWER), "{what}");
+        assert_eq!(arrival.at.elapsed(), millis(10_000), "{what}");
+    }
+
+    // Never sent again, however long the clock runs on.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    quiet("a call sent again", &mut arrivals).await;
+    assert_eq!(requests, 3, "one upstream request per call");
+    for line in [
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="ok"} 1"#,
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="unreachable"} 1"#,
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="unreachable"} 1"#,
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="client_closed"} 0"#,
+        r#"tgin_gateway_retries_total{bot="gw"} 0"#,
+    ] {
+        tgin.assert_metric(line);
+    }
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// A bot on the `api_url` shorthand (what a v1 config has) keeps the v1
+/// bound: after its upload, it waits its whole `upstream_idle_timeout`
+/// (90 s) for the headers, not the 60 s a cloud upstream's
+/// `response_timeout` defaults to, then gets the 502 in the new wording.
+#[tokio::test(start_paused = true)]
+async fn shorthand_response_wait_is_the_idle_bound() {
+    let frozen = freeze();
+    let (api, mut arrivals) = waiting_server().await;
+    let tgin = start(&limited_config(
+        &format!("http://{api}"),
+        "{ upstream_idle_timeout: 90s }",
+    ))
+    .await;
+    let (content_type, upload) = multipart("7");
+    let response = spawn_call(
+        tgin.http
+            .post(tgin.url(&format!("/bot{TOKEN}/sendDocument?mode=never")))
+            .header("content-type", content_type)
+            .body(upload.clone()),
+    );
+    let arrival = within("the upload", arrivals.recv()).await.expect("open");
+    assert_eq!(&arrival.body[..], upload.as_bytes(), "the whole upload");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    unanswered("a shorthand bot at 60 s", &response).await;
+    tokio::time::advance(Duration::from_millis(29_999)).await;
+    unanswered("a shorthand bot before its idle bound", &response).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let (status, body) = within("the 502", response).await.expect("sent");
+    assert_eq!(status, 502);
+    assert_eq!(body, telegram_error(502, NO_ANSWER));
+    assert_eq!(arrival.at.elapsed(), Duration::from_secs(90));
+    quiet("a call sent again", &mut arrivals).await;
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// While the upload runs, `upstream_idle_timeout` still bounds a stall,
+/// however long `response_timeout` is: 100 of 1000 announced bytes, then
+/// nothing, get the 502 exactly 1 s after the last bytes moved. The server
+/// never had the whole request, so the 502 says it is unreachable, not
+/// that the call may have been executed.
+#[tokio::test(start_paused = true)]
+async fn idle_stall_mid_upload_still_502() {
+    let frozen = freeze();
+    let (api, mut frames) = reading_server().await;
+    let tgin = start(&local_config(&format!("http://{api}"), "staller", "10m")).await;
+
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    stream
+        .write_all(&[b'x'; 100])
+        .await
+        .expect("part of the body");
+    let mut received = 0;
+    while received < 100 {
+        received += within("the first bytes upstream", frames.recv())
+            .await
+            .expect("open");
+    }
+    let reader = tokio::spawn(async move {
+        let raw = read_response(&mut stream).await;
+        // Kept open until the response is read.
+        drop(stream);
+        raw
+    });
+    tokio::time::advance(Duration::from_millis(999)).await;
+    unanswered("a stalled upload before the idle timeout", &reader).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let stalled = within("the 502", reader).await.expect("read");
+    assert_eq!(stalled.status, 502);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stalled.body).expect("JSON"),
+        telegram_error(502, UNREACHABLE)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="staller",method="sendDocument",outcome="unreachable"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="staller",method="sendDocument",outcome="client_closed"} 0"#,
+    );
+    assert!(
+        LOGS.text().lines().any(|l| l.contains("WARN")
+            && l.contains("bot=staller")
+            && l.contains("upstream_idle_timeout")),
+        "the stall is logged with the bound it ran into"
+    );
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// A server that refuses the connection got nothing, whatever the body: a
+/// JSON call read whole first, a streamed upload, and a GET without a body
+/// (sent the moment it connects). Each gets the "unreachable" 502 and is
+/// counted `unreachable`; the log says "Bot API server", not "Telegram".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_failure_says_unreachable() {
+    // Bound but not listening, and held for the whole test: connecting is
+    // refused, and no other socket can take the port meanwhile.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = closed.local_addr().unwrap().port();
+    // An idle timeout longer than a refused connect takes (Windows retries
+    // one for about 2 s).
+    let config = local_config(&format!("http://127.0.0.1:{port}"), "refused", "10s")
+        .replace("upstream_idle_timeout: 1s", "upstream_idle_timeout: 30s");
+    let tgin = start(&config).await;
+    let (content_type, upload) = multipart("7");
+    let calls = [
+        (
+            "sendMessage",
+            tgin.http
+                .post(tgin.url(&format!("/bot{TOKEN}/sendMessage")))
+                .json(&json!({ "chat_id": 7, "text": "hi" })),
+        ),
+        (
+            "sendDocument",
+            tgin.http
+                .post(tgin.url(&format!("/bot{TOKEN}/sendDocument")))
+                .header("content-type", content_type)
+                .body(upload),
+        ),
+        (
+            "getChat",
+            tgin.http
+                .get(tgin.url(&format!("/bot{TOKEN}/getChat?chat_id=7"))),
+        ),
+    ];
+    for (method, request) in calls {
+        let response = timeout(PATIENCE, request.send())
+            .await
+            .expect("answered in time")
+            .expect("response");
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, 502, "{method}");
+        assert_eq!(body, telegram_error(502, UNREACHABLE), "{method}");
+        tgin.assert_metric(&format!(
+            r#"tgin_gateway_requests_total{{bot="refused",method="{method}",outcome="unreachable"}} 1"#
+        ));
+    }
+    let logs = LOGS.text();
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains("bot=refused")).collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("WARN") && l.contains("the Bot API server is unreachable"))
+            .count(),
+        3,
+        "one warning per call:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("Telegram")),
+        "a self-hosted server is no Telegram:\n{}",
+        lines.join("\n")
+    );
+    assert!(!logs.contains(TOKEN), "the token reached a log line");
+    tgin.stop().await;
+}
+
+/// A server that reads the whole request and closes the connection without
+/// an answer may have executed the call: the 502 says so, for a buffered
+/// call and a streamed upload alike, and neither goes upstream again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_lost_after_upload_may_have_been_executed() {
+    let (api, requests) = closing_server().await;
+    let tgin = start(&local_config(&format!("http://{api}"), "dropped", "10s")).await;
+    let (content_type, upload) = multipart("7");
+    let calls = [
+        (
+            "sendMessage",
+            tgin.http
+                .post(tgin.url(&format!("/bot{TOKEN}/sendMessage")))
+                .json(&json!({ "chat_id": 7, "text": "hi" })),
+        ),
+        (
+            "sendDocument",
+            tgin.http
+                .post(tgin.url(&format!("/bot{TOKEN}/sendDocument")))
+                .header("content-type", content_type)
+                .body(upload),
+        ),
+    ];
+    for (method, request) in calls {
+        let response = timeout(PATIENCE, request.send())
+            .await
+            .expect("answered in time")
+            .expect("response");
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, 502, "{method}");
+        assert_eq!(body, telegram_error(502, NO_ANSWER), "{method}");
+        tgin.assert_metric(&format!(
+            r#"tgin_gateway_requests_total{{bot="dropped",method="{method}",outcome="unreachable"}} 1"#
+        ));
+    }
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one upstream request per call"
+    );
+    assert!(
+        LOGS.text().lines().any(|l| l.contains("WARN")
+            && l.contains("bot=dropped")
+            && l.contains("the call may have been executed")),
+        "the lost answer is logged with the bot's name"
+    );
     tgin.stop().await;
 }

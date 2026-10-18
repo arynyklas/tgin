@@ -998,6 +998,58 @@ async fn reply_call_bounded_by_30s() {
     tgin.stop().await;
 }
 
+/// Below 30 s, the upstream's `response_timeout` bounds a reply's call
+/// instead (here a local upstream's 5 s): it ends at exactly 5 s, counts
+/// `failed` and `unreachable`, and the warning says the Bot API server did
+/// not answer and the call may have been executed.
+#[tokio::test(start_paused = true)]
+async fn reply_call_bounded_by_response_timeout() {
+    let frozen = freeze();
+    let telegram = Telegram::default();
+    let (arrived, release) = telegram.hold_next();
+    let api = telegram.serve().await;
+    let down = MockServer::start().await;
+    let reply = r#"{"method":"sendMessage","chat_id":5,"text":"slow"}"#;
+    answer_update(&down, 1, 200, "application/json", reply).await;
+    let yaml = config(&api, &down.uri(), &Extra::default())
+        .replace("name: hooked", "name: slowtba")
+        .replace(&format!("    api_url: \"{api}\"\n"), "    upstream: tba\n")
+        .replace(
+            "bots:\n",
+            &format!(
+                "upstreams:\n  tba: {{ kind: local, url: \"{api}\", response_timeout: 5s }}\nbots:\n"
+            ),
+        );
+    let tgin = start(&yaml).await;
+    let failed = r#"tgin_webhook_replies_total{consumer="hooks",outcome="failed"} 1"#;
+
+    tgin.admit(1, 5).await;
+    within("the reply reaches the server", arrived)
+        .await
+        .expect("held");
+    tokio::time::advance(Duration::from_millis(4_999)).await;
+    let _ = real_time(QUIET).await;
+    assert!(!tgin.has_metric(failed), "the reply call ended before 5 s");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    until("the reply call times out", || tgin.has_metric(failed)).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="slowtba",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    let logs = LOGS.text();
+    assert!(
+        logs.lines().any(|l| l.contains("WARN")
+            && l.contains("bot=slowtba")
+            && l.contains(
+                "webhook reply failed: the Bot API server did not answer; the call may have been executed"
+            )),
+        "no warning that the call may have been executed"
+    );
+    assert_no_token_logged();
+    drop(release);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
 /// A multipart reply's `chat_id` is not read for the limits, as for a
 /// streamed gateway request: only the global quota applies, so it goes
 /// while its chat's quota is used up. A JSON reply to that chat is refused.

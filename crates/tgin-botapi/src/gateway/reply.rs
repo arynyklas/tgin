@@ -1,6 +1,6 @@
 //! Webhook replies: the method call a push endpoint answered an update
-//! with, made to Telegram the way Telegram makes a webhook's (decision 3,
-//! `WebhookActor.cpp`):
+//! with, made to the bot's Bot API server the way Telegram makes a
+//! webhook's (decision 3, `WebhookActor.cpp`):
 //! - the method is the body's `method` parameter (JSON, urlencoded or a
 //!   multipart text field); an empty or missing one, any `get…` method,
 //!   `setWebhook`, `deleteWebhook`, `close` and `logOut` are refused, in
@@ -8,7 +8,7 @@
 //! - to a bot whose server in local mode must not get a local file
 //!   reference, a reply carrying one is refused (`local_files`);
 //! - the bot's rate limits apply as to a gateway request;
-//! - the body goes to `{api_url}/bot{token}/{method}` unchanged, with its
+//! - the body goes to `{url}/bot{token}/{method}` unchanged, with its
 //!   `Content-Type`, once: nothing is re-encoded, multipart files included,
 //!   and nothing is retried. Nobody sees the result, as with Telegram.
 
@@ -33,14 +33,16 @@ use super::params::text_param;
 use super::proxy::{deadline, outcome, url};
 use super::{Bot, Bounded, Gateway, read_bounded};
 
-/// Bound on a reply's call to Telegram, from connecting to the end of the
-/// response. The body is in memory, so no upload can be slow.
+/// The longest bound on a reply's call, from connecting to the end of the
+/// response; the bot's response wait (`Bot::response_timeout`), when
+/// shorter, bounds it instead. The body is in memory, so no upload can be
+/// slow.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest method name executed; Bot API names are far shorter.
 const MAX_METHOD_LEN: usize = 64;
-/// The longest error body of Telegram's read for its `description`.
+/// The longest error body of the server's read for its `description`.
 const REFUSAL_LIMIT: usize = 64 * 1024;
-/// The most bytes of Telegram's `description` a log line carries.
+/// The most bytes of the server's `description` a log line carries.
 const MAX_DESCRIPTION_LEN: usize = 256;
 
 impl Gateway {
@@ -94,7 +96,7 @@ impl Gateway {
         let method = text_param(Some(&reply.content_type), &reply.body, "method");
         let Some(method) = method.filter(|method| executable(method)) else {
             counts.count(ReplyOutcome::Refused);
-            tracing::debug!(bot = %bot.name, consumer = %consumer, "webhook reply refused: no method, or one Telegram refuses in a webhook reply");
+            tracing::debug!(bot = %bot.name, consumer = %consumer, "webhook reply refused: no method, or one the Bot API server refuses in a webhook reply");
             return;
         };
         let label = MethodLabel::of(&method);
@@ -158,7 +160,7 @@ async fn admit(
 
 /// Whether a webhook reply may call `method`: a Bot API method name of at
 /// most [`MAX_METHOD_LEN`] ASCII letters, digits and `_` (so it is one
-/// clean path segment), that Telegram does not refuse in a reply.
+/// clean path segment), that the Bot API server does not refuse in a reply.
 fn executable(method: &str) -> bool {
     let refused = method
         .get(..3)
@@ -174,7 +176,7 @@ fn executable(method: &str) -> bool {
         && !refused
 }
 
-/// One reply's call to Telegram.
+/// One reply's call to the bot's Bot API server.
 struct Call<'a> {
     bot: &'a Bot,
     consumer: &'a str,
@@ -185,7 +187,8 @@ struct Call<'a> {
 impl Call<'_> {
     /// POSTs the reply's body as it came, with its `Content-Type`, to
     /// `method`, and counts the answer: in `tgin_webhook_replies_total`
-    /// and, as every upstream call, in `tgin_gateway_requests_total`.
+    /// and, as every upstream call, in `tgin_gateway_requests_total`. No
+    /// answer after the body was sent, the call may have been executed.
     async fn send(&self, method: &str, reply: &Reply) {
         let bot = self.bot;
         let handles = bot.metrics.method(self.label);
@@ -193,7 +196,7 @@ impl Call<'_> {
         let sent = bot
             .client
             .post(url(&bot.method_base, method, None))
-            .timeout(REPLY_TIMEOUT)
+            .timeout(bot.response_timeout.min(REPLY_TIMEOUT))
             .header(CONTENT_TYPE, reply.content_type.clone())
             .header(VIA, bot.via.clone())
             .body(reply.body.clone())
@@ -204,7 +207,11 @@ impl Call<'_> {
             Err(err) => {
                 handles.count(Outcome::Unreachable);
                 self.counts.count(ReplyOutcome::Failed);
-                tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), error = %describe_error(&err), "webhook reply failed: Telegram is unreachable");
+                if err.is_connect() {
+                    tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), error = %describe_error(&err), "webhook reply failed: the Bot API server is unreachable");
+                } else {
+                    tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), error = %describe_error(&err), "webhook reply failed: the Bot API server did not answer; the call may have been executed");
+                }
                 return;
             }
         };
@@ -228,7 +235,7 @@ impl Call<'_> {
             .and_then(description)
             .map(|description| redacted(&description, bot.token.expose()))
             .unwrap_or_default();
-        tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), status = status.as_u16(), description = %description, "webhook reply failed: Telegram refused it");
+        tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), status = status.as_u16(), description = %description, "webhook reply failed: the Bot API server refused it");
     }
 }
 

@@ -150,8 +150,18 @@ struct Bot {
     /// Whether requests carrying a local file reference are refused
     /// (`local_files`).
     refuses_local_files: bool,
+    /// The longest wait for the response headers once the request body has
+    /// been sent. A bot on the `api_url` shorthand gets its own
+    /// `upstream_idle_timeout`: that is all a v1 config can reach, it cannot
+    /// set `response_timeout`, and before upstreams existed the idle bound
+    /// ran from the upload's end, so such a bot keeps exactly the wait it
+    /// had. A bot on an `upstreams` entry gets that entry's
+    /// `response_timeout`, configured or defaulted, as it is. Computed here,
+    /// so the resolved upstream (and `/v1/config`) stays as configured.
+    response_timeout: Duration,
     /// The gateway profile: no total timeout, the connect timeout above;
-    /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
+    /// the proxy bounds idleness with `gateway.upstream_idle_timeout` and
+    /// the wait for an answer with `response_timeout`.
     client: reqwest::Client,
     /// This process's `Via` (see [`Gateway::new`]).
     via: HeaderValue,
@@ -179,6 +189,11 @@ impl Bot {
         let rewrite = Rewrite::new(&bot.upstream);
         let refuses_local_files =
             local_files::refuses_local_files(&bot.upstream, bot.allow_local_files);
+        let response_timeout = if *bot.upstream.name == *config::Upstream::SHORTHAND {
+            bot.gateway.upstream_idle_timeout
+        } else {
+            bot.upstream.response_timeout
+        };
         let client = client(&ClientOptions {
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: None,
@@ -194,6 +209,7 @@ impl Bot {
             files,
             rewrite,
             refuses_local_files,
+            response_timeout,
             client,
             via,
             metrics,

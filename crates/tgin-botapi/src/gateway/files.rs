@@ -33,6 +33,7 @@ use tgin_core::config::{Files, Upstream, UpstreamKind};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
+use super::proxy::NO_ANSWER;
 use super::{Bot, Bounded, base, errors, read_bounded};
 
 /// A file the bot's directory does not hold.
@@ -455,11 +456,8 @@ pub(super) async fn rewrite_response(bot: &Bot, response: Response) -> Response 
             tracing::debug!(bot = %bot.name, "getFile answer over 64 KiB passed verbatim");
             Response::from_parts(parts, partial.into_body())
         }
-        // The proxy counted and logged the failed body.
-        Err(_) => errors::error(
-            StatusCode::BAD_GATEWAY,
-            "Bad Gateway: Telegram is unreachable",
-        ),
+        // The proxy counted and logged the failed body; the call went out.
+        Err(_) => errors::error(StatusCode::BAD_GATEWAY, NO_ANSWER),
     }
 }
 

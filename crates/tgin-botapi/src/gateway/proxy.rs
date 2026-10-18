@@ -1,14 +1,19 @@
-//! The streaming proxy: a gateway request goes to `{api_url}/bot{token}/…`
-//! (or to the bot's file base, see `files`) with an allowlist of headers,
-//! both bodies stream without buffering and keep their `Content-Length`,
-//! and `upstream_idle_timeout` bounds the time without progress in either
-//! direction.
+//! The streaming proxy: a gateway request goes to `{url}/bot{token}/…` (or
+//! to the bot's file base, see `files`) with an allowlist of headers, both
+//! bodies stream without buffering and keep their `Content-Length`, and two
+//! bounds apply: `upstream_idle_timeout` to the time without progress in
+//! either direction while the request body is being sent and while the
+//! response body streams, the bot's response wait (`Bot::response_timeout`:
+//! the upstream's `response_timeout`, or `upstream_idle_timeout` on the
+//! `api_url` shorthand) to the wait for the response headers once the
+//! request body has been sent. A local Bot API server may take minutes to
+//! answer a large upload it has whole.
 //!
-//! reqwest's own `read_timeout` cannot be that bound: it runs one fixed
+//! reqwest's own `read_timeout` cannot be either bound: it runs one fixed
 //! timer from sending until the response headers (reqwest 0.13.5,
 //! `async_impl/client.rs` `PendingRequest`), so an upload taking longer
 //! would be cut while its bytes still flow. The client sets no timeout but
-//! the connect one, and this module measures idleness itself.
+//! the connect one, and this module measures both itself.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,7 +35,7 @@ use parking_lot::Mutex;
 use reqwest::Url;
 use serde::Deserialize;
 use tgin_runtime::http::describe_error;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, Sleep, sleep_until};
 
 use super::chat_key::{ChatKey, chat_key};
@@ -48,6 +53,14 @@ use super::{Bot, Bounded, Forwarding, errors, read_bounded};
 const BUFFER_LIMIT: usize = 64 * 1024;
 /// The longest upstream 429 body read for its `retry_after`.
 const FLOOD_LIMIT: usize = 64 * 1024;
+/// The 502 once the whole request was sent and no response came, because
+/// the connection was lost or `response_timeout` passed: the server may
+/// have executed the call, so a client must not take it as not done.
+pub(super) const NO_ANSWER: &str =
+    "Bad Gateway: the Bot API server did not answer; the call may have been executed";
+/// The 502 when the server never had the whole request (the connection
+/// failed, or the upload stalled or broke off): it did not execute the call.
+const UNREACHABLE: &str = "Bad Gateway: the Bot API server is unreachable";
 
 /// Request headers forwarded on every route. Never `Content-Encoding`:
 /// telegram-bot-api inflates gzip and deflate bodies, and the local file
@@ -207,15 +220,22 @@ enum Payload {
     Streamed(Body),
 }
 
-/// Why a request got no response from Telegram.
+/// Why a request got no response from the Bot API server.
 #[derive(Debug)]
 enum Failed {
     /// Reading the client's body failed: the client went away.
     ClientClosed,
-    /// Telegram could not be reached (logged where it happened).
+    /// The server never had the whole request: the connection failed, or
+    /// broke off before the request body was all sent (logged where it
+    /// happened).
     Unreachable,
-    /// Nothing moved for `upstream_idle_timeout`, in either direction.
+    /// The request body did not move for `upstream_idle_timeout`, in either
+    /// direction, before it was all sent.
     Idle,
+    /// The whole request was sent, and the connection was lost or
+    /// `response_timeout` passed before the response headers (logged where
+    /// it happened): the server may have executed the call.
+    NoAnswer,
     /// Its parameters may not reach the bot's server in local mode.
     Refused(Refusal),
 }
@@ -274,14 +294,17 @@ fn query_chat(query: Option<&str>) -> Option<ChatKey> {
 /// `body` read up to `limit` bytes, waiting at most `idle` for each frame.
 async fn read_within(body: Body, limit: usize, idle: Duration) -> Result<Bounded, Failed> {
     let progress = Arc::new(Progress::new());
-    let stamped = Body::new(Upload {
-        body: Mutex::new(body),
-        progress: Arc::clone(&progress),
-    });
-    match await_headers(read_bounded(stamped, limit), &progress, idle).await {
+    let stamped = Body::new(Upload::new(body, Arc::clone(&progress)));
+    // A body that has ended completes the read at once, so only `idle`
+    // ever runs out here.
+    let bounds = Bounds {
+        idle,
+        response: idle,
+    };
+    match await_headers(read_bounded(stamped, limit), &progress, bounds).await {
         Waited::Ready(Ok(read)) => Ok(read),
         Waited::Ready(Err(_)) => Err(Failed::ClientClosed),
-        Waited::Idle => Err(Failed::Idle),
+        Waited::Idle | Waited::NoAnswer => Err(Failed::Idle),
     }
 }
 
@@ -424,20 +447,22 @@ impl Call<'_> {
         tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), scope = limited.scope.as_str(), retry_after = ?limited.retry_after, "gateway request refused by the rate limits");
     }
 
-    /// Sends `body` to `url` and waits for Telegram's response headers:
-    /// the response and when its headers arrived.
+    /// Sends `body` to `url` and waits for the server's response headers:
+    /// the response and when its headers arrived. While the body is being
+    /// sent, `upstream_idle_timeout` bounds its stalls; once it has been
+    /// sent, `response_timeout` bounds the wait from its end.
     async fn send(
         &self,
         url: Url,
         headers: HeaderMap,
         body: Body,
     ) -> Result<(reqwest::Response, Instant), Failed> {
-        let idle = self.bot.gateway.upstream_idle_timeout;
-        let progress = Arc::new(Progress::new());
-        let upload = Upload {
-            body: Mutex::new(body),
-            progress: Arc::clone(&progress),
+        let bounds = Bounds {
+            idle: self.bot.gateway.upstream_idle_timeout,
+            response: self.bot.response_timeout,
         };
+        let progress = Arc::new(Progress::new());
+        let upload = Upload::new(body, Arc::clone(&progress));
         let started = Instant::now();
         let send = self
             .bot
@@ -446,14 +471,24 @@ impl Call<'_> {
             .headers(headers)
             .body(reqwest::Body::wrap(upload))
             .send();
-        let response = match await_headers(send, &progress, idle).await {
+        let response = match await_headers(send, &progress, bounds).await {
             Waited::Ready(Ok(response)) => response,
             Waited::Ready(Err(_)) if progress.client_failed() => return Err(Failed::ClientClosed),
-            Waited::Ready(Err(err)) => {
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: Telegram is unreachable");
+            // A body that was empty from the start counts as sent at once,
+            // so a failed connect is told apart by the error.
+            Waited::Ready(Err(err)) if err.is_connect() || !progress.ended() => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server is unreachable");
                 return Err(Failed::Unreachable);
             }
+            Waited::Ready(Err(err)) => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server did not answer; the call may have been executed");
+                return Err(Failed::NoAnswer);
+            }
             Waited::Idle => return Err(Failed::Idle),
+            Waited::NoAnswer => {
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), response_timeout = ?bounds.response, "gateway request failed: no response within response_timeout after the request was sent; the call may have been executed");
+                return Err(Failed::NoAnswer);
+            }
         };
         let at = Instant::now();
         self.handles
@@ -465,7 +500,7 @@ impl Call<'_> {
     fn failed(&self, failed: Failed) -> Response {
         match failed {
             Failed::ClientClosed => {
-                // Not Telegram's failure, and nobody reads the answer.
+                // Not the server's failure, and nobody reads the answer.
                 tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), "gateway request abandoned: the client closed the request body early");
                 self.count(Outcome::ClientClosed);
                 errors::error(
@@ -475,12 +510,16 @@ impl Call<'_> {
             }
             Failed::Unreachable => {
                 self.counted.store(true, Ordering::Relaxed);
-                unreachable(self.handles)
+                unreachable(self.handles, UNREACHABLE)
             }
             Failed::Idle => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
                 self.counted.store(true, Ordering::Relaxed);
-                unreachable(self.handles)
+                unreachable(self.handles, UNREACHABLE)
+            }
+            Failed::NoAnswer => {
+                self.counted.store(true, Ordering::Relaxed);
+                unreachable(self.handles, NO_ANSWER)
             }
             Failed::Refused(refusal) => {
                 tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a Bot API server in local mode");
@@ -490,7 +529,7 @@ impl Call<'_> {
         }
     }
 
-    /// Telegram's answer, streamed to the client and counted once it ends.
+    /// The server's answer, streamed to the client and counted once it ends.
     fn relay(&self, response: reqwest::Response) -> Response {
         self.counted.store(true, Ordering::Relaxed);
         let status = response.status();
@@ -511,7 +550,7 @@ impl Call<'_> {
         answer(status, headers, Body::new(download))
     }
 
-    /// Telegram answered a buffered request with 429. Its body is read up
+    /// The server answered a buffered request with 429. Its body is read up
     /// to [`FLOOD_LIMIT`]; when its `parameters.retry_after` is above zero
     /// and within `retry_429.max_wait`, the request waits that long after
     /// the 429 arrived (at `at`), books the limits again where they apply,
@@ -525,18 +564,15 @@ impl Call<'_> {
         let flood = match read_bounded(body, FLOOD_LIMIT).await {
             Ok(Bounded::Complete(flood)) => flood,
             Ok(Bounded::Over(partial)) => {
-                // Telegram's 429s are small: this one streams through, and
-                // counts as relayed.
+                // 429s are small: this one streams through, and counts as
+                // relayed.
                 self.count(Outcome::RateLimited);
                 return answer(status, headers, partial.into_body());
             }
             Err(err) => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %err, "gateway response aborted");
                 self.count(Outcome::UpstreamError);
-                return errors::error(
-                    StatusCode::BAD_GATEWAY,
-                    "Bad Gateway: Telegram is unreachable",
-                );
+                return errors::error(StatusCode::BAD_GATEWAY, NO_ANSWER);
             }
         };
         let max_wait = self.bot.gateway.retry_429_max_wait;
@@ -551,7 +587,7 @@ impl Call<'_> {
             return answer(status, headers, Body::from(flood));
         }
         self.bot.metrics.retried();
-        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), retry_after = ?wait, "gateway request sent again after Telegram's 429");
+        tracing::debug!(bot = %self.bot.name, method = self.label.as_str(), retry_after = ?wait, "gateway request sent again after the Bot API server's 429");
         match self
             .send(again.url, again.headers, Body::from(again.body))
             .await
@@ -636,12 +672,13 @@ pub(super) fn outcome(status: StatusCode) -> Outcome {
     }
 }
 
-fn unreachable(handles: &MethodMetrics) -> Response {
+/// Counts a request that got no HTTP answer from the server, whatever the
+/// reason (a failed connect, a stalled upload, a lost connection or
+/// `response_timeout`), as `unreachable`, and answers it with a 502 whose
+/// `description` tells whether the server may have executed the call.
+fn unreachable(handles: &MethodMetrics, description: &str) -> Response {
     handles.count(Outcome::Unreachable);
-    errors::error(
-        StatusCode::BAD_GATEWAY,
-        "Bad Gateway: Telegram is unreachable",
-    )
+    errors::error(StatusCode::BAD_GATEWAY, description)
 }
 
 /// `idle` after `from`; for an `idle` past any representable instant, 30
@@ -653,11 +690,16 @@ pub(super) fn deadline(from: Instant, idle: Duration) -> Instant {
         .unwrap_or(from)
 }
 
-/// When the request body last moved, and whether it failed.
+/// When the request body last moved, whether it has ended, and whether it
+/// failed.
 struct Progress {
     origin: Instant,
     /// Nanoseconds after `origin`.
     last: AtomicU64,
+    /// The body has ended: all of it was handed on, and `last` is when.
+    ended: AtomicBool,
+    /// Notified once when the body ends.
+    end: Notify,
     /// Reading the downstream's body failed: the client went away.
     client_failed: AtomicBool,
 }
@@ -667,6 +709,8 @@ impl Progress {
         Progress {
             origin: Instant::now(),
             last: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
+            end: Notify::new(),
             client_failed: AtomicBool::new(false),
         }
     }
@@ -676,8 +720,23 @@ impl Progress {
         self.last.fetch_max(nanos, Ordering::Relaxed);
     }
 
+    /// Marks the body ended now, once.
+    fn finish(&self) {
+        if self.ended.load(Ordering::Acquire) {
+            return;
+        }
+        self.stamp();
+        if !self.ended.swap(true, Ordering::AcqRel) {
+            self.end.notify_one();
+        }
+    }
+
     fn last(&self) -> Instant {
         self.origin + Duration::from_nanos(self.last.load(Ordering::Relaxed))
+    }
+
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
     }
 
     fn client_failed(&self) -> bool {
@@ -685,30 +744,47 @@ impl Progress {
     }
 }
 
-enum Waited<T> {
-    Ready(T),
-    /// Neither the request body nor the response moved for the idle
-    /// timeout.
-    Idle,
+/// The bounds of [`await_headers`].
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    /// While the request body has not ended: the longest time without
+    /// progress.
+    idle: Duration,
+    /// Once it has ended: the longest wait from its end.
+    response: Duration,
 }
 
-/// Waits for `send` until `idle` has passed since the request body last
-/// moved (or ended; at the start for a body that never does). Also bounds
-/// the read of a body tgin buffers, whose frames stamp `progress` alike.
+enum Waited<T> {
+    Ready(T),
+    /// The request body did not move for `idle` before it ended.
+    Idle,
+    /// Nothing came for `response` after the request body ended.
+    NoAnswer,
+}
+
+/// Waits for `send` until `bounds.idle` has passed since the request body
+/// last moved (at the start for a body that never does), or, once the body
+/// has ended, until `bounds.response` has passed since its end. Also
+/// bounds the read of a body tgin buffers, whose frames stamp `progress`
+/// alike.
 async fn await_headers<F: Future>(
     send: F,
     progress: &Progress,
-    idle: Duration,
+    bounds: Bounds,
 ) -> Waited<F::Output> {
     tokio::pin!(send);
     loop {
-        let at = deadline(progress.last(), idle);
+        let ended = progress.ended();
+        let bound = if ended { bounds.response } else { bounds.idle };
+        let at = deadline(progress.last(), bound);
         tokio::select! {
             biased;
             output = &mut send => return Waited::Ready(output),
+            // The end moves the deadline, possibly earlier.
+            () = progress.end.notified(), if !ended => {}
             () = sleep_until(at) => {
-                if deadline(progress.last(), idle) <= Instant::now() {
-                    return Waited::Idle;
+                if progress.ended() == ended && deadline(progress.last(), bound) <= Instant::now() {
+                    return if ended { Waited::NoAnswer } else { Waited::Idle };
                 }
             }
         }
@@ -716,13 +792,27 @@ async fn await_headers<F: Future>(
 }
 
 /// The downstream's request body, made `Sync` for `reqwest::Body::wrap`,
-/// which keeps its exact length (C§3.2), and stamping progress on every
-/// frame and at its end.
+/// which keeps its exact length (C§3.2), stamping progress on every frame
+/// and marking its end: after the frame past which it has no more (hyper
+/// stops at the announced length without polling for the end), at its
+/// end, or at once for an empty body.
 struct Upload {
     /// Only `size_hint` and `is_end_stream` lock it; `poll_frame` reaches
     /// it through `get_mut`.
     body: Mutex<Body>,
     progress: Arc<Progress>,
+}
+
+impl Upload {
+    fn new(body: Body, progress: Arc<Progress>) -> Upload {
+        if body.is_end_stream() {
+            progress.finish();
+        }
+        Upload {
+            body: Mutex::new(body),
+            progress,
+        }
+    }
 }
 
 impl HttpBody for Upload {
@@ -734,18 +824,31 @@ impl HttpBody for Upload {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let this = self.get_mut();
-        let polled = Pin::new(this.body.get_mut()).poll_frame(cx);
-        if polled.is_ready() {
-            this.progress.stamp();
-        }
-        if let Poll::Ready(Some(Err(_))) = &polled {
-            this.progress.client_failed.store(true, Ordering::Relaxed);
+        let body = this.body.get_mut();
+        let polled = Pin::new(&mut *body).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(_))) => {
+                this.progress.stamp();
+                if body.is_end_stream() {
+                    this.progress.finish();
+                }
+            }
+            Poll::Ready(None) => this.progress.finish(),
+            Poll::Ready(Some(Err(_))) => {
+                this.progress.stamp();
+                this.progress.client_failed.store(true, Ordering::Relaxed);
+            }
+            Poll::Pending => {}
         }
         polled
     }
 
     fn is_end_stream(&self) -> bool {
-        self.body.lock().is_end_stream()
+        let ended = self.body.lock().is_end_stream();
+        if ended {
+            self.progress.finish();
+        }
+        ended
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -991,11 +1094,15 @@ mod tests {
         }
     }
 
-    /// The wait for headers ends only after `idle` without progress: each
-    /// stamp moves the deadline.
+    /// While the body has not ended, the wait for headers ends only after
+    /// `idle` without progress: each stamp moves the deadline, and a long
+    /// `response` bound does not apply.
     #[tokio::test(start_paused = true)]
     async fn headers_wait_follows_request_progress() {
-        let idle = Duration::from_secs(10);
+        let bounds = Bounds {
+            idle: Duration::from_secs(10),
+            response: Duration::from_secs(3_600),
+        };
         let progress = Arc::new(Progress::new());
         let stamper = {
             let progress = Arc::clone(&progress);
@@ -1007,13 +1114,55 @@ mod tests {
             })
         };
         let started = Instant::now();
-        let waited = await_headers(pending::<()>(), &progress, idle).await;
+        let waited = await_headers(pending::<()>(), &progress, bounds).await;
         assert!(matches!(waited, Waited::Idle));
         assert_eq!(started.elapsed(), Duration::from_secs(50));
         stamper.await.expect("stamper");
 
-        let ready = await_headers(async { 7 }, &Progress::new(), idle).await;
+        let ready = await_headers(async { 7 }, &Progress::new(), bounds).await;
         assert!(matches!(ready, Waited::Ready(7)));
+    }
+
+    /// Once the body has ended, the wait for headers ends `response` after
+    /// its end, whether that is longer than `idle` or shorter (the end wakes
+    /// a wait asleep towards a later idle deadline).
+    #[tokio::test(start_paused = true)]
+    async fn headers_wait_switches_to_response_bound_at_the_end() {
+        let secs = Duration::from_secs;
+        for (idle, response) in [(secs(10), secs(100)), (secs(100), secs(10))] {
+            let progress = Arc::new(Progress::new());
+            let finisher = {
+                let progress = Arc::clone(&progress);
+                tokio::spawn(async move {
+                    tokio::time::sleep(secs(8)).await;
+                    progress.stamp();
+                    tokio::time::sleep(secs(8)).await;
+                    progress.finish();
+                })
+            };
+            let started = Instant::now();
+            let waited = await_headers(pending::<()>(), &progress, Bounds { idle, response }).await;
+            assert!(matches!(waited, Waited::NoAnswer), "idle {idle:?}");
+            assert_eq!(started.elapsed(), secs(16) + response, "idle {idle:?}");
+            finisher.await.expect("finisher");
+        }
+    }
+
+    /// An empty body has ended from the start; a body of known length ends
+    /// with its last frame, before anything polls for its end (hyper stops
+    /// at the announced length).
+    #[tokio::test]
+    async fn upload_ends_with_its_last_frame() {
+        let progress = Arc::new(Progress::new());
+        let _empty = Upload::new(Body::empty(), Arc::clone(&progress));
+        assert!(progress.ended());
+
+        let progress = Arc::new(Progress::new());
+        let mut upload = Upload::new(Body::from("abc"), Arc::clone(&progress));
+        assert!(!progress.ended());
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut upload).poll_frame(cx)).await;
+        assert!(matches!(frame, Some(Ok(_))));
+        assert!(progress.ended());
     }
 
     /// A response body errors after `idle` without a frame and is counted

@@ -30,6 +30,7 @@ use tgin_core::engine::{Consumer, Engine, Mode, TokenChanged, WebhookChange};
 use tgin_runtime::secret::Secret;
 
 use super::metrics::{MethodLabel, Outcome};
+use super::proxy::NO_ANSWER;
 use super::{Bot, Bounded, errors, params, read_bounded};
 use crate::pull;
 
@@ -254,7 +255,7 @@ impl Call<'_> {
             Some(WebhookChange::Deleted) => WEBHOOK_WAS_DELETED,
             Some(WebhookChange::AlreadyDeleted) => WEBHOOK_IS_ALREADY_DELETED,
             None => {
-                tracing::info!(bot = %self.bot.name, consumer = self.consumer, method = self.label.as_str(), "answered locally and not forwarded to Telegram; nothing changed");
+                tracing::info!(bot = %self.bot.name, consumer = self.consumer, method = self.label.as_str(), "answered locally and not forwarded to the Bot API server; nothing changed");
                 if url.is_empty() {
                     WEBHOOK_WAS_DELETED
                 } else {
@@ -338,17 +339,14 @@ pub(super) async fn learn_identity(bot: &Bot, response: Response) -> Response {
             match crate::client::identity(&body) {
                 Ok(identity) => bot.identity.store(Some(Arc::new(identity))),
                 Err(_) => {
-                    tracing::debug!(bot = %bot.name, "Telegram's getMe answer is no identity; not cached");
+                    tracing::debug!(bot = %bot.name, "the Bot API server's getMe answer is no identity; not cached");
                 }
             }
             Response::from_parts(parts, Body::from(body))
         }
         Ok(Bounded::Over(partial)) => Response::from_parts(parts, partial.into_body()),
-        // The proxy counted and logged the failed body.
-        Err(_) => errors::error(
-            StatusCode::BAD_GATEWAY,
-            "Bad Gateway: Telegram is unreachable",
-        ),
+        // The proxy counted and logged the failed body; the call went out.
+        Err(_) => errors::error(StatusCode::BAD_GATEWAY, NO_ANSWER),
     }
 }
 

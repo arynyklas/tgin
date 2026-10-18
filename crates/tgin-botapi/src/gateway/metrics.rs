@@ -133,9 +133,10 @@ struct ReplyLabels {
 
 type HistogramCtor = fn() -> Histogram;
 
-/// Time to response headers: 1 ms to about 33 s, as delivery latency.
+/// Time to response headers: 1 ms to about 524 s, so that a local server's
+/// answer minutes after a large upload still lands in a bucket.
 fn upstream_histogram() -> Histogram {
-    Histogram::new(exponential_buckets(0.001, 2.0, 16))
+    Histogram::new(exponential_buckets(0.001, 2.0, 20))
 }
 
 /// The gateway metric families. Cloning shares the families.
@@ -168,7 +169,7 @@ impl GatewayMetrics {
         );
         reg.register(
             "gateway_upstream_seconds",
-            "Time from sending a gateway request to Telegram's response headers",
+            "Time from sending a gateway request to the Bot API server's response headers",
             m.upstream.clone(),
         );
         reg.register(
@@ -348,7 +349,7 @@ impl MethodMetrics {
         self.outcomes[outcome as usize].inc();
     }
 
-    /// Telegram's response headers arrived `seconds` after sending.
+    /// The server's response headers arrived `seconds` after sending.
     pub fn upstream_seconds(&self, seconds: f64) {
         self.upstream.observe(seconds);
     }
@@ -437,5 +438,35 @@ mod tests {
         metrics.remove_replies("hooks");
         let out = exported(&reg);
         assert!(!out.contains(r#"consumer="hooks""#), "{out}");
+    }
+
+    /// `tgin_gateway_upstream_seconds` reaches from 1 ms to about 524 s in
+    /// 20 doubling buckets: an answer minutes after a large upload to a
+    /// local server lands in a bucket of its own, not only in `+Inf`.
+    #[test]
+    fn buckets_cover_ten_minutes() {
+        let mut reg = Registry::with_prefix("tgin");
+        let metrics = GatewayMetrics::register(&mut reg);
+        let bot = metrics.bot("shop");
+        let send = bot.method(MethodLabel::of("sendDocument"));
+        send.upstream_seconds(0.000_5);
+        send.upstream_seconds(400.0);
+        let out = exported(&reg);
+        let buckets: Vec<(f64, u64)> = out
+            .lines()
+            .filter(|l| l.starts_with("tgin_gateway_upstream_seconds_bucket{"))
+            .filter_map(|l| {
+                let le = l.split("le=\"").nth(1)?.split('"').next()?;
+                let count = l.rsplit(' ').next()?.parse().ok()?;
+                Some((le.parse().ok()?, count))
+            })
+            .filter(|(le, _): &(f64, u64)| le.is_finite())
+            .collect();
+        assert_eq!(buckets.len(), 20, "{out}");
+        assert_eq!(buckets[0], (0.001, 1), "{out}");
+        let (top, top_count) = buckets[19];
+        assert!((top - 524.288).abs() < 1e-9, "top bucket {top}");
+        assert_eq!(top_count, 2, "400 s counted below the top bucket");
+        assert_eq!(buckets[18], (262.144, 1), "{out}");
     }
 }
