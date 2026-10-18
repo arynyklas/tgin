@@ -2360,14 +2360,18 @@ async fn bot_close_deletes_webhook_then_closes() {
 }
 
 /// Mounts what a `close` of the bot `token` on `server` meets, before
-/// `mount_bot`: `getWebhookInfo` reporting a webhook its operator set,
-/// with no pending update, and `close` refused with a 429. Returns that
-/// webhook's URL.
-async fn mount_refused_close(server: &MockServer, token: &str) -> &'static str {
+/// `mount_bot`: `getWebhookInfo` reporting a webhook its operator set
+/// (uploading a certificate if `custom_certificate`), with no pending
+/// update, and `close` refused with a 429. Returns that webhook's URL.
+async fn mount_refused_close_with(
+    server: &MockServer,
+    token: &str,
+    custom_certificate: bool,
+) -> &'static str {
     const URL: &str = "https://ops.example/route/hook?k=v";
     Mock::given(path(format!("/bot{token}/getWebhookInfo")))
         .respond_with(ok(json!({
-            "url": URL, "has_custom_certificate": false, "pending_update_count": 0,
+            "url": URL, "has_custom_certificate": custom_certificate, "pending_update_count": 0,
             "max_connections": 7, "allowed_updates": ["message", "callback_query"],
         })))
         .mount(server)
@@ -2380,6 +2384,11 @@ async fn mount_refused_close(server: &MockServer, token: &str) -> &'static str {
         .mount(server)
         .await;
     URL
+}
+
+/// [`mount_refused_close_with`] a webhook without a custom certificate.
+async fn mount_refused_close(server: &MockServer, token: &str) -> &'static str {
+    mount_refused_close_with(server, token, false).await
 }
 
 /// The bodies of the `setWebhook` calls `server` got for `token`.
@@ -2488,6 +2497,39 @@ async fn bot_close_failure_reports_an_unrestored_webhook() {
     );
     assert!(!logs.contains(TOKEN), "the token reached a log line");
     assert_eq!(source_state(&tgin, "unrestored").await, "running");
+    tgin.stop().await;
+}
+
+/// A webhook set with a custom certificate is not set again (tgin does not
+/// have the certificate): no `setWebhook`, and the 502 says the webhook
+/// must be set again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_close_failure_leaves_a_certificate_webhook_to_the_operator() {
+    let telegram = MockServer::start().await;
+    mount_refused_close_with(&telegram, TOKEN, true).await;
+    mount_bot(&telegram, TOKEN, me("tgin_bot"), Duration::from_secs(3600)).await;
+    let tgin = start(
+        "bot_close_failure_leaves_a_certificate_webhook_to_the_operator",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            hook_bot(&telegram, "certified", TOKEN, "/hook", "workers")
+        )),
+    )
+    .await;
+    let answer = tgin
+        .admin_post("/v1/bots/certified/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 502, "{}", answer.body);
+    assert_eq!(
+        answer.json(),
+        json!({
+            "error": "upstream refused",
+            "description": "Too Many Requests: retry after 312; the bot's webhook was deleted and could not be set again: set it again",
+        })
+    );
+    assert!(set_webhooks(&telegram, TOKEN).await.is_empty());
+    wait_logged(&[" ERROR ", "bot=certified", "custom certificate"], 0).await;
+    assert_eq!(source_state(&tgin, "certified").await, "running");
     tgin.stop().await;
 }
 
