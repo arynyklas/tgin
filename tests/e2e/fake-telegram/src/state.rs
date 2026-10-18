@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,10 +40,33 @@ pub(crate) struct Shared {
     pub client: reqwest::Client,
     pub cancel: CancellationToken,
     next_file: AtomicU64,
+    /// Local mode: where the bots' files go.
+    pub local: Option<LocalFiles>,
+}
+
+/// The files directory of a local-mode fake (the server's `--dir`).
+pub(crate) struct LocalFiles {
+    /// Absolute.
+    pub root: PathBuf,
+    /// Whether file names may contain ':'. Like the server, a bot's
+    /// directory keeps the token's ':' unless the filesystem refuses it,
+    /// and then uses '~' (`telegram-bot-api.cpp`, `Client.cpp`).
+    pub colon: bool,
+}
+
+impl LocalFiles {
+    /// The directory of the bot with `token`.
+    pub fn bot_dir(&self, token: &str) -> PathBuf {
+        if self.colon {
+            self.root.join(token)
+        } else {
+            self.root.join(token.replace(':', "~"))
+        }
+    }
 }
 
 impl Shared {
-    pub fn new(cancel: CancellationToken) -> reqwest::Result<Self> {
+    pub fn new(cancel: CancellationToken, local: Option<LocalFiles>) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
@@ -54,6 +78,7 @@ impl Shared {
             client,
             cancel,
             next_file: AtomicU64::new(1),
+            local,
         })
     }
 

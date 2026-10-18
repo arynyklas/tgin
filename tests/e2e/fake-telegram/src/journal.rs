@@ -81,6 +81,9 @@ pub struct Entry {
     pub reply_method: Option<String>,
     pub reply: Option<ReplyOutcome>,
     pub error: Option<String>,
+    /// A parameter named a local file (`file:…`), at the top level or in
+    /// JSON carried by a parameter, as a local-mode server would read it.
+    pub local_file: bool,
     #[serde(skip)]
     pub token: String,
 }
@@ -104,6 +107,7 @@ impl Entry {
             reply_method: None,
             reply: None,
             error: None,
+            local_file: false,
             token: token.to_owned(),
         }
     }

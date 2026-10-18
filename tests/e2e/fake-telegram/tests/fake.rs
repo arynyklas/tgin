@@ -18,7 +18,7 @@ use axum::{
 use bytes::Bytes;
 use reqwest::{Client, multipart};
 use serde_json::{Value, json};
-use tgin_fake_telegram::Server;
+use tgin_fake_telegram::{Options, Server};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -41,6 +41,40 @@ impl Fake {
             server: Server::start(listener).unwrap(),
             http: Client::new(),
         }
+    }
+
+    /// A local-mode fake writing files under `files_dir`.
+    async fn start_local(files_dir: &std::path::Path) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let options = Options {
+            local_mode: true,
+            files_dir: Some(files_dir.to_owned()),
+        };
+        Self {
+            server: Server::start_with(listener, options).unwrap(),
+            http: Client::new(),
+        }
+    }
+
+    /// Upload `data` as a `sendDocument` multipart part; returns the file_id.
+    async fn upload(&self, token: &str, data: &'static [u8], name: &str) -> String {
+        let form = multipart::Form::new().text("chat_id", "5").part(
+            "document",
+            multipart::Part::bytes(data).file_name(name.to_owned()),
+        );
+        let response = self
+            .http
+            .post(self.url(&format!("/bot{token}/sendDocument")))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        body["result"]["document"]["file_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn url(&self, path: &str) -> String {
@@ -1121,5 +1155,199 @@ async fn token_and_method_errors_follow_the_brief_token_rule() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    fake.server.stop().await.unwrap();
+}
+
+/// The bot's directory on a local server: the token, or with ':' → '~'
+/// where the filesystem refuses ':' in a name (probed like the server).
+fn token_dir(root: &std::path::Path, token: &str) -> std::path::PathBuf {
+    let root = std::path::absolute(root).unwrap();
+    let probe = root.join("1:a-test-probe");
+    let name = if std::fs::create_dir(&probe).is_ok() {
+        std::fs::remove_dir(&probe).unwrap();
+        token.to_owned()
+    } else {
+        token.replace(':', "~")
+    };
+    root.join(name)
+}
+
+#[tokio::test]
+async fn local_mode_absolute_paths_and_no_file_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::start_local(dir.path()).await;
+    let file_id = fake.upload(TOKEN, b"local bytes", "a.txt").await;
+    let file = fake.ok(TOKEN, "getFile", json!({"file_id": file_id})).await;
+    let path = file["file_path"].as_str().unwrap().to_owned();
+    assert!(std::path::Path::new(&path).is_absolute(), "{path}");
+    let expected = token_dir(dir.path(), TOKEN)
+        .join("documents")
+        .join("file_1.txt");
+    assert_eq!(std::path::Path::new(&path), expected);
+
+    // The real server has no file route at all.
+    for file_path in [path.as_str(), "documents/file_1.txt"] {
+        let response = fake
+            .http
+            .get(fake.url(&format!("/file/bot{TOKEN}/{file_path}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{file_path}");
+    }
+    // ...and answers 404 before it looks at a token.
+    for path in ["/file/botnot-a-token/x", "/file/x", "/files"] {
+        let response = fake.http.get(fake.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            &br#"{"ok":false,"error_code":404,"description":"Not Found"}"#[..]
+        );
+    }
+    let downloads = fake.journal("?kind=file").await;
+    assert_eq!(downloads.len(), 2, "{downloads:?}");
+    assert!(downloads.iter().all(|d| d["status"] == 404));
+    fake.server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_mode_writes_bytes_under_token_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::start_local(dir.path()).await;
+    let first = fake.upload(TOKEN, b"first file", "one.bin").await;
+    let second = fake.upload(OTHER, b"second", "two").await;
+    let first = fake.ok(TOKEN, "getFile", json!({"file_id": first})).await;
+    let second = fake.ok(OTHER, "getFile", json!({"file_id": second})).await;
+    let first = std::path::PathBuf::from(first["file_path"].as_str().unwrap());
+    let second = std::path::PathBuf::from(second["file_path"].as_str().unwrap());
+    assert!(first.starts_with(token_dir(dir.path(), TOKEN)), "{first:?}");
+    assert!(
+        second.starts_with(token_dir(dir.path(), OTHER)),
+        "{second:?}"
+    );
+    assert_eq!(std::fs::read(&first).unwrap(), b"first file");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second");
+    fake.server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn file_reference_journaled() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::start_local(dir.path()).await;
+    let message = fake
+        .ok(
+            TOKEN,
+            "sendDocument",
+            json!({"chat_id": 5, "document": "file:///srv/data/report.pdf"}),
+        )
+        .await;
+    assert_eq!(message["document"]["file_name"], "report.pdf");
+    // Nested in InputMedia JSON too.
+    let media = json!([{"type": "photo", "media": "file:///srv/a.jpg"}]).to_string();
+    fake.ok(
+        TOKEN,
+        "sendMediaGroup",
+        json!({"chat_id": 5, "media": media}),
+    )
+    .await;
+    fake.ok(
+        TOKEN,
+        "sendLivePhoto",
+        json!({"chat_id": 5, "live_photo": "file:///srv/z.mov"}),
+    )
+    .await;
+    fake.ok(
+        TOKEN,
+        "sendMessage",
+        json!({"chat_id": 5, "text": "file: not a file"}),
+    )
+    .await;
+    let calls = fake.journal(&format!("?token={TOKEN}&kind=call")).await;
+    let flags: Vec<_> = calls
+        .iter()
+        .map(|c| {
+            (
+                c["method"].as_str().unwrap(),
+                c["local_file"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            ("sendDocument", true),
+            ("sendMediaGroup", true),
+            ("sendLivePhoto", true),
+            ("sendMessage", false),
+        ]
+    );
+    fake.server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn log_out_clears_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::start_local(dir.path()).await;
+    fake.inject(TOKEN, text_update("a")).await;
+    fake.inject(TOKEN, text_update("b")).await;
+    assert_eq!(fake.ok(TOKEN, "close", json!({})).await, true);
+    assert_eq!(fake.update_ids(TOKEN, json!({})).await, [1, 2]);
+
+    fake.ok(
+        TOKEN,
+        "setWebhook",
+        json!({"url": "http://127.0.0.1:9/hook"}),
+    )
+    .await;
+    assert_eq!(fake.ok(TOKEN, "logOut", json!({})).await, true);
+    let info = fake.ok(TOKEN, "getWebhookInfo", json!({})).await;
+    assert_eq!(info["url"], "");
+    assert_eq!(info["pending_update_count"], 0);
+    assert!(fake.update_ids(TOKEN, json!({})).await.is_empty());
+    let log_outs = fake.journal(&format!("?token={TOKEN}&method=logOut")).await;
+    assert_eq!(log_outs.len(), 1);
+    assert_eq!(log_outs[0]["status"], 200);
+    fake.server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_mode_unchanged() {
+    let fake = Fake::start().await;
+    let file_id = fake.upload(TOKEN, b"cloud", "c.txt").await;
+    let file = fake.ok(TOKEN, "getFile", json!({"file_id": file_id})).await;
+    assert_eq!(file["file_path"], "documents/file_1.txt");
+    let response = fake
+        .http
+        .get(fake.url(&format!("/file/bot{TOKEN}/documents/file_1.txt")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap(), &b"cloud"[..]);
+
+    // file: references are not files to the cloud server.
+    let (status, body) = fake
+        .call(
+            TOKEN,
+            "sendDocument",
+            json!({"chat_id": 5, "document": "file:///etc/passwd"}),
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        body["description"],
+        "Bad Request: wrong file identifier/HTTP URL specified"
+    );
+    // ...but the journal still says one was sent.
+    let documents = fake
+        .journal(&format!("?token={TOKEN}&method=sendDocument"))
+        .await;
+    assert_eq!(documents[1]["local_file"], true);
+
+    // logOut and close only answer true.
+    fake.inject(TOKEN, text_update("kept")).await;
+    assert_eq!(fake.ok(TOKEN, "logOut", json!({})).await, true);
+    assert_eq!(fake.ok(TOKEN, "close", json!({})).await, true);
+    assert_eq!(fake.update_ids(TOKEN, json!({})).await.len(), 1);
     fake.server.stop().await.unwrap();
 }
