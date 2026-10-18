@@ -70,9 +70,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `upstream_idle_timeout`. Webhook replies wait the smaller of
   `response_timeout` and 30 s.
 - Webhooks from a self-hosted server in local mode: `public_url` may be
-  `http` on any port, and `max_connections` up to 100 000, but not above
-  `server.max_connections`. `ip_allowlist: telegram` on a `local` upstream
-  is a config error.
+  `http` on any port, and `max_connections` up to 100 000; a value above
+  100 (the local-mode range) must not exceed `server.max_connections`.
+  `ip_allowlist: telegram` on a `local` upstream is a config error.
 - `setWebhook` registration retries in the background (`register:<bot>`,
   1 s to 5 min, honouring `retry_after`) until it succeeds or the bot
   stops; a cloud server's `401`, `403` or `404` ends it. On a `local`
