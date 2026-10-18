@@ -182,6 +182,10 @@ pub struct WebhookRules {
 pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
 /// The most connections Telegram opens to a webhook.
 pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
+/// What a plain-http upstream URL off loopback hints.
+const BOT_API_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches";
+/// What a plain-http `files.url` off loopback hints.
+const FILE_SERVER_HINT: &str = "use https, or keep the file server on a network only tgin reaches";
 
 impl WebhookRules {
     /// Telegram's rules, unless the server is local and in local mode.
@@ -780,7 +784,12 @@ impl Resolver<'_> {
         for (name, upstream) in &raw.upstreams {
             let path = format!("upstreams.{}", name.as_str());
             let upstream = &upstream.value;
-            let url = self.upstream_url(&format!("{path}.url"), name.as_str(), &upstream.url);
+            let url = self.upstream_url(
+                &format!("{path}.url"),
+                name.as_str(),
+                &upstream.url,
+                BOT_API_HINT,
+            );
             let files = match &upstream.files {
                 None => Some(None),
                 Some(files) => {
@@ -811,8 +820,14 @@ impl Resolver<'_> {
 
     /// An upstream's URL. Plain `http` to a host that is not loopback
     /// warns, naming the upstream and never the URL, which may hold
-    /// credentials.
-    fn upstream_url(&mut self, path: &str, name: &str, text: &Template) -> Option<SensitiveUrl> {
+    /// credentials, with `hint`.
+    fn upstream_url(
+        &mut self,
+        path: &str,
+        name: &str,
+        text: &Template,
+        hint: &str,
+    ) -> Option<SensitiveUrl> {
         let url = self.url(path, text, false)?;
         if url.expose().scheme() == "http" && !loopback(url.expose()) {
             self.diag.warnings.push(
@@ -820,7 +835,7 @@ impl Resolver<'_> {
                     "upstream `{name}` sends bot tokens over plain http to a host that is not loopback"
                 ))
                 .at(located(path, text.0.location))
-                .hint("use https, or keep the Bot API server on a network only tgin reaches"),
+                .hint(hint),
             );
         }
         Some(url)
@@ -831,7 +846,8 @@ impl Resolver<'_> {
     /// name each bot's token.
     fn files(&mut self, path: &str, name: &str, files: &raw::Files) -> Option<Files> {
         if let Some(url) = &files.url {
-            return (self.upstream_url(&format!("{path}.url"), name, url)).map(Files::Url);
+            let path = format!("{path}.url");
+            return (self.upstream_url(&path, name, url, FILE_SERVER_HINT)).map(Files::Url);
         }
         let text = files.dir.as_ref()?;
         let dir_path = format!("{path}.dir");
@@ -943,7 +959,7 @@ impl Resolver<'_> {
         }
         let path = format!("{path}.api_url");
         let url = match &bot.api_url {
-            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text)?,
+            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text, BOT_API_HINT)?,
             None => self.url(&path, &defaults::api_url(), false)?,
         };
         Some(Arc::new(Upstream {

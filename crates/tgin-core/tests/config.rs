@@ -2962,6 +2962,9 @@ fn http_upstream_warning() {
         !warning.to_string().contains("telegram-bot-api"),
         "{warning}"
     );
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("Bot API server"), "{warning}");
+    assert!(!hint.contains("kind: local"), "{warning}");
 
     for quiet in [
         "http://127.0.0.1:8081",
@@ -3011,6 +3014,11 @@ fn http_files_url_warning() {
     );
     assert_message(warning, "`local`");
     assert!(!warning.to_string().contains("files.internal"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("file server") && !hint.contains("Bot API server"),
+        "{warning}"
+    );
     for quiet in ["http://127.0.0.1:8090/tba", "https://files.internal/tba"] {
         let cfg = loads(&yaml(quiet));
         assert!(
