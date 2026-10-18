@@ -1927,14 +1927,32 @@ async fn trailers_never_end_a_refused_body_upstream() {
     tgin.stop().await;
 }
 
+/// `fut`, bounded by [`PATIENCE`] of real time, whatever tokio's clock does.
+async fn within<F: Future>(what: &str, fut: F) -> F::Output {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(PATIENCE);
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        out = fut => out,
+        _ = rx => panic!("{what} did not happen within {PATIENCE:?}"),
+    }
+}
+
 /// A download served from disk is a call in flight for the shutdown's
 /// drain, as one from the cloud or a file origin is: a client that reads
-/// its first bytes, then pauses past the drain's quiet second and the data
-/// plane's close grace, still gets the whole file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// its first bytes, then pauses for 4 s, past the drain's quiet second and
+/// the data plane's close grace, still gets the whole file. On tokio's
+/// frozen clock (as `gateway.rs::freeze`): only the test moves time.
+#[tokio::test(start_paused = true)]
 async fn drain_finishes_a_slow_disk_download() {
     // Far more than the socket buffers on both ends hold.
     const SIZE: usize = 32 << 20;
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    drop(tokio::task::spawn_blocking(move || {
+        let _ = held.recv();
+    }));
     let server = MockServer::start().await;
     let root = scratch("files");
     put(
@@ -1949,24 +1967,48 @@ async fn drain_finishes_a_slow_disk_download() {
         .send(SignalKind::Terminate)
         .await
         .expect("the app listens");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut response = tgin.file(TOKEN, "documents/large.bin", &[]).await;
+    within("the drain's start", async {
+        while !LOGS
+            .text()
+            .lines()
+            .any(|l| l.contains("shutdown started; draining") && l.contains("grace=10s"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let mut response = within(
+        "the download's head",
+        tgin.http
+            .get(tgin.url(&format!(
+                "/file/bot{}/documents/large.bin",
+                TOKEN.replace(':', "%3A")
+            )))
+            .send(),
+    )
+    .await
+    .expect("a response");
     assert_eq!(response.status(), 200);
-    let mut read = response
-        .chunk()
+    let mut read = within("a first chunk", response.chunk())
         .await
-        .expect("a first chunk")
+        .expect("the body")
         .expect("bytes")
         .len();
-    tokio::time::sleep(Duration::from_millis(3500)).await;
-    while let Some(chunk) = timeout(PATIENCE, response.chunk())
+    for _ in 0..40 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    while let Some(chunk) = within("the rest", response.chunk())
         .await
-        .expect("the rest in time")
         .expect("the body goes on")
     {
         read += chunk.len();
     }
     assert_eq!(read, SIZE);
+    drop(hold);
+    tokio::time::resume();
     let outcome = timeout(PATIENCE, tgin.run)
         .await
         .expect("the app exits in time")
