@@ -551,7 +551,9 @@ impl Reloader {
     /// 2. the bot's ingest stops, and it is parked;
     /// 3. tgin delivers what it holds of the bot, until the deadline;
     /// 4. the server is called: `logOut`, or `deleteWebhook` then `close`.
-    ///    When that fails, the bot is unparked and starts again.
+    ///    When that fails, the bot is unparked and starts again; once it
+    ///    succeeds, the gateway refuses the bot's calls that would go to a
+    ///    server ([`tgin_botapi::gateway::Gateway::set_parked`]).
     ///
     /// `None`, having changed nothing, when the requester went away before
     /// the server ran dry (step 1): no one would learn the outcome. Once it
@@ -647,6 +649,9 @@ impl Reloader {
         };
         Some(match called {
             Ok(result) => {
+                // From now on the old server would log the bot in again on
+                // its next call: none goes.
+                shared.gateway.set_parked(name, true);
                 tracing::info!(bot = %name, method = how.method(), upstream = %bot.upstream.name, left, "the bot was logged out of its Bot API server and stays parked; a reload that changes its upstream starts it there");
                 Ok(Moved {
                     bot: name.to_owned(),

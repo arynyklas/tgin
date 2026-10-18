@@ -85,7 +85,8 @@ impl Gateway {
     /// for an update of the bot `source`, and counts its outcome. A reply
     /// from a runtime endpoint runs only with the token that set the
     /// endpoint, checked once the limits let it go: a reload that rotated
-    /// the token since refuses it.
+    /// the token since refuses it. A parked bot's reply is refused
+    /// ([`Gateway::set_parked`]).
     async fn run_reply(&self, consumer: &str, source: SourceId, reply: Reply) {
         let counts = self.reply_metrics(consumer);
         let table = self.table.load_full();
@@ -116,6 +117,13 @@ impl Gateway {
         {
             counts.count(ReplyOutcome::Refused);
             tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), "webhook reply refused: the token of the bot whose setWebhook set the endpoint changed");
+            return;
+        }
+        // Last, after any delay of the limits: the bot may have been parked
+        // meanwhile.
+        if self.is_parked(&bot.name) {
+            counts.count(ReplyOutcome::Refused);
+            tracing::info!(bot = %bot.name, consumer = %consumer, method = label.as_str(), "webhook reply refused: the bot is being moved to another Bot API server by tgin");
             return;
         }
         let call = Call {

@@ -484,6 +484,7 @@ impl Sources {
                 Stop::SourceGone => registry.stops.remove(name),
                 Stop::BotGone => {
                     registry.parked.remove(name);
+                    self.gateway.set_parked(name, false);
                     registry.stops.remove(name)
                 }
             };
@@ -522,9 +523,11 @@ impl Sources {
         tracing::info!(bot = %name, "the bot's ingest stopped; the bot is parked");
     }
 
-    /// Ends the parking of the bot `name`, which the caller starts again;
-    /// `false` if it was not parked.
+    /// Ends the parking of the bot `name`, which the caller starts again,
+    /// and the gateway's refusal of its calls; `false` if it was not
+    /// parked.
     pub(crate) fn unpark(&self, name: &str) -> bool {
+        self.gateway.set_parked(name, false);
         self.registry.lock().parked.remove(name)
     }
 

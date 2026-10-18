@@ -3804,3 +3804,169 @@ async fn upstream_up_survives_reload_of_other_upstream_settings() {
     }
     tgin.stop().await;
 }
+
+/// The 503 every call a parked bot would send to a Bot API server gets.
+const PARKED: &str =
+    "Service Unavailable: the bot is being moved to another Bot API server by tgin";
+
+/// Once `close` has logged the bot out, nothing of it reaches the server it
+/// left, which would launch it there again: a downstream's `sendMessage`
+/// and file download get a 503 with `Retry-After`, and the webhook reply
+/// to an update tgin still held is refused. What needs no server goes on:
+/// the cached `getMe` and the pull of that update. A reload that moves the
+/// bot to another upstream lifts the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_bot_calls_reach_no_server() {
+    let old = telegram().await;
+    mount_moves(&old, TOKEN, 0).await;
+    let new = telegram().await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ok(json!({ "message_id": 1 })))
+        .mount(&new)
+        .await;
+    // Answers the update with a reply only after the move has ended.
+    let down = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/in"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(
+                    r#"{"method":"sendMessage","chat_id":500,"text":"late reply"}"#,
+                    "application/json",
+                )
+                .set_delay(Duration::from_millis(1500)),
+        )
+        .mount(&down)
+        .await;
+    let yaml = |server: &MockServer| {
+        config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n  hooks: {{ push: {{ endpoints: [{{ url: \"{}/in\" }}] }} }}\n",
+            hook_bot(server, "hooked", TOKEN, "/hook", "workers, hooks"),
+            down.uri()
+        ))
+    };
+    let tgin = start("parked_bot_calls_reach_no_server", &yaml(&old)).await;
+    tgin.deliver("/hook", &[1]).await;
+    let closed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(closed.status, 200, "{}", closed.body);
+
+    let send = || {
+        tgin.http
+            .post(tgin.data_url(&format!("/bot{TOKEN}/sendMessage")))
+            .json(&json!({ "chat_id": 500, "text": "hi" }))
+            .send()
+    };
+    let download = tgin
+        .http
+        .get(tgin.data_url(&format!("/file/bot{TOKEN}/documents/file_1.pdf")))
+        .send();
+    for response in [
+        send().await.expect("answered"),
+        download.await.expect("answered"),
+    ] {
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.headers()["retry-after"], "5");
+        let body: Value = response.json().await.expect("JSON");
+        assert_eq!(
+            body,
+            json!({ "ok": false, "error_code": 503, "description": PARKED })
+        );
+    }
+    let me = answer(
+        tgin.http
+            .post(tgin.data_url(&format!("/bot{TOKEN}/getMe")))
+            .header("content-type", "application/json")
+            .body("{}"),
+    )
+    .await;
+    assert_eq!(me.status, 200, "{}", me.body);
+    assert_eq!(me.json()["result"]["username"], "tgin_bot");
+    assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1]);
+    let refused = r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#;
+    let started = Instant::now();
+    while !tgin.metrics_text().lines().any(|l| l == refused) {
+        assert!(started.elapsed() < PATIENCE, "the reply was never refused");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let metrics = tgin.metrics_text();
+    assert!(
+        metrics.lines().any(|l| l
+            == r#"tgin_gateway_requests_total{bot="hooked",method="sendMessage",outcome="rejected"} 1"#),
+        "{metrics}"
+    );
+    assert_eq!(sent_calls(&old).await, 0, "the old server got a call");
+    assert_eq!(sent_calls(&new).await, 0, "the new server got a call");
+
+    tgin.rewrite(&yaml(&new));
+    assert_eq!(tgin.reload().await.status, 200);
+    let sent = send().await.expect("answered");
+    assert_eq!(sent.status(), 200);
+    assert_eq!(count_calls(&new, TOKEN, "sendMessage").await, 1);
+    assert_eq!(sent_calls(&old).await, 0, "the old server got a call");
+    assert!(!LOGS.text().contains(TOKEN), "the token reached a log line");
+    tgin.stop().await;
+}
+
+/// How many `sendMessage` calls and file downloads `server` got.
+async fn sent_calls(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/sendMessage") || r.url.path().starts_with("/file/"))
+        .count()
+}
+
+/// A parked bot removed from the config loses its parking: added back,
+/// even on the same upstream, its calls go through again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_parked_bot_comes_back_unparked() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    mount_bot(
+        &telegram,
+        OTHER_TOKEN,
+        me("other_bot"),
+        Duration::from_secs(3600),
+    )
+    .await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ok(json!({ "message_id": 1 })))
+        .mount(&telegram)
+        .await;
+    let other = hook_bot(&telegram, "other", OTHER_TOKEN, "/other", "others");
+    let with_hooked = config(&format!(
+        "bots:\n{}{other}consumers:\n  workers: {{ pull: {{}} }}\n  others: {{ pull: {{}} }}\n",
+        hook_bot(&telegram, "hooked", TOKEN, "/hook", "workers"),
+    ));
+    let without = config(&format!(
+        "bots:\n{other}consumers:\n  others: {{ pull: {{}} }}\n"
+    ));
+    let tgin = start("removed_parked_bot_comes_back_unparked", &with_hooked).await;
+    let closed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=100ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(closed.status, 200, "{}", closed.body);
+    let send = || async {
+        answer(
+            tgin.http
+                .post(tgin.data_url(&format!("/bot{TOKEN}/sendMessage")))
+                .header("content-type", "application/json")
+                .body(r#"{"chat_id":500,"text":"hi"}"#),
+        )
+        .await
+        .status
+    };
+    assert_eq!(send().await, 503);
+
+    tgin.rewrite(&without);
+    assert_eq!(tgin.reload().await.status, 200);
+    tgin.rewrite(&with_hooked);
+    assert_eq!(tgin.reload().await.status, 200);
+    assert_eq!(send().await, 200);
+    assert_eq!(count_calls(&telegram, TOKEN, "sendMessage").await, 1);
+    tgin.stop().await;
+}

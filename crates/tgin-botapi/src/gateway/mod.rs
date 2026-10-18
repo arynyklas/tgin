@@ -20,7 +20,7 @@ pub mod path;
 mod proxy;
 mod reply;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +46,9 @@ use tokio::time::Instant;
 
 use self::files::{FileTarget, Rewrite};
 use self::limit::BotLimiter;
-use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics, UpstreamMetrics};
+use self::metrics::{
+    BotMetrics, MethodLabel, MethodMetrics, Outcome, ReplyMetrics, UpstreamMetrics,
+};
 pub use self::metrics::{GatewayMetrics, UpstreamUp};
 use self::path::GatewayPath;
 use self::proxy::Upstream;
@@ -79,7 +81,20 @@ pub struct Gateway {
     /// The requests forwarded to Telegram, and the files served from disk,
     /// for the shutdown's drain.
     upstreams: Arc<Upstreams>,
+    /// The bots moved off their Bot API server and not yet onto another
+    /// ([`Gateway::set_parked`]), by name: kept apart from the table, so an
+    /// entry a reload rebuilds stays parked.
+    parked: ArcSwap<BTreeSet<Arc<str>>>,
 }
+
+/// What a parked bot's calls that would go to a Bot API server or a file
+/// origin answer, with `Retry-After` [`PARKED_RETRY_AFTER`]: the server it
+/// left launches a bot again on its next call, and the bot's updates would
+/// be split between two servers.
+const PARKED: &str =
+    "Service Unavailable: the bot is being moved to another Bot API server by tgin";
+/// Seconds.
+const PARKED_RETRY_AFTER: u64 = 5;
 
 /// The gateway's requests forwarded to Telegram, and its files served from
 /// disk: how many are in flight, and when one last started or ended
@@ -307,7 +322,38 @@ impl Gateway {
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
             upstreams: Arc::default(),
+            parked: ArcSwap::default(),
         }
+    }
+
+    /// Parks the bot `bot`, or ends its parking. While it is parked, every
+    /// call of it the gateway would send to its Bot API server or file
+    /// origin, webhook replies included, is refused; what needs no server
+    /// (the intercepts, pull `getUpdates`, files served from disk) goes on.
+    /// Reloads that rebuild the bot's entry leave it parked.
+    pub fn set_parked(&self, bot: &str, parked: bool) {
+        self.parked.rcu(|set| {
+            let mut set = BTreeSet::clone(set);
+            if parked {
+                set.insert(Arc::from(bot));
+            } else {
+                set.remove(bot);
+            }
+            set
+        });
+    }
+
+    /// Whether the bot `bot` is parked.
+    fn is_parked(&self, bot: &str) -> bool {
+        self.parked.load().contains(bot)
+    }
+
+    /// The answer to a call of the parked bot `bot`, counted `rejected`:
+    /// refused by tgin, as its other refusals are, before any server.
+    fn refuse_parked(bot: &Bot, handles: &MethodMetrics, label: MethodLabel) -> Response {
+        handles.count(Outcome::Rejected);
+        tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request refused: the bot is parked, moved off its Bot API server");
+        errors::service_unavailable(PARKED, PARKED_RETRY_AFTER)
     }
 
     /// Replaces the bot table. An entry whose token, upstream and gateway
@@ -427,7 +473,8 @@ impl Gateway {
     /// `intercept`); a local-mode `getFile` answer has the bot's own file
     /// path made relative. Every other method streams to the Bot API
     /// server. The file route goes where the bot's upstream keeps files
-    /// (see `files`).
+    /// (see `files`). A parked bot's calls that would go to a server get
+    /// 503 ([`Gateway::set_parked`]).
     pub async fn handle(&self, req: Request) -> Response {
         let uri = req.uri().clone();
         let Some(target) = path::parse(uri.path()) else {
@@ -472,6 +519,7 @@ impl Gateway {
                 };
                 return match call.route(req).await {
                     intercept::Routed::Answered(response) => response,
+                    _ if self.is_parked(&bot.name) => Self::refuse_parked(bot, handles, label),
                     intercept::Routed::Proxy(req) => {
                         let forwarding = Forwarding::new(&self.upstreams);
                         proxy::forward(bot, upstream, label, req, forwarding).await
@@ -491,6 +539,9 @@ impl Gateway {
             GatewayPath::File { file_path, .. } => *file_path,
         };
         let root = match &bot.files {
+            FileTarget::Proxy(_) | FileTarget::Origin(_) if self.is_parked(&bot.name) => {
+                return Self::refuse_parked(bot, handles, label);
+            }
             FileTarget::Proxy(base) => {
                 let forwarding = Forwarding::new(&self.upstreams);
                 let upstream = Upstream::File {
@@ -760,6 +811,7 @@ mod tests {
         gateway.set_identity("a", &identity);
         gateway.set_identity("nobody", &identity);
         let first = Arc::clone(&gateway.table.load().bots[0]);
+        gateway.set_parked("a", true);
 
         gateway.set_bots(vec![gateway_bot(&cfg, "1:a")], Vec::new());
         assert!(Arc::ptr_eq(&first, &gateway.table.load().bots[0]), "kept");
@@ -771,6 +823,9 @@ mod tests {
             "rebuilt"
         );
         assert_eq!(gateway.identity("a").as_deref(), Some(&identity));
+        assert!(gateway.is_parked("a"), "a rebuilt entry stays parked");
+        gateway.set_parked("a", false);
+        assert!(!gateway.is_parked("a"));
 
         gateway.set_bots(vec![gateway_bot(&slower, "1:b")], Vec::new());
         assert!(
