@@ -312,36 +312,128 @@ fn unescape(b: u8) -> u8 {
     }
 }
 
-/// Why a [`MultipartGuard`] failed its body.
+/// Why a [`ScanGuard`] failed its body.
 #[derive(Debug, thiserror::Error)]
 #[error("the request body was refused by the local file scan")]
 struct Refused;
 
-/// A multipart request body on its way to a self-hosted server. Each
-/// frame is scanned before it is passed on, so the frame that completes a
-/// local file reference never is, and neither is the closing delimiter
-/// after it: the body fails instead, which drops the upstream connection
-/// with the request incomplete. Once the scan has read the closing
-/// delimiter, the rest passes unread. The verdict goes to the receiver
-/// [`MultipartGuard::new`] returns as soon as there is one.
-pub(super) struct MultipartGuard {
+/// What a [`ScanGuard`] reads its body with.
+enum Scanner {
+    Multipart(Box<MultipartScan>),
+    /// A JSON body, and its bytes so far.
+    Json(Values, usize),
+    /// An urlencoded body, and its bytes so far.
+    Form(Values, Form, usize),
+}
+
+impl Scanner {
+    /// Feeds the next bytes; the verdict once there is one.
+    fn feed(&mut self, data: &[u8]) -> Option<Verdict> {
+        let (values, total) = match self {
+            Scanner::Multipart(scan) => return scan.feed(data),
+            Scanner::Json(values, total) => {
+                for &b in data {
+                    values.json_byte(0, b);
+                    if values.found {
+                        break;
+                    }
+                }
+                (values, total)
+            }
+            Scanner::Form(values, form, total) => {
+                for &b in data {
+                    form.byte(values, b);
+                    if values.found {
+                        break;
+                    }
+                }
+                (values, total)
+            }
+        };
+        *total += data.len();
+        if values.found {
+            Some(Verdict::Refused(Refusal::LocalFile))
+        } else if *total > MAX_PARAMETERS {
+            Some(Verdict::Refused(Refusal::TooLarge))
+        } else {
+            None
+        }
+    }
+
+    /// The body ended: the verdict on all of it.
+    fn finish(&mut self) -> Verdict {
+        let found = match self {
+            Scanner::Multipart(scan) => return scan.finish(),
+            Scanner::Json(values, _) => values.found,
+            Scanner::Form(values, form, _) => {
+                form.end(values);
+                values.found
+            }
+        };
+        if found {
+            Verdict::Refused(Refusal::LocalFile)
+        } else {
+            Verdict::Clean
+        }
+    }
+}
+
+/// A request body on its way to a self-hosted server, scanned as it
+/// streams. Each frame is scanned before it is passed on, so the frame that
+/// completes a local file reference, or passes [`MAX_PARAMETERS`] of JSON
+/// or urlencoded text, never is; nor is the frame that ends the body (by
+/// its length, or the end of a body of unknown length) before the scan of
+/// the whole has come out clean. The body fails instead, which drops the
+/// upstream connection with the request incomplete. Once a multipart scan
+/// has read the closing delimiter, the rest passes unread. The verdict goes
+/// to the receiver the constructor returns as soon as there is one.
+pub(super) struct ScanGuard {
     body: Body,
     scan: Scan,
+    /// Bytes still to come, when the body's length is known.
+    remaining: Option<u64>,
     verdict: Option<oneshot::Sender<Verdict>>,
 }
 
 enum Scan {
-    Scanning(Box<MultipartScan>),
+    Scanning(Scanner),
     Clean,
     Refused,
 }
 
-impl MultipartGuard {
-    pub(super) fn new(body: Body, boundary: &[u8]) -> (MultipartGuard, oneshot::Receiver<Verdict>) {
-        let (verdict, receiver) = oneshot::channel();
-        let guard = MultipartGuard {
+impl ScanGuard {
+    /// A multipart body with the delimiter `boundary`.
+    pub(super) fn multipart(
+        body: Body,
+        boundary: &[u8],
+    ) -> (ScanGuard, oneshot::Receiver<Verdict>) {
+        ScanGuard::new(
             body,
-            scan: Scan::Scanning(Box::new(MultipartScan::new(boundary))),
+            Scanner::Multipart(Box::new(MultipartScan::new(boundary))),
+        )
+    }
+
+    /// A JSON or urlencoded body (`encoding`; multipart reads as
+    /// urlencoded, but has its own constructor).
+    pub(super) fn params(
+        body: Body,
+        encoding: Encoding,
+    ) -> (ScanGuard, oneshot::Receiver<Verdict>) {
+        let scanner = match encoding {
+            Encoding::Json => Scanner::Json(Values::default(), 0),
+            Encoding::Form | Encoding::Multipart => {
+                Scanner::Form(Values::default(), Form::default(), 0)
+            }
+        };
+        ScanGuard::new(body, scanner)
+    }
+
+    fn new(body: Body, scanner: Scanner) -> (ScanGuard, oneshot::Receiver<Verdict>) {
+        let (verdict, receiver) = oneshot::channel();
+        let guard = ScanGuard {
+            remaining: body.size_hint().exact(),
+            body,
+            scan: Scan::Scanning(scanner),
             verdict: Some(verdict),
         };
         (guard, receiver)
@@ -359,7 +451,7 @@ impl MultipartGuard {
     }
 }
 
-impl HttpBody for MultipartGuard {
+impl HttpBody for ScanGuard {
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -375,7 +467,15 @@ impl HttpBody for MultipartGuard {
         };
         let polled = Pin::new(&mut this.body).poll_frame(cx);
         let verdict = match &polled {
-            Poll::Ready(Some(Ok(frame))) => frame.data_ref().and_then(|data| scan.feed(data)),
+            Poll::Ready(Some(Ok(frame))) => frame.data_ref().and_then(|data| {
+                let verdict = scan.feed(data);
+                if let Some(remaining) = &mut this.remaining {
+                    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                    *remaining = remaining.saturating_sub(len);
+                }
+                let last = this.remaining == Some(0) || this.body.is_end_stream();
+                verdict.or_else(|| last.then(|| scan.finish()))
+            }),
             Poll::Ready(None) => Some(scan.finish()),
             Poll::Ready(Some(Err(_))) | Poll::Pending => None,
         };
@@ -845,7 +945,7 @@ mod tests {
 
     /// Polls every frame of `guard` until it ends or fails: the data passed
     /// on, and whether it failed.
-    async fn drain(mut guard: MultipartGuard) -> (Vec<u8>, bool) {
+    async fn drain(mut guard: ScanGuard) -> (Vec<u8>, bool) {
         let mut passed = Vec::new();
         while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut guard).poll_frame(cx)).await
         {
@@ -865,6 +965,94 @@ mod tests {
         Body::from_stream(futures_util::stream::iter(frames))
     }
 
+    /// `frames` as a body of known length, which ends with its last frame.
+    fn sized(frames: &[&[u8]]) -> Body {
+        struct Sized(std::collections::VecDeque<Bytes>);
+        impl HttpBody for Sized {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+                Poll::Ready(
+                    self.get_mut()
+                        .0
+                        .pop_front()
+                        .map(|data| Ok(Frame::data(data))),
+                )
+            }
+            fn is_end_stream(&self) -> bool {
+                self.0.is_empty()
+            }
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(self.0.iter().map(|data| data.len() as u64).sum())
+            }
+        }
+        Body::new(Sized(
+            frames
+                .iter()
+                .map(|frame| Bytes::copy_from_slice(frame))
+                .collect(),
+        ))
+    }
+
+    /// A JSON or urlencoded body streams frame by frame; the frame that
+    /// completes a reference, or passes the parameter bound, is withheld.
+    #[tokio::test]
+    async fn params_guard_withholds_the_frame_that_completes_a_reference() {
+        let head: &[u8] = br#"{"chat_id":1,"caption":"x","document":"fi"#;
+        for body in [frames(&[head, b"le:/x\"}"]), sized(&[head, b"le:/x\"}"])] {
+            let (guard, mut verdict) = ScanGuard::params(body, Encoding::Json);
+            let (passed, failed) = drain(guard).await;
+            assert!(failed);
+            assert_eq!(passed, head);
+            assert_eq!(verdict.try_recv(), Ok(LOCAL));
+        }
+        let (guard, mut verdict) = ScanGuard::params(
+            frames(&[b"a=1&media=%5B%22fi", b"le%3A%2Fx%22%5D"]),
+            Encoding::Form,
+        );
+        let (passed, failed) = drain(guard).await;
+        assert!(failed);
+        assert_eq!(passed, b"a=1&media=%5B%22fi");
+        assert_eq!(verdict.try_recv(), Ok(LOCAL));
+
+        let chunk = vec![b' '; MAX_PARAMETERS / 2];
+        let (guard, mut verdict) =
+            ScanGuard::params(frames(&[b"{", &chunk, &chunk, b"}"]), Encoding::Json);
+        let (passed, failed) = drain(guard).await;
+        assert!(failed);
+        assert_eq!(passed.len(), 1 + chunk.len());
+        assert_eq!(verdict.try_recv(), Ok(Verdict::Refused(Refusal::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn params_guard_passes_a_clean_body_whole() {
+        let parts: [&[u8]; 3] = [br#"{"chat_id":1,"text":"see "#, b"file:/x", br#""}"#];
+        for body in [frames(&parts), sized(&parts)] {
+            let (guard, mut verdict) = ScanGuard::params(body, Encoding::Json);
+            let (passed, failed) = drain(guard).await;
+            assert!(!failed);
+            assert_eq!(passed, parts.concat());
+            assert_eq!(verdict.try_recv(), Ok(Verdict::Clean));
+        }
+    }
+
+    /// A body of known length ends with its last frame: that frame goes
+    /// only once the whole body has scanned clean, so a multipart body cut
+    /// short never reaches the server whole.
+    #[tokio::test]
+    async fn guard_withholds_the_last_frame_of_a_sized_body_until_clean() {
+        let head = format!("--{BOUNDARY}\r\n{}\r\n\r\nvalue", text("caption"));
+        let (guard, mut verdict) =
+            ScanGuard::multipart(sized(&[head.as_bytes()]), BOUNDARY.as_bytes());
+        let (passed, failed) = drain(guard).await;
+        assert!(failed);
+        assert!(passed.is_empty());
+        assert_eq!(verdict.try_recv(), Ok(UNREADABLE));
+    }
+
     #[tokio::test]
     async fn guard_withholds_the_frame_that_completes_a_reference() {
         let head = format!(
@@ -878,14 +1066,14 @@ mod tests {
             b"le:/x",
             closing.as_bytes(),
         ]);
-        let (guard, mut verdict) = MultipartGuard::new(body, BOUNDARY.as_bytes());
+        let (guard, mut verdict) = ScanGuard::multipart(body, BOUNDARY.as_bytes());
         let (passed, failed) = drain(guard).await;
         assert!(failed);
         assert_eq!(passed, [head.as_bytes(), late.as_bytes()].concat());
         assert_eq!(verdict.try_recv(), Ok(LOCAL));
 
         let ended_early = frames(&[head.as_bytes()]);
-        let (guard, mut verdict) = MultipartGuard::new(ended_early, BOUNDARY.as_bytes());
+        let (guard, mut verdict) = ScanGuard::multipart(ended_early, BOUNDARY.as_bytes());
         let (passed, failed) = drain(guard).await;
         assert!(failed);
         assert_eq!(passed, head.as_bytes());
@@ -904,7 +1092,7 @@ mod tests {
         let (start, end) = body.split_at(body.len() / 2);
         let epilogue = b"file:/x, unread";
         let (guard, mut verdict) =
-            MultipartGuard::new(frames(&[start, end, epilogue]), BOUNDARY.as_bytes());
+            ScanGuard::multipart(frames(&[start, end, epilogue]), BOUNDARY.as_bytes());
         let (passed, failed) = drain(guard).await;
         assert!(!failed);
         assert_eq!(passed, [&body[..], epilogue].concat());

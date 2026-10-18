@@ -1,8 +1,9 @@
 //! The gateway streams: 4 MiB and 200 MiB uploads and downloads pass
-//! through keeping `Content-Length` both ways, a multipart upload to a
-//! server in local mode is scanned for local file references as it passes,
-//! and what tgin buffers stays under one fixed bound ([`BOUND`], 4 MiB)
-//! whatever the body size.
+//! through keeping `Content-Length` both ways, a multipart upload, and
+//! JSON bodies over 64 KiB, to a self-hosted server are scanned for local
+//! file references as they pass, and what tgin buffers stays under one
+//! fixed bound ([`BOUND`], 4 MiB) whatever the body size, or about what an
+//! unscanned body takes.
 //!
 //! "Buffered" is measured as the growth of the process's live heap over a
 //! transfer, through the shared counting global allocator
@@ -443,5 +444,158 @@ async fn assert_refused(recorded: &Recorded, uploads: &mut u64, out: (String, St
     assert!(
         !recorded.closing_seen.load(Ordering::SeqCst),
         "the server got the closing boundary"
+    );
+}
+
+/// Requests in flight at once in [`scanned_json_held_flat_across_concurrent_requests`].
+const CONCURRENT: usize = 32;
+
+/// A server that reads each request's body whole and answers none until
+/// `expected` bodies have arrived, so every request is in flight at once;
+/// returns its address and the body bytes it has read.
+async fn holding_server(expected: Arc<AtomicU64>) -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let arrived = Arc::new(AtomicU64::new(0));
+    let read = Arc::new(AtomicU64::new(0));
+    let read_out = Arc::clone(&read);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (arrived, read, expected) = (
+                Arc::clone(&arrived),
+                Arc::clone(&read),
+                Arc::clone(&expected),
+            );
+            tokio::spawn(async move {
+                let mut buf = [0u8; CHUNK];
+                while let Some((end, extra)) = read_head(&mut stream, &mut buf).await {
+                    let head = std::str::from_utf8(&buf[..end]).expect("ASCII").to_owned();
+                    let length: u64 =
+                        header(&head, "content-length").map_or(0, |v| v.parse().expect("length"));
+                    let rest = drain(&mut stream, length - extra as u64, &mut buf).await;
+                    read.fetch_add(extra as u64 + rest, Ordering::SeqCst);
+                    arrived.fetch_add(1, Ordering::SeqCst);
+                    while arrived.load(Ordering::SeqCst) < expected.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let body = br#"{"ok":true,"result":true}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.expect("reply");
+                    stream.write_all(body).await.expect("reply");
+                }
+            });
+        }
+    });
+    (addr, read_out)
+}
+
+/// The bot that streams unscanned, on the `api_url` shorthand.
+const PLAIN_TOKEN: &str = "987654321:BBBBanotherSecretTokenValue_-xyz";
+
+/// Posts a clean JSON `sendMessage` of `size` bytes through tgin for the
+/// bot `token`; returns the response head.
+async fn json_upload(tgin: SocketAddr, token: &'static str, size: usize) -> String {
+    let open = br#"{"chat_id":1,"text":""#;
+    let close = br#""}"#;
+    let mut stream = TcpStream::connect(tgin).await.expect("connect");
+    let head = format!(
+        "POST /bot{token}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/json\r\nContent-Length: {size}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    stream.write_all(open).await.expect("body");
+    let filler = [b'x'; CHUNK];
+    let mut left = size - open.len() - close.len();
+    while left > 0 {
+        let n = left.min(CHUNK);
+        stream.write_all(&filler[..n]).await.expect("body");
+        left -= n;
+    }
+    stream.write_all(close).await.expect("body");
+    let mut buf = [0u8; 1024];
+    let (end, _) = read_head(&mut stream, &mut buf).await.expect("a response");
+    std::str::from_utf8(&buf[..end]).expect("ASCII").to_owned()
+}
+
+/// [`CONCURRENT`] JSON uploads of `size` bytes for `token` at once, each
+/// held by the server until all have arrived; the heap's growth over the
+/// batch.
+async fn json_batch(tgin: SocketAddr, token: &'static str, size: usize) -> isize {
+    let batch = Box::pin(async move {
+        let uploads: Vec<_> = (0..CONCURRENT)
+            .map(|_| tokio::spawn(json_upload(tgin, token, size)))
+            .collect();
+        for upload in uploads {
+            let head = upload.await.expect("the upload task");
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        }
+    });
+    growth(batch).await.0
+}
+
+/// JSON bodies to a self-hosted server are scanned for local file
+/// references while they stream, so tgin keeps no copy of them:
+/// [`CONCURRENT`] 1 MiB bodies in flight at once grow the heap about as
+/// much as as many to a cloud bot, which stream unscanned (hyper's
+/// per-connection read buffers, up to 408 KiB each, are most of it), and
+/// far less than a copy of each would. Measured on Windows: 5 to 18 MB
+/// scanned, 10 to 18 MB unscanned; reading each body whole, as tgin once
+/// did, 71 to 81 MB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scanned_json_held_flat_across_concurrent_requests() {
+    const SIZE_1M: usize = 1024 * 1024 - 64;
+    let _serial = SERIAL.lock().await;
+    let expected = Arc::new(AtomicU64::new(CONCURRENT as u64));
+    let (api, read) = holding_server(Arc::clone(&expected)).await;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("gateway-bounded-json");
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    let file = dir.join("tgin.yaml");
+    std::fs::write(
+        &file,
+        format!(
+            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nupstreams:\n  tba: {{ kind: local, url: \"http://{api}\", local_mode: true }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    upstream: tba\n    gateway: {{ rate_limit: {{ mode: off }} }}\n  - name: plain\n    token: \"{PLAIN_TOKEN}\"\n    api_url: \"http://{api}\"\n    gateway: {{ rate_limit: {{ mode: off }} }}\n"
+        ),
+    )
+    .expect("the config file");
+    let boot = Boot::load(&file, Arc::new(MapEnv::default())).expect("valid config");
+    let app = App::start(boot).await.expect("tgin starts");
+    let tgin = app.data_addrs()[0];
+
+    let mut batches = 0;
+    let mut batch = async |token| {
+        let grew = json_batch(tgin, token, SIZE_1M).await;
+        expected.fetch_add(CONCURRENT as u64, Ordering::SeqCst);
+        batches += 1;
+        grew
+    };
+    // Warm: connections, tasks, metric handles and buffers.
+    batch(TOKEN).await;
+    batch(PLAIN_TOKEN).await;
+    let (mut scanned, mut plain) = (0, 0);
+    for _ in 0..3 {
+        scanned = scanned.max(batch(TOKEN).await);
+        plain = plain.max(batch(PLAIN_TOKEN).await);
+    }
+    assert_eq!(
+        read.load(Ordering::SeqCst),
+        (CONCURRENT * batches * SIZE_1M) as u64,
+        "every body reached the server whole"
+    );
+    println!(
+        "heap growth for {CONCURRENT} x {SIZE_1M} B in flight: {scanned} B scanned, {plain} B unscanned"
+    );
+    let one_each = (CONCURRENT * SIZE_1M) as isize;
+    assert!(
+        scanned <= 2 * plain + BOUND,
+        "scanned bodies grew the heap by {scanned} B, unscanned ones by {plain} B"
+    );
+    assert!(
+        scanned <= one_each * 3 / 4,
+        "{scanned} B for {one_each} B in flight"
     );
 }

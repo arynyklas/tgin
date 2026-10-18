@@ -41,8 +41,7 @@ use tokio::time::{Instant, Sleep, sleep_until};
 use super::chat_key::{ChatKey, chat_key};
 use super::limit::Limited;
 use super::local_files::{
-    MAX_PARAMETERS, MultipartGuard, Refusal, Verdict, boundary, form_has_local_file,
-    json_has_local_file,
+    MAX_PARAMETERS, Refusal, ScanGuard, Verdict, boundary, form_has_local_file, json_has_local_file,
 };
 use super::metrics::{BotMetrics, MethodLabel, MethodMetrics, Outcome, RateAction};
 use super::params::{Encoding, encoding};
@@ -340,12 +339,17 @@ fn scanned_encoding(url: &Url, headers: &HeaderMap) -> Result<Option<Encoding>, 
     Ok(content_type.and_then(encoding))
 }
 
-/// [`prepare`] for a body whose parameters are scanned (ruling R2):
-/// - JSON or urlencoded, it is read whole up to [`MAX_PARAMETERS`] (longer,
-///   refused as too large), refused when it carries a local file
-///   reference, else buffered, its chat read from it;
-/// - multipart, it streams through a [`MultipartGuard`], whose verdict
-///   comes back; an empty one, with no parameters, goes as it is.
+/// [`prepare`] for a body whose parameters are scanned:
+/// - JSON or urlencoded, it is read up to [`BUFFER_LIMIT`]; whole, it is
+///   refused when it carries a local file reference, else buffered, its
+///   chat read from it, as in [`prepare`]. Longer, it streams through a
+///   [`ScanGuard`], so tgin holds no more of it than an unscanned body;
+///   one that announces more than [`MAX_PARAMETERS`] is refused as too
+///   large at once, and one that only turns out longer, while it streams;
+/// - multipart, it streams through a [`ScanGuard`]; an empty one, with no
+///   parameters, goes as it is.
+///
+/// A streamed body's verdict comes back with it.
 async fn prepare_scanned(
     scanned: Encoding,
     content_type: Option<&HeaderValue>,
@@ -354,40 +358,57 @@ async fn prepare_scanned(
     idle: Duration,
     limited: bool,
 ) -> Result<(Payload, Option<ChatKey>, Option<oneshot::Receiver<Verdict>>), Failed> {
+    let chat_of_query = || limited.then(|| query_chat(query)).flatten();
     if scanned == Encoding::Multipart {
-        let chat = limited.then(|| query_chat(query)).flatten();
         // An empty body carries no parameters; wrapped, its end would be
         // hidden until the guard read it, which hyper never does for a
         // zero length.
         if body.is_end_stream() {
-            return Ok((Payload::Streamed(body), chat, None));
+            return Ok((Payload::Streamed(body), chat_of_query(), None));
         }
         let Some(boundary) =
             content_type.and_then(|content_type| boundary(content_type.as_bytes()))
         else {
             return Err(Failed::Refused(Refusal::Unreadable));
         };
-        let (guard, verdict) = MultipartGuard::new(body, boundary);
-        return Ok((Payload::Streamed(Body::new(guard)), chat, Some(verdict)));
+        let (guard, verdict) = ScanGuard::multipart(body, boundary);
+        return Ok((
+            Payload::Streamed(Body::new(guard)),
+            chat_of_query(),
+            Some(verdict),
+        ));
     }
-    let Bounded::Complete(bytes) = read_within(body, MAX_PARAMETERS, idle).await? else {
+    let partial = match read_within(body, BUFFER_LIMIT, idle).await? {
+        Bounded::Complete(bytes) => {
+            let found = match scanned {
+                Encoding::Json => json_has_local_file(&bytes),
+                Encoding::Form | Encoding::Multipart => form_has_local_file(&bytes),
+            };
+            if found {
+                return Err(Failed::Refused(Refusal::LocalFile));
+            }
+            let chat = limited
+                .then(|| query_chat(query).or_else(|| chat_key(content_type, &bytes)))
+                .flatten();
+            return Ok((Payload::Buffered(bytes), chat, None));
+        }
+        Bounded::Over(partial) => partial,
+    };
+    let body = partial.into_body();
+    let max = u64::try_from(MAX_PARAMETERS).unwrap_or(u64::MAX);
+    if body.size_hint().lower() > max {
         return Err(Failed::Refused(Refusal::TooLarge));
-    };
-    let found = match scanned {
-        Encoding::Json => json_has_local_file(&bytes),
-        Encoding::Form | Encoding::Multipart => form_has_local_file(&bytes),
-    };
-    if found {
-        return Err(Failed::Refused(Refusal::LocalFile));
     }
-    let chat = limited
-        .then(|| query_chat(query).or_else(|| chat_key(content_type, &bytes)))
-        .flatten();
-    Ok((Payload::Buffered(bytes), chat, None))
+    let (guard, verdict) = ScanGuard::params(body, scanned);
+    Ok((
+        Payload::Streamed(Body::new(guard)),
+        chat_of_query(),
+        Some(verdict),
+    ))
 }
 
-/// `failed`, or the refusal that made it fail: a [`MultipartGuard`] fails
-/// the upload it refuses.
+/// `failed`, or the refusal that made it fail: a [`ScanGuard`] fails the
+/// upload it refuses.
 fn refused_by(failed: Failed, verdict: Option<oneshot::Receiver<Verdict>>) -> Failed {
     match verdict.and_then(|mut verdict| verdict.try_recv().ok()) {
         Some(Verdict::Refused(refusal)) => Failed::Refused(refusal),

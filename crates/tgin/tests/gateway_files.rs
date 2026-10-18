@@ -1589,3 +1589,92 @@ consumers:
     );
     tgin.stop().await;
 }
+
+/// JSON and urlencoded bodies over 64 KiB stream through the scan: a clean
+/// one reaches the server byte for byte, one whose reference comes late,
+/// or that turns out longer than 1 MiB while it streams (no length
+/// announced), never reaches it whole, and gets 400 or 413.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_bodies_scanned_while_they_stream() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    let padding = "x".repeat(200 * 1024);
+    let clean_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"BQAC"}}"#);
+    let clean_form = format!("chat_id=1&caption={padding}&document=BQAC");
+    for (content_type, body) in [(JSON, &clean_json), (FORM, &clean_form)] {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{TOKEN}/sendDocument"),
+                content_type,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{content_type}");
+        assert_forwarded(&server, TOKEN, "sendDocument", body.as_bytes()).await;
+    }
+    let forwarded = server.received_requests().await.expect("recording").len();
+
+    let late_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"{LOCAL_FILE}"}}"#);
+    let late_form = format!(
+        "chat_id=1&caption={padding}&media={}",
+        encoded(&format!(r#"[{{"media":"{LOCAL_FILE}"}}]"#))
+    );
+    for (content_type, body) in [(JSON, late_json), (FORM, late_form)] {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{TOKEN}/sendDocument"),
+                content_type,
+                body,
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{content_type}"
+        );
+    }
+    let chunk = format!(r#"{{"chat_id":1,"caption":"{}"#, "y".repeat(64 * 1024));
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendMessage"),
+            JSON,
+            reqwest::Body::wrap(Chunked(vec![chunk; 20])),
+        )
+        .await;
+    assert_eq!(
+        description(response).await,
+        (413, "Request Entity Too Large".to_owned())
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        forwarded,
+        "a refused call reached the server whole"
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    tgin.stop().await;
+}
+
+/// A body of `chunks` with no length announced: it goes chunked.
+struct Chunked(Vec<String>);
+
+impl http_body::Body for Chunked {
+    type Data = axum::body::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let chunk = self.get_mut().0.pop();
+        std::task::Poll::Ready(chunk.map(|chunk| Ok(http_body::Frame::data(chunk.into()))))
+    }
+}
