@@ -162,7 +162,7 @@ Telegram posts updates to the data plane.
 | `drop_pending_updates` | boolean | `false` | Telegram's `drop_pending_updates` for `setWebhook`. |
 | `ip_address` | IP address |  | Telegram's `ip_address` for `setWebhook`. |
 | `ip_allowlist` | [IpAllowlist](#ipallowlist) | `none` | Who may post updates: `none` (anyone), `telegram` (Telegram's published networks; not for a `local` upstream) or a list of networks. |
-| `max_connections` | integer (at least 1, at most 100000) |  | Telegram's `max_connections`: 1 to 100, or to 100000 for an upstream in local mode. |
+| `max_connections` | integer (at least 1, at most 100000) |  | Telegram's `max_connections`: 1 to 100, or to 100000 for an upstream in local mode, where a value above 100 must not exceed `server.max_connections`. |
 | `path` | string (not empty) |  | HTTP path updates are posted to. Omitted, `/webhook/<bot name>`. It is matched as written, so it must be what a URL sends: no `?`, `#`, spaces, control or non-ASCII characters, `.`/`..` segments or `\`. Supports `${env:…}` and `${file:…}`. |
 | `public_url` | string (not empty) |  | The public base URL the Bot API server reaches tgin at; `setWebhook` registers it followed by `path`. `https` on port 443, 80, 88 or 8443, except for an upstream in local mode, which takes `http` and any port. Supports `${env:…}` and `${file:…}`. |
 | `register` | boolean | `false` | Call `setWebhook` at start; needs `public_url`. |
@@ -475,9 +475,9 @@ Where a local server's files are: `dir` (with `server_dir`) or `url`. The server
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `dir` | string (not empty) |  | The server's files directory (its `--files-dir`, or `--dir` when that is unset) as mounted in tgin; read-only is enough. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
+| `dir` | string (not empty) |  | The server's files directory, its `--files-dir` (without it, the bot directories hold the server's databases too), as mounted in tgin; read-only is enough. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
 | `server_dir` | string (not empty) |  | The same directory as the server sees it, an absolute path; only with `dir`, which it defaults to. Supports `${env:…}` and `${file:…}`. |
-| `url` | string (not empty) |  | An HTTP origin serving the server's files directory (its `--files-dir`, or `--dir` when that is unset), `http` or `https`. Supports `${env:…}` and `${file:…}`. |
+| `url` | string (not empty) |  | An HTTP origin serving the server's files directory, its `--files-dir`, `http` or `https`. Supports `${env:…}` and `${file:…}`. |
 
 ## `UpstreamKind`
 

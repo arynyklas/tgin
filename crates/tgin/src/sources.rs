@@ -13,13 +13,14 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tgin_botapi::gateway::Gateway;
 use tgin_botapi::{
-    ApiError, BotClient, Identity, LongPollOptions, LongPollSource, Registration, SetWebhook,
+    ApiError, BotClient, Identity, LongPollOptions, LongPollSource, Registration, Retried,
+    SetWebhook, WebhookInfo,
 };
 use tgin_core::config::{Bot, Ingress, LongPoll, SensitiveUrl, UpstreamKind, Webhook};
 use tgin_core::engine::Engine;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
-use tgin_runtime::backoff::{Backoff, honor_retry_after};
+use tgin_runtime::backoff::Backoff;
 use tgin_runtime::obs::{Health, Readiness};
 use tgin_runtime::supervisor::{Exit, Supervisor, TaskState};
 use tokio_util::sync::CancellationToken;
@@ -33,12 +34,6 @@ const IDENTITY_PREFIX: &str = "identity:";
 /// The supervisor's task-name prefix of a webhook bot's `setWebhook`
 /// retries.
 const REGISTER_PREFIX: &str = "register:";
-/// The backoff of a webhook bot's background `getMe`: `(initial, max, floor)`.
-const IDENTITY_BACKOFF: (Duration, Duration, Duration) = (
-    Duration::from_secs(1),
-    Duration::from_secs(300),
-    Duration::from_millis(100),
-);
 /// How long a removed source's task may take to end before its entry is
 /// left to the shutdown.
 const REAP_WAIT: Duration = Duration::from_secs(60);
@@ -724,11 +719,12 @@ impl Sources {
     }
 
     /// After the first `getMe` of the webhook bot `bot` failed with
-    /// `first`, keeps calling it in the background, backing off from 1 s to
-    /// 5 min, until it succeeds (the username then goes to the engine), the
-    /// Bot API server rejects the token (never on a self-hosted server,
-    /// whose 401 or 404 may be about its own api_id or api_hash), or the
-    /// bot stops.
+    /// `first`, keeps calling it in the background with
+    /// [`tgin_botapi::retry_call`] (backing off from 1 s to 5 min, or for the
+    /// server's `retry_after`), until it succeeds (the username then goes
+    /// to the engine), the Bot API server rejects the token (never on a
+    /// self-hosted server, whose 401 or 404 may be about its own api_id or
+    /// api_hash), or the bot stops.
     fn learn_username(&self, bot: &Prepared, first: &ApiError) {
         let local = bot.local_upstream();
         if tgin_botapi::is_fatal(first, local) {
@@ -741,7 +737,7 @@ impl Sources {
             bot.client.clone(),
             bot.stop.clone(),
         );
-        let first_retry_after = retry_after(first);
+        let first = first.clone();
         self.supervisor.spawn(
             Arc::from(identity_task(&name)),
             Backoff::new(
@@ -758,38 +754,25 @@ impl Sources {
                     stop.clone(),
                     Arc::clone(&name),
                 );
+                let first = first.clone();
                 async move {
-                    let (initial, max, floor) = IDENTITY_BACKOFF;
-                    let mut backoff = Backoff::new(initial, max, floor);
-                    let mut server_wait = first_retry_after;
-                    loop {
-                        let delay = honor_retry_after(
-                            backoff.next_delay(&mut rand::rng()),
-                            server_wait,
-                            max,
-                        );
-                        let sleep = tokio::time::sleep(delay);
-                        if stop.run_until_cancelled(sleep).await.is_none() {
-                            return Exit::Done;
+                    let failing = |err: &ApiError, _: Duration| {
+                        tracing::debug!(source = %name, error = %err, "getMe failed again");
+                    };
+                    let get_me = || client.get_me();
+                    match tgin_botapi::retry_call(&stop, local, Some(first), get_me, failing).await
+                    {
+                        Retried::Done(identity) => {
+                            tracing::info!(source = %name, "getMe succeeded; commands addressed to this bot by @username match");
+                            gateway.set_identity(&name, &identity);
+                            engine.set_username(id, identity.user.username);
                         }
-                        match stop.run_until_cancelled(client.get_me()).await {
-                            None => return Exit::Done,
-                            Some(Ok(identity)) => {
-                                tracing::info!(source = %name, "getMe succeeded; commands addressed to this bot by @username match");
-                                gateway.set_identity(&name, &identity);
-                                engine.set_username(id, identity.user.username);
-                                return Exit::Done;
-                            }
-                            Some(Err(err)) if tgin_botapi::is_fatal(&err, local) => {
-                                tracing::warn!(source = %name, error = %err, "the Bot API server rejected the bot token; no longer calling getMe");
-                                return Exit::Done;
-                            }
-                            Some(Err(err)) => {
-                                tracing::debug!(source = %name, error = %err, "getMe failed again");
-                                server_wait = retry_after(&err);
-                            }
+                        Retried::Stopped => {}
+                        Retried::Rejected(err) => {
+                            tracing::warn!(source = %name, error = %err, "the Bot API server rejected the bot token; no longer calling getMe");
                         }
                     }
+                    Exit::Done
                 }
             },
         );
@@ -807,14 +790,6 @@ fn long_poll_options(poll: &LongPoll, local_upstream: bool) -> LongPollOptions {
         delete_webhook_on_start: poll.delete_webhook_on_start,
         local_upstream,
         ..LongPollOptions::default()
-    }
-}
-
-/// The server's `retry_after`, if it sent one.
-fn retry_after(err: &ApiError) -> Option<Duration> {
-    match err {
-        ApiError::Http { retry_after, .. } => *retry_after,
-        _ => None,
     }
 }
 
@@ -853,6 +828,39 @@ async fn webhook_request(bot: &Prepared, hook: &Webhook) -> Option<SetWebhook> {
         ip_address: hook.ip_address,
         certificate,
     })
+}
+
+/// Sets the webhook of `bot`, whose webhook tgin does not register, again
+/// as `before` (what `getWebhookInfo` reported before a `deleteWebhook`):
+/// its URL, `max_connections` and `allowed_updates`, with the secret
+/// tgin's route checks. A webhook with a custom certificate cannot be set
+/// again: tgin does not have it. The error is masked.
+pub(crate) async fn restore_webhook(
+    bot: &Bot,
+    client: &BotClient,
+    before: &WebhookInfo,
+) -> Result<(), String> {
+    let Some(Ingress::Webhook(hook)) = &bot.ingress else {
+        return Ok(());
+    };
+    if before.has_custom_certificate {
+        return Err("it had a custom certificate, which tgin cannot upload again".to_owned());
+    }
+    let url = url::Url::parse(&before.url)
+        .map_err(|_| "the server reported a webhook URL that does not parse".to_owned())?;
+    let request = SetWebhook {
+        url,
+        secret_token: webhook_secret(bot, hook),
+        allowed_updates: before.allowed_updates.clone().unwrap_or_default(),
+        max_connections: before.max_connections,
+        drop_pending_updates: false,
+        ip_address: None,
+        certificate: None,
+    };
+    client
+        .set_webhook(&request)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// Logs the webhook of the bot `name` as registered at `public_url`.

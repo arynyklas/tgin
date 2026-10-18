@@ -180,6 +180,15 @@ pub struct WebhookRules {
 
 /// The ports Telegram posts webhooks to.
 pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
+/// The most connections Telegram opens to a webhook.
+pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
+/// What a plain-http upstream URL off loopback hints.
+const BOT_API_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches";
+/// What a plain-http `files.url` off loopback hints.
+const FILE_SERVER_HINT: &str = "use https, or keep the file server on a network only tgin reaches";
+/// What a plain-http `api_url` off loopback hints: such a URL is most
+/// likely a self-hosted server, which the shorthand treats as the cloud.
+const SHORTHAND_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches; a self-hosted Bot API server belongs in `upstreams: { <name>: { kind: local, url: … } }` with the bot's `upstream: <name>`, as only there does tgin refuse `file:` references (local files of the server) from the bot's downstreams";
 
 impl WebhookRules {
     /// Telegram's rules, unless the server is local and in local mode.
@@ -188,7 +197,11 @@ impl WebhookRules {
         WebhookRules {
             http_allowed: local,
             any_port: local,
-            max_connections: if local { 100_000 } else { 100 },
+            max_connections: if local {
+                100_000
+            } else {
+                TELEGRAM_MAX_CONNECTIONS
+            },
         }
     }
 }
@@ -774,10 +787,17 @@ impl Resolver<'_> {
         for (name, upstream) in &raw.upstreams {
             let path = format!("upstreams.{}", name.as_str());
             let upstream = &upstream.value;
-            let url = self.upstream_url(&format!("{path}.url"), name.as_str(), &upstream.url);
+            let url = self.upstream_url(
+                &format!("{path}.url"),
+                name.as_str(),
+                &upstream.url,
+                BOT_API_HINT,
+            );
             let files = match &upstream.files {
                 None => Some(None),
-                Some(files) => self.files(&format!("{path}.files"), &files.value).map(Some),
+                Some(files) => {
+                    (self.files(&format!("{path}.files"), name.as_str(), &files.value)).map(Some)
+                }
             };
             let kind = upstream.kind.value;
             let response_timeout = upstream.response_timeout.as_ref().map_or(
@@ -803,8 +823,14 @@ impl Resolver<'_> {
 
     /// An upstream's URL. Plain `http` to a host that is not loopback
     /// warns, naming the upstream and never the URL, which may hold
-    /// credentials.
-    fn upstream_url(&mut self, path: &str, name: &str, text: &Template) -> Option<SensitiveUrl> {
+    /// credentials, with `hint`.
+    fn upstream_url(
+        &mut self,
+        path: &str,
+        name: &str,
+        text: &Template,
+        hint: &str,
+    ) -> Option<SensitiveUrl> {
         let url = self.url(path, text, false)?;
         if url.expose().scheme() == "http" && !loopback(url.expose()) {
             self.diag.warnings.push(
@@ -812,17 +838,19 @@ impl Resolver<'_> {
                     "upstream `{name}` sends bot tokens over plain http to a host that is not loopback"
                 ))
                 .at(located(path, text.0.location))
-                .hint("use https, or keep the Bot API server on a network only tgin reaches"),
+                .hint(hint),
             );
         }
         Some(url)
     }
 
-    /// An upstream's `files`; validation reported a shape that is neither
-    /// `dir` nor `url`.
-    fn files(&mut self, path: &str, files: &raw::Files) -> Option<Files> {
+    /// The `files` of the upstream `name`; validation reported a shape that
+    /// is neither `dir` nor `url`. A `url` is an upstream URL: its paths
+    /// name each bot's token.
+    fn files(&mut self, path: &str, name: &str, files: &raw::Files) -> Option<Files> {
         if let Some(url) = &files.url {
-            return self.url(&format!("{path}.url"), url, false).map(Files::Url);
+            let path = format!("{path}.url");
+            return (self.upstream_url(&path, name, url, FILE_SERVER_HINT)).map(Files::Url);
         }
         let text = files.dir.as_ref()?;
         let dir_path = format!("{path}.dir");
@@ -853,7 +881,7 @@ impl Resolver<'_> {
                     self.diag.errors.push(
                         ConfigError::new("`server_dir` must be an absolute path")
                             .at(located(path, text.0.location))
-                            .hint("it is the files directory as the Bot API server sees it (its `--files-dir`, or `--dir` when that is unset), whose absolute paths `getFile` answers in local mode"),
+                            .hint("it is the files directory as the Bot API server sees it (its `--files-dir`), whose absolute paths `getFile` answers in local mode"),
                     );
                     return None;
                 }
@@ -934,7 +962,7 @@ impl Resolver<'_> {
         }
         let path = format!("{path}.api_url");
         let url = match &bot.api_url {
-            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text)?,
+            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text, SHORTHAND_HINT)?,
             None => self.url(&path, &defaults::api_url(), false)?,
         };
         Some(Arc::new(Upstream {

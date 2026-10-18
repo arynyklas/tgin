@@ -11,8 +11,9 @@ use prometheus_client::registry::Registry;
 use reqwest::StatusCode;
 use serde_json::json;
 use tgin_botapi::{
-    ApiError, BotClient, DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, Registration, SetWebhook,
-    WebhookOptions, register, retry_registration, webhook_router, webhook_secret,
+    ApiError, BotClient, DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, Registration, Retried,
+    SetWebhook, WebhookOptions, register, retry_call, retry_registration, webhook_router,
+    webhook_secret,
 };
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
@@ -782,6 +783,32 @@ async fn registration_retries_honour_retry_after() {
     .await;
     assert_eq!(registered, Registration::Registered);
     assert_eq!(*calls.lock(), [Duration::from_secs(3)]);
+}
+
+/// The shared retry loop returns what the call gave, and waits a server's
+/// `retry_after` longer than the backoff's 5 min cap (up to 1 h): on a
+/// frozen clock, a call answered 429 `retry_after` 600 is made again
+/// exactly 600 s later; `failing` heard of the error with that wait.
+#[tokio::test(start_paused = true)]
+async fn retried_calls_return_their_result_after_a_long_retry_after() {
+    let started = tokio::time::Instant::now();
+    let calls = Mutex::new(Vec::new());
+    let heard = Mutex::new(Vec::new());
+    let retried = retry_call(
+        &CancellationToken::new(),
+        false,
+        Some(too_many_requests(600)),
+        || {
+            calls.lock().push(started.elapsed());
+            std::future::ready(Ok::<_, ApiError>(7_u32))
+        },
+        |err: &ApiError, delay: Duration| heard.lock().push((err.retry_after(), delay)),
+    )
+    .await;
+    assert_eq!(retried, Retried::Done(7));
+    assert_eq!(*calls.lock(), [Duration::from_secs(600)]);
+    let wait = Duration::from_secs(600);
+    assert_eq!(*heard.lock(), [(Some(wait), wait)]);
 }
 
 /// On a frozen clock: cancelling the bot's ingest ends the retries at once,

@@ -44,6 +44,17 @@ pub enum ApiError {
     Config(&'static str),
 }
 
+impl ApiError {
+    /// How long the server asked to wait before calling again, when it
+    /// said (`parameters.retry_after`, or the `Retry-After` header).
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
 /// The fields of the bot's own account tgin reads.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct BotUser {
@@ -107,6 +118,22 @@ fn url_origin(url: &Url) -> String {
         shown.push_str("/…");
     }
     shown
+}
+
+/// The fields of `getWebhookInfo` tgin reads. No `Debug`: the URL's path
+/// and query may carry a secret.
+#[derive(Clone, Default, Deserialize)]
+pub struct WebhookInfo {
+    /// Empty when no webhook is set.
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub has_custom_certificate: bool,
+    #[serde(default)]
+    pub pending_update_count: u64,
+    pub max_connections: Option<u32>,
+    /// Absent for the server's default set.
+    pub allowed_updates: Option<Vec<String>>,
 }
 
 /// One bot's Bot API client; clones share the connection pool. `Debug` shows
@@ -264,15 +291,17 @@ impl BotClient {
     /// `getWebhookInfo`'s `pending_update_count`: the updates the server
     /// still holds for the bot.
     pub async fn pending_update_count(&self) -> Result<u64, ApiError> {
-        #[derive(Deserialize)]
-        struct Info {
-            #[serde(default)]
-            pending_update_count: u64,
-        }
+        self.webhook_info()
+            .await
+            .map(|info| info.pending_update_count)
+    }
+
+    /// `getWebhookInfo`: the bot's webhook as the server holds it.
+    pub async fn webhook_info(&self) -> Result<WebhookInfo, ApiError> {
         let body = self
             .send(self.http.get(self.url("getWebhookInfo")?))
             .await?;
-        self.scrubbed(parse_result::<Info>(&body).map(|info| info.pending_update_count))
+        self.scrubbed(parse_result::<WebhookInfo>(&body))
     }
 
     /// `logOut`: the server's `description`, if it sent one, with the token
@@ -994,6 +1023,25 @@ mod tests {
             "{}",
             scrape()
         );
+    }
+
+    #[test]
+    fn retry_after_only_from_http_errors() {
+        let wait = Some(Duration::from_secs(7));
+        let throttled = ApiError::Http {
+            status: 429,
+            description: String::new(),
+            retry_after: wait,
+        };
+        assert_eq!(throttled.retry_after(), wait);
+        let plain = ApiError::Http {
+            status: 502,
+            description: String::new(),
+            retry_after: None,
+        };
+        assert_eq!(plain.retry_after(), None);
+        assert_eq!(ApiError::Network("down".into()).retry_after(), None);
+        assert_eq!(ApiError::Decode("bad".into()).retry_after(), None);
     }
 
     #[tokio::test]

@@ -138,8 +138,8 @@ struct MoveArgs {
     #[arg(long)]
     yes: bool,
     /// How long the Bot API server and tgin get to deliver the bot's
-    /// pending updates, such as `30s` [default: the config's
-    /// `reload.drain_timeout`].
+    /// pending updates, counted from the request, such as `30s`; at most
+    /// `1h` [default: the config's `reload.drain_timeout`, at most `1h`].
     #[arg(long, value_parser = client::parse_timeout, value_name = "DURATION")]
     timeout: Option<HumanDuration>,
 }

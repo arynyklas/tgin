@@ -2661,12 +2661,14 @@ fn files_rules() {
     let err = single_error(&yaml);
     assert_at(&err, "upstreams.u.files.server_dir", pos(&yaml, "var/lib"));
     assert_message(&err, "absolute");
+    // The server's `--files-dir` only: without it, its bot directories
+    // hold TDLib's databases too, which are never to be served.
+    let hint = err.hint.as_deref().unwrap_or_default();
     assert!(
-        err.hint
-            .as_deref()
-            .is_some_and(|h| h.contains("as the Bot API server sees it")),
+        hint.contains("as the Bot API server sees it") && hint.contains("--files-dir"),
         "{err}"
     );
+    assert!(!hint.contains("`--dir`"), "{err}");
 
     // `server_dir` defaults to `dir`, made absolute.
     let cfg = loads(&upstream(
@@ -2776,7 +2778,7 @@ fn duplicate_tokens_rejected() {
 fn webhook_rules_follow_the_upstream_kind() {
     let yaml = |upstreams: &str, bot: &str, hook: &str| {
         format!(
-            "version: 1\nserver: {{}}\n{upstreams}bots:\n  - name: a\n    token: \"1:t\"\n{bot}    ingress: {{ webhook: {hook} }}\n"
+            "version: 1\nserver: {{ max_connections: 100000 }}\n{upstreams}bots:\n  - name: a\n    token: \"1:t\"\n{bot}    ingress: {{ webhook: {hook} }}\n"
         )
     };
     let cloud_like = [
@@ -2893,6 +2895,52 @@ fn webhook_rules_follow_the_upstream_kind() {
     loads(&yaml("", "", "{ ip_allowlist: telegram }"));
 }
 
+/// A local-mode webhook's `max_connections` above 100 must also fit the
+/// data plane's own `server.max_connections`, which closes connections
+/// beyond it; values in Telegram's 1 to 100 are never checked against it,
+/// so no v1 config changes.
+#[test]
+fn local_webhook_max_connections_fit_the_data_plane() {
+    const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+    let yaml = |upstream: &str, server: &str, max: u32| {
+        format!(
+            "version: 1\nserver: {server}\nupstreams:\n  l: {upstream}\nbots:\n  - name: a\n    token: \"{TOKEN}\"\n    upstream: l\n    ingress: {{ webhook: {{ max_connections: {max} }} }}\n"
+        )
+    };
+    let local = "{ kind: local, url: \"http://127.0.0.1:8081\", local_mode: true }";
+    let text = yaml(local, "{}", 10_001);
+    let err = single_error(&text);
+    assert_at(
+        &err,
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "10001"),
+    );
+    assert_message(&err, "above `server.max_connections` (10000)");
+    let hint = err.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("server.max_connections"), "{err}");
+    assert!(!format!("{err}").contains(TOKEN) && !hint.contains(TOKEN));
+
+    let text = yaml(local, "{ max_connections: 500 }", 501);
+    assert_at(
+        &single_error(&text),
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "501"),
+    );
+    for (upstream, server, max) in [
+        (local, "{ max_connections: 20000 }", 20_000),
+        (local, "{}", 10_000),
+        // Within Telegram's range: never compared.
+        (local, "{ max_connections: 50 }", 100),
+        (
+            "{ kind: cloud, url: \"https://api.telegram.org\" }",
+            "{ max_connections: 50 }",
+            100,
+        ),
+    ] {
+        loads(&yaml(upstream, server, max));
+    }
+}
+
 /// A plain-http upstream off loopback warns once, naming the upstream and
 /// never the URL.
 #[test]
@@ -2914,6 +2962,9 @@ fn http_upstream_warning() {
         !warning.to_string().contains("telegram-bot-api"),
         "{warning}"
     );
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("Bot API server"), "{warning}");
+    assert!(!hint.contains("kind: local"), "{warning}");
 
     for quiet in [
         "http://127.0.0.1:8081",
@@ -2929,7 +2980,8 @@ fn http_upstream_warning() {
         );
     }
 
-    // The shorthand is an upstream too.
+    // The shorthand is an upstream too, a cloud one: a self-hosted server
+    // behind it would not have tgin refuse `file:` references.
     let text = "version: 1\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"http://bot-api:8081\"\n";
     let cfg = loads(text);
     let [warning] = cfg.warnings.as_slice() else {
@@ -2938,6 +2990,49 @@ fn http_upstream_warning() {
     assert_at(warning, "bots[0].api_url", pos(text, "\"http://"));
     assert_message(warning, "`api_url`");
     assert!(!warning.to_string().contains("bot-api"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("upstreams: { <name>: { kind: local") && hint.contains("`file:`"),
+        "{warning}"
+    );
+}
+
+/// A `files.url` origin is asked for each bot's directory, named after its
+/// token: plain http to a host that is not loopback warns as an upstream
+/// URL does, naming the upstream and never the URL.
+#[test]
+fn http_files_url_warning() {
+    let yaml = |files_url: &str| {
+        format!(
+            "version: 1\nupstreams:\n  local: {{ kind: local, url: \"http://127.0.0.1:8081\", files: {{ url: \"{files_url}\" }} }}\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: local\n"
+        )
+    };
+    let text = yaml("http://files.internal/tba");
+    let cfg = loads(&text);
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_at(
+        warning,
+        "upstreams.local.files.url",
+        pos(&text, "\"http://files"),
+    );
+    assert_message(warning, "`local`");
+    assert!(!warning.to_string().contains("files.internal"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("file server") && !hint.contains("Bot API server"),
+        "{warning}"
+    );
+    for quiet in ["http://127.0.0.1:8090/tba", "https://files.internal/tba"] {
+        let cfg = loads(&yaml(quiet));
+        assert!(
+            cfg.warnings.is_empty(),
+            "{quiet}: {}",
+            render(&cfg.warnings)
+        );
+    }
 }
 
 #[test]

@@ -22,7 +22,9 @@ use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
 use tgin_runtime::supervisor::TaskState;
 
-use super::{BotMove, ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
+use super::{
+    BotMove, ConsumerStatus, EndpointStatus, MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
+};
 use crate::app::Shared;
 use crate::cli::VERSION;
 use crate::reload::{MoveError, ReloadError};
@@ -389,7 +391,11 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
     let timeout = match Query::<MoveQuery>::try_from_uri(uri).map(|q| q.0.timeout) {
         Ok(None) => None,
         Ok(Some(text)) => match text.parse::<HumanDuration>() {
-            Ok(timeout) if timeout.calendar_unit().is_none() => Some(timeout.get()),
+            Ok(timeout)
+                if timeout.calendar_unit().is_none() && timeout.get() <= MAX_MOVE_TIMEOUT =>
+            {
+                Some(timeout.get())
+            }
             _ => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
         },
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
@@ -404,12 +410,26 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
         Err(MoveError::UnknownBot) => error(StatusCode::NOT_FOUND, "unknown bot"),
         Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
         Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
-        Err(MoveError::Upstream(err)) => {
-            let text = match err {
-                ApiError::Http { description, .. } => description,
-                other => other.to_string(),
-            };
-            error(StatusCode::BAD_GATEWAY, &redactor().redact(&text))
-        }
+        Err(MoveError::Upstream(err)) => refused(shared, &err, ""),
+        Err(MoveError::Unrestored(err)) => refused(
+            shared,
+            &err,
+            "; the bot's webhook was deleted and could not be set again: set it again",
+        ),
     }
+}
+
+/// 502 `upstream refused`: the Bot API server refused a move's call with
+/// `err`, whose text (with `more` appended) may echo a secret, so it
+/// passes through the current redactor.
+fn refused(shared: &Shared, err: &ApiError, more: &str) -> Response {
+    let text = match err {
+        ApiError::Http { description, .. } => format!("{description}{more}"),
+        other => format!("{other}{more}"),
+    };
+    let body = json!({
+        "error": "upstream refused",
+        "description": shared.redactor.load().redact(&text),
+    });
+    (StatusCode::BAD_GATEWAY, axum::Json(body)).into_response()
 }

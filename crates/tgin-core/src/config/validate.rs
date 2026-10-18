@@ -12,7 +12,7 @@ use super::model::{
     At, Bot, Consumer, Files, Gateway, HumanDuration, Ingress, IpAllowlist, Name, Push, RateMode,
     RawConfig, Split, SplitStrategy, Target, Upstream, UpstreamKind,
 };
-use super::resolve::{self, WebhookRules};
+use super::resolve::{self, TELEGRAM_MAX_CONNECTIONS, WebhookRules};
 
 /// Paths that tgin itself serves or will serve: a configured path must not
 /// be one of them or lie below one. The Bot API gateway's paths are reserved
@@ -617,6 +617,25 @@ fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, bot: &Bot, ingre
                     rules.max_connections,
                     ingress.location,
                 );
+                // Above Telegram's 100 (local mode only), the server could
+                // hold more connections than the data plane accepts.
+                if let Some(server) = &raw.server
+                    && (TELEGRAM_MAX_CONNECTIONS + 1..=rules.max_connections).contains(&max.value)
+                    && usize::try_from(max.value).is_ok_and(|n| n > server.max_connections.value)
+                {
+                    let limit = server.max_connections.value;
+                    diag.errors.push(
+                        ConfigError::new(format!(
+                            "`max_connections: {}` is above `server.max_connections` ({limit}); the data plane closes connections beyond that, so the Bot API server's could take every one",
+                            max.value
+                        ))
+                        .at(located(
+                            format!("{path}.max_connections"),
+                            known(max.location, ingress.location),
+                        ))
+                        .hint(format!("lower it to {limit} or less, or raise `server.max_connections`")),
+                    );
+                }
             }
             if hook.ip_allowlist.value == IpAllowlist::Telegram
                 && upstream.is_some_and(|upstream| upstream.kind.value == UpstreamKind::Local)

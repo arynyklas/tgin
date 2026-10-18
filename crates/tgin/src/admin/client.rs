@@ -11,7 +11,7 @@ use tgin_core::config::model::HumanDuration;
 use tgin_runtime::http::{self, ClientOptions, describe_error};
 use url::Url;
 
-use super::{BotMove, ConsumerStatus, Moved, Status};
+use super::{BotMove, ConsumerStatus, MAX_MOVE_TIMEOUT, Moved, Status};
 use crate::exit;
 
 /// The admin API `tgin admin` talks to without `--url`: the default of
@@ -66,8 +66,8 @@ pub fn parse_url(text: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// Parses `bot logout|close --timeout`: a duration such as `30s`, without
-/// month or year units.
+/// Parses `bot logout|close --timeout`: a duration such as `30s`, at most
+/// 1 h, without month or year units.
 ///
 /// # Errors
 ///
@@ -76,10 +76,13 @@ pub fn parse_timeout(text: &str) -> Result<HumanDuration, String> {
     let timeout: HumanDuration = text
         .parse()
         .map_err(|err| format!("not a duration such as `30s`: {err}"))?;
-    match timeout.calendar_unit() {
-        Some(unit) => Err(format!("`{unit}` is a month or year unit")),
-        None => Ok(timeout),
+    if let Some(unit) = timeout.calendar_unit() {
+        return Err(format!("`{unit}` is a month or year unit"));
     }
+    if timeout.get() > MAX_MOVE_TIMEOUT {
+        return Err("a move's timeout is at most 1h".to_owned());
+    }
+    Ok(timeout)
 }
 
 /// What `bot logout|close` without `--yes` prints: the steps it would take.
@@ -295,14 +298,18 @@ fn health(command: &Command, answer: &Answer) -> u8 {
     }
 }
 
-/// The server's account of a failure: its `error`, its list of config
-/// errors, or the body as sent.
+/// The server's account of a failure: its `error` (with its
+/// `description`, when it sent one), its list of config errors, or the
+/// body as sent.
 fn failure(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return body.trim().to_owned();
     };
     if let Some(error) = value["error"].as_str() {
-        return error.to_owned();
+        return match value["description"].as_str() {
+            Some(description) => format!("{error}: {description}"),
+            None => error.to_owned(),
+        };
     }
     if let Some(errors) = value["errors"].as_array() {
         let mut text = format!(
@@ -605,6 +612,16 @@ mod tests {
     }
 
     #[test]
+    fn move_timeouts_are_at_most_an_hour() {
+        for ok in ["30s", "1h", "60m", "0s"] {
+            assert!(parse_timeout(ok).is_ok(), "{ok}");
+        }
+        for bad in ["61m", "1h 1s", "2h", "1M", "soon"] {
+            assert!(parse_timeout(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn failure_lists_config_errors() {
         let body = r#"{"errors":[{"path":"bots[0].token","line":3,"column":12,"message":"bad","hint":"fix it"},{"path":null,"line":null,"column":null,"message":"other","hint":null}]}"#;
         assert_eq!(
@@ -612,6 +629,10 @@ mod tests {
             "the config was rejected (2 errors); the running config is unchanged\nerror: bots[0].token (line 3, column 12): bad\n  hint: fix it\nerror: other"
         );
         assert_eq!(failure(r#"{"error":"unauthorized"}"#), "unauthorized");
+        assert_eq!(
+            failure(r#"{"error":"upstream refused","description":"Bad Request: no"}"#),
+            "upstream refused: Bad Request: no"
+        );
         assert_eq!(failure("plain text\n"), "plain text");
     }
 

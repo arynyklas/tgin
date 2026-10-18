@@ -10,13 +10,13 @@ pub mod pull;
 mod secret;
 mod webhook;
 
-pub use client::{ApiError, BotClient, BotUser, Identity, SetWebhook, split_updates};
+pub use client::{ApiError, BotClient, BotUser, Identity, SetWebhook, WebhookInfo, split_updates};
 pub use facts::{FactsError, extract};
 /// The network type of [`IpAllowlist`] and [`WebhookOptions::trusted_proxies`].
 pub use ipnet::IpNet;
 pub use longpoll::{LongPollOptions, LongPollSource, OnIdentity, is_fatal};
 pub use secret::webhook_secret;
 pub use webhook::{
-    DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, Registration, WebhookOptions, client_ip, register,
-    retry_registration, webhook_router,
+    DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, Registration, Retried, WebhookOptions, client_ip,
+    register, retry_call, retry_registration, webhook_router,
 };
