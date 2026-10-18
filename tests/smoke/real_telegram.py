@@ -213,6 +213,12 @@ def description(answer):
     return answer.get("description", "") if isinstance(answer, dict) else str(answer)
 
 
+def result(answer):
+    """A Bot API answer's `result` object, or {} (an error, a timeout, a non-object)."""
+    value = answer.get("result") if isinstance(answer, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
 def multipart(fields, file_field=None, filename=None, content=b""):
     """A multipart/form-data body: text `fields`, then one file part unless
     `file_field` is None."""
@@ -452,19 +458,20 @@ class Run:
             raise Abort("migration not confirmed; nothing was changed")
 
     def probe_server(self):
-        """Any HTTP answer from the self-hosted server, asked without the token;
-        aborts (before the logout, so nothing changes) when there is none."""
+        """An answer from the self-hosted server, asked without the token: any
+        status below 500 (the server answers 404 to an unknown path). Aborts,
+        before the logout, so nothing changes, on no answer or a 5xx, which a
+        proxy in front of a dead server sends."""
         try:
             status = request("GET", f"{self.api}/", timeout=10)[0]
         except OSError as err:
             status = type(err).__name__
-        if not isinstance(status, int):
+        if not isinstance(status, int) or status >= 500:
             raise Abort(f"the self-hosted server {self.api} does not answer ({status}); nothing was changed")
         say(f"the self-hosted server answers (HTTP {status} without a token)")
 
     def migrate(self):
         say("\nMIGRATION (--migrate)")
-        self.probe_server()
         env = {k: v for k, v in os.environ.items() if not k.startswith("TGIN_ADMIN_")}
         done = subprocess.run(
             [str(self.args.tgin), "admin", "--url", self.admin, "bot", "logout", "smoke", "--yes", "--timeout", "60s"],
@@ -568,14 +575,16 @@ class Run:
         status, answer = call(captured, "setWebhook", params)
         CHECK("the same setWebhook again is 'already set'", description(answer) == "Webhook is already set", description(answer))
         status, info = call(captured, "getWebhookInfo")
-        CHECK("getWebhookInfo on /c/captured/ shows the runtime endpoint", info["result"]["url"] == self.hook.url("/captured"), info)
+        CHECK("getWebhookInfo on /c/captured/ shows the runtime endpoint", result(info).get("url") == self.hook.url("/captured"), info)
         status, raw = request("GET", f"{self.admin}/v1/status", timeout=10)[0::2]
-        endpoints = next(
-            (c.get("endpoints", []) for c in json.loads(raw).get("consumers", []) if c["name"] == "captured"), []
-        )
-        CHECK("/v1/status lists it as runtime", [e.get("runtime") for e in endpoints] == [True], endpoints)
+        try:
+            consumers = json.loads(raw).get("consumers", []) if status == 200 else []
+        except ValueError:
+            consumers = []
+        endpoints = next((c.get("endpoints", []) for c in consumers if c["name"] == "captured"), [])
+        CHECK("/v1/status lists it as runtime", [e.get("runtime") for e in endpoints] == [True], endpoints or status)
         status, info = call(self.direct, "getWebhookInfo")
-        CHECK(f"{self.server} still has no webhook after the capture", info["result"].get("url") == "", status)
+        CHECK(f"{self.server} still has no webhook after the capture", status == 200 and result(info).get("url") == "", status)
 
         status, photos = call(self.gateway, "getUserProfilePhotos", {"user_id": self.bot_id, "limit": 1})
         sizes = photos["result"]["photos"] if status == 200 and photos.get("ok") and photos["result"]["photos"] else None
@@ -989,6 +998,8 @@ def main():
         run = Run(args, token)
         if args.migrate:
             run.precheck(f"{run.cloud}/bot{token}", "the cloud Bot API")
+            # Before the question: a run that would abort never asks for the logout.
+            run.probe_server()
             run.confirm_migration()
         else:
             run.precheck(run.direct, "the local server" if run.local else "the Bot API")
