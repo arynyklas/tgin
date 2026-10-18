@@ -35,8 +35,9 @@
 //! after that it goes on. Failures: 400 `invalid
 //! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
 //! `parked`, 504 `upstream not drained` when the server still held updates
-//! at the deadline, or could not say (the bot runs on unchanged; the
-//! warning logged names the server's error), 504 `calls in flight` when
+//! `min(5 s, timeout/4)` before the deadline, or could not say (the bot
+//! runs on unchanged; the warning logged names the server's error), 504
+//! `calls in flight` when
 //! calls of the bot were still being sent to the server at the deadline,
 //! their count and the way out in `description` (nothing was called on the
 //! server; the bot runs on), 502 `upstream

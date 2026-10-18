@@ -1818,7 +1818,7 @@ async fn upstream_429_longer_than_max_wait_passes_through() {
     tgin.stop().await;
 }
 
-/// Review Focus 3: a request goes upstream at most twice, even when
+/// A request goes upstream at most twice, even when
 /// Telegram answers the second time with a 429 that could be retried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_429_goes_upstream_at_most_twice() {

@@ -162,7 +162,7 @@ struct Answer {
 }
 
 /// The admin client's options: `timeout` for connecting, and for the whole
-/// request unless `None`, and no proxy ever (R34): the bearer token would
+/// request unless `None`, and no proxy ever: the bearer token would
 /// reach the proxy in cleartext, and the health check would depend on it.
 fn client_options(connect: Duration, total: Option<Duration>) -> ClientOptions {
     ClientOptions {

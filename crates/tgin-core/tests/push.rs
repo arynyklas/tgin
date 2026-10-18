@@ -1085,7 +1085,7 @@ async fn runtime_endpoint_receives_updates_with_secret() {
     );
 }
 
-/// Push consumer with no endpoint at all (decision 8, R21): it leases
+/// Push consumer with no endpoint at all: it leases
 /// nothing, so updates admitted before a `setWebhook` stay queued, none
 /// dead-lettered, and the dispatcher sleeps until an endpoint arrives. On
 /// the paused clock the 50-minute sleep completes only if the dispatcher
@@ -1453,7 +1453,7 @@ impl ReplyExecutor for Gate {
     fn forget(&self, _consumer: &str) {}
 }
 
-/// R26: a delivery gives its endpoint's in-flight claim back before its
+/// A delivery gives its endpoint's in-flight claim back before its
 /// reply runs, so `least_in_flight` sees the endpoint free while the reply
 /// is executed, and the next update goes to the same endpoint.
 #[tokio::test]

@@ -1,4 +1,4 @@
-//! Local file references (plan decision 4, ruling R14): a Bot API server in
+//! Local file references: a Bot API server in
 //! local mode reads a parameter as a file of its own disk when the value
 //! begins with `file:/` (telegram-bot-api `Client::get_input_file`). For a
 //! bot on a `local` upstream without `allow_local_files`, in local mode or

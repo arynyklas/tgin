@@ -58,7 +58,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
 /// rotated token applies at once). Without a token, a request is
 /// authorized only while every admin listener is on loopback: a reload may
 /// drop the token while a non-loopback listener stays bound until a
-/// restart, and then nothing is authorized (R40).
+/// restart, and then nothing is authorized.
 fn authorized(shared: &Shared, headers: &HeaderMap) -> bool {
     match &shared.config.load().admin.token {
         Some(token) => bearer_matches(headers, token),

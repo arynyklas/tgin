@@ -1581,7 +1581,7 @@ consumers:
     assert_eq!(h.stats("shared").available, 1, "x's leftover stays");
 }
 
-/// A runtime endpoint belongs to the bot whose `setWebhook` set it (R37):
+/// A runtime endpoint belongs to the bot whose `setWebhook` set it:
 /// a reload that keeps the consumer and its bot keeps it; one that moves
 /// the consumer to another bot, leaves it with none, or turns
 /// `accept_set_webhook` off clears it.

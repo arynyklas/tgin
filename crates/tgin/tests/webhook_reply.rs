@@ -512,7 +512,7 @@ fn assert_no_token_logged() {
     assert!(!LOGS.text().contains(TOKEN), "the bot token was logged");
 }
 
-/// Review Focus 5: the reply goes to Telegram exactly as the endpoint sent
+/// The reply goes to Telegram exactly as the endpoint sent
 /// it, once per delivery, while the update is still leased. Under
 /// `ordering: per_chat` the chat's next update is posted only after the
 /// reply call has completed.

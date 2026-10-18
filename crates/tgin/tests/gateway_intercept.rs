@@ -460,7 +460,7 @@ async fn get_updates_consumer_scoped_serves_queue() {
     assert_eq!(status, 200, "{body}");
     assert!(update_ids(&body).is_empty());
     tgin.wait_held("workers", 0).await;
-    // Review Focus 6: on an empty queue, grammY's and Telegraf's shutdown
+    // On an empty queue, grammY's and Telegraf's shutdown
     // confirm (no `timeout`) still answers at once, not after a long poll.
     let started = Instant::now();
     let confirm = timeout(

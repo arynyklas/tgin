@@ -29,7 +29,7 @@ const MAX_DELIMITER_LEN: usize = MAX_BOUNDARY_LEN + 4;
 const MAX_PART_HEADERS: usize = 1 << 18;
 /// The server's bound on its text parameters (`HttpReader`'s
 /// `MAX_TOTAL_PARAMETERS_LENGTH`): the longest JSON or urlencoded body tgin
-/// reads to scan, and the most multipart text it scans (ruling R2).
+/// reads to scan, and the most multipart text it scans.
 pub(in crate::gateway) const MAX_PARAMETERS: usize = 1 << 20;
 
 /// The boundary of a multipart `Content-Type` as the server takes it: the

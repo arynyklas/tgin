@@ -474,7 +474,7 @@ pub(crate) fn compile(
 
 /// Clears the runtime endpoint of every push consumer of `state` that no
 /// longer accepts one, that the bot whose `setWebhook` set it no longer
-/// feeds (R37), or whose bot's token changed since: a token holder never
+/// feeds, or whose bot's token changed since: a token holder never
 /// redirects another bot's updates, not even across reloads, and rotating a
 /// leaked token evicts what its holder set. Draining instances keep theirs
 /// to deliver what they hold, unless their bot's token changed (see

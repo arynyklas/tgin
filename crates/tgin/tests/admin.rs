@@ -1291,7 +1291,7 @@ async fn local_upstream_rejection_backs_off() {
     tgin.stop().await;
 }
 
-/// R40: once a reload drops `admin.token` while a non-loopback admin
+/// Once a reload drops `admin.token` while a non-loopback admin
 /// listener stays bound (`admin.listen` changes need a restart), every
 /// protected endpoint refuses every request; the probes stay open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3277,7 +3277,7 @@ async fn wait_logged(parts: &[&str], before: usize) {
     }
 }
 
-/// R17: a move asked for before a reload runs before it. While one move
+/// A move asked for before a reload runs before it. While one move
 /// runs (its server reports pending updates until the test clears them)
 /// and another waits, a SIGHUP reload moving the waiting bot to another
 /// upstream waits too: the waiting bot is logged out of the server it

@@ -1,5 +1,5 @@
 //! The file route of self-hosted Bot API servers and local mode's `getFile`
-//! paths (plan decision 3):
+//! paths:
 //!
 //! | Upstream | `/file/bot<token>/<rel>` | `getFile` |
 //! |---|---|---|
@@ -43,8 +43,8 @@ pub(super) const NOT_SERVED: &str = "Not Found: files are not served for this up
 /// A path that leaves the bot's directory, or that no file origin is
 /// given.
 pub(super) const NOT_FOUND: &str = "Not Found";
-/// The largest `getFile` answer read for its rewrite (ruling R3); a larger
-/// one passes verbatim.
+/// The largest `getFile` answer read for its rewrite, so a rewrite never
+/// buffers an unbounded body; a larger one passes verbatim.
 const GET_FILE_LIMIT: usize = 64 * 1024;
 /// The read size of a served file.
 const CHUNK: usize = 64 * 1024;
@@ -77,8 +77,8 @@ pub(super) enum Rewrite {
     Off,
     /// `{server_dir}/{token dir}/…`: the server's directory as it sees it.
     Under(String),
-    /// An absolute path through `/{token dir}/` (ruling R9: a file origin
-    /// has no `server_dir`).
+    /// An absolute path through `/{token dir}/` (a file origin has no
+    /// `server_dir`).
     AtBotDir,
 }
 
@@ -428,7 +428,7 @@ fn digits(text: &str) -> Option<u64> {
 }
 
 /// A local-mode `getFile` answer from `bot`'s upstream with its own
-/// absolute `file_path` made relative (ruling R3): a 2xx answer without
+/// absolute `file_path` made relative: a 2xx answer without
 /// `Content-Encoding` of at most [`GET_FILE_LIMIT`] bytes is read and
 /// rewritten by [`rewrite_get_file`], `Content-Length` adjusted; any other
 /// answer passes verbatim.

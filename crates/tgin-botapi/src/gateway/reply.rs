@@ -1,6 +1,6 @@
 //! Webhook replies: the method call a push endpoint answered an update
 //! with, made to the bot's Bot API server the way Telegram makes a
-//! webhook's (decision 3, `WebhookActor.cpp`):
+//! webhook's (`WebhookActor.cpp`):
 //! - the method is the body's `method` parameter (JSON, urlencoded or a
 //!   multipart text field); an empty or missing one, any `get…` method,
 //!   `setWebhook`, `deleteWebhook`, `close` and `logOut` are refused, in
