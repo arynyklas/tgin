@@ -37,8 +37,9 @@
 //! `parked`, 504 `upstream not drained` when the server still held updates
 //! at the deadline, or could not say (the bot runs on unchanged; the
 //! warning logged names the server's error), 504 `calls in flight` when
-//! calls of the bot were still being sent to the server at the deadline
-//! (nothing was called on the server; the bot runs on), 502 `upstream
+//! calls of the bot were still being sent to the server at the deadline,
+//! their count and the way out in `description` (nothing was called on the
+//! server; the bot runs on), 502 `upstream
 //! refused` with the server's masked text in `description` when it refused
 //! the call (the bot runs on).
 //!

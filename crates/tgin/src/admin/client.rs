@@ -633,6 +633,12 @@ mod tests {
             failure(r#"{"error":"upstream refused","description":"Bad Request: no"}"#),
             "upstream refused: Bad Request: no"
         );
+        assert_eq!(
+            failure(
+                r#"{"error":"calls in flight","description":"2 calls of the bot were still being sent"}"#
+            ),
+            "calls in flight: 2 calls of the bot were still being sent"
+        );
         assert_eq!(failure("plain text\n"), "plain text");
     }
 

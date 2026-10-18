@@ -4269,9 +4269,12 @@ async fn move_waits_for_a_call_being_sent() {
     tgin.stop().await;
 }
 
+/// The `description` of a move's 504 `calls in flight` with one call left.
+const BUSY_ONE: &str = "1 calls of the bot were still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)";
+
 /// A call still being sent at the move's deadline fails the move with 504
-/// `calls in flight`: nothing is called on the server, and the bot runs on,
-/// its calls going through again.
+/// `calls in flight`, saying how many and what to do: nothing is called on
+/// the server, and the bot runs on, its calls going through again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_fails_504_while_a_call_is_still_sent() {
     let Herald {
@@ -4291,7 +4294,10 @@ async fn move_fails_504_while_a_call_is_still_sent() {
         .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(failed.status, 504, "{}", failed.body);
-    assert_eq!(failed.json(), json!({ "error": "calls in flight" }));
+    assert_eq!(
+        failed.json(),
+        json!({ "error": "calls in flight", "description": BUSY_ONE })
+    );
     assert!(
         !methods
             .lock()
@@ -4351,7 +4357,10 @@ async fn move_fails_504_while_a_webhook_reply_is_sent() {
         .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(failed.status, 504, "{}", failed.body);
-    assert_eq!(failed.json(), json!({ "error": "calls in flight" }));
+    assert_eq!(
+        failed.json(),
+        json!({ "error": "calls in flight", "description": BUSY_ONE })
+    );
     assert!(
         !methods
             .lock()

@@ -114,9 +114,9 @@ pub(crate) enum MoveError {
     /// The Bot API server still held updates of the bot at the deadline;
     /// the bot runs on unchanged.
     Undrained,
-    /// Calls of the bot were still being sent to its server at the
-    /// deadline; nothing was called on the server, and the bot runs on.
-    Busy,
+    /// This many calls of the bot were still being sent to its server at
+    /// the deadline; nothing was called on the server, and the bot runs on.
+    Busy(usize),
     /// The Bot API server refused or failed the call (token masked); the
     /// bot runs on.
     Upstream(ApiError),
@@ -679,7 +679,7 @@ impl Reloader {
                 let sending = gateway.sending(name);
                 tracing::warn!(bot = %name, ?timeout, sending, "calls of the bot were still being sent to its Bot API server at the deadline; the bot was not moved and starts again");
                 self.resume(&cfg, bot).await;
-                return Some(Err(MoveError::Busy));
+                return Some(Err(MoveError::Busy(sending)));
             }
             Some(Ok(())) => {}
         }

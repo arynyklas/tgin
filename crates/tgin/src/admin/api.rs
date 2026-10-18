@@ -410,7 +410,15 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
         Err(MoveError::UnknownBot) => error(StatusCode::NOT_FOUND, "unknown bot"),
         Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
         Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
-        Err(MoveError::Busy) => error(StatusCode::GATEWAY_TIMEOUT, "calls in flight"),
+        Err(MoveError::Busy(sending)) => {
+            let body = json!({
+                "error": "calls in flight",
+                "description": format!(
+                    "{sending} calls of the bot were still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)"
+                ),
+            });
+            (StatusCode::GATEWAY_TIMEOUT, axum::Json(body)).into_response()
+        }
         Err(MoveError::Upstream(err)) => refused(shared, &err, ""),
         Err(MoveError::Unrestored(err)) => refused(
             shared,
