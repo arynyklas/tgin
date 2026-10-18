@@ -1512,7 +1512,13 @@ consumers:
 
     // An origin outage before any server outcome: still absent.
     let down = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
-    assert_eq!(down.status(), 502);
+    assert_eq!(
+        description(down).await,
+        (
+            502,
+            "Bad Gateway: the file server is unreachable".to_owned()
+        )
+    );
     assert_eq!(series("gw"), None);
 
     let call = tgin

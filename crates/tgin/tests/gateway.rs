@@ -2750,3 +2750,58 @@ async fn upstream_that_never_reads_sets_upstream_up_to_zero() {
     held.abort();
     tgin.stop().await;
 }
+
+/// A `files.url` origin is a static file server, not the Bot API server: it
+/// gets `upstream_idle_timeout` (1 s) to answer, not the upstream's
+/// `response_timeout` (10 m here), and its silence is its own, never "the
+/// call may have been executed".
+#[tokio::test(start_paused = true)]
+async fn file_origin_bounded_by_the_idle_timeout() {
+    let frozen = freeze();
+    let (api, mut arrivals) = waiting_server().await;
+    let config = local_config(&format!("http://{api}"), "origin", "10m").replace(
+        "response_timeout: 10m }",
+        &format!("response_timeout: 10m, files: {{ url: \"http://{api}/files\" }} }}"),
+    );
+    let tgin = start(&config).await;
+    let response = spawn_call(
+        tgin.http
+            .get(tgin.url(&format!("/file/bot{TOKEN}/documents/file_1.pdf"))),
+    );
+    let arrival = within("the origin request", arrivals.recv())
+        .await
+        .expect("open");
+    tokio::time::advance(Duration::from_millis(999)).await;
+    unanswered("a silent origin before the idle timeout", &response).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let (status, body) = within("the 502", response).await.expect("sent");
+    assert_eq!(
+        (status, body),
+        (
+            502,
+            telegram_error(502, "Bad Gateway: the file server did not answer")
+        )
+    );
+    assert_eq!(arrival.at.elapsed(), Duration::from_secs(1));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="origin",method="file",outcome="unreachable"} 1"#,
+    );
+    let logs = LOGS.text();
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains("bot=origin")).collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("WARN") && l.contains("the file server did not answer")),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("Bot API server") || l.contains("may have been executed")),
+        "{}",
+        lines.join("\n")
+    );
+    frozen.thaw();
+    tgin.stop().await;
+}

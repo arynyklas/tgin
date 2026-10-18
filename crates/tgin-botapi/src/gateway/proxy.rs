@@ -60,6 +60,11 @@ pub(super) const NO_ANSWER: &str =
 /// The 502 when the server never had the whole request (the connection
 /// failed, or the upload stalled or broke off): it did not execute the call.
 const UNREACHABLE: &str = "Bad Gateway: the Bot API server is unreachable";
+/// The 502 when a file origin (`files.url`) sent no answer: a download
+/// changes nothing, so there is nothing to be unsure of.
+const FILE_NO_ANSWER: &str = "Bad Gateway: the file server did not answer";
+/// The 502 when a file origin could not be reached.
+const FILE_UNREACHABLE: &str = "Bad Gateway: the file server is unreachable";
 
 /// Request headers forwarded on every route. Never `Content-Encoding`:
 /// telegram-bot-api inflates gzip and deflate bodies, and the local file
@@ -514,17 +519,25 @@ impl Call<'_> {
 
     /// [`Call::send`]'s exchange. While the body is being sent,
     /// `upstream_idle_timeout` bounds its stalls; once it has been sent,
-    /// `response_timeout` bounds the wait from its end.
+    /// `response_timeout` bounds the wait from its end, for the Bot API
+    /// server. A file origin serves static files: `upstream_idle_timeout`
+    /// bounds its answer too.
     async fn exchange(
         &self,
         url: Url,
         headers: HeaderMap,
         body: Body,
     ) -> Result<(reqwest::Response, Instant), Failed> {
+        let idle = self.bot.gateway.upstream_idle_timeout;
         let bounds = Bounds {
-            idle: self.bot.gateway.upstream_idle_timeout,
-            response: self.bot.response_timeout,
+            idle,
+            response: if self.server {
+                self.bot.response_timeout
+            } else {
+                idle
+            },
         };
+        let peer = self.peer();
         let progress = Arc::new(Progress::new());
         let upload = Upload::new(body, Arc::clone(&progress));
         let started = Instant::now();
@@ -541,17 +554,25 @@ impl Call<'_> {
             // A body that was empty from the start counts as sent at once,
             // so a failed connect is told apart by the error.
             Waited::Ready(Err(err)) if err.is_connect() || !progress.ended() => {
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server is unreachable");
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: {peer} is unreachable");
                 return Err(Failed::Unreachable);
             }
             Waited::Ready(Err(err)) => {
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server did not answer; the call may have been executed");
+                if self.server {
+                    tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server did not answer; the call may have been executed");
+                } else {
+                    tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the file server did not answer");
+                }
                 return Err(Failed::NoAnswer);
             }
             Waited::Idle if progress.client_pending() => return Err(Failed::ClientIdle),
             Waited::Idle => return Err(Failed::Idle),
             Waited::NoAnswer => {
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), response_timeout = ?bounds.response, "gateway request failed: no response within response_timeout after the request was sent; the call may have been executed");
+                if self.server {
+                    tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), response_timeout = ?bounds.response, "gateway request failed: no response within response_timeout after the request was sent; the call may have been executed");
+                } else {
+                    tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?bounds.response, "gateway request failed: the file server did not answer within upstream_idle_timeout");
+                }
                 return Err(Failed::NoAnswer);
             }
         };
@@ -559,6 +580,27 @@ impl Call<'_> {
         self.handles
             .upstream_seconds(at.duration_since(started).as_secs_f64());
         Ok((response, at))
+    }
+
+    /// Who the request goes to, for log lines.
+    fn peer(&self) -> &'static str {
+        if self.server {
+            "the Bot API server"
+        } else {
+            "the file server"
+        }
+    }
+
+    /// The description of the 502 for a request without an answer: `sent`,
+    /// the whole request had gone out. Only a call to the Bot API server
+    /// may have been executed.
+    fn no_answer(&self, sent: bool) -> &'static str {
+        match (self.server, sent) {
+            (true, true) => NO_ANSWER,
+            (true, false) => UNREACHABLE,
+            (false, true) => FILE_NO_ANSWER,
+            (false, false) => FILE_UNREACHABLE,
+        }
     }
 
     /// The answer to a request that got no response, counted.
@@ -575,16 +617,16 @@ impl Call<'_> {
             }
             Failed::Unreachable => {
                 self.counted.store(true, Ordering::Relaxed);
-                unreachable(self.handles, UNREACHABLE)
+                unreachable(self.handles, self.no_answer(false))
             }
             Failed::Idle | Failed::ClientIdle => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
                 self.counted.store(true, Ordering::Relaxed);
-                unreachable(self.handles, UNREACHABLE)
+                unreachable(self.handles, self.no_answer(false))
             }
             Failed::NoAnswer => {
                 self.counted.store(true, Ordering::Relaxed);
-                unreachable(self.handles, NO_ANSWER)
+                unreachable(self.handles, self.no_answer(true))
             }
             Failed::Refused(refusal) => {
                 tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
