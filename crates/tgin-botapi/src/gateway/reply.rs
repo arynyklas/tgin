@@ -5,8 +5,9 @@
 //!   multipart text field); an empty or missing one, any `get…` method,
 //!   `setWebhook`, `deleteWebhook`, `close` and `logOut` are refused, in
 //!   any case;
-//! - to a bot whose self-hosted server must not get a local file
-//!   reference, a reply carrying one is refused (`local_files`);
+//! - to a bot on a Bot API server other than the Telegram cloud, a reply
+//!   carrying a local file reference is refused unless the bot allows
+//!   them (`local_files`);
 //! - the bot's rate limits apply as to a gateway request;
 //! - the body goes to `{url}/bot{token}/{method}` unchanged, with its
 //!   `Content-Type`, once: nothing is re-encoded, multipart files included,
@@ -107,7 +108,7 @@ impl Gateway {
             && let Verdict::Refused(refusal) = body_verdict(Some(&reply.content_type), &reply.body)
         {
             counts.count(ReplyOutcome::Refused);
-            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), reason = refusal.reason(), "webhook reply refused: it carries a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
+            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), reason = refusal.reason(), "webhook reply refused: it carries a local file reference, or parameters tgin cannot check, for a Bot API server other than the Telegram cloud");
             return;
         }
         if bot.limiter.applies(&method) && !admit(bot, consumer, label, &reply, &counts).await {

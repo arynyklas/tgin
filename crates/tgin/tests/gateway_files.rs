@@ -30,6 +30,7 @@ const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
 const OTHER_TOKEN: &str = "987654321:BBBBanotherSecretTokenValue_-xyz";
 const THIRD_TOKEN: &str = "555555555:CCCCthirdSecretTokenValue_-xyz-abc";
 const FOURTH_TOKEN: &str = "444444444:DDDDfourthSecretTokenValue_-xyz-abc";
+const FIFTH_TOKEN: &str = "333333333:EEEEfifthSecretTokenValue_-xyz-abcd";
 const CONTENT: &[u8] = b"0123456789";
 
 /// Everything every test logs, unredacted: the test subscriber has no
@@ -988,9 +989,10 @@ const MULTIPART: &str = "multipart/form-data; boundary=local-files-boundary";
 
 /// Bots on `api`: `gw` (`TOKEN`) and `allowed` (`OTHER_TOKEN`, with
 /// `allow_local_files`) on a local upstream in local mode, `plain`
-/// (`THIRD_TOKEN`) on a local upstream without it (refused all the same),
-/// `cloud` (`FOURTH_TOKEN`) on the cloud. Only `gw` keeps the default rate
-/// limits.
+/// (`THIRD_TOKEN`) on a local upstream without it, `shorthand`
+/// (`FOURTH_TOKEN`) on the `api_url` shorthand and `named` (`FIFTH_TOKEN`)
+/// on an upstream of `kind: cloud`: all refused but `allowed`, as none of
+/// them is the Telegram cloud. Only `gw` keeps the default rate limits.
 fn local_files_config(api: &str) -> String {
     format!(
         r#"version: 1
@@ -1000,6 +1002,7 @@ admin: {{ listen: ["127.0.0.1:0"] }}
 upstreams:
   tba: {{ kind: local, url: "{api}", local_mode: true }}
   plain: {{ kind: local, url: "{api}" }}
+  custom: {{ kind: cloud, url: "{api}" }}
 bots:
   - name: gw
     token: "{TOKEN}"
@@ -1016,16 +1019,22 @@ bots:
     upstream: plain
     gateway: {{ rate_limit: {{ mode: off }} }}
     routes: [{{ to: [c] }}]
-  - name: cloud
+  - name: shorthand
     token: "{FOURTH_TOKEN}"
     api_url: "{api}"
     gateway: {{ rate_limit: {{ mode: off }} }}
     routes: [{{ to: [d] }}]
+  - name: named
+    token: "{FIFTH_TOKEN}"
+    upstream: custom
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [e] }}]
 consumers:
   a: {{ pull: {{}} }}
   b: {{ pull: {{}} }}
   c: {{ pull: {{}} }}
   d: {{ pull: {{}} }}
+  e: {{ pull: {{}} }}
 "#
     )
 }
@@ -1424,45 +1433,36 @@ async fn assert_references_pass(tgin: &Tgin, server: &MockServer, token: &str) {
     }
 }
 
+/// A bot that allows local files has none refused, whatever its server,
+/// and no 1 MiB bound either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allowed_bot_passes_file_references() {
     let server = answering_server().await;
     let tgin = start(&local_files_config(&server.uri())).await;
     assert_references_pass(&tgin, &server, OTHER_TOKEN).await;
-    tgin.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cloud_upstreams_unaffected() {
-    let server = answering_server().await;
-    let tgin = start(&local_files_config(&server.uri())).await;
-    assert_references_pass(&tgin, &server, FOURTH_TOKEN).await;
-    // No 1 MiB bound either.
     let large = large_json();
     let response = tgin
         .send(
             reqwest::Method::POST,
-            &format!("/bot{FOURTH_TOKEN}/sendMessage"),
+            &format!("/bot{OTHER_TOKEN}/sendMessage"),
             JSON,
             large.clone(),
         )
         .await;
     assert_eq!(response.status(), 200);
-    assert_forwarded(&server, FOURTH_TOKEN, "sendMessage", &large).await;
+    assert_forwarded(&server, OTHER_TOKEN, "sendMessage", &large).await;
     tgin.stop().await;
 }
 
-/// A `local` upstream configured without `local_mode` may still run with
-/// `--local`: its bots' references are refused all the same.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_upstream_without_local_mode_refused() {
-    let server = answering_server().await;
-    let tgin = start(&local_files_config(&server.uri())).await;
+/// Sends every reference of [`local_references`] and
+/// [`query_references`] for `token` and asserts each was refused, and that
+/// nothing reached `server`.
+async fn assert_references_refused(tgin: &Tgin, server: &MockServer, token: &str) {
     for (method, content_type, body) in local_references() {
         let response = tgin
             .send(
                 reqwest::Method::POST,
-                &format!("/bot{THIRD_TOKEN}/{method}"),
+                &format!("/bot{token}/{method}"),
                 content_type,
                 body,
             )
@@ -1475,12 +1475,7 @@ async fn local_upstream_without_local_mode_refused() {
     }
     for (method, path, content_type, body) in query_references() {
         let response = tgin
-            .send(
-                method,
-                &format!("/bot{THIRD_TOKEN}/{path}"),
-                content_type,
-                body,
-            )
+            .send(method, &format!("/bot{token}/{path}"), content_type, body)
             .await;
         assert_eq!(
             description(response).await,
@@ -1496,6 +1491,35 @@ async fn local_upstream_without_local_mode_refused() {
             .is_empty(),
         "a refused call reached the server"
     );
+}
+
+/// A `local` upstream configured without `local_mode` may still run with
+/// `--local`: its bots' references are refused all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_upstream_without_local_mode_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_refused(&tgin, &server, THIRD_TOKEN).await;
+    tgin.stop().await;
+}
+
+/// The `api_url` shorthand pointed anywhere but `api.telegram.org` may be
+/// a server running `--local`: its bots' references are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shorthand_off_the_telegram_cloud_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_refused(&tgin, &server, FOURTH_TOKEN).await;
+    tgin.stop().await;
+}
+
+/// So may an upstream of `kind: cloud` whose URL is not
+/// `api.telegram.org`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_cloud_upstream_off_the_telegram_cloud_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_refused(&tgin, &server, FIFTH_TOKEN).await;
     tgin.stop().await;
 }
 

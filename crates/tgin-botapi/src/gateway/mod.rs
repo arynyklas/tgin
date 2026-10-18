@@ -63,7 +63,8 @@ pub struct GatewayBot {
     pub source: SourceId,
     pub token: Secret<String>,
     pub upstream: Arc<config::Upstream>,
-    /// `file:` references may reach an upstream in local mode.
+    /// `file:` references may reach the bot's server, whatever it is
+    /// (`config::Upstream::refuses_local_files`).
     pub allow_local_files: bool,
     pub gateway: config::Gateway,
 }
@@ -295,8 +296,7 @@ impl Bot {
             return Err(upstream_metrics);
         };
         let rewrite = Rewrite::new(&bot.upstream);
-        let refuses_local_files =
-            local_files::refuses_local_files(&bot.upstream, bot.allow_local_files);
+        let refuses_local_files = bot.upstream.refuses_local_files(bot.allow_local_files);
         let response_timeout = if *bot.upstream.name == *config::Upstream::SHORTHAND {
             bot.gateway.upstream_idle_timeout
         } else {
@@ -332,8 +332,7 @@ impl Bot {
     fn same(&self, bot: &GatewayBot) -> bool {
         self.token.expose() == bot.token.expose()
             && self.upstream == bot.upstream
-            && self.refuses_local_files
-                == local_files::refuses_local_files(&bot.upstream, bot.allow_local_files)
+            && self.refuses_local_files == bot.upstream.refuses_local_files(bot.allow_local_files)
             && self.gateway == bot.gateway
             && self.source == bot.source
     }
@@ -852,6 +851,8 @@ mod tests {
         gateway.set_identity("a", &identity);
         gateway.set_identity("nobody", &identity);
         let first = Arc::clone(&gateway.table.load().bots[0]);
+        // On the Telegram cloud: the gateway scans nothing for this bot.
+        assert!(!first.refuses_local_files);
         gateway.set_parked("a", true);
 
         gateway.set_bots(vec![gateway_bot(&cfg, "1:a")], Vec::new());

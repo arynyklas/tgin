@@ -549,11 +549,12 @@ async fn trickling_telegram() -> SocketAddr {
 }
 
 /// Sends a `sendDocument` head announcing 1 000 bytes, then `chunks` of
-/// 100 bytes one every `gap`, and returns the response.
+/// 100 bytes one every `gap`, and returns the response. The bytes are no
+/// parameters (`application/octet-stream`), so no bot scans them.
 async fn upload(tgin: &Tgin, chunks: u32, gap: Duration) -> Raw {
     let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     let (mut read, mut write) = stream.into_split();
@@ -717,7 +718,7 @@ async fn client_closing_mid_upload_is_client_closed() {
 
     let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     stream
@@ -2712,7 +2713,7 @@ async fn upstream_that_never_reads_sets_upstream_up_to_zero() {
     const LENGTH: usize = 256 << 20;
     let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {LENGTH}\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: {LENGTH}\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     let (mut read, mut write) = stream.into_split();

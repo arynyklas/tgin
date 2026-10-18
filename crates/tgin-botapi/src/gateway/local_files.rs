@@ -1,9 +1,10 @@
 //! Local file references: a Bot API server in
 //! local mode reads a parameter as a file of its own disk when the value
 //! begins with `file:/` (telegram-bot-api `Client::get_input_file`). For a
-//! bot on a `local` upstream without `allow_local_files`, in local mode or
-//! not (a server may run `--local` whatever its config says), the gateway
-//! and the webhook-reply executor refuse every request in which a
+//! bot whose server is not Telegram's cloud, or is a `local` upstream,
+//! without `allow_local_files` (`config::Upstream::refuses_local_files`:
+//! any such server may run `--local`, whatever its config says), the
+//! gateway and the webhook-reply executor refuse every request in which a
 //! parameter the server reads begins with `file:`: one byte short of the
 //! server's prefix, a margin against newer servers.
 //!
@@ -34,7 +35,6 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use tgin_core::config::{Upstream, UpstreamKind};
 use tokio::sync::oneshot;
 
 use self::http_reader::{Form, MultipartScan, is_space};
@@ -54,12 +54,6 @@ const LOCAL_PREFIX: &[u8] = b"file:";
 /// carries, the strings of JSON carried in those, and one more level; a
 /// JSON document in a value of the last level is refused unread.
 const MAX_DEPTH: usize = 4;
-
-/// Whether a bot on `upstream` has its local file references refused: any
-/// `local` upstream, `local_mode` or not, unless the bot allows them.
-pub(super) fn refuses_local_files(upstream: &Upstream, allow_local_files: bool) -> bool {
-    upstream.kind == UpstreamKind::Local && !allow_local_files
-}
 
 /// The outcome of a scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -54,16 +54,20 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   frameworks download through tgin. A `local` upstream without `files`
   answers downloads with `404 Not Found: files are not served for this
   upstream`. Downloads from disk hold the shutdown drain open.
-- Local file references: for a bot on any `kind: local` upstream,
-  `local_mode` or not, the gateway and webhook replies refuse any
-  parameter that begins with `file:` (query string, JSON at any depth,
-  urlencoded values, multipart text fields read as telegram-bot-api reads
-  them) with `400 Bad Request: local file uploads are disabled by tgin`,
-  unless the bot sets `allow_local_files: true`. Such bots' JSON and
-  urlencoded bodies are read whole up to 64 KiB and scanned as they stream
-  above it, up to 1 MiB (`413` above). A bot on the `api_url` shorthand
-  gets no refusal: a self-hosted server configured there must move under
-  `upstreams` with `kind: local` to be protected.
+- Local file references: for a bot on any Bot API server but the Telegram
+  cloud (an upstream URL `https://api.telegram.org`; plain `http` to that
+  host counts as any other server), the `api_url` shorthand and
+  `kind: cloud` upstreams included, and for every `kind: local` upstream,
+  `local_mode` or not, the gateway and webhook
+  replies refuse any parameter that begins with `file:` (query string,
+  JSON at any depth, urlencoded values, multipart text fields read as
+  telegram-bot-api reads them) with `400 Bad Request: local file uploads
+  are disabled by tgin`, unless the bot sets `allow_local_files: true`.
+  Such bots' JSON and urlencoded bodies are read whole up to 64 KiB and
+  scanned as they stream above it, up to 1 MiB (`413` above). A
+  self-hosted server reached through `api_url` is protected too; it needs
+  `upstreams` with `kind: local` for its file routes and the `getFile`
+  rewrite.
 - `response_timeout` per upstream (`1m` for `cloud`, `10m` for `local`, at
   most `1h`) bounds the wait for the server's answer once a request was
   sent; on the `api_url` shorthand that wait is the bot's

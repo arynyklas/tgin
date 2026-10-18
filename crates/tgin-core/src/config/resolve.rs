@@ -127,7 +127,8 @@ pub struct Bot {
     /// A named upstream, shared with the other bots that use it, or the
     /// bot's own from its `api_url` shorthand.
     pub upstream: Arc<Upstream>,
-    /// `file:` references may reach a `local` upstream.
+    /// `file:` references may reach the bot's server, whatever it is
+    /// ([`Upstream::refuses_local_files`]).
     pub allow_local_files: bool,
     pub ingress: Option<Ingress>,
     pub gateway: Gateway,
@@ -182,13 +183,17 @@ pub struct WebhookRules {
 pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
 /// The most connections Telegram opens to a webhook.
 pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
+/// The host of Telegram's own Bot API, the one server that never reads a
+/// `file:` reference from its disk, when reached over `https`.
+const TELEGRAM_CLOUD_HOST: &str = "api.telegram.org";
 /// What a plain-http upstream URL off loopback hints.
 const BOT_API_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches";
 /// What a plain-http `files.url` off loopback hints.
 const FILE_SERVER_HINT: &str = "use https, or keep the file server on a network only tgin reaches";
 /// What a plain-http `api_url` off loopback hints: such a URL is most
-/// likely a self-hosted server, which the shorthand treats as the cloud.
-const SHORTHAND_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches; a self-hosted Bot API server belongs in `upstreams: { <name>: { kind: local, url: … } }` with the bot's `upstream: <name>`, as only there does tgin refuse `file:` references (local files of the server) from the bot's downstreams";
+/// likely a self-hosted server, whose file routes and `getFile` rewrite
+/// need a `local` upstream.
+const SHORTHAND_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches; a self-hosted Bot API server belongs in `upstreams: { <name>: { kind: local, url: … } }` with the bot's `upstream: <name>`, for tgin to serve its files and make its local `getFile` paths downloadable";
 
 impl WebhookRules {
     /// Telegram's rules, unless the server is local and in local mode.
@@ -223,6 +228,27 @@ impl Upstream {
 
     pub fn webhook_rules(&self) -> WebhookRules {
         WebhookRules::new(self.kind, self.local_mode)
+    }
+
+    /// Whether this is Telegram's own Bot API: an `https` URL whose host
+    /// is `api.telegram.org`, in any ASCII case. Over plain `http` nothing
+    /// authenticates the server (a hosts entry, a resolver or a proxy may
+    /// put a `--local` server there), and any other server may run with
+    /// `--local`, whatever its `kind` says.
+    pub fn is_telegram_cloud(&self) -> bool {
+        let url = self.url.expose();
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(TELEGRAM_CLOUD_HOST))
+    }
+
+    /// Whether the gateway and the webhook-reply executor refuse a bot's
+    /// `file:` references (files on the server's own disk) to this
+    /// upstream: for a `local` upstream and for every server but
+    /// Telegram's cloud, unless the bot has `allow_local_files`.
+    pub fn refuses_local_files(&self, allow_local_files: bool) -> bool {
+        !allow_local_files && (self.kind == UpstreamKind::Local || !self.is_telegram_cloud())
     }
 
     /// Whether `other` is the same Bot API server as this one: the same
