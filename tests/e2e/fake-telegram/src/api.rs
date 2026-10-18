@@ -152,6 +152,9 @@ pub(crate) async fn handle(shared: Arc<Shared>, request: Request) -> Response {
     let path = percent_decode_str(request.uri().path())
         .decode_utf8_lossy()
         .into_owned();
+    if shared.local.is_some() && path.starts_with("/file") {
+        return no_file_route(&shared, request.method().as_str(), &path);
+    }
     if let Some(rest) = path.strip_prefix("/file/bot") {
         return download(&shared, request.method().as_str(), rest);
     }
@@ -329,7 +332,7 @@ fn send_document(shared: &Shared, bot: &Bot, params: &Params) -> Result<Value, A
         Some(part) => store(shared, bot, &mut state, part)?,
         None => match params.get("document") {
             Some(id) if state.files.contains_key(id) => id.to_owned(),
-            Some(reference) if shared.files_root.is_some() && reference.starts_with("file:") => {
+            Some(reference) if shared.local.is_some() && reference.starts_with("file:") => {
                 local_reference(shared, &mut state, reference)
             }
             Some(_) => {
@@ -361,7 +364,7 @@ fn send_document(shared: &Shared, bot: &Bot, params: &Params) -> Result<Value, A
 }
 
 /// Keep an uploaded part under a new `file_id`; returns the id. In local
-/// mode the bytes are also written to `{files_root}/{token~}/{file_path}`
+/// mode the bytes are also written to `{bot_dir}/{file_path}`
 /// and `file_path` is that absolute path, as the real server answers.
 fn store(
     shared: &Shared,
@@ -382,11 +385,11 @@ fn store(
         .map(|extension| format!(".{extension}"))
         .unwrap_or_default();
     let relative = format!("documents/file_{number}{extension}");
-    let file_path = match &shared.files_root {
+    let file_path = match &shared.local {
         None => relative,
-        Some(root) => {
-            let path = root
-                .join(bot.token.replace(':', "~"))
+        Some(local) => {
+            let path = local
+                .bot_dir(&bot.token)
                 .join("documents")
                 .join(format!("file_{number}{extension}"));
             let written = path
@@ -444,7 +447,7 @@ fn local_reference(shared: &Shared, state: &mut BotState, reference: &str) -> St
 /// dropped, as a server forgets a logged-out bot; the cloud fake only
 /// answers `true`.
 fn log_out(shared: &Shared, bot: &Bot) -> Value {
-    if shared.files_root.is_some() {
+    if shared.local.is_some() {
         let mut state = bot.state.lock();
         state.queue.clear();
         if state.webhook.take().is_some() {
@@ -693,6 +696,24 @@ async fn long_poll(
     }
 }
 
+/// Local mode: the server has no file route, and answers 404 for any path
+/// outside `/bot` before it looks at a token (`HttpConnection.cpp`). A
+/// `/file/bot…` request with a valid token is still journaled.
+fn no_file_route(shared: &Shared, http_method: &str, path: &str) -> Response {
+    if let Some(rest) = path.strip_prefix("/file/bot") {
+        let (token, file_path) = rest.split_once('/').unwrap_or((rest, ""));
+        if let Some(id) = bot_id(token) {
+            let mut entry = Entry::new(token, id, Kind::File, http_method);
+            entry
+                .args
+                .insert("file_path".to_owned(), file_path.to_owned());
+            entry.status = Some(404);
+            shared.journal.record(entry);
+        }
+    }
+    Answer::error(404, "Not Found", None).into_response()
+}
+
 /// `GET /file/bot{token}/{file_path}`; `rest` is already percent-decoded.
 fn download(shared: &Arc<Shared>, http_method: &str, rest: &str) -> Response {
     let (token, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -703,11 +724,6 @@ fn download(shared: &Arc<Shared>, http_method: &str, rest: &str) -> Response {
     let mut entry = Entry::new(token, id, Kind::File, http_method);
     entry.args.insert("file_path".to_owned(), path.to_owned());
     let seq = shared.journal.record(entry);
-    if shared.files_root.is_some() {
-        // A local-mode server has no file route.
-        shared.journal.finish(seq, 404);
-        return Answer::error(404, "Not Found", None).into_response();
-    }
     let data = bot.state.lock().file_by_path(path).map(|f| f.data.clone());
     match data {
         Some(data) => {

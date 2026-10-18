@@ -1158,11 +1158,18 @@ async fn token_and_method_errors_follow_the_brief_token_rule() {
     fake.server.stop().await.unwrap();
 }
 
-/// The bot's directory on a local server: the token with ':' → '~'.
+/// The bot's directory on a local server: the token, or with ':' → '~'
+/// where the filesystem refuses ':' in a name (probed like the server).
 fn token_dir(root: &std::path::Path, token: &str) -> std::path::PathBuf {
-    std::path::absolute(root)
-        .unwrap()
-        .join(token.replace(':', "~"))
+    let root = std::path::absolute(root).unwrap();
+    let probe = root.join("1:a-test-probe");
+    let name = if std::fs::create_dir(&probe).is_ok() {
+        std::fs::remove_dir(&probe).unwrap();
+        token.to_owned()
+    } else {
+        token.replace(':', "~")
+    };
+    root.join(name)
 }
 
 #[tokio::test]
@@ -1188,6 +1195,18 @@ async fn local_mode_absolute_paths_and_no_file_route() {
             .unwrap();
         assert_eq!(response.status(), 404, "{file_path}");
     }
+    // ...and answers 404 before it looks at a token.
+    for path in ["/file/botnot-a-token/x", "/file/x", "/files"] {
+        let response = fake.http.get(fake.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            &br#"{"ok":false,"error_code":404,"description":"Not Found"}"#[..]
+        );
+    }
+    let downloads = fake.journal("?kind=file").await;
+    assert_eq!(downloads.len(), 2, "{downloads:?}");
+    assert!(downloads.iter().all(|d| d["status"] == 404));
     fake.server.stop().await.unwrap();
 }
 
@@ -1233,6 +1252,12 @@ async fn file_reference_journaled() {
     .await;
     fake.ok(
         TOKEN,
+        "sendLivePhoto",
+        json!({"chat_id": 5, "live_photo": "file:///srv/z.mov"}),
+    )
+    .await;
+    fake.ok(
+        TOKEN,
         "sendMessage",
         json!({"chat_id": 5, "text": "file: not a file"}),
     )
@@ -1252,6 +1277,7 @@ async fn file_reference_journaled() {
         [
             ("sendDocument", true),
             ("sendMediaGroup", true),
+            ("sendLivePhoto", true),
             ("sendMessage", false),
         ]
     );

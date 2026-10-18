@@ -21,9 +21,12 @@
 //!
 //! [`Options::local_mode`] (`--local-mode` / `FAKE_TELEGRAM_LOCAL_MODE`,
 //! with `--files-dir` / `FAKE_TELEGRAM_FILES_DIR`) imitates
-//! `telegram-bot-api --local`: uploads are written to
-//! `{files_dir}/{token with ':' → '~'}/documents/file_N[.ext]` and `getFile`
-//! answers that absolute path; `/file/bot…` answers 404; `sendDocument`
+//! `telegram-bot-api --local`: at start the files directory must accept a
+//! new file (else start fails, as the server exits); uploads are written to
+//! `{files_dir}/{bot dir}/documents/file_N[.ext]` and `getFile` answers that
+//! absolute path. The bot dir is the token itself, or the token with ':'
+//! replaced by '~' when the filesystem refuses ':' in a name (the server's
+//! `mkdtemp("1:a…")` probe). Every `/file…` path answers 404; `sendDocument`
 //! accepts a `file:` reference; `logOut` drops the pending updates and the
 //! webhook (`close` only answers `true`). In the default mode `logOut` and
 //! `close` only answer `true`.
@@ -34,7 +37,15 @@ mod params;
 mod state;
 mod webhook;
 
-use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
@@ -50,14 +61,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     journal::Filter,
-    state::{Fault, Shared, bot_id},
+    state::{Fault, LocalFiles, Shared, bot_id},
 };
 
 /// How the fake behaves; the default is the cloud Bot API.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     /// Behave like `telegram-bot-api --local`: uploads are written under
-    /// `{files_dir}/{token with ':' → '~'}/`, `getFile` answers absolute
+    /// `{files_dir}/{token}/` (`{token with ':' → '~'}/` where the
+    /// filesystem refuses ':'), `getFile` answers absolute
     /// paths, `/file/bot…` is 404, `file:` references are accepted, and
     /// `logOut` drops the pending updates and the webhook.
     pub local_mode: bool,
@@ -82,20 +94,19 @@ impl Server {
     /// Serve on `listener` with `options` until [`Server::stop`].
     pub fn start_with(listener: TcpListener, options: Options) -> io::Result<Self> {
         let addr = listener.local_addr()?;
-        let files_root = if options.local_mode {
+        let local = if options.local_mode {
             let dir = options.files_dir.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "local mode needs a files directory",
+                    "local mode needs a files directory (--files-dir)",
                 )
             })?;
-            std::fs::create_dir_all(&dir)?;
-            Some(std::path::absolute(dir)?)
+            Some(local_files(&dir)?)
         } else {
             None
         };
         let cancel = CancellationToken::new();
-        let shared = Arc::new(Shared::new(cancel.clone(), files_root).map_err(io::Error::other)?);
+        let shared = Arc::new(Shared::new(cancel.clone(), local).map_err(io::Error::other)?);
         let stop = cancel.clone();
         let task = tokio::spawn(async move {
             axum::serve(listener, router(shared))
@@ -116,6 +127,38 @@ impl Server {
         self.cancel.cancel();
         self.task.await.map_err(io::Error::other)?
     }
+}
+
+/// Probe the files directory as `telegram-bot-api` does at startup: it must
+/// accept a new file, and a bot's directory keeps the token's ':' only if
+/// the filesystem accepts a ':' in a name.
+fn local_files(dir: &std::path::Path) -> io::Result<LocalFiles> {
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(dir)?;
+    let root = std::path::absolute(dir)?;
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        PROBES.fetch_add(1, Ordering::Relaxed)
+    );
+    let file = root.join(format!(".fake-telegram-probe-{unique}"));
+    std::fs::File::create_new(&file)
+        .and_then(|_| std::fs::remove_file(&file))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "can't create files in the directory {}: {error}; use --files-dir to specify a writable files directory",
+                    root.display()
+                ),
+            )
+        })?;
+    let colon_dir = root.join(format!("1:a-fake-telegram-probe-{unique}"));
+    let colon = std::fs::create_dir(&colon_dir).is_ok();
+    if colon {
+        std::fs::remove_dir(&colon_dir)?;
+    }
+    Ok(LocalFiles { root, colon })
 }
 
 fn router(shared: Arc<Shared>) -> Router {

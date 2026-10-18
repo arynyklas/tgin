@@ -12,10 +12,12 @@ struct Cli {
     /// Address to listen on.
     #[arg(long, env = "FAKE_TELEGRAM_LISTEN", default_value = "0.0.0.0:8081")]
     listen: SocketAddr,
-    /// Behave like `telegram-bot-api --local`: uploads go under
-    /// `--files-dir`, `getFile` answers absolute paths, `/file/bot…` is 404,
-    /// `file:` references are accepted, and `logOut` drops pending updates.
-    #[arg(long, env = "FAKE_TELEGRAM_LOCAL_MODE", requires = "files_dir")]
+    /// Behave like `telegram-bot-api --local` (needs `--files-dir`, which
+    /// must be writable): uploads go under `{files-dir}/{token}/` ('~' for
+    /// ':' where the filesystem refuses ':'), `getFile` answers absolute
+    /// paths, `/file…` is 404, `file:` references are accepted, and `logOut`
+    /// drops pending updates and the webhook.
+    #[arg(long, env = "FAKE_TELEGRAM_LOCAL_MODE")]
     local_mode: bool,
     /// The files directory (the server's `--dir`); used in local mode.
     #[arg(long, env = "FAKE_TELEGRAM_FILES_DIR")]

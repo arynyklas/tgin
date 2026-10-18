@@ -180,6 +180,7 @@ const INPUT_FILES: &[&str] = &[
     "voice",
     "webm_sticker",
     "cover",
+    "live_photo",
 ];
 
 fn is_local_file(value: &str) -> bool {
