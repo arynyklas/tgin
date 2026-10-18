@@ -76,21 +76,24 @@ pub struct Gateway {
     table: ArcSwap<Table>,
     /// `tgin_webhook_replies_total` handles by push consumer.
     replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
-    /// The requests forwarded to Telegram, for the shutdown's drain.
+    /// The requests forwarded to Telegram, and the files served from disk,
+    /// for the shutdown's drain.
     upstreams: Arc<Upstreams>,
 }
 
-/// The gateway's requests forwarded to Telegram: how many are in flight,
-/// and when one last started or ended (`None` before the first).
+/// The gateway's requests forwarded to Telegram, and its files served from
+/// disk: how many are in flight, and when one last started or ended
+/// (`None` before the first).
 #[derive(Default)]
 struct Upstreams {
     in_flight: AtomicUsize,
     last: Mutex<Option<Instant>>,
 }
 
-/// One request forwarded to Telegram, counted in [`Upstreams`] until it is
-/// dropped: with its response body, which may stream long after the
-/// headers, or with the request when no body is relayed.
+/// One request forwarded to Telegram, or one file served from disk,
+/// counted in [`Upstreams`] until it is dropped: with its response body,
+/// which may stream long after the headers, or with the request when no
+/// body is relayed.
 pub(super) struct Forwarding(Arc<Upstreams>);
 
 impl Forwarding {
@@ -106,6 +109,39 @@ impl Drop for Forwarding {
         // Stamped first: whoever sees nothing in flight sees this end.
         *self.0.last.lock() = Some(Instant::now());
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A body tgin serves itself, a file from disk, kept in flight for the
+/// shutdown's drain until it ends or is dropped, as a relayed body is: a
+/// bot that downloads an update's file before answering it is served the
+/// same whatever its upstream.
+struct Held {
+    body: Body,
+    forwarding: Option<Forwarding>,
+}
+
+impl HttpBody for Held {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.forwarding = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -487,6 +523,7 @@ impl Gateway {
             }
             FileTarget::Disk { root } => root,
         };
+        let forwarding = Forwarding::new(&self.upstreams);
         let response = match files::bot_dir(root, bot.token.expose()).await {
             Some(dir) => files::serve(&dir, file_path, req.headers()).await,
             None => errors::error(StatusCode::NOT_FOUND, files::FILE_NOT_FOUND),
@@ -494,14 +531,19 @@ impl Gateway {
         let status = response.status();
         handles.count(proxy::outcome(status));
         tracing::debug!(bot = %bot.name, method = label.as_str(), status = status.as_u16(), "gateway file served from disk");
-        response
+        response.map(|body| {
+            Body::new(Held {
+                body,
+                forwarding: Some(forwarding),
+            })
+        })
     }
 
-    /// When the gateway last forwarded a request to Telegram: `now` while
-    /// one is in flight, else when the last one started or ended, `None`
-    /// before the first. Requests the gateway answers itself (`getUpdates`
-    /// and the other intercepts) do not count, so pollers never hold the
-    /// shutdown's drain open.
+    /// When the gateway last forwarded a request to Telegram or served a
+    /// file from disk: `now` while one is in flight, else when the last one
+    /// started or ended, `None` before the first. Requests the gateway
+    /// answers itself (`getUpdates` and the other intercepts) do not count,
+    /// so pollers never hold the shutdown's drain open.
     pub fn upstream_busy_at(&self, now: Instant) -> Option<Instant> {
         if self.upstreams.in_flight.load(Ordering::SeqCst) > 0 {
             return Some(now);

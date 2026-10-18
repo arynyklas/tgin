@@ -1917,3 +1917,50 @@ async fn trailers_never_end_a_refused_body_upstream() {
     assert!(records.iter().all(|record| !record.complete), "{records:?}");
     tgin.stop().await;
 }
+
+/// A download served from disk is a call in flight for the shutdown's
+/// drain, as one from the cloud or a file origin is: a client that reads
+/// its first bytes, then pauses past the drain's quiet second and the data
+/// plane's close grace, still gets the whole file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_finishes_a_slow_disk_download() {
+    // Far more than the socket buffers on both ends hold.
+    const SIZE: usize = 32 << 20;
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    put(
+        &bot_dir(&root, TOKEN),
+        "documents/large.bin",
+        &vec![b'f'; SIZE],
+    );
+    let yaml =
+        disk_config(&server.uri(), &root).replace("shutdown_grace: 2s", "shutdown_grace: 10s");
+    let tgin = start(&yaml).await;
+    tgin.signals
+        .send(SignalKind::Terminate)
+        .await
+        .expect("the app listens");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut response = tgin.file(TOKEN, "documents/large.bin", &[]).await;
+    assert_eq!(response.status(), 200);
+    let mut read = response
+        .chunk()
+        .await
+        .expect("a first chunk")
+        .expect("bytes")
+        .len();
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    while let Some(chunk) = timeout(PATIENCE, response.chunk())
+        .await
+        .expect("the rest in time")
+        .expect("the body goes on")
+    {
+        read += chunk.len();
+    }
+    assert_eq!(read, SIZE);
+    let outcome = timeout(PATIENCE, tgin.run)
+        .await
+        .expect("the app exits in time")
+        .expect("the app does not panic");
+    assert_eq!(outcome, Outcome::Clean);
+}
