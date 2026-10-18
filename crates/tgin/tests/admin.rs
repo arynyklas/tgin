@@ -3231,3 +3231,59 @@ async fn status_shows_upstream_and_parked() {
     );
     tgin.stop().await;
 }
+
+/// A reload that edits only the bot's upstream's other settings (here its
+/// `response_timeout`) keeps the bot on the same server: its source runs
+/// on, and `tgin_upstream_up` stays and keeps following its long polls,
+/// down to 0 when the server goes away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_up_survives_reload_of_other_upstream_settings() {
+    // Not pooled: dropping it closes its listener.
+    let server = MockServer::builder().start().await;
+    let mut polls = mount_bot(&server, TOKEN, me("steady_bot"), Duration::from_millis(50)).await;
+    let yaml = |timeout: &str| {
+        config(&format!(
+            "upstreams:\n  tba: {{ kind: local, url: \"{}\", response_timeout: {timeout} }}\nbots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            server.uri(),
+            polled_as("steady", "upstream: tba", "1s"),
+        ))
+    };
+    let tgin = start(
+        "upstream_up_survives_reload_of_other_upstream_settings",
+        &yaml("30s"),
+    )
+    .await;
+    let up = r#"tgin_upstream_up{bot="steady"}"#;
+    next(&mut polls).await;
+    let text = tgin.metrics_text();
+    assert!(has_line(&text, &format!("{up} 1")), "{text}");
+
+    tgin.rewrite(&yaml("45s"));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    assert_eq!(reload.json()["sources_restarted"], json!([]));
+    assert_eq!(reload.json()["upstream_changed"], json!([]));
+    while polls.try_recv().is_ok() {}
+    for _ in 0..3 {
+        next(&mut polls).await;
+    }
+    let text = tgin.metrics_text();
+    assert!(has_line(&text, &format!("{up} 1")), "{text}");
+    assert!(
+        has_line(&text, r#"tgin_bot_info{bot="steady",upstream="tba"} 1"#),
+        "{text}"
+    );
+
+    // The server goes away: the running long poll's next call fails.
+    drop(server);
+    let started = Instant::now();
+    loop {
+        let text = tgin.metrics_text();
+        if has_line(&text, &format!("{up} 0")) {
+            break;
+        }
+        assert!(started.elapsed() < PATIENCE, "{up} never became 0:\n{text}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tgin.stop().await;
+}

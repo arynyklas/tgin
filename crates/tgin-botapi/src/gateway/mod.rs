@@ -243,9 +243,10 @@ impl Gateway {
     /// Replaces the bot table. An entry whose token, upstream and gateway
     /// config are unchanged keeps its state (client, identity, limiter); a
     /// bot whose token stays keeps its identity, and its limiter too while
-    /// its rate limits stay. A bot whose upstream changes gets a new
-    /// `tgin_bot_info` label pair and its `tgin_upstream_up` starts absent
-    /// again. A removed bot's metric series go, and so do the
+    /// its rate limits stay. A bot moved to another server (its upstream's
+    /// name or URL changed) gets a new `tgin_bot_info` label pair and its
+    /// `tgin_upstream_up` starts absent again; other upstream edits keep
+    /// both. A removed bot's metric series go, and so do the
     /// webhook-reply series of consumers the engine no longer has.
     pub fn set_bots(&self, bots: Vec<GatewayBot>, trusted_proxies: Vec<IpNet>) {
         let old = self.table.load_full();
@@ -279,8 +280,11 @@ impl Gateway {
                     }
                 },
             };
+            // Kept while the bot stays on the same server: its running
+            // source holds this handle until a reload that moves it, and
+            // only such a reload restarts the source for its upstream.
             let upstream_metrics = match previous {
-                Some(previous) if previous.upstream == bot.upstream => {
+                Some(previous) if previous.upstream.same_server(&bot.upstream) => {
                     previous.upstream_metrics.clone()
                 }
                 _ => {
