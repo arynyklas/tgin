@@ -4446,3 +4446,54 @@ async fn busy_bot_moves_once_its_reply_ends_within_the_reserve() {
     assert!(photo < closed && closed.is_some(), "{methods:?}");
     tgin.stop().await;
 }
+
+/// `getWebhookInfo` reporting one pending update until `until` has
+/// passed, none after.
+struct PendingUntil {
+    until: Instant,
+}
+
+impl Respond for PendingUntil {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let pending = u64::from(Instant::now() < self.until);
+        ok(json!({ "url": "", "has_custom_certificate": false, "pending_update_count": pending }))
+    }
+}
+
+/// The server's drain (step 1) gets no more of a move's time than delivery
+/// (step 3): with a 2 s timeout, it must end by 1.5 s, the last half second
+/// kept for calls being sent. A server that still holds an update at 1.5 s
+/// and runs dry at 1.7 s fails the move with 504 `upstream not drained`,
+/// and nothing is called on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_drain_leaves_the_reserve_to_calls_being_sent() {
+    let telegram = telegram().await;
+    for m in ["logOut", "close"] {
+        Mock::given(path(format!("/bot{TOKEN}/{m}")))
+            .respond_with(ok(json!(true)))
+            .mount(&telegram)
+            .await;
+    }
+    let tgin = start(
+        "a_late_drain_leaves_the_reserve_to_calls_being_sent",
+        &hooked(&telegram, ""),
+    )
+    .await;
+    Mock::given(path(format!("/bot{TOKEN}/getWebhookInfo")))
+        .respond_with(PendingUntil {
+            until: Instant::now() + Duration::from_millis(1700),
+        })
+        .mount(&telegram)
+        .await;
+    let answer = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=2s", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(answer.json(), json!({ "error": "upstream not drained" }));
+    let calls = calls(&telegram, TOKEN).await;
+    assert!(
+        !calls.iter().any(|m| m == "close" || m == "deleteWebhook"),
+        "{calls:?}"
+    );
+    tgin.stop().await;
+}

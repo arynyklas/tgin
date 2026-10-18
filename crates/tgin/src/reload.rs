@@ -550,15 +550,15 @@ impl Reloader {
     /// Moves the bot of `job` off its Bot API server, `how` says with which
     /// call, in these steps; its timeout (`reload.drain_timeout` when
     /// `None`, at most [`MAX_MOVE_TIMEOUT`] either way), counted from the
-    /// request, bounds steps 1 to 4 together:
+    /// request, bounds steps 1 to 4 together; steps 1 and 3 end
+    /// [`IN_FLIGHT_RESERVE`] (or a quarter of the timeout, if less) before
+    /// it, so step 4 always has that much left:
     /// 1. the server runs dry of the bot's updates, its ingest running on
-    ///    ([`crate::sources::Sources::drain_upstream`]); not done by the
-    ///    deadline, the move fails ([`MoveError::Undrained`]) and changes
-    ///    nothing, as when the move waited in the queue past its deadline;
+    ///    ([`crate::sources::Sources::drain_upstream`]); not done in time,
+    ///    the move fails ([`MoveError::Undrained`]) and changes nothing, as
+    ///    when the move waited in the queue past its deadline;
     /// 2. the bot's ingest stops, and it is parked;
-    /// 3. tgin delivers what it holds of the bot, until
-    ///    [`IN_FLIGHT_RESERVE`] (or a quarter of the timeout, if less)
-    ///    before the deadline, so step 4 always has that much left;
+    /// 3. tgin delivers what it holds of the bot, until its time is up;
     /// 4. the gateway refuses the bot's calls that would go to a server
     ///    ([`tgin_botapi::gateway::Gateway::set_parked`]), those still
     ///    waiting on a rate limit or a 429 included, and the move waits for
@@ -618,10 +618,17 @@ impl Reloader {
             return Some(Err(MoveError::Undrained));
         }
         let ingest = shared.lifecycle.ingest_token();
+        // Steps 1 and 3 end early enough to leave step 4 a budget: a bot
+        // whose updates tgin still delivers has calls of its own on their
+        // way.
+        let reserve = IN_FLIGHT_RESERVE.min(timeout / 4);
+        let delivering_until = deadline.checked_sub(reserve).unwrap_or(deadline);
 
         let mut failure = None;
-        let drain =
-            tokio::time::timeout_at(deadline, sources.drain_upstream(bot, &client, &mut failure));
+        let drain = tokio::time::timeout_at(
+            delivering_until,
+            sources.drain_upstream(bot, &client, &mut failure),
+        );
         let drained = tokio::select! {
             drained = ingest.run_until_cancelled(drain) => drained,
             () = reply.closed() => {
@@ -646,10 +653,6 @@ impl Reloader {
         }
         sources.park(name);
         let engine = &shared.engine;
-        // Step 3 ends early enough to leave step 4 a budget: a bot whose
-        // updates tgin still delivers has calls of its own on their way.
-        let reserve = IN_FLIGHT_RESERVE.min(timeout / 4);
-        let delivering_until = deadline.checked_sub(reserve).unwrap_or(deadline);
         let delivered = tokio::time::timeout_at(delivering_until, async {
             while engine.pending_from(id) > 0 {
                 tokio::time::sleep(MOVE_CHECK).await;
