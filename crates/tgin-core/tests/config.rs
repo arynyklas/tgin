@@ -2661,12 +2661,14 @@ fn files_rules() {
     let err = single_error(&yaml);
     assert_at(&err, "upstreams.u.files.server_dir", pos(&yaml, "var/lib"));
     assert_message(&err, "absolute");
+    // The server's `--files-dir` only: without it, its bot directories
+    // hold TDLib's databases too, which are never to be served.
+    let hint = err.hint.as_deref().unwrap_or_default();
     assert!(
-        err.hint
-            .as_deref()
-            .is_some_and(|h| h.contains("as the Bot API server sees it")),
+        hint.contains("as the Bot API server sees it") && hint.contains("--files-dir"),
         "{err}"
     );
+    assert!(!hint.contains("`--dir`"), "{err}");
 
     // `server_dir` defaults to `dir`, made absolute.
     let cfg = loads(&upstream(

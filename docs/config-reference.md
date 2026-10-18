@@ -475,9 +475,9 @@ Where a local server's files are: `dir` (with `server_dir`) or `url`. The server
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `dir` | string (not empty) |  | The server's files directory (its `--files-dir`, or `--dir` when that is unset) as mounted in tgin; read-only is enough. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
+| `dir` | string (not empty) |  | The server's files directory, its `--files-dir` (without it, the bot directories hold the server's databases too), as mounted in tgin; read-only is enough. A relative path is relative to the config file's directory. Supports `${env:…}` and `${file:…}`. |
 | `server_dir` | string (not empty) |  | The same directory as the server sees it, an absolute path; only with `dir`, which it defaults to. Supports `${env:…}` and `${file:…}`. |
-| `url` | string (not empty) |  | An HTTP origin serving the server's files directory (its `--files-dir`, or `--dir` when that is unset), `http` or `https`. Supports `${env:…}` and `${file:…}`. |
+| `url` | string (not empty) |  | An HTTP origin serving the server's files directory, its `--files-dir`, `http` or `https`. Supports `${env:…}` and `${file:…}`. |
 
 ## `UpstreamKind`
 
