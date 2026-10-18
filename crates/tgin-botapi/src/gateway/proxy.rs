@@ -249,7 +249,7 @@ enum Failed {
     /// `response_timeout` passed before the response headers (logged where
     /// it happened): the server may have executed the call.
     NoAnswer,
-    /// Its parameters may not reach the bot's server in local mode.
+    /// Its parameters may not reach the bot's self-hosted server.
     Refused(Refusal),
 }
 
@@ -560,7 +560,7 @@ impl Call<'_> {
                 unreachable(self.handles, NO_ANSWER)
             }
             Failed::Refused(refusal) => {
-                tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a Bot API server in local mode");
+                tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
                 self.count(Outcome::Rejected);
                 refusal.answer()
             }

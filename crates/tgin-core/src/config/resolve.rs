@@ -127,7 +127,7 @@ pub struct Bot {
     /// A named upstream, shared with the other bots that use it, or the
     /// bot's own from its `api_url` shorthand.
     pub upstream: Arc<Upstream>,
-    /// `file:` references may reach an upstream in local mode.
+    /// `file:` references may reach a `local` upstream.
     pub allow_local_files: bool,
     pub ingress: Option<Ingress>,
     pub gateway: Gateway,

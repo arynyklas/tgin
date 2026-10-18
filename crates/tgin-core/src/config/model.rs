@@ -189,9 +189,11 @@ pub struct Bot {
     /// The `upstreams` entry this bot talks to. Not with `api_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<At<Name>>,
-    /// Let `file:` references (files on the server's own disk) reach an
-    /// upstream in local mode. Off, the gateway and webhook replies refuse
-    /// them, so a client cannot read the server's files through tgin.
+    /// Let `file:` references (files on the server's own disk) reach a
+    /// `local` upstream. Off, the gateway and webhook replies refuse them
+    /// for every `local` upstream, `local_mode` or not (the server may run
+    /// `--local` all the same), so a client cannot read the server's files
+    /// through tgin. Cloud upstreams never read local files.
     #[serde(default)]
     pub allow_local_files: bool,
     /// How updates arrive; at most one. Omitted, the bot receives none.

@@ -5,7 +5,7 @@
 //!   multipart text field); an empty or missing one, any `get…` method,
 //!   `setWebhook`, `deleteWebhook`, `close` and `logOut` are refused, in
 //!   any case;
-//! - to a bot whose server in local mode must not get a local file
+//! - to a bot whose self-hosted server must not get a local file
 //!   reference, a reply carrying one is refused (`local_files`);
 //! - the bot's rate limits apply as to a gateway request;
 //! - the body goes to `{url}/bot{token}/{method}` unchanged, with its
@@ -105,7 +105,7 @@ impl Gateway {
             && let Verdict::Refused(refusal) = body_verdict(Some(&reply.content_type), &reply.body)
         {
             counts.count(ReplyOutcome::Refused);
-            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), reason = refusal.reason(), "webhook reply refused: it carries a local file reference, or parameters tgin cannot check, for a Bot API server in local mode");
+            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), reason = refusal.reason(), "webhook reply refused: it carries a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
             return;
         }
         if bot.limiter.applies(&method) && !admit(bot, consumer, label, &reply, &counts).await {

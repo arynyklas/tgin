@@ -975,8 +975,9 @@ const MULTIPART: &str = "multipart/form-data; boundary=local-files-boundary";
 
 /// Bots on `api`: `gw` (`TOKEN`) and `allowed` (`OTHER_TOKEN`, with
 /// `allow_local_files`) on a local upstream in local mode, `plain`
-/// (`THIRD_TOKEN`) on a local upstream without it, `cloud` (`FOURTH_TOKEN`)
-/// on the cloud. Only `gw` keeps the default rate limits.
+/// (`THIRD_TOKEN`) on a local upstream without it (refused all the same),
+/// `cloud` (`FOURTH_TOKEN`) on the cloud. Only `gw` keeps the default rate
+/// limits.
 fn local_files_config(api: &str) -> String {
     format!(
         r#"version: 1
@@ -1379,24 +1380,69 @@ async fn allowed_bot_passes_file_references() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cloud_and_non_local_upstreams_unaffected() {
+async fn cloud_upstreams_unaffected() {
     let server = answering_server().await;
     let tgin = start(&local_files_config(&server.uri())).await;
-    for token in [THIRD_TOKEN, FOURTH_TOKEN] {
-        assert_references_pass(&tgin, &server, token).await;
-        // No 1 MiB bound either.
-        let large = large_json();
+    assert_references_pass(&tgin, &server, FOURTH_TOKEN).await;
+    // No 1 MiB bound either.
+    let large = large_json();
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{FOURTH_TOKEN}/sendMessage"),
+            JSON,
+            large.clone(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, FOURTH_TOKEN, "sendMessage", &large).await;
+    tgin.stop().await;
+}
+
+/// A `local` upstream configured without `local_mode` may still run with
+/// `--local`: its bots' references are refused all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_upstream_without_local_mode_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    for (method, content_type, body) in local_references() {
         let response = tgin
             .send(
                 reqwest::Method::POST,
-                &format!("/bot{token}/sendMessage"),
-                JSON,
-                large.clone(),
+                &format!("/bot{THIRD_TOKEN}/{method}"),
+                content_type,
+                body,
             )
             .await;
-        assert_eq!(response.status(), 200);
-        assert_forwarded(&server, token, "sendMessage", &large).await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{method}"
+        );
     }
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(
+                method,
+                &format!("/bot{THIRD_TOKEN}/{path}"),
+                content_type,
+                body,
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{path}"
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
     tgin.stop().await;
 }
 

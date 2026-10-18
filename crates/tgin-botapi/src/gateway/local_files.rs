@@ -1,8 +1,9 @@
 //! Local file references (plan decision 4, ruling R14): a Bot API server in
 //! local mode reads a parameter as a file of its own disk when the value
 //! begins with `file:/` (telegram-bot-api `Client::get_input_file`). For a
-//! bot on a `local` upstream in local mode without `allow_local_files`, the
-//! gateway and the webhook-reply executor refuse every request in which a
+//! bot on a `local` upstream without `allow_local_files`, in local mode or
+//! not (a server may run `--local` whatever its config says), the gateway
+//! and the webhook-reply executor refuse every request in which a
 //! parameter the server reads begins with `file:`: one byte short of the
 //! server's prefix, a margin against newer servers.
 //!
@@ -54,10 +55,10 @@ const LOCAL_PREFIX: &[u8] = b"file:";
 /// JSON document in a value of the last level is refused unread.
 const MAX_DEPTH: usize = 4;
 
-/// Whether a bot on `upstream` has its local file references refused: a
-/// `local` upstream in local mode, unless the bot allows them.
+/// Whether a bot on `upstream` has its local file references refused: any
+/// `local` upstream, `local_mode` or not, unless the bot allows them.
 pub(super) fn refuses_local_files(upstream: &Upstream, allow_local_files: bool) -> bool {
-    upstream.kind == UpstreamKind::Local && upstream.local_mode && !allow_local_files
+    upstream.kind == UpstreamKind::Local && !allow_local_files
 }
 
 /// The outcome of a scan.
@@ -316,7 +317,7 @@ fn unescape(b: u8) -> u8 {
 #[error("the request body was refused by the local file scan")]
 struct Refused;
 
-/// A multipart request body on its way to a server in local mode. Each
+/// A multipart request body on its way to a self-hosted server. Each
 /// frame is scanned before it is passed on, so the frame that completes a
 /// local file reference never is, and neither is the closing delimiter
 /// after it: the body fails instead, which drops the upstream connection

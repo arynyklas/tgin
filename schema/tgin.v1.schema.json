@@ -59,7 +59,7 @@
       "properties": {
         "allow_local_files": {
           "default": false,
-          "description": "Let `file:` references (files on the server's own disk) reach an\nupstream in local mode. Off, the gateway and webhook replies refuse\nthem, so a client cannot read the server's files through tgin.",
+          "description": "Let `file:` references (files on the server's own disk) reach a\n`local` upstream. Off, the gateway and webhook replies refuse them\nfor every `local` upstream, `local_mode` or not (the server may run\n`--local` all the same), so a client cannot read the server's files\nthrough tgin. Cloud upstreams never read local files.",
           "type": "boolean"
         },
         "api_url": {
