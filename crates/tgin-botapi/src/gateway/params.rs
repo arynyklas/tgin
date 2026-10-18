@@ -188,22 +188,25 @@ impl<'de> Visitor<'de> for Text {
 /// The first parameter `name` of a multipart body: a text field of at most
 /// [`MULTIPART_FIELD_LIMIT`] bytes, which must be UTF-8, or a parameter of
 /// a part typed urlencoded. A field name is the server's: percent-decoded,
-/// a `filename` inside another parameter's quoted value not counting.
+/// a `filename` inside another parameter's quoted value not counting. A
+/// body the server refuses as a whole has none.
 fn multipart_param<'a>(
     content_type: &HeaderValue,
     body: &'a [u8],
     name: &str,
 ) -> Option<Cow<'a, str>> {
     let boundary = boundary(content_type.as_bytes())?;
-    parts(boundary, body).find_map(|part| match part.kind {
-        Kind::File => None,
-        Kind::Text => part.named(name).then(|| {
-            (part.value.len() <= MULTIPART_FIELD_LIMIT)
-                .then(|| std::str::from_utf8(part.value).ok().map(Cow::Borrowed))
-                .flatten()
-        }),
-        Kind::Form => form_value(part.value, name).map(form_decode),
-    })?
+    parts(boundary, body)?
+        .into_iter()
+        .find_map(|part| match part.kind {
+            Kind::File => None,
+            Kind::Text => part.named(name).then(|| {
+                (part.value.len() <= MULTIPART_FIELD_LIMIT)
+                    .then(|| std::str::from_utf8(part.value).ok().map(Cow::Borrowed))
+                    .flatten()
+            }),
+            Kind::Form => form_value(part.value, name).map(form_decode),
+        })?
 }
 
 #[cfg(test)]
@@ -397,6 +400,46 @@ mod tests {
         assert_eq!(get("q").as_deref(), Some("quoted"));
         assert_eq!(get("method").as_deref(), Some("decoded"));
         assert_eq!(get("chat_id").as_deref(), Some("+1"));
+
+        // A body the server refuses as a whole has no parameters at all,
+        // not even those of the parts before its error.
+        let url = part(
+            r#"Content-Disposition: form-data; name="url""#,
+            "https://a.example/h",
+        );
+        for broken in [
+            // Fewer than two bytes after the last delimiter.
+            format!("{url}--{BOUNDARY}"),
+            format!("{url}--{BOUNDARY}-"),
+            // A later part's value without its delimiter.
+            format!(
+                "{url}--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nno end"
+            ),
+            // A later part's header block malformed.
+            format!("{url}--{BOUNDARY}\r\nno colon here\r\n\r\nv\r\n--{BOUNDARY}--\r\n"),
+            // No closing delimiter at all.
+            url.clone(),
+        ] {
+            assert_eq!(
+                text_param(
+                    Some(&HeaderValue::from_str(&ct).unwrap()),
+                    broken.as_bytes(),
+                    "url"
+                ),
+                None,
+                "{broken:?}"
+            );
+        }
+        let whole = format!("{url}--{BOUNDARY}--");
+        assert_eq!(
+            text_param(
+                Some(&HeaderValue::from_str(&ct).unwrap()),
+                whole.as_bytes(),
+                "url"
+            )
+            .as_deref(),
+            Some("https://a.example/h")
+        );
     }
 
     /// Form values are UTF-8 like every other parameter; one that is not is

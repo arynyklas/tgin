@@ -429,21 +429,19 @@ impl Name<'_> {
 }
 
 /// The parts of a whole multipart body with the delimiter `boundary`, in
-/// order, read as [`MultipartScan`] reads them; it stops at the closing
-/// delimiter or at the first error (which the server answers with 400).
-pub(in crate::gateway) fn parts<'a>(
-    boundary: &[u8],
-    body: &'a [u8],
-) -> impl Iterator<Item = Part<'a>> {
-    let boundary = boundary[..boundary.len().min(MAX_BOUNDARY_LEN)].to_vec();
+/// order, read as [`MultipartScan`] reads them; `None` unless the body
+/// reaches its closing delimiter, as the server reads no parameter at all
+/// from a body it refuses with 400.
+pub(in crate::gateway) fn parts<'a>(boundary: &[u8], body: &'a [u8]) -> Option<Vec<Part<'a>>> {
+    let boundary = &boundary[..boundary.len().min(MAX_BOUNDARY_LEN)];
     let mut next = b"\r\n--".to_vec();
-    next.extend_from_slice(&boundary);
+    next.extend_from_slice(boundary);
     let first = &next[2..];
-    let mut at = find(body, first).map(|start| start + first.len());
+    let mut at = find(body, first)? + first.len();
     let mut headers_total = 0;
-    std::iter::from_fn(move || {
-        let start = at.take()?;
-        let rest = &body[start..];
+    let mut parts = Vec::new();
+    loop {
+        let rest = &body[at..];
         let len = find(rest, b"\r\n\r\n")?;
         headers_total += len;
         if len == 0 || headers_total > MAX_PART_HEADERS {
@@ -452,16 +450,20 @@ pub(in crate::gateway) fn parts<'a>(
         let head = part_head(&rest[2..len + 2])?;
         let content = &rest[len + 4..];
         let end = find(content, &next)?;
-        let after = &content[end + next.len()..];
-        if after.len() >= 2 && !after.starts_with(b"--") {
-            at = Some(body.len() - after.len());
-        }
-        Some(Part {
+        parts.push(Part {
             kind: head.kind,
             name: head.name,
             value: &content[..end],
-        })
-    })
+        });
+        let after = &content[end + next.len()..];
+        if after.len() < 2 {
+            return None;
+        }
+        if after.starts_with(b"--") {
+            return Some(parts);
+        }
+        at = body.len() - after.len();
+    }
 }
 
 /// Where `pattern` first occurs in `bytes` (td's `find_boundary`).
