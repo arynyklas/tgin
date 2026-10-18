@@ -390,6 +390,17 @@ impl Gateway {
                 };
                 return proxy::forward(bot, upstream, label, req, forwarding).await;
             }
+            FileTarget::Origin(base) => {
+                // Never the raw bytes: the checked segments, encoded again.
+                let Some(path) = files::origin_path(file_path) else {
+                    handles.count(Outcome::Rejected);
+                    tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway file request refused: the path is not a plain relative path");
+                    return errors::error(StatusCode::NOT_FOUND, files::NOT_FOUND);
+                };
+                let forwarding = Forwarding::new(&self.upstreams);
+                let upstream = Upstream::File { base, path: &path };
+                return proxy::forward(bot, upstream, label, req, forwarding).await;
+            }
             FileTarget::NotServed => {
                 handles.count(Outcome::Rejected);
                 return errors::error(StatusCode::NOT_FOUND, files::NOT_SERVED);

@@ -40,7 +40,9 @@ static LOGS: LazyLock<Logs> = LazyLock::new(|| {
     tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
+        // wiremock logs an unmatched request whole, URL and all; those
+        // lines are not tgin's.
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace,wiremock=off"))
         .try_init()
         .expect("the only global subscriber");
     logs
@@ -499,6 +501,21 @@ async fn origin_files_proxied() {
         )
         .mount(&origin)
         .await;
+    // Paths are forwarded as their decoded segments, encoded again: a
+    // double-encoded dot run stays one literal segment, an encoded
+    // unreserved character arrives plain.
+    for (rel, body) in [
+        ("%252e%252e%252fx", "literal"),
+        ("documents/file_1.pdf", "plain"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{encoded}/{rel}")))
+            .and(query_param("probe", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .with_priority(1)
+            .mount(&origin)
+            .await;
+    }
     let yaml = format!(
         r#"version: 1
 runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
@@ -548,6 +565,43 @@ consumers:
             .is_empty()
     );
     tgin.assert_metric(r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="ok"} 1"#);
+
+    // Traversal, encoded or not, never reaches the origin.
+    for escape in ["..%2F/", "..%2F..%2Fx", "%2e%2e%2fx", "a%5C..%5Cx", "a%00b"] {
+        let response = tgin.file(TOKEN, escape, &[]).await;
+        assert_eq!(
+            description(response).await,
+            (404, "Not Found".to_owned()),
+            "{escape}"
+        );
+    }
+    assert_eq!(
+        origin.received_requests().await.expect("recording").len(),
+        1
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="rejected"} 5"#,
+    );
+
+    for (rel, expected_path, body) in [
+        (
+            "%252e%252e%252fx",
+            format!("/files/{encoded}/%252e%252e%252fx"),
+            "literal",
+        ),
+        (
+            "documents/file%5F1.pdf",
+            format!("/files/{encoded}/documents/file_1.pdf"),
+            "plain",
+        ),
+    ] {
+        let response = tgin.file(TOKEN, &format!("{rel}?probe=1"), &[]).await;
+        assert_eq!(response.status(), 200, "{rel}");
+        assert_eq!(&response.bytes().await.expect("body")[..], body.as_bytes());
+        let requests = origin.received_requests().await.expect("recording");
+        let last = requests.last().expect("a request");
+        assert_eq!(last.url.path(), expected_path, "{rel}");
+    }
     assert_logs_clean(&[TOKEN]);
     tgin.stop().await;
 }
@@ -821,7 +875,12 @@ consumers:
         serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
     assert_eq!(value, failed);
 
-    let response = tgin.get(&format!("/bot{TOKEN}/getStickerSet"), &[]).await;
+    let response = tgin
+        .get(
+            &format!("/bot{TOKEN}/getStickerSet"),
+            &[("accept-encoding", "gzip")],
+        )
+        .await;
     let value: Value =
         serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
     assert_eq!(value, other_method);
@@ -833,6 +892,38 @@ consumers:
     let value: Value =
         serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
     assert_eq!(value, large);
+
+    // A rewritten getFile goes upstream uncompressed (its answer is read);
+    // a verbatim one, and any other method, keeps the client's header.
+    let requests = server.received_requests().await.expect("recording");
+    let encoding_of = |path: String| {
+        let found: Vec<Option<String>> = requests
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .map(|request| {
+                request
+                    .headers
+                    .get("accept-encoding")
+                    .map(|value| value.to_str().expect("ASCII").to_owned())
+            })
+            .collect();
+        assert!(!found.is_empty(), "no request at {path}");
+        found
+    };
+    for token in [TOKEN, THIRD_TOKEN] {
+        for encoding in encoding_of(format!("/bot{token}/getFile")) {
+            assert_eq!(encoding, None);
+        }
+    }
+    for token in [OTHER_TOKEN, FOURTH_TOKEN] {
+        for encoding in encoding_of(format!("/bot{token}/getFile")) {
+            assert_eq!(encoding.as_deref(), Some("gzip"));
+        }
+    }
+    assert_eq!(
+        encoding_of(format!("/bot{TOKEN}/getStickerSet")),
+        [Some("gzip".to_owned())]
+    );
 
     tgin.stop().await;
 }

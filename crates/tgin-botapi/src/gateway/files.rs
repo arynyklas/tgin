@@ -13,6 +13,7 @@
 //! ([`Upstream::token_dirs`]). Both names are secrets: nothing here logs a
 //! path, a directory or a URL, only the bot's name.
 
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,8 +39,9 @@ use super::{Bot, Bounded, base, errors, read_bounded};
 pub(super) const FILE_NOT_FOUND: &str = "Not Found: file not found";
 /// The file route of a `local` upstream without `files`.
 pub(super) const NOT_SERVED: &str = "Not Found: files are not served for this upstream";
-/// A path that leaves the bot's directory.
-const NOT_FOUND: &str = "Not Found";
+/// A path that leaves the bot's directory, or that no file origin is
+/// given.
+pub(super) const NOT_FOUND: &str = "Not Found";
 /// The largest `getFile` answer read for its rewrite (ruling R3); a larger
 /// one passes verbatim.
 const GET_FILE_LIMIT: usize = 64 * 1024;
@@ -55,9 +57,11 @@ const TOKEN_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
 
 /// Where a bot's `/file/bot<token>/<rel>` route goes.
 pub(super) enum FileTarget {
-    /// Proxied below this base: `{url}/file/bot{token}/` on the cloud,
-    /// `{files.url}/{token}/` for a file origin.
+    /// The cloud: the raw path proxied below `{url}/file/bot{token}/`.
     Proxy(Url),
+    /// A file origin: the path checked by [`origin_path`] and proxied below
+    /// `{files.url}/{token}/`.
+    Origin(Url),
     /// Served from the bot's directory under `root`, the server's
     /// directory as mounted in tgin.
     Disk { root: PathBuf },
@@ -90,7 +94,7 @@ impl FileTarget {
             Some(Files::Dir { dir, .. }) => FileTarget::Disk {
                 root: dir.expose().clone(),
             },
-            Some(Files::Url(url)) => FileTarget::Proxy(origin_base(url.expose(), token)?),
+            Some(Files::Url(url)) => FileTarget::Origin(origin_base(url.expose(), token)?),
         })
     }
 }
@@ -200,8 +204,9 @@ pub async fn serve(dir: &Path, rel: &str, req_headers: &HeaderMap) -> Response {
         _ => return file_not_found(),
     };
     let len = meta.len();
-    let modified = meta.modified().ok().and_then(whole_seconds);
-    let etag = etag(len, modified);
+    let mtime = meta.modified().ok();
+    let etag = etag(len, mtime);
+    let modified = mtime.and_then(whole_seconds);
     let last_modified = modified.map(httpdate::fmt_http_date);
 
     let mut validators = HeaderMap::new();
@@ -259,12 +264,23 @@ pub async fn serve(dir: &Path, rel: &str, req_headers: &HeaderMap) -> Response {
     response
 }
 
-/// `rel` percent-decoded as a relative path of plain components: `None`
-/// for an empty segment (so an absolute path), `.` or `..`, a `\`, a NUL,
-/// or, on Windows, a ':' (a drive or an alternate data stream).
-fn relative(rel: &str) -> Option<PathBuf> {
+/// `rel` percent-decoded once, when it is plain relative segments: `None`
+/// for invalid UTF-8, a NUL, a `\`, or an empty (so an absolute path too),
+/// `.` or `..` segment.
+fn checked(rel: &str) -> Option<Cow<'_, str>> {
     let rel = percent_decode_str(rel).decode_utf8().ok()?;
-    if rel.contains(['\0', '\\']) || (cfg!(windows) && rel.contains(':')) {
+    let plain = !rel.contains(['\0', '\\'])
+        && rel
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    plain.then_some(rel)
+}
+
+/// `rel` as a relative path of plain components ([`checked`]), refused
+/// on Windows also for a ':' (a drive or an alternate data stream).
+fn relative(rel: &str) -> Option<PathBuf> {
+    let rel = checked(rel)?;
+    if cfg!(windows) && rel.contains(':') {
         return None;
     }
     let mut path = PathBuf::new();
@@ -278,6 +294,22 @@ fn relative(rel: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// `rel` for a file origin: its [`checked`] segments, each percent-encoded
+/// again with the strict unreserved set, so an origin that decodes once
+/// sees exactly the path checked here, whatever the request's encoding.
+/// The rules do not depend on tgin's OS: the origin is remote.
+pub(super) fn origin_path(rel: &str) -> Option<String> {
+    let rel = checked(rel)?;
+    let mut path = String::with_capacity(rel.len());
+    for (i, segment) in rel.split('/').enumerate() {
+        if i > 0 {
+            path.push('/');
+        }
+        path.extend(utf8_percent_encode(segment, TOKEN_SEGMENT));
+    }
+    Some(path)
+}
+
 /// `time` cut to whole seconds, as HTTP dates carry it; `None` before
 /// 1970.
 fn whole_seconds(time: SystemTime) -> Option<SystemTime> {
@@ -285,10 +317,10 @@ fn whole_seconds(time: SystemTime) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(since.as_secs()))
 }
 
-/// A weak validator: the file's size and modification time.
+/// A weak validator: the file's size and full-precision modification time.
 fn etag(len: u64, modified: Option<SystemTime>) -> String {
     match modified.and_then(|time| time.duration_since(UNIX_EPOCH).ok()) {
-        Some(since) => format!("W/\"{len:x}-{:x}\"", since.as_secs()),
+        Some(since) => format!("W/\"{len:x}-{:x}\"", since.as_nanos()),
         None => format!("W/\"{len:x}\""),
     }
 }
@@ -585,6 +617,35 @@ mod tests {
     }
 
     #[test]
+    fn origin_paths_checked_and_encoded_again() {
+        let ok = |rel| origin_path(rel).unwrap_or_else(|| panic!("{rel} refused"));
+        assert_eq!(ok("documents/file_1.pdf"), "documents/file_1.pdf");
+        assert_eq!(ok("documents/file%5F1.pdf"), "documents/file_1.pdf");
+        assert_eq!(ok("%252e%252e%252fx"), "%252e%252e%252fx");
+        assert_eq!(ok("a%20b/c%3Ad"), "a%20b/c%3Ad");
+        assert_eq!(ok("C%3Aabc"), "C%3Aabc");
+        assert_eq!(ok("%C3%A9"), "%C3%A9");
+        for refused in [
+            "",
+            "/x",
+            "%2Fx",
+            "a//b",
+            "a/",
+            ".",
+            "..",
+            "a/./b",
+            "..%2F",
+            "..%2F..%2Fx",
+            "%2e%2e%2fx",
+            "a%5C..%5Cx",
+            "a%00b",
+            "%ff",
+        ] {
+            assert_eq!(origin_path(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
     fn own_relative_paths() {
         let root = Some("/srv/tba");
         assert_eq!(
@@ -672,8 +733,13 @@ mod tests {
     #[test]
     fn conditionals() {
         let modified = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // Full precision: 1_000_000 s + 500 ns (Windows keeps 100 ns).
+        assert_eq!(
+            etag(10, Some(modified + Duration::from_nanos(500))),
+            "W/\"a-38d7ea4c681f4\""
+        );
         let etag = etag(10, Some(modified));
-        assert_eq!(etag, "W/\"a-f4240\"");
+        assert_eq!(etag, "W/\"a-38d7ea4c68000\"");
         let headers = |pairs: &[(&'static str, &str)]| {
             let mut map = HeaderMap::new();
             for (name, value) in pairs {
@@ -682,14 +748,14 @@ mod tests {
             map
         };
         assert!(not_modified(
-            &headers(&[("if-none-match", "\"a-f4240\"")]),
+            &headers(&[("if-none-match", "\"a-38d7ea4c68000\"")]),
             &etag,
             Some(modified)
         ));
         assert!(not_modified(
             &headers(&[
                 ("if-none-match", "\"x\""),
-                ("if-none-match", "W/\"a-f4240\"")
+                ("if-none-match", "W/\"a-38d7ea4c68000\"")
             ]),
             &etag,
             Some(modified)
