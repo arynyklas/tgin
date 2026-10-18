@@ -44,6 +44,17 @@ pub enum ApiError {
     Config(&'static str),
 }
 
+impl ApiError {
+    /// How long the server asked to wait before calling again, when it
+    /// said (`parameters.retry_after`, or the `Retry-After` header).
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
 /// The fields of the bot's own account tgin reads.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct BotUser {
@@ -1012,6 +1023,25 @@ mod tests {
             "{}",
             scrape()
         );
+    }
+
+    #[test]
+    fn retry_after_only_from_http_errors() {
+        let wait = Some(Duration::from_secs(7));
+        let throttled = ApiError::Http {
+            status: 429,
+            description: String::new(),
+            retry_after: wait,
+        };
+        assert_eq!(throttled.retry_after(), wait);
+        let plain = ApiError::Http {
+            status: 502,
+            description: String::new(),
+            retry_after: None,
+        };
+        assert_eq!(plain.retry_after(), None);
+        assert_eq!(ApiError::Network("down".into()).retry_after(), None);
+        assert_eq!(ApiError::Decode("bad".into()).retry_after(), None);
     }
 
     #[tokio::test]

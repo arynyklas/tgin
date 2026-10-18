@@ -38,10 +38,11 @@ const RETRY_AFTER_SECS: &str = "5";
 
 const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 const FORWARDED_FOR: &str = "x-forwarded-for";
-/// The backoff between `setWebhook` attempts: `(initial, max)`.
-const REGISTER_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(300));
-/// The longest server-requested `retry_after` a registration waits.
-const REGISTER_RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
+/// The backoff between attempts of a retried Bot API call: `(initial,
+/// max)`.
+const RETRY_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(300));
+/// The longest server-requested `retry_after` a retried call waits.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
 
 /// The networks Telegram's cloud sends webhooks from; a self-hosted Bot API
 /// server sends from wherever it runs (config validation keeps this preset
@@ -202,58 +203,90 @@ pub enum Registration {
     Rejected(ApiError),
 }
 
-/// Makes `attempt`, a `setWebhook` call, until one succeeds, `stop` is
-/// cancelled or the server rejects it for good. `failed` is the error of
-/// an attempt made just before, waited out first; without it the first
-/// attempt is made at once. Between attempts it waits the backoff, 1 s
-/// doubling to 5 min with full jitter, or the server's `retry_after` (up to
-/// 1 h) when that is longer. `name` is the bot's, for logs.
-///
-/// An error is final when [`crate::is_fatal`] says so for the upstream:
-/// on a cloud upstream a 401, 403 or 404 (the token rejected), on a
-/// self-hosted one (`local_upstream`) only a 403, since its 401 or 404 may
-/// be about the server's own api_id or api_hash. The caller logs a
-/// [`Registration::Rejected`]; cancellation, mid-wait or mid-attempt, ends
-/// it at once as [`Registration::Stopped`].
+/// Makes `attempt`, a `setWebhook` call, with [`retry_call`] (see there:
+/// backoff, `retry_after`, final errors, cancellation), logging each
+/// failure. `name` is the bot's, for logs; the caller logs a
+/// [`Registration::Rejected`].
 pub async fn retry_registration<F, Fut>(
     name: &str,
     stop: &CancellationToken,
     local_upstream: bool,
-    mut failed: Option<ApiError>,
-    mut attempt: F,
+    failed: Option<ApiError>,
+    attempt: F,
 ) -> Registration
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), ApiError>>,
 {
-    let (initial, max) = REGISTER_BACKOFF;
+    let failing = |err: &ApiError, delay: Duration| {
+        tracing::warn!(source = %name, error = %err, ?delay, "setWebhook failed; the Bot API server may not deliver updates until a retry succeeds");
+    };
+    match retry_call(stop, local_upstream, failed, attempt, failing).await {
+        Retried::Done(()) => Registration::Registered,
+        Retried::Stopped => Registration::Stopped,
+        Retried::Rejected(err) => Registration::Rejected(err),
+    }
+}
+
+/// How [`retry_call`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retried<T> {
+    /// An attempt succeeded with this.
+    Done(T),
+    /// `stop` was cancelled first.
+    Stopped,
+    /// An error no retry can fix (see [`crate::is_fatal`]).
+    Rejected(ApiError),
+}
+
+/// Makes `attempt`, a Bot API call, until one succeeds, `stop` is cancelled
+/// or the server rejects it for good. `failed` is the error of an attempt
+/// made just before, waited out first; without it the first attempt is
+/// made at once. Between attempts it waits the backoff, 1 s doubling to
+/// 5 min with full jitter, or the server's `retry_after` (up to 1 h) when
+/// that is longer; `failing` hears of each error a retry follows, with the
+/// wait.
+///
+/// An error is final when [`crate::is_fatal`] says so for the upstream:
+/// on a cloud upstream a 401, 403 or 404 (the token rejected), on a
+/// self-hosted one (`local_upstream`) only a 403, since its 401 or 404 may
+/// be about the server's own api_id or api_hash. Cancellation, mid-wait or
+/// mid-attempt, ends it at once as [`Retried::Stopped`].
+pub async fn retry_call<T, F, Fut>(
+    stop: &CancellationToken,
+    local_upstream: bool,
+    mut failed: Option<ApiError>,
+    mut attempt: F,
+    mut failing: impl FnMut(&ApiError, Duration),
+) -> Retried<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ApiError>>,
+{
+    let (initial, max) = RETRY_BACKOFF;
     let mut backoff = Backoff::new(initial, max, Duration::ZERO);
     loop {
         if let Some(err) = failed.take() {
             if crate::is_fatal(&err, local_upstream) {
-                return Registration::Rejected(err);
+                return Retried::Rejected(err);
             }
-            let retry_after = match &err {
-                ApiError::Http { retry_after, .. } => *retry_after,
-                _ => None,
-            };
             let delay = honor_retry_after(
                 backoff.next_delay(&mut rand::rng()),
-                retry_after,
-                REGISTER_RETRY_AFTER_CAP,
+                err.retry_after(),
+                RETRY_AFTER_CAP,
             );
-            tracing::warn!(source = %name, error = %err, ?delay, "setWebhook failed; the Bot API server may not deliver updates until a retry succeeds");
+            failing(&err, delay);
             if stop
                 .run_until_cancelled(tokio::time::sleep(delay))
                 .await
                 .is_none()
             {
-                return Registration::Stopped;
+                return Retried::Stopped;
             }
         }
         match stop.run_until_cancelled(attempt()).await {
-            None => return Registration::Stopped,
-            Some(Ok(())) => return Registration::Registered,
+            None => return Retried::Stopped,
+            Some(Ok(value)) => return Retried::Done(value),
             Some(Err(err)) => failed = Some(err),
         }
     }

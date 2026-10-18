@@ -167,17 +167,14 @@ impl Backoffs {
 
     /// The next delay after `err`, or the server's `retry_after` if longer.
     fn delay(&mut self, err: &ApiError) -> Duration {
-        let (backoff, retry_after) = match err {
+        let backoff = match err {
             ApiError::Http {
-                status: 401 | 404,
-                retry_after,
-                ..
-            } => (&mut self.rejected, *retry_after),
-            ApiError::Http { retry_after, .. } => (&mut self.errors, *retry_after),
-            _ => (&mut self.errors, None),
+                status: 401 | 404, ..
+            } => &mut self.rejected,
+            _ => &mut self.errors,
         };
         let computed = backoff.next_delay(&mut rand::rng());
-        honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+        honor_retry_after(computed, err.retry_after(), RETRY_AFTER_CAP)
     }
 }
 
