@@ -783,7 +783,9 @@ impl Resolver<'_> {
             let url = self.upstream_url(&format!("{path}.url"), name.as_str(), &upstream.url);
             let files = match &upstream.files {
                 None => Some(None),
-                Some(files) => self.files(&format!("{path}.files"), &files.value).map(Some),
+                Some(files) => {
+                    (self.files(&format!("{path}.files"), name.as_str(), &files.value)).map(Some)
+                }
             };
             let kind = upstream.kind.value;
             let response_timeout = upstream.response_timeout.as_ref().map_or(
@@ -824,11 +826,12 @@ impl Resolver<'_> {
         Some(url)
     }
 
-    /// An upstream's `files`; validation reported a shape that is neither
-    /// `dir` nor `url`.
-    fn files(&mut self, path: &str, files: &raw::Files) -> Option<Files> {
+    /// The `files` of the upstream `name`; validation reported a shape that
+    /// is neither `dir` nor `url`. A `url` is an upstream URL: its paths
+    /// name each bot's token.
+    fn files(&mut self, path: &str, name: &str, files: &raw::Files) -> Option<Files> {
         if let Some(url) = &files.url {
-            return self.url(&format!("{path}.url"), url, false).map(Files::Url);
+            return (self.upstream_url(&format!("{path}.url"), name, url)).map(Files::Url);
         }
         let text = files.dir.as_ref()?;
         let dir_path = format!("{path}.dir");

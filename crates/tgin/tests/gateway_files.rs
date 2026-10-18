@@ -948,7 +948,8 @@ consumers:
 }
 
 /// Each token's '~' form, the directory name telegram-bot-api may use,
-/// is a secret the logs mask, as the token itself is.
+/// and its `%3A` forms, as a `files.url` origin's paths carry it, are
+/// secrets the logs mask, as the token itself is.
 #[test]
 fn token_directory_forms_are_secrets() {
     let yaml = format!(
@@ -957,9 +958,18 @@ fn token_directory_forms_are_secrets() {
     let cfg = tgin_core::config::load(&yaml, Path::new("tgin.yaml"), &MapEnv::default())
         .unwrap_or_else(|errors| panic!("{errors:?}"));
     let secrets = secrets(&cfg);
+    let redactor = tgin_runtime::secret::Redactor::new(secrets.clone());
     for token in [TOKEN, OTHER_TOKEN] {
         assert!(secrets.iter().any(|s| s == token));
         assert!(secrets.iter().any(|s| *s == tilde(token)));
+        let secret = token.split_once(':').expect("a token").1;
+        for encoded in ["%3A", "%3a"] {
+            let form = token.replace(':', encoded);
+            assert!(secrets.contains(&form), "{encoded}");
+            let line = format!("GET http://files.internal/tba/{form}/documents/file_1.pdf");
+            let masked = redactor.redact(&line);
+            assert!(!masked.contains(secret), "{masked}");
+        }
     }
 }
 

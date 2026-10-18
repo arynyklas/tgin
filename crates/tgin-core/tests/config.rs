@@ -2986,6 +2986,39 @@ fn http_upstream_warning() {
     assert!(!warning.to_string().contains("bot-api"), "{warning}");
 }
 
+/// A `files.url` origin is asked for each bot's directory, named after its
+/// token: plain http to a host that is not loopback warns as an upstream
+/// URL does, naming the upstream and never the URL.
+#[test]
+fn http_files_url_warning() {
+    let yaml = |files_url: &str| {
+        format!(
+            "version: 1\nupstreams:\n  local: {{ kind: local, url: \"http://127.0.0.1:8081\", files: {{ url: \"{files_url}\" }} }}\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: local\n"
+        )
+    };
+    let text = yaml("http://files.internal/tba");
+    let cfg = loads(&text);
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_at(
+        warning,
+        "upstreams.local.files.url",
+        pos(&text, "\"http://files"),
+    );
+    assert_message(warning, "`local`");
+    assert!(!warning.to_string().contains("files.internal"), "{warning}");
+    for quiet in ["http://127.0.0.1:8090/tba", "https://files.internal/tba"] {
+        let cfg = loads(&yaml(quiet));
+        assert!(
+            cfg.warnings.is_empty(),
+            "{quiet}: {}",
+            render(&cfg.warnings)
+        );
+    }
+}
+
 #[test]
 fn response_timeout_defaults_and_bounds() {
     let yaml = |kind: &str, timeout: &str| {
