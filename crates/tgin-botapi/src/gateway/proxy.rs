@@ -57,8 +57,10 @@ const FLOOD_LIMIT: usize = 64 * 1024;
 /// have executed the call, so a client must not take it as not done.
 pub(super) const NO_ANSWER: &str =
     "Bad Gateway: the Bot API server did not answer; the call may have been executed";
-/// The 502 when the server never had the whole request (the connection
-/// failed, or the upload stalled or broke off): it did not execute the call.
+/// The 502 when the call was not executed: the server never had the whole
+/// request (the connect failed or never finished, or the upload stalled or
+/// broke off), or it answered 429 and that answer's body broke (flood
+/// control refused the call). A client may send it again.
 const UNREACHABLE: &str = "Bad Gateway: the Bot API server is unreachable";
 /// The 502 when a file origin (`files.url`) sent no answer: a download
 /// changes nothing, so there is nothing to be unsure of.
@@ -238,13 +240,15 @@ enum Payload {
 enum Failed {
     /// Reading the client's body failed: the client went away.
     ClientClosed,
-    /// The server never had the whole request: the connection failed, or
-    /// broke off before the request body was all sent (logged where it
-    /// happened).
+    /// The server never had the whole request: the connect failed or never
+    /// finished, or the connection broke off before the request body was
+    /// all sent (logged where it happened).
     Unreachable,
-    /// The request body did not move for `upstream_idle_timeout`, in either
-    /// direction, before it was all sent, while the server was not reading
-    /// it (the client's body had a frame ready).
+    /// The body did not move for `upstream_idle_timeout`: while it was sent
+    /// upstream, in either direction, with the server not reading it (the
+    /// client's body had a frame ready); or while tgin read it from the
+    /// client before sending anything (`prepare`, `read_within`), a client
+    /// stall that never reached the server.
     Idle,
     /// As [`Failed::Idle`], but the client's body had nothing to send: the
     /// downstream stalled, not the server. Answered as `Idle` is.
