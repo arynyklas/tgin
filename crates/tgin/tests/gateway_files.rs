@@ -1220,6 +1220,47 @@ async fn assert_forwarded(server: &MockServer, token: &str, method: &str, body: 
     assert_eq!(last.body, body, "{method}");
 }
 
+/// Sends `head` (a request head, its empty line included) and then `body`
+/// on a connection of its own to tgin, writing nothing more, and reads
+/// tgin's answer within [`PATIENCE`]: its status and its description.
+async fn raw_exchange(tgin: &Tgin, head: &str, body: &[u8]) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(tgin.addr)
+        .await
+        .expect("connect");
+    stream.write_all(head.as_bytes()).await.expect("the head");
+    stream.write_all(body).await.expect("the body");
+    let read = async {
+        let mut answer = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = answer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&answer[..end]).expect("ASCII");
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().expect("a length"))
+                    })
+                    .expect("a Content-Length");
+                if answer.len() >= end + 4 + length {
+                    let status = head[9..12].parse().expect("a status");
+                    let value: Value = serde_json::from_slice(&answer[end + 4..end + 4 + length])
+                        .expect("a JSON answer");
+                    let description = value["description"].as_str().unwrap_or_default();
+                    return (status, description.to_owned());
+                }
+            }
+            let n = stream.read(&mut buf).await.expect("the answer");
+            assert!(n > 0, "closed: {}", String::from_utf8_lossy(&answer));
+            answer.extend_from_slice(&buf[..n]);
+        }
+    };
+    timeout(PATIENCE, read).await.expect("an answer in time")
+}
+
 /// A JSON body over 1 MiB.
 fn large_json() -> Vec<u8> {
     format!(r#"{{"chat_id":4,"text":"{}"}}"#, "x".repeat(1 << 20)).into_bytes()
@@ -1246,16 +1287,15 @@ async fn local_file_refused_in_every_position() {
             String::from_utf8_lossy(&body)
         );
     }
-    let large = tgin
-        .send(
-            reqwest::Method::POST,
-            &format!("/bot{TOKEN}/sendMessage"),
-            JSON,
-            large_json(),
-        )
-        .await;
+    // Announced over 1 MiB, answered at once and no byte of it read: the
+    // body is never written, as a client still writing it may never read
+    // the answer (a broken pipe, or a reset for the bytes tgin left unread).
+    let head = format!(
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: {JSON}\r\nContent-Length: {}\r\n\r\n",
+        (1 << 20) + 1
+    );
     assert_eq!(
-        description(large).await,
+        raw_exchange(&tgin, &head, b"").await,
         (413, "Request Entity Too Large".to_owned())
     );
     assert!(
@@ -1657,20 +1697,27 @@ async fn large_bodies_scanned_while_they_stream() {
         );
         refused.push(len);
     }
-    let chunk = format!(r#"{{"chat_id":1,"caption":"{}"#, "y".repeat(64 * 1024));
-    let response = tgin
-        .send(
-            reqwest::Method::POST,
-            &format!("/bot{TOKEN}/sendMessage"),
-            JSON,
-            reqwest::Body::wrap(Chunked(vec![chunk.clone(); 20])),
-        )
-        .await;
+    // Exactly 1 MiB of JSON text in 64 KiB chunks, all scanned clean, then
+    // one more byte, and nothing after it: tgin refuses at that byte, having
+    // read everything sent, so its answer cannot be lost to a client still
+    // writing or to a reset for unread data.
+    let mut body = Vec::new();
+    let mut text = br#"{"chat_id":1,"caption":""#.to_vec();
+    text.resize(1 << 20, b'y');
+    for chunk in text.chunks(64 * 1024) {
+        body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        body.extend_from_slice(chunk);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"1\r\ny\r\n");
+    let head = format!(
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: {JSON}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
     assert_eq!(
-        description(response).await,
+        raw_exchange(&tgin, &head, &body).await,
         (413, "Request Entity Too Large".to_owned())
     );
-    refused.push(20 * chunk.len());
+    refused.push(text.len() + 1);
 
     // Each refused upload breaks the connection it went on, which the
     // server records as ended short: with the part of the request it got,
@@ -1711,22 +1758,6 @@ fn summary(records: &[Recorded]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// A body of `chunks` with no length announced: it goes chunked.
-struct Chunked(Vec<String>);
-
-impl http_body::Body for Chunked {
-    type Data = axum::body::Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let chunk = self.get_mut().0.pop();
-        std::task::Poll::Ready(chunk.map(|chunk| Ok(http_body::Frame::data(chunk.into()))))
-    }
 }
 
 /// What [`recorder`] saw of one connection's last request: the path, the
