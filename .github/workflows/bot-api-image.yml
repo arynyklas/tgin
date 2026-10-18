@@ -49,11 +49,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # Two exporters: the local Docker image for the smoke test, and a
-      # directory that receives the SBOM and the provenance next to the
-      # root filesystem. The weekly run skips the cache, so it really fetches
-      # and builds again; it still refreshes the cache for later runs.
-      - name: Build
+      # The SBOM and the provenance make the result an image index with
+      # attestation manifests, which the docker exporter cannot load. So this
+      # step exports only to a directory, which receives `sbom.spdx.json` and
+      # `provenance.json` next to the root filesystem. The weekly run skips
+      # the cache, so it really fetches and builds again; it still refreshes
+      # the cache for later runs.
+      - name: Build (attested)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: docker/telegram-bot-api
@@ -62,11 +64,23 @@ jobs:
           sbom: true
           provenance: true
           no-cache: ${{ github.event_name == 'schedule' }}
-          outputs: |
-            type=docker,name=tgin-telegram-bot-api:ci
-            type=local,dest=${{ runner.temp }}/bot-api-image
+          outputs: type=local,dest=${{ runner.temp }}/bot-api-image
           cache-from: type=gha,scope=bot-api-image-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=bot-api-image-${{ matrix.arch }}
+      # The same build without attestations, loaded into Docker for the smoke
+      # test. Every step is cached by the build above (the builder's own cache,
+      # and the GHA scope), so nothing is rebuilt.
+      - name: Load for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/telegram-bot-api
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          sbom: false
+          provenance: false
+          load: true
+          tags: tgin-telegram-bot-api:ci
+          cache-from: type=gha,scope=bot-api-image-${{ matrix.arch }}
       - name: Smoke test
         run: |
           docker run --rm tgin-telegram-bot-api:ci --help
