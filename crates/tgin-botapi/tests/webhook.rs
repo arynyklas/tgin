@@ -11,8 +11,8 @@ use prometheus_client::registry::Registry;
 use reqwest::StatusCode;
 use serde_json::json;
 use tgin_botapi::{
-    BotClient, DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, SetWebhook, WebhookOptions,
-    register, webhook_router, webhook_secret,
+    ApiError, BotClient, DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, IpNet, Registration, SetWebhook,
+    WebhookOptions, register, retry_registration, webhook_router, webhook_secret,
 };
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
@@ -738,4 +738,148 @@ async fn register_sends_derived_secret() {
     let client = BotClient::new(http, &failing.uri().parse().unwrap(), &token).unwrap();
     let err = register(&client, &again).await.unwrap_err();
     assert!(err.to_string().contains("bad webhook"), "{err}");
+}
+
+/// A 429 asking to wait `secs` seconds, as the Bot API server sends it.
+fn too_many_requests(secs: u64) -> ApiError {
+    ApiError::Http {
+        status: 429,
+        description: format!("Too Many Requests: retry after {secs}"),
+        retry_after: Some(Duration::from_secs(secs)),
+    }
+}
+
+/// On a frozen clock: a `setWebhook` answered 429 with `retry_after` 3 is
+/// made again exactly 3 s later (the backoff's first delay is at most 1 s),
+/// and the next 200 registers the webhook. A failed attempt made before
+/// the retries start is waited out the same way.
+#[tokio::test(start_paused = true)]
+async fn registration_retries_honour_retry_after() {
+    let started = tokio::time::Instant::now();
+    let calls = Mutex::new(Vec::new());
+    // Popped from the end: the 429 first, then the 200.
+    let mut replies = vec![Ok(()), Err(too_many_requests(3))];
+    let registered = retry_registration("wh", &CancellationToken::new(), false, None, || {
+        calls.lock().push(started.elapsed());
+        std::future::ready(replies.pop().expect("two attempts"))
+    })
+    .await;
+    assert_eq!(registered, Registration::Registered);
+    assert_eq!(*calls.lock(), [Duration::ZERO, Duration::from_secs(3)]);
+
+    let started = tokio::time::Instant::now();
+    let calls = Mutex::new(Vec::new());
+    let registered = retry_registration(
+        "wh",
+        &CancellationToken::new(),
+        false,
+        Some(too_many_requests(3)),
+        || {
+            calls.lock().push(started.elapsed());
+            std::future::ready(Ok(()))
+        },
+    )
+    .await;
+    assert_eq!(registered, Registration::Registered);
+    assert_eq!(*calls.lock(), [Duration::from_secs(3)]);
+}
+
+/// On a frozen clock: cancelling the bot's ingest ends the retries at once,
+/// both while a retry is waited for and while an attempt is in flight.
+#[tokio::test(start_paused = true)]
+async fn registration_stops_with_ingest() {
+    let started = tokio::time::Instant::now();
+    let stop = CancellationToken::new();
+    let attempts = Mutex::new(0);
+    let retries = retry_registration("wh", &stop, false, None, || {
+        *attempts.lock() += 1;
+        std::future::ready(Err(too_many_requests(3600)))
+    });
+    let cancel = async {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        stop.cancel();
+    };
+    let (registered, ()) = tokio::join!(retries, cancel);
+    assert_eq!(registered, Registration::Stopped);
+    assert_eq!(*attempts.lock(), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+
+    let started = tokio::time::Instant::now();
+    let stop = CancellationToken::new();
+    let hanging = retry_registration("wh", &stop, false, None, std::future::pending);
+    let cancel = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stop.cancel();
+    };
+    let (registered, ()) = tokio::join!(hanging, cancel);
+    assert_eq!(registered, Registration::Stopped);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+}
+
+fn http_error(status: u16) -> ApiError {
+    ApiError::Http {
+        status,
+        description: format!("error {status}"),
+        retry_after: None,
+    }
+}
+
+/// On a frozen clock: a cloud server's 401, 403 or 404 rejects the token
+/// for good, so registration ends after that one attempt, also when it is
+/// the error handed over from an attempt made before. A self-hosted
+/// server's 401 or 404 may be about its own api_id or api_hash: it is
+/// retried; its 403 is final too.
+#[tokio::test(start_paused = true)]
+async fn registration_rejected_for_good_on_cloud_only() {
+    for status in [401, 403, 404] {
+        // A retry fails the test at once rather than waiting on the paused
+        // clock forever.
+        let attempts = Mutex::new(0);
+        let outcome = retry_registration("wh", &CancellationToken::new(), false, None, || {
+            let mut n = attempts.lock();
+            *n += 1;
+            assert_eq!(*n, 1, "{status} retried after a rejection");
+            std::future::ready(Err(http_error(status)))
+        })
+        .await;
+        assert_eq!(outcome, Registration::Rejected(http_error(status)));
+        assert_eq!(*attempts.lock(), 1, "{status}");
+
+        let outcome = retry_registration(
+            "wh",
+            &CancellationToken::new(),
+            false,
+            Some(http_error(status)),
+            || -> std::future::Ready<Result<(), ApiError>> {
+                panic!("no attempt after a rejection")
+            },
+        )
+        .await;
+        assert_eq!(outcome, Registration::Rejected(http_error(status)));
+    }
+
+    for status in [401, 404] {
+        let attempts = Mutex::new(0);
+        let outcome = retry_registration("wh", &CancellationToken::new(), true, None, || {
+            let mut attempts = attempts.lock();
+            *attempts += 1;
+            std::future::ready(if *attempts < 3 {
+                Err(http_error(status))
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert_eq!(outcome, Registration::Registered, "{status}");
+        assert_eq!(*attempts.lock(), 3, "{status}");
+    }
+    let attempts = Mutex::new(0);
+    let outcome = retry_registration("wh", &CancellationToken::new(), true, None, || {
+        let mut n = attempts.lock();
+        *n += 1;
+        assert_eq!(*n, 1, "local 403 retried after a rejection");
+        std::future::ready(Err(http_error(403)))
+    })
+    .await;
+    assert_eq!(outcome, Registration::Rejected(http_error(403)));
 }

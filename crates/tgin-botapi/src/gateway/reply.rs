@@ -206,6 +206,7 @@ impl Call<'_> {
         let response = match sent {
             Ok(response) => response,
             Err(err) => {
+                bot.upstream_metrics.up().unreachable();
                 handles.count(Outcome::Unreachable);
                 self.counts.count(ReplyOutcome::Failed);
                 if err.is_connect() {
@@ -216,6 +217,7 @@ impl Call<'_> {
                 return;
             }
         };
+        bot.upstream_metrics.up().answered();
         handles.upstream_seconds(started.elapsed().as_secs_f64());
         let status = response.status();
         handles.count(outcome(status));

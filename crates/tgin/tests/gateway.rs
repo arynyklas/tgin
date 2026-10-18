@@ -2553,3 +2553,94 @@ async fn response_timeout_below_idle_is_honoured() {
     frozen.thaw();
     tgin.stop().await;
 }
+
+/// Whether the scrape has a series of the family `family` for `bot`.
+fn has_series(text: &str, family: &str, bot: &str) -> bool {
+    let prefix = format!("{family}{{bot=\"{bot}\"");
+    text.lines().any(|l| l.starts_with(&prefix))
+}
+
+/// `tgin_upstream_up{bot}` appears with the bot's first upstream outcome,
+/// not before; `tgin_bot_info` names each bot's upstream from the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_up_absent_before_first_outcome() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/getChat")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .mount(&telegram)
+        .await;
+    let tgin = start(&gateway_config(&telegram.uri())).await;
+    tgin.assert_metric(r#"tgin_bot_info{bot="gw",upstream="api_url"} 1"#);
+    tgin.assert_metric(r#"tgin_bot_info{bot="other",upstream="api_url"} 1"#);
+    let before = tgin.metrics.encode();
+    for bot in ["gw", "other"] {
+        assert!(!has_series(&before, "tgin_upstream_up", bot), "{before}");
+    }
+
+    let response = tgin
+        .http
+        .post(tgin.url(&format!("/bot{TOKEN}/getChat")))
+        .send()
+        .await
+        .expect("an answer");
+    assert_eq!(response.status(), 200);
+    response.bytes().await.expect("the body");
+    tgin.assert_metric(r#"tgin_upstream_up{bot="gw"} 1"#);
+    let after = tgin.metrics.encode();
+    assert!(!has_series(&after, "tgin_upstream_up", "other"), "{after}");
+    assert!(!after.contains(TOKEN) && !after.contains(&telegram.uri()));
+    tgin.stop().await;
+}
+
+/// Any HTTP answer, an error status too, sets `tgin_upstream_up` to 1; a
+/// request the upstream leaves unanswered sets it to 0, until it answers
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_up_flips_on_failure_and_recovery() {
+    let telegram = MockServer::start().await;
+    let at = format!("/bot{TOKEN}/getChat");
+    Mock::given(path(at.clone()))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_json(telegram_error(500, "Internal Server Error")),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&telegram)
+        .await;
+    // Longer than `gw`'s `upstream_idle_timeout` (1 s).
+    Mock::given(path(at.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SENT, "application/json")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&telegram)
+        .await;
+    Mock::given(path(at.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SENT, "application/json"))
+        .with_priority(3)
+        .mount(&telegram)
+        .await;
+    let tgin = start(&gateway_config(&telegram.uri())).await;
+    let call = || async {
+        let response = tgin
+            .http
+            .post(tgin.url(&at))
+            .send()
+            .await
+            .expect("an answer");
+        let status = response.status().as_u16();
+        response.bytes().await.expect("the body");
+        status
+    };
+
+    assert_eq!(call().await, 500);
+    tgin.assert_metric(r#"tgin_upstream_up{bot="gw"} 1"#);
+    assert_eq!(call().await, 502);
+    tgin.assert_metric(r#"tgin_upstream_up{bot="gw"} 0"#);
+    assert_eq!(call().await, 200);
+    tgin.assert_metric(r#"tgin_upstream_up{bot="gw"} 1"#);
+    tgin.stop().await;
+}

@@ -12,6 +12,7 @@ use tgin_core::metrics::{SourceErrorReason, SourceMetrics, SourceStateLabel};
 use tgin_core::sink::{Admit, Sink};
 use tgin_runtime::backoff::{Backoff, honor_retry_after};
 use tgin_runtime::supervisor::Exit;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +28,8 @@ const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_LIMIT: u32 = 100;
 /// The longest server-requested `retry_after` honoured.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
+/// The longest wait after a 401 or 404 from a self-hosted Bot API server.
+const REJECTED_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A webhook that is active again this soon after a successful
 /// `deleteWebhook` was set again by another process (a bot framework calling
 /// `setWebhook`, say); deleting it again would only fight that process.
@@ -50,6 +53,11 @@ pub struct LongPollOptions {
     pub delete_webhook_on_start: bool,
     /// The error backoff: `(initial, max, floor)`.
     pub backoff: (Duration, Duration, Duration),
+    /// The upstream is a self-hosted Bot API server (a `local` upstream).
+    /// Its 401 and 404 can come from the server itself (its api_id or
+    /// api_hash rejected), so the source waits them out with the error
+    /// backoff, capped at 5 min instead, rather than stopping.
+    pub local_upstream: bool,
     /// The wait after a 409 that polling again cannot fix.
     pub conflict_backoff: Duration,
     /// The wait before offering again an update the sink refused with
@@ -69,6 +77,7 @@ impl Default for LongPollOptions {
                 Duration::from_secs(30),
                 Duration::from_millis(50),
             ),
+            local_upstream: false,
             conflict_backoff: Duration::from_secs(5),
             admit_retry: Duration::from_millis(250),
         }
@@ -87,6 +96,34 @@ pub struct LongPollSource<S: Sink> {
     on_identity: OnIdentity,
     /// Why the source backs off, while it does.
     last_error: Mutex<Option<String>>,
+    /// An operator's wait for the server to run dry; see
+    /// [`LongPollSource::drain`].
+    drain: Drain,
+}
+
+/// [`LongPollSource::drain`]'s state, shared with the poll loop.
+struct Drain {
+    /// True while a drain runs, and after it succeeded: polls do not wait
+    /// for updates (`timeout` 0), and an empty batch holds the source. Each
+    /// change wakes the poll loop: becoming true gives up its long poll in
+    /// flight, becoming false lets a held source poll again.
+    on: watch::Sender<bool>,
+    /// Counts the empty batches polled while draining.
+    empty: watch::Sender<u64>,
+}
+
+/// Calls a drain off unless disarmed: the source polls on as before.
+struct Resume<'a> {
+    drain: &'a Drain,
+    armed: bool,
+}
+
+impl Drop for Resume<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.drain.on.send_replace(false);
+        }
+    }
 }
 
 /// What the poll loop does after a failed `getUpdates`.
@@ -100,27 +137,48 @@ enum Step {
 struct Poll {
     /// The first update not yet confirmed: the last admitted id + 1.
     offset: i64,
-    backoff: Backoff,
+    backoff: Backoffs,
     /// When `deleteWebhook` last succeeded.
     webhook_deleted: Option<Instant>,
     /// Whether the source is in [`SourceStateLabel::Running`].
     running: bool,
 }
 
-impl Poll {
-    fn error_delay(&mut self, err: &ApiError) -> Duration {
-        error_delay(&mut self.backoff, err)
-    }
+/// The source's error backoffs: one for every error a retry may fix, and
+/// one, capped at [`REJECTED_BACKOFF_MAX`], for a self-hosted server's 401
+/// or 404.
+struct Backoffs {
+    errors: Backoff,
+    rejected: Backoff,
 }
 
-/// The backoff's next delay, or the server's `retry_after` if longer.
-fn error_delay(backoff: &mut Backoff, err: &ApiError) -> Duration {
-    let retry_after = match err {
-        ApiError::Http { retry_after, .. } => *retry_after,
-        _ => None,
-    };
-    let computed = backoff.next_delay(&mut rand::rng());
-    honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+impl Backoffs {
+    fn new((initial, max, floor): (Duration, Duration, Duration)) -> Self {
+        Self {
+            errors: Backoff::new(initial, max, floor),
+            rejected: Backoff::new(initial, REJECTED_BACKOFF_MAX, floor),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.errors.reset();
+        self.rejected.reset();
+    }
+
+    /// The next delay after `err`, or the server's `retry_after` if longer.
+    fn delay(&mut self, err: &ApiError) -> Duration {
+        let (backoff, retry_after) = match err {
+            ApiError::Http {
+                status: 401 | 404,
+                retry_after,
+                ..
+            } => (&mut self.rejected, *retry_after),
+            ApiError::Http { retry_after, .. } => (&mut self.errors, *retry_after),
+            _ => (&mut self.errors, None),
+        };
+        let computed = backoff.next_delay(&mut rand::rng());
+        honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+    }
 }
 
 impl<S: Sink> LongPollSource<S> {
@@ -147,6 +205,10 @@ impl<S: Sink> LongPollSource<S> {
             metrics,
             on_identity,
             last_error: Mutex::new(None),
+            drain: Drain {
+                on: watch::channel(false).0,
+                empty: watch::channel(0).0,
+            },
         }
     }
 
@@ -156,13 +218,34 @@ impl<S: Sink> LongPollSource<S> {
         self.last_error.lock().clone()
     }
 
+    /// Returns once the Bot API server holds no update of this bot, all
+    /// fetched ones admitted: from now on the source polls without waiting
+    /// for updates (giving up its long poll in flight, whose updates are
+    /// not confirmed, so the next poll gets them again) until a poll finds
+    /// none. The source then polls no more until it is stopped. Dropped
+    /// before it returns, the drain is called off and the source polls on
+    /// as before.
+    pub async fn drain(&self) {
+        let mut empty = self.drain.empty.subscribe();
+        let mut resume = Resume {
+            drain: &self.drain,
+            armed: true,
+        };
+        self.drain.on.send_replace(true);
+        // The sender lives as long as `self`.
+        let _ = empty.changed().await;
+        resume.armed = false;
+    }
+
     /// Calls `getMe`, then polls until `ingest` is cancelled.
     ///
-    /// Returns [`Exit::Done`] on cancellation and [`Exit::Fatal`] when
-    /// Telegram rejects the token (401, 403 or 404). Every other failure,
-    /// of `getMe` too, is waited out here, on a sleep that cancelling
-    /// `ingest` ends at once. Updates not yet admitted at cancellation are
-    /// not confirmed, so Telegram delivers them again to the next poller.
+    /// Returns [`Exit::Done`] on cancellation and [`Exit::Fatal`] when the
+    /// Bot API server rejects the token (401, 403 or 404; on a self-hosted
+    /// server only 403, see [`LongPollOptions::local_upstream`]). Every
+    /// other failure, of `getMe` too, is waited out here, on a sleep that
+    /// cancelling `ingest` ends at once. Updates not yet admitted at
+    /// cancellation are not confirmed, so the server delivers them again to
+    /// the next poller.
     pub async fn run(&self, ingest: CancellationToken) -> Exit {
         self.metrics.set_state(SourceStateLabel::Starting);
         let exit = self.poll(&ingest).await;
@@ -184,7 +267,7 @@ impl<S: Sink> LongPollSource<S> {
     async fn identify(
         &self,
         ingest: &CancellationToken,
-        backoff: &mut Backoff,
+        backoff: &mut Backoffs,
     ) -> Result<Identity, Exit> {
         loop {
             let err = match ingest.run_until_cancelled(self.client.get_me()).await {
@@ -194,11 +277,11 @@ impl<S: Sink> LongPollSource<S> {
             };
             self.count(&err);
             let message = format!("getMe failed: {err}");
-            if is_fatal(&err) {
-                tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
+            if is_fatal(&err, self.opts.local_upstream) {
+                tracing::error!(source = %self.name, error = %err, "the Bot API server rejected the bot token; the source stops");
                 return Err(Exit::Fatal(message));
             }
-            let delay = error_delay(backoff, &err);
+            let delay = backoff.delay(&err);
             tracing::warn!(source = %self.name, error = %err, ?delay, "getMe failed; trying again");
             *self.last_error.lock() = Some(message);
             self.metrics.set_state(SourceStateLabel::Backoff);
@@ -213,8 +296,7 @@ impl<S: Sink> LongPollSource<S> {
     }
 
     async fn poll(&self, ingest: &CancellationToken) -> Exit {
-        let (initial, max, floor) = self.opts.backoff;
-        let mut backoff = Backoff::new(initial, max, floor);
+        let mut backoff = Backoffs::new(self.opts.backoff);
         let identity = match self.identify(ingest, &mut backoff).await {
             Ok(identity) => identity,
             Err(exit) => return exit,
@@ -250,17 +332,27 @@ impl<S: Sink> LongPollSource<S> {
             }
         }
 
+        let mut drain = self.drain.on.subscribe();
         loop {
-            let polled = ingest
-                .run_until_cancelled(self.client.get_updates(
-                    state.offset,
-                    self.opts.limit,
-                    self.opts.timeout,
-                    &self.opts.allowed_updates,
-                ))
-                .await;
-            let Some(polled) = polled else {
-                return Exit::Done;
+            // Marked seen here, so a drain beginning after this read wakes
+            // the poll below.
+            let draining = *drain.borrow_and_update();
+            let timeout = if draining {
+                Duration::ZERO
+            } else {
+                self.opts.timeout
+            };
+            let request = self.client.get_updates(
+                state.offset,
+                self.opts.limit,
+                timeout,
+                &self.opts.allowed_updates,
+            );
+            // A long poll given up confirms nothing: its updates come again.
+            let polled = tokio::select! {
+                () = ingest.cancelled() => return Exit::Done,
+                _ = drain.changed(), if !draining => continue,
+                polled = request => polled,
             };
             let step = match polled.and_then(|body| split_updates(&body)) {
                 Ok(updates) => {
@@ -271,6 +363,9 @@ impl<S: Sink> LongPollSource<S> {
                         self.metrics.set_state(SourceStateLabel::Running);
                     }
                     if !self.admit(&updates, &mut state.offset, ingest).await {
+                        return Exit::Done;
+                    }
+                    if draining && updates.is_empty() && !self.hold(&mut drain, ingest).await {
                         return Exit::Done;
                     }
                     Step::Poll
@@ -292,6 +387,16 @@ impl<S: Sink> LongPollSource<S> {
                 Step::Exit(exit) => return exit,
             }
         }
+    }
+
+    /// After a drain's empty batch: reports it, then waits until the drain
+    /// is called off (`drain` false). Returns `false` if `ingest` is
+    /// cancelled first.
+    async fn hold(&self, drain: &mut watch::Receiver<bool>, ingest: &CancellationToken) -> bool {
+        self.drain.empty.send_modify(|n| *n += 1);
+        // The sender lives as long as `self`; it never closes here.
+        let resumed = drain.wait_for(|on| !on);
+        ingest.run_until_cancelled(resumed).await.is_some()
     }
 
     /// Offers each update in order and moves `offset` past each one the sink
@@ -374,7 +479,7 @@ impl<S: Sink> LongPollSource<S> {
                     Some(Err(err)) => {
                         self.count(&err);
                         tracing::warn!(source = %self.name, error = %err, "deleteWebhook failed");
-                        Step::Wait(state.error_delay(&err))
+                        Step::Wait(state.backoff.delay(&err))
                     }
                 }
             }
@@ -392,12 +497,12 @@ impl<S: Sink> LongPollSource<S> {
                 tracing::warn!(source = %self.name, error = %err, "another process is polling this bot token; run one tgin per token");
                 Step::Wait(self.opts.conflict_backoff)
             }
-            _ if is_fatal(&err) => {
-                tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
+            _ if is_fatal(&err, self.opts.local_upstream) => {
+                tracing::error!(source = %self.name, error = %err, "the Bot API server rejected the bot token; the source stops");
                 Step::Exit(Exit::Fatal(format!("getUpdates failed: {err}")))
             }
             _ => {
-                let delay = state.error_delay(&err);
+                let delay = state.backoff.delay(&err);
                 tracing::warn!(source = %self.name, error = %err, ?delay, "getUpdates failed; backing off");
                 Step::Wait(delay)
             }
@@ -411,16 +516,18 @@ impl<S: Sink> LongPollSource<S> {
     }
 }
 
-/// Errors no retry can fix: Telegram rejected the token (401, 403, 404) or
-/// the client is misconfigured.
-pub fn is_fatal(err: &ApiError) -> bool {
-    matches!(
-        err,
+/// Errors no retry can fix: the Bot API server rejected the token (401, 403,
+/// 404) or the client is misconfigured. On a self-hosted server
+/// (`local_upstream`) a 401 or 404 may come from the server itself (its
+/// api_id or api_hash rejected) and is retried, so only a 403 is fatal.
+pub fn is_fatal(err: &ApiError, local_upstream: bool) -> bool {
+    match err {
         ApiError::Http {
-            status: 401 | 403 | 404,
-            ..
-        } | ApiError::Config(_)
-    )
+            status: 401 | 404, ..
+        } => !local_upstream,
+        ApiError::Http { status: 403, .. } | ApiError::Config(_) => true,
+        _ => false,
+    }
 }
 
 /// The metric reason of `err`; a client setup error is not a source error.
@@ -437,4 +544,156 @@ fn reason(err: &ApiError) -> Option<SourceErrorReason> {
         ApiError::Http { .. } => SourceErrorReason::Http,
         ApiError::Config(_) => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(status: u16) -> ApiError {
+        ApiError::Http {
+            status,
+            description: String::new(),
+            retry_after: None,
+        }
+    }
+
+    /// A self-hosted server's 401 and 404 back off up to 5 min, on a
+    /// backoff of their own; other errors keep the configured cap.
+    #[test]
+    fn rejections_back_off_up_to_5_min() {
+        let defaults = LongPollOptions::default().backoff;
+        let mut backoffs = Backoffs::new(defaults);
+        for _ in 0..64 {
+            for status in [401, 404] {
+                assert!(backoffs.delay(&http(status)) <= REJECTED_BACKOFF_MAX);
+            }
+            assert!(backoffs.delay(&http(502)) <= defaults.1);
+        }
+        assert_eq!(backoffs.rejected.max(), Duration::from_secs(300));
+        assert_eq!(backoffs.rejected.attempt(), 128);
+        assert_eq!(backoffs.errors.attempt(), 64);
+        backoffs.reset();
+        assert_eq!(
+            (backoffs.errors.attempt(), backoffs.rejected.attempt()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn rejections_fatal_on_cloud_only() {
+        for status in [401, 404] {
+            assert!(is_fatal(&http(status), false), "{status}");
+            assert!(!is_fatal(&http(status), true), "{status}");
+        }
+        for local in [false, true] {
+            assert!(is_fatal(&http(403), local));
+            assert!(is_fatal(&ApiError::Config("x"), local));
+            assert!(!is_fatal(&http(429), local));
+            assert!(!is_fatal(&http(500), local));
+        }
+    }
+
+    /// Admits everything.
+    struct Admits;
+
+    impl Sink for Admits {
+        fn admit(&self, _: SourceId, _: i64, _: Bytes, _: &Facts<'_>) -> Admit {
+            Admit::Admitted
+        }
+    }
+
+    /// The `timeout` of each `getUpdates` `server` has seen, in order.
+    async fn poll_timeouts(server: &wiremock::MockServer) -> Vec<u64> {
+        let requests = server.received_requests().await.unwrap_or_default();
+        let polls = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/getUpdates"));
+        polls
+            .map(|r| {
+                let params: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                params["timeout"].as_u64().unwrap()
+            })
+            .collect()
+    }
+
+    /// A drain called off while the source holds after its empty batch
+    /// wakes it: it long-polls again with its own timeout. (One thread:
+    /// once the test sees the empty batch, the source waits in `hold`.)
+    #[tokio::test]
+    async fn called_off_drain_resumes_long_polling() {
+        use futures_util::FutureExt as _;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/bot{TOKEN}/getMe")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"B"}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/bot{TOKEN}/getUpdates")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ok":true,"result":[]}"#)
+                    .set_delay(Duration::from_millis(20)),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let token = tgin_runtime::secret::Secret::new(TOKEN.to_owned());
+        let client = BotClient::new(http, &server.uri().parse().unwrap(), &token).unwrap();
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = tgin_core::metrics::CoreMetrics::register(&mut registry).source("lp");
+        let opts = LongPollOptions {
+            timeout: Duration::from_secs(7),
+            delete_webhook_on_start: false,
+            ..LongPollOptions::default()
+        };
+        let source = Arc::new(LongPollSource::new(
+            SourceId(0),
+            Arc::from("lp"),
+            client,
+            opts,
+            Arc::new(Admits),
+            metrics,
+            Arc::new(|_: SourceId, _: &Identity| {}),
+        ));
+        let ingest = CancellationToken::new();
+        let run = tokio::spawn({
+            let (source, ingest) = (Arc::clone(&source), ingest.clone());
+            async move { source.run(ingest).await }
+        });
+        let wait = Duration::from_secs(10);
+
+        let mut empty = source.drain.empty.subscribe();
+        let mut drain = Box::pin(source.drain());
+        assert!((&mut drain).now_or_never().is_none(), "drained at once");
+        tokio::time::timeout(wait, empty.changed())
+            .await
+            .expect("an empty batch in time")
+            .unwrap();
+        let held = poll_timeouts(&server).await;
+        assert_eq!(held.last(), Some(&0), "{held:?}");
+        drop(drain);
+
+        let resumed = tokio::time::timeout(wait, async {
+            loop {
+                let polls = poll_timeouts(&server).await;
+                if polls.len() > held.len() {
+                    return polls[held.len()..].to_vec();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("polling again in time");
+        assert_eq!(resumed[0], 7, "{resumed:?}");
+        ingest.cancel();
+        assert_eq!(run.await.unwrap(), Exit::Done);
+    }
 }

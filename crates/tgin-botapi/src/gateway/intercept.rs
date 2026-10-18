@@ -8,7 +8,7 @@
 //! | `getMe` | the cached identity; proxied once to fill it | same |
 //! | `setWebhook`, `deleteWebhook` | answered, nothing changes | applied to a push consumer with `accept_set_webhook` |
 //! | `getWebhookInfo` | synthesized | the runtime endpoint and the consumer's pending count |
-//! | `logOut`, `close` | answered, a warning logged | same |
+//! | `logOut`, `close` | 400, a warning logged | same |
 //! | `getFile` (local mode with `files`) | proxied, the bot's own absolute `file_path` made relative | same |
 //!
 //! The method is matched by its label, which the case-insensitive method
@@ -46,6 +46,9 @@ const MAX_SECRET_TOKEN_LEN: usize = 256;
 /// forwarded call would take its updates.
 const PROXY_ONLY_GET_UPDATES: &str =
     "Conflict: tgin serves getUpdates per consumer at /c/<consumer>/bot<token>/getUpdates";
+/// `logOut` or `close` from a downstream: forwarded, it would log the bot
+/// out from under tgin's source and every other downstream.
+const LOG_OUT_DISABLED: &str = "Bad Request: logOut and close are disabled by tgin; operators move bots with tgin admin bot logout|close";
 // telegram-bot-api `Client.cpp` (master e3e9dd8): `do_set_webhook` and
 // `on_webhook_verified`.
 const WEBHOOK_WAS_SET: &str = "Webhook was set";
@@ -100,8 +103,8 @@ impl Call<'_> {
             "getWebhookInfo" => self.webhook_info(),
             "logOut" | "close" => {
                 self.count(Outcome::Local);
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), "a downstream asked to log the bot out of Telegram; answered locally, not forwarded");
-                errors::ok_true(None)
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), "a downstream asked to log the bot out of its Bot API server; refused, not forwarded (operators move bots with tgin admin bot logout|close)");
+                errors::error(StatusCode::BAD_REQUEST, LOG_OUT_DISABLED)
             }
             "getFile" if self.bot.rewrite.is_on() => {
                 let mut req = req;

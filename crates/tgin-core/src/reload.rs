@@ -308,8 +308,7 @@ impl Plan {
                     }
                     Some(new) => {
                         let (old_upstream, new_upstream) = (&bot.upstream, &new.upstream);
-                        let moved = new_upstream.name != old_upstream.name
-                            || new_upstream.url != old_upstream.url;
+                        let moved = !new_upstream.same_server(old_upstream);
                         if moved {
                             report.upstream_changed.push(new.name.clone());
                         }

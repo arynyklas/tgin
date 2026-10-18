@@ -212,6 +212,14 @@ impl Upstream {
         WebhookRules::new(self.kind, self.local_mode)
     }
 
+    /// Whether `other` is the same Bot API server as this one: the same
+    /// name and URL. A bot moved to another server is in
+    /// `upstream_changed` and starts there; its other settings (`kind`,
+    /// `local_mode`, `files`, `response_timeout`) may change without that.
+    pub fn same_server(&self, other: &Upstream) -> bool {
+        self.name == other.name && self.url == other.url
+    }
+
     fn mask(&mut self, redactor: &tgin_runtime::secret::Redactor) {
         self.url.mask(redactor);
         match &mut self.files {

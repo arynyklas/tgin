@@ -1026,8 +1026,12 @@ async fn get_webhook_info_synthesized() {
     tgin.stop().await;
 }
 
+/// A downstream's `logOut` or `close` would log the bot out of its Bot API
+/// server under every other downstream and under tgin's own source: it is
+/// refused with a 400 that points at the operator's command, never
+/// forwarded, and logged as a warning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn log_out_and_close_never_forwarded() {
+async fn downstream_log_out_and_close_are_errors() {
     let telegram = telegram().await;
     let tgin = start(&intercept_config(&telegram.uri(), "")).await;
     for path in [
@@ -1037,7 +1041,18 @@ async fn log_out_and_close_never_forwarded() {
         format!("/bot{OTHER_TOKEN}/Close"),
     ] {
         let (status, body) = tgin.post_json(&path, &json!({})).await;
-        assert_eq!((status, body), (200, ok_true(None)), "{path}");
+        assert_eq!(
+            (status, body),
+            (
+                400,
+                json!({
+                    "ok": false,
+                    "error_code": 400,
+                    "description": "Bad Request: logOut and close are disabled by tgin; operators move bots with tgin admin bot logout|close",
+                })
+            ),
+            "{path}"
+        );
     }
     assert_eq!(
         upstream_paths(&telegram).await,

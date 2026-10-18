@@ -46,8 +46,8 @@ use tokio::time::Instant;
 
 use self::files::{FileTarget, Rewrite};
 use self::limit::BotLimiter;
-pub use self::metrics::GatewayMetrics;
-use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics};
+use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics, UpstreamMetrics};
+pub use self::metrics::{GatewayMetrics, UpstreamUp};
 use self::path::GatewayPath;
 use self::proxy::Upstream;
 use crate::client::Identity;
@@ -167,6 +167,9 @@ struct Bot {
     /// This process's `Via` (see [`Gateway::new`]).
     via: HeaderValue,
     metrics: BotMetrics,
+    /// `tgin_bot_info` and `tgin_upstream_up` for `upstream`: kept while
+    /// the bot's upstream stays the same, replaced when it changes.
+    upstream_metrics: UpstreamMetrics,
     /// Shared with the entries that replace this one while the token and
     /// the rate limits stay the same, so a reload never resets a quota.
     limiter: Arc<BotLimiter>,
@@ -180,13 +183,18 @@ impl Bot {
         bot: GatewayBot,
         via: HeaderValue,
         metrics: BotMetrics,
+        upstream_metrics: UpstreamMetrics,
         identity: Arc<ArcSwapOption<Identity>>,
         limiter: Arc<BotLimiter>,
-    ) -> Option<Bot> {
+    ) -> Result<Bot, UpstreamMetrics> {
         let token = bot.token.expose();
         let url = bot.upstream.url.expose();
-        let method_base = base(url, &[&format!("bot{token}")])?;
-        let files = FileTarget::new(&bot.upstream, token)?;
+        let (Some(method_base), Some(files)) = (
+            base(url, &[&format!("bot{token}")]),
+            FileTarget::new(&bot.upstream, token),
+        ) else {
+            return Err(upstream_metrics);
+        };
         let rewrite = Rewrite::new(&bot.upstream);
         let refuses_local_files =
             local_files::refuses_local_files(&bot.upstream, bot.allow_local_files);
@@ -200,7 +208,7 @@ impl Bot {
             request_timeout: None,
             ..ClientOptions::default()
         });
-        Some(Bot {
+        Ok(Bot {
             name: bot.name,
             source: bot.source,
             token: bot.token,
@@ -214,6 +222,7 @@ impl Bot {
             client,
             via,
             metrics,
+            upstream_metrics,
             limiter,
             identity,
         })
@@ -268,8 +277,11 @@ impl Gateway {
     /// Replaces the bot table. An entry whose token, upstream and gateway
     /// config are unchanged keeps its state (client, identity, limiter); a
     /// bot whose token stays keeps its identity, and its limiter too while
-    /// its rate limits stay. A removed bot's metric series go, and so do
-    /// the webhook-reply series of consumers the engine no longer has.
+    /// its rate limits stay. A bot moved to another server (its upstream's
+    /// name or URL changed) gets a new `tgin_bot_info` label pair and its
+    /// `tgin_upstream_up` starts absent again; other upstream edits keep
+    /// both. A removed bot's metric series go, and so do the
+    /// webhook-reply series of consumers the engine no longer has.
     pub fn set_bots(&self, bots: Vec<GatewayBot>, trusted_proxies: Vec<IpNet>) {
         let old = self.table.load_full();
         let mut entries = Vec::with_capacity(bots.len());
@@ -302,16 +314,41 @@ impl Gateway {
                     }
                 },
             };
-            match Bot::new(bot, self.via.clone(), metrics, identity, limiter) {
-                Some(entry) => entries.push(Arc::new(entry)),
-                None => {
-                    tracing::error!(bot = %name, "the bot's upstream URL cannot be a base URL; the gateway does not serve it")
+            // Kept while the bot stays on the same server: its running
+            // source holds this handle until a reload that moves it, and
+            // only such a reload restarts the source for its upstream.
+            let upstream_metrics = match previous {
+                Some(previous) if previous.upstream.same_server(&bot.upstream) => {
+                    previous.upstream_metrics.clone()
+                }
+                _ => {
+                    // The old series go first: the new ones may carry the
+                    // same labels (the upstream's URL changed, not its name).
+                    if let Some(previous) = previous {
+                        self.metrics.remove_upstream(&previous.upstream_metrics);
+                    }
+                    self.metrics.upstream(&bot.name, &bot.upstream.name)
+                }
+            };
+            match Bot::new(
+                bot,
+                self.via.clone(),
+                metrics,
+                upstream_metrics,
+                identity,
+                limiter,
+            ) {
+                Ok(entry) => entries.push(Arc::new(entry)),
+                Err(upstream_metrics) => {
+                    self.metrics.remove_upstream(&upstream_metrics);
+                    tracing::error!(bot = %name, "the bot's upstream URL cannot be a base URL; the gateway does not serve it");
                 }
             }
         }
         for gone in &old.bots {
             if !entries.iter().any(|entry| entry.name == gone.name) {
                 self.metrics.remove_bot(&gone.metrics);
+                self.metrics.remove_upstream(&gone.upstream_metrics);
             }
         }
         self.table.store(Arc::new(Table {
@@ -319,6 +356,14 @@ impl Gateway {
             trusted_proxies,
         }));
         self.retain_reply_metrics();
+    }
+
+    /// The `tgin_upstream_up` handle of the bot `bot` on its current
+    /// upstream, for the bot's own Bot API calls (long polls, `getMe`,
+    /// `setWebhook` and the like).
+    pub fn upstream_up(&self, bot: &str) -> Option<UpstreamUp> {
+        let table = self.table.load();
+        Some(table.named(bot)?.upstream_metrics.up().clone())
     }
 
     /// Records the identity `getMe` returned for the bot `bot`.

@@ -448,10 +448,29 @@ impl Call<'_> {
     }
 
     /// Sends `body` to `url` and waits for the server's response headers:
-    /// the response and when its headers arrived. While the body is being
-    /// sent, `upstream_idle_timeout` bounds its stalls; once it has been
-    /// sent, `response_timeout` bounds the wait from its end.
+    /// the response and when its headers arrived. Feeds the bot's
+    /// `tgin_upstream_up`: any response is an answer; every failure but
+    /// the client's own leaves the upstream unanswering.
     async fn send(
+        &self,
+        url: Url,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Result<(reqwest::Response, Instant), Failed> {
+        let sent = self.exchange(url, headers, body).await;
+        let up = self.bot.upstream_metrics.up();
+        match &sent {
+            Ok(_) => up.answered(),
+            Err(Failed::ClientClosed) => {}
+            Err(_) => up.unreachable(),
+        }
+        sent
+    }
+
+    /// [`Call::send`]'s exchange. While the body is being sent,
+    /// `upstream_idle_timeout` bounds its stalls; once it has been sent,
+    /// `response_timeout` bounds the wait from its end.
+    async fn exchange(
         &self,
         url: Url,
         headers: HeaderMap,
