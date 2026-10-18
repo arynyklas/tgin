@@ -553,8 +553,10 @@ impl Reloader {
     ///    When that fails, the bot is unparked and starts again.
     ///
     /// `None`, having changed nothing, when the requester went away before
-    /// step 2: no one would learn the outcome. During the shutdown nothing
-    /// is called on the server.
+    /// the server ran dry (step 1): no one would learn the outcome. Once it
+    /// has, the move goes on, as calling off a finished drain would leave
+    /// the bot's long poll held. During the shutdown nothing is called on
+    /// the server.
     async fn move_bot(&self, job: &mut Move) -> Option<Result<Moved, MoveError>> {
         let Move {
             bot: name,
@@ -565,7 +567,7 @@ impl Reloader {
         } = job;
         let (name, how) = (name.as_str(), *how);
         let abandoned = || {
-            tracing::warn!(bot = %name, "the requester of the bot's move went away before its ingest stopped; the move was dropped and changed nothing");
+            tracing::warn!(bot = %name, "the requester of the bot's move went away before the Bot API server ran dry of its updates; the move was dropped and changed nothing");
         };
         if reply.is_closed() {
             abandoned();
@@ -622,10 +624,6 @@ impl Reloader {
                 return Some(Err(MoveError::Undrained));
             }
             Some(Ok(())) => {}
-        }
-        if reply.is_closed() {
-            abandoned();
-            return None;
         }
         sources.park(name);
         let engine = &shared.engine;

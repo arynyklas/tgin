@@ -3018,6 +3018,144 @@ async fn long_poll_504_resumes_long_polling() {
     tgin.stop().await;
 }
 
+/// Once the server has run dry of a long-poll bot's updates, its move goes
+/// on even if its requester leaves: the bot is parked and logged out, and
+/// its long poll is never left held. (A requester gone while the server
+/// still drains drops the move, the long poll resuming: see
+/// `long_poll_504_resumes_long_polling`, whose drain is called off the
+/// same way.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_poll_move_outlives_a_requester_gone_after_the_drain() {
+    let telegram = MockServer::start().await;
+    let (pending, mut polls) = mount_pending(&telegram, TOKEN, Duration::from_millis(50)).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let api = format!("api_url: {}", telegram.uri());
+    let tgin = start(
+        "long_poll_move_outlives_a_requester_gone_after_the_drain",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            polled_as("outlived", &api, "1s")
+        )),
+    )
+    .await;
+    next(&mut polls).await;
+    // One update tgin holds, leased and never acknowledged: the move's
+    // step 3 waits for it until the deadline, with the bot parked.
+    pending.lock().expect("updates").push(1);
+    let started = Instant::now();
+    loop {
+        let leased = tgin.poll_ids("/c/workers/getUpdates?timeout=1").await;
+        if leased == [1] {
+            break;
+        }
+        assert!(started.elapsed() < PATIENCE, "update 1 never came");
+    }
+
+    let moving = spawn_logout(&tgin, "outlived", "3s");
+    tgin.wait_status("outlived parked", |s| {
+        s.sources
+            .iter()
+            .any(|source| source.name == "outlived" && source.state == "stopped")
+    })
+    .await;
+    moving.abort();
+    let started = Instant::now();
+    while count_calls(&telegram, TOKEN, "logOut").await == 0 {
+        assert!(started.elapsed() < PATIENCE, "never logged out");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_logged(&[" INFO ", "bot=outlived", "left=1", "stays parked"], 0).await;
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 1);
+    let again = tgin
+        .admin_post("/v1/bots/outlived/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(again.json(), json!({ "error": "parked" }));
+    assert_eq!(logged(&[" WARN ", "bot=outlived", "requester"]), 0);
+    tgin.stop().await;
+}
+
+/// What became of a long-poll bot after its move's requester left.
+#[derive(Debug, PartialEq)]
+enum AfterAbandon {
+    /// Parked, the move having gone on.
+    Parked,
+    /// Long-polling again with its own timeout, the move dropped.
+    Resumed,
+}
+
+/// Waits until the bot `name` ([`TOKEN`] on `server`, `timeout: 1s`) is
+/// parked or long-polls again after its first `after` polls; a long poll
+/// held by a drain nobody called off does neither, and fails.
+async fn after_abandon(tgin: &Tgin, server: &MockServer, name: &str, after: usize) -> AfterAbandon {
+    let started = Instant::now();
+    loop {
+        if source_state(tgin, name).await == "stopped" {
+            return AfterAbandon::Parked;
+        }
+        if poll_timeouts(server, TOKEN)
+            .await
+            .iter()
+            .skip(after)
+            .any(|t| *t == 1)
+        {
+            return AfterAbandon::Resumed;
+        }
+        assert!(started.elapsed() < PATIENCE, "the long poll was left held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A requester leaving just as the server runs dry (its client is aborted
+/// when the drain's empty batch is answered) leaves the long-poll bot
+/// either parked, the move going on, or long-polling again, the move
+/// dropped: never held. Repeated, as the two races either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requester_gone_as_the_drain_ends_never_holds_the_long_poll() {
+    let telegram = MockServer::start().await;
+    let (_pending, mut polls) = mount_pending(&telegram, TOKEN, Duration::from_millis(50)).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let api = format!("api_url: {}", telegram.uri());
+    let tgin = start(
+        "requester_gone_as_the_drain_ends_never_holds_the_long_poll",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            polled_as("raced", &api, "1s")
+        )),
+    )
+    .await;
+    next(&mut polls).await;
+    let mut outcomes = Vec::new();
+    for _ in 0..20 {
+        let before = poll_timeouts(&telegram, TOKEN).await.len();
+        let moving = spawn_logout(&tgin, "raced", "3s");
+        // Reported once its answer, an empty batch at once, is decided.
+        loop {
+            next(&mut polls).await;
+            let timeouts = poll_timeouts(&telegram, TOKEN).await;
+            if timeouts.iter().skip(before).any(|t| *t == 0) {
+                break;
+            }
+        }
+        moving.abort();
+        let after = poll_timeouts(&telegram, TOKEN).await.len();
+        let outcome = after_abandon(&tgin, &telegram, "raced", after).await;
+        let parked = outcome == AfterAbandon::Parked;
+        outcomes.push(outcome);
+        if parked {
+            break;
+        }
+    }
+    if outcomes.last() == Some(&AfterAbandon::Parked) {
+        let started = Instant::now();
+        while count_calls(&telegram, TOKEN, "logOut").await == 0 {
+            assert!(started.elapsed() < PATIENCE, "parked, never logged out");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    tracing::info!(?outcomes, "abandoned moves");
+    tgin.stop().await;
+}
+
 /// A long poll whose server refuses `logOut`: 502, and the bot is started
 /// again on that server, long-polling and delivering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -29,8 +29,9 @@
 //! bot's ingest stops, and tgin delivers what it holds of the bot; then the
 //! server is called (`logOut`, or `deleteWebhook` and `close`) and the bot
 //! is parked: reloads do not start it again until one changes its
-//! upstream. A move whose requester goes away before the bot's ingest
-//! stops is dropped, having changed nothing. Failures: 400 `invalid
+//! upstream. A move whose requester goes away before the server has run
+//! dry of the bot's updates is dropped, having changed nothing; after that
+//! it goes on. Failures: 400 `invalid
 //! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
 //! `parked`, 504 `upstream not drained` when the server still held updates
 //! at the deadline, or could not say (the bot runs on unchanged; the
