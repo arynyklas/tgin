@@ -67,10 +67,10 @@ of them.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--api-id`, `--api-hash` | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Required. Prefer the variables: flags show up in `ps` and `docker inspect` |
+| `--api-id`, `--api-hash` | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Required. Prefer the variables: flags show up in the host's `ps`. Both show up in `docker inspect`, so limit who can reach the Docker API |
 | `--local` | off | Local mode: uploads up to 2000 MB, downloads of any size, `getFile` answers an absolute path on the server, `file:` uploads read the server's own files, and webhooks may use plain HTTP, any port and private addresses |
-| `-d`, `--dir` | `./` (the volume) | Working directory: each bot's TDLib database (its Telegram session) under `<dir>/<token with ':' as '~'>`, the update queue `tqueue.binlog` and `webhooks_db.binlog` |
-| `-f`, `--files-dir` | `--dir` | Each bot's files under `<files-dir>/<token with ':' as '~'>`. Point it at its own volume so that tgin can read files without seeing the databases |
+| `-d`, `--dir` | `./` (the volume) | Working directory: each bot's TDLib database (its Telegram session) in `<dir>/<token>/`, the update queue `tqueue.binlog` and `webhooks_db.binlog` |
+| `-f`, `--files-dir` | `--dir` | Each bot's files in `<files-dir>/<token>/`. Point it at its own volume so that tgin can read files without seeing the databases |
 | `-t`, `--temp-dir` | the system temporary directory | Where uploads are spooled; a relative path is under `--files-dir`. It must hold the largest upload |
 | `--http-ip-address` | `0.0.0.0` | Bind address of the Bot API listener |
 | `-p`, `--http-port` | `8081` | Port of the Bot API listener |
@@ -82,8 +82,17 @@ of them.
 | `--proxy` | none | HTTP proxy for outgoing webhook requests |
 
 The image runs as `10001:10001`; `-u`/`-g` (switch user) are not needed.
-TDLib creates the bots' directories with mode 0700 by default, so a process
-that reads the files volume (tgin) must run as the same user.
+
+A bot's directory is named after its full token, `:` included, as in
+`123456:AAE…/`. The server switches to `~` (`123456~AAE…/`) only when its
+startup check finds that the filesystem rejects `:` in names; bots on the
+test DC get a `:T` suffix. Treat these names as secrets: they are the tokens.
+
+TDLib creates the bots' directories with mode 0750 and their files with
+0640 (under the default umask 0022), and the image creates `files` with
+0750 and the working directory with 0700. A process that reads the files
+volume (tgin) therefore needs only group 10001 (`group_add`), not the
+server's uid; the databases stay private to the server.
 
 ### Volumes
 
@@ -92,8 +101,9 @@ that reads the files volume (tgin) must run as the same user.
 | `/var/lib/telegram-bot-api` (`--dir`) | TDLib databases (bot sessions), pending updates, webhook settings | The server only. It survives restarts: losing it logs every bot out of this server and drops its pending updates |
 | `/var/lib/telegram-bot-api/files` (`--files-dir`) | Downloaded and uploaded files | The server read-write; tgin read-only, at the same path |
 
-A new named volume takes its owner (10001) from the image, which creates
-both directories. A bind mount must be owned by 10001.
+A new named volume takes its owner (10001) and mode from the image, which
+creates both directories. A bind mount must be owned by 10001, with group
+read access on the files directory.
 
 ## Security
 

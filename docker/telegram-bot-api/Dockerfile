@@ -46,21 +46,22 @@ LABEL org.opencontainers.image.title="telegram-bot-api" \
       org.opencontainers.image.licenses="BSL-1.0" \
       org.opencontainers.image.version="${BOT_API_VERSION}" \
       org.opencontainers.image.revision="${TELEGRAM_BOT_API_COMMIT}" \
-      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.2" \
       io.github.tdlib.telegram-bot-api.commit="${TELEGRAM_BOT_API_COMMIT}" \
       io.github.tdlib.telegram-bot-api.bot-api-version="${BOT_API_VERSION}"
 
 RUN apk add --no-cache libstdc++ openssl zlib && \
     addgroup -S -g 10001 telegram-bot-api && \
     adduser -S -D -H -h /var/lib/telegram-bot-api -s /sbin/nologin -u 10001 -G telegram-bot-api telegram-bot-api && \
-    install -d -m 0700 -o 10001 -g 10001 /var/lib/telegram-bot-api /var/lib/telegram-bot-api/files
+    install -d -m 0700 -o 10001 -g 10001 /var/lib/telegram-bot-api && \
+    install -d -m 0750 -o 10001 -g 10001 /var/lib/telegram-bot-api/files
 
 COPY --from=builder /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
 USER 10001:10001
 # The server's working directory (`--dir`, default `./`): the bots' TDLib
-# databases, the update queue and the webhook settings. `files` is where the
-# README points `--files-dir`, the directory tgin reads files from.
+# databases, the update queue and the webhook settings, private to the
+# server. `files` is where the README points `--files-dir`; its group (10001)
+# may read it, as TDLib creates the bots' files 0640 in directories 0750.
 WORKDIR /var/lib/telegram-bot-api
 VOLUME ["/var/lib/telegram-bot-api"]
 # The Bot API listener (`--http-port`). The statistics port is off unless

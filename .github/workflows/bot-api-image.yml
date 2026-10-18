@@ -51,7 +51,8 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Two exporters: the local Docker image for the smoke test, and a
       # directory that receives the SBOM and the provenance next to the
-      # root filesystem.
+      # root filesystem. The weekly run skips the cache, so it really fetches
+      # and builds again; it still refreshes the cache for later runs.
       - name: Build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -60,6 +61,7 @@ jobs:
           push: false
           sbom: true
           provenance: true
+          no-cache: ${{ github.event_name == 'schedule' }}
           outputs: |
             type=docker,name=tgin-telegram-bot-api:ci
             type=local,dest=${{ runner.temp }}/bot-api-image

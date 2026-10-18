@@ -45,13 +45,15 @@ services:
 
   tgin:
     build: ../..
-    # The server's user: its directories are private to it (mode 0700), and
-    # tgin reads the files volume.
-    user: "10001:10001"
+    # tgin keeps its own uid (65532) and joins the server's group, which may
+    # read the files: TDLib creates them 0640 in directories 0750.
+    group_add: ["10001"]
     # Shutdown drains for up to about 20 s; Docker's default 10 s cuts it short.
     stop_grace_period: 30s
     volumes:
-      - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+      # The directory, not the file: a single-file bind mount keeps the old
+      # inode, so an edit saved by rename would never reach the container.
+      - ./config:/etc/tgin:ro
       # The files volume read-only, at the path the server uses.
       - server-files:/var/lib/telegram-bot-api/files:ro
     environment:

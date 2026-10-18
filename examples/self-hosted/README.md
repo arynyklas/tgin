@@ -18,9 +18,13 @@ Telegram ── telegram-bot-api ◄── tgin ◄─────────�
 - The bot (`examples/simple/bot1.py`) is on the `bots` network with tgin, so
   it cannot reach the server around tgin. It answers every message.
 - The server keeps its state (the bots' TDLib databases, the update queue)
-  in the `server-state` volume, and the files in `server-files`, which is
-  mounted read-only into tgin at the same path. tgin runs as the server's
-  user, 10001, because the server's directories are private to that user.
+  in the `server-state` volume, private to its user (10001), and the files
+  in `server-files`, which is mounted read-only into tgin at the same path.
+  tgin keeps its own uid (65532) and joins the server's group (`group_add`),
+  which may read the files: TDLib creates them 0640 in directories 0750.
+- tgin's config is `config/tgin.yaml`, mounted as the directory
+  `/etc/tgin`: a single-file mount would keep the old file after an edit
+  saved by rename, so tgin would never see the change.
 
 ## Run it
 
@@ -57,7 +61,9 @@ The first build of the server compiles TDLib and takes a while.
 
 `compose.fake.yaml` swaps the server for tgin's fake Bot API server
 (`tests/e2e/fake-telegram`) under the same name, and gives tgin and the bot
-the fake token `123456:self_hosted_example_fake_token`. `fake.env` only
+the fake token `123456:self_hosted_example_fake_token`. It runs as its own
+Compose project, `tgin-self-hosted-fake`, so it never touches a real
+deployment of this example, its image or its volumes. `fake.env` only
 satisfies the variables `compose.yaml` requires; a token in your shell's
 environment is not used. Nothing reaches Telegram.
 
@@ -105,12 +111,15 @@ through a self-hosted Bot API server".
 - **Keep the `server-state` volume.** It holds the bots' Telegram sessions
   and their pending updates; losing it logs every bot out of this server.
 - **Keep the api_id, api_hash and tokens out of images and version
-  control.** Pass them through the environment, as here.
+  control.** Pass them through the environment, as here. `docker inspect`
+  and `docker compose config` show them, so limit who can reach the Docker
+  API.
 
 ## Files
 
-The server stores files under `/var/lib/telegram-bot-api/files`, and tgin
-has that volume read-only at the same path. With `api_url` alone tgin does
-not serve it yet: `getFile` answers the server's absolute path, and a
+The server stores each bot's files in
+`/var/lib/telegram-bot-api/files/<token>/` (the token with its `:`), and
+tgin has that volume read-only at the same path. With `api_url` alone tgin
+does not serve it yet: `getFile` answers the server's absolute path, and a
 download through tgin's `/file/bot…` route gets the server's 404, as the
 server has no such route.
