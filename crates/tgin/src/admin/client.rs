@@ -95,11 +95,11 @@ fn move_plan(name: &str, how: BotMove, timeout: Option<&HumanDuration>) -> Strin
     format!(
         "tgin admin bot {segment} would, for the bot {name}:\n\
          1. wait until its Bot API server holds no update for it (its ingest runs on)\n\
-         2. stop its ingest\n\
+         2. stop its ingest and park it: reloads do not start it again until one changes its upstream\n\
          3. wait until tgin has delivered the updates it holds of it\n\
-         4. {call}\n\
-         5. park it: reloads do not start it again until one changes its upstream\n\
-         Steps 1 to 3 get {within}; if step 1 does not finish in time, nothing changes.\n\
+         4. stop sending its calls to any server, and wait for those being sent\n\
+         5. {call}\n\
+         Steps 1 to 4 get {within} (at most 1h), counted from the request; if step 1 does not finish in time, nothing changes.\n\
          Run it again with --yes to do it.",
         segment = how.segment(),
     )
@@ -609,6 +609,36 @@ mod tests {
         );
         assert!(parse_url("ftp://host").is_err());
         assert!(parse_url("not a url").is_err());
+    }
+
+    #[test]
+    fn move_plan_lists_the_steps_in_order() {
+        let timeout: HumanDuration = "5s".parse().unwrap();
+        let plan = move_plan("shop", BotMove::Close, Some(&timeout));
+        let steps = [
+            "1. wait until its Bot API server holds no update",
+            "2. stop its ingest and park it",
+            "3. wait until tgin has delivered",
+            "4. stop sending its calls to any server",
+            "5. call deleteWebhook, then close",
+            "Steps 1 to 4 get 5s (at most 1h), counted from the request",
+        ];
+        let mut at = 0;
+        for step in steps {
+            let found = plan[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step}: {plan}"));
+            at += found + step.len();
+        }
+        let plan = move_plan("shop", BotMove::LogOut, None);
+        assert!(
+            plan.contains("5. call logOut on its Bot API server"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("get reload.drain_timeout (at most 1h)"),
+            "{plan}"
+        );
     }
 
     #[test]
