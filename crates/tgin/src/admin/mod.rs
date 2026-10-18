@@ -24,11 +24,13 @@
 //!
 //! `POST /v1/bots/{name}/logout|close[?timeout=<duration>]` moves a bot off
 //! its Bot API server, serialized with the reloads. Within the timeout
-//! (`30s`, `2m`…; `reload.drain_timeout` without one) the server runs dry
-//! of the bot's updates, the bot's ingest stops, and tgin delivers what it
-//! holds of the bot; then the server is called (`logOut`, or
-//! `deleteWebhook` and `close`) and the bot is parked: reloads do not start
-//! it again until one changes its upstream. Failures: 400 `invalid
+//! (`30s`, `2m`…, at most `1h`; `reload.drain_timeout` without one),
+//! counted from the request, the server runs dry of the bot's updates, the
+//! bot's ingest stops, and tgin delivers what it holds of the bot; then the
+//! server is called (`logOut`, or `deleteWebhook` and `close`) and the bot
+//! is parked: reloads do not start it again until one changes its
+//! upstream. A move whose requester goes away before the bot's ingest
+//! stops is dropped, having changed nothing. Failures: 400 `invalid
 //! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
 //! `parked`, 504 `upstream not drained` when the server still held updates
 //! at the deadline, or could not say (the bot runs on unchanged; the
@@ -44,7 +46,13 @@ mod api;
 pub mod client;
 
 pub(crate) use api::{loop_detected, router};
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+/// The longest `timeout` of a bot move: the move holds up every reload
+/// while it runs.
+pub const MAX_MOVE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How `POST /v1/bots/{name}/…` moves a bot off its Bot API server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

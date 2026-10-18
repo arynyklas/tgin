@@ -22,7 +22,9 @@ use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
 use tgin_runtime::supervisor::TaskState;
 
-use super::{BotMove, ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
+use super::{
+    BotMove, ConsumerStatus, EndpointStatus, MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
+};
 use crate::app::Shared;
 use crate::cli::VERSION;
 use crate::reload::{MoveError, ReloadError};
@@ -389,7 +391,11 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
     let timeout = match Query::<MoveQuery>::try_from_uri(uri).map(|q| q.0.timeout) {
         Ok(None) => None,
         Ok(Some(text)) => match text.parse::<HumanDuration>() {
-            Ok(timeout) if timeout.calendar_unit().is_none() => Some(timeout.get()),
+            Ok(timeout)
+                if timeout.calendar_unit().is_none() && timeout.get() <= MAX_MOVE_TIMEOUT =>
+            {
+                Some(timeout.get())
+            }
             _ => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
         },
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid timeout"),

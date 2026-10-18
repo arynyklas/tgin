@@ -2622,16 +2622,18 @@ async fn cli_requires_yes() {
         "{}",
         dry_close.stderr
     );
-    let bad = output(admin(&[
-        "bot",
-        "logout",
-        "hooked",
-        "--yes",
-        "--timeout",
-        "5M",
-    ]))
-    .await;
-    assert_eq!(bad.code, Some(64), "{}", bad.stderr);
+    for timeout in ["5M", "2h"] {
+        let bad = output(admin(&[
+            "bot",
+            "logout",
+            "hooked",
+            "--yes",
+            "--timeout",
+            timeout,
+        ]))
+        .await;
+        assert_eq!(bad.code, Some(64), "{timeout}: {}", bad.stderr);
+    }
     assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 0);
     assert_eq!(source_state(&tgin, "hooked").await, "running");
 
@@ -2658,7 +2660,7 @@ async fn cli_requires_yes() {
         "{}",
         again.stderr
     );
-    for out in [&dry, &dry_close, &bad, &done, &again] {
+    for out in [&dry, &dry_close, &done, &again] {
         assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
         assert!(!out.stdout.contains(ADMIN_TOKEN) && !out.stderr.contains(ADMIN_TOKEN));
     }
@@ -2682,7 +2684,7 @@ async fn unknown_bot_404() {
         assert_eq!(answer.status, 404, "{}", answer.body);
         assert_eq!(answer.json(), json!({ "error": "unknown bot" }));
     }
-    for bad in ["5", "5M", "soon"] {
+    for bad in ["5", "5M", "soon", "2h", "61m"] {
         let answer = tgin
             .admin_post(
                 &format!("/v1/bots/hooked/logout?timeout={bad}"),
@@ -3161,6 +3163,124 @@ async fn queued_move_runs_before_a_later_reload() {
     assert_eq!(count_calls(&local, OTHER_TOKEN, "getMe").await, 1);
     let waiter_state = status.sources.iter().find(|s| s.name == "waiter");
     assert_eq!(waiter_state.map(|s| s.state.as_str()), Some("running"));
+    tgin.stop().await;
+}
+
+/// Two webhook bots on one fresh server: `first` ([`TOKEN`]), whose move
+/// drains until the returned gate is set to 0, and `second`
+/// ([`OTHER_TOKEN`]), whose moves succeed at once.
+async fn gated_pair(test: &str, first: &str, second: &str) -> (Tgin, MockServer, Arc<AtomicU64>) {
+    let telegram = MockServer::start().await;
+    mount_bot(&telegram, TOKEN, me("first_bot"), Duration::from_secs(3600)).await;
+    let gate = Arc::new(AtomicU64::new(1));
+    Mock::given(path(format!("/bot{TOKEN}/getWebhookInfo")))
+        .respond_with(GatedInfo {
+            pending: Arc::clone(&gate),
+        })
+        .mount(&telegram)
+        .await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    mount_bot(
+        &telegram,
+        OTHER_TOKEN,
+        me("second_bot"),
+        Duration::from_secs(3600),
+    )
+    .await;
+    mount_moves(&telegram, OTHER_TOKEN, 0).await;
+    let tgin = start(
+        test,
+        &config(&format!(
+            "bots:\n{}{}consumers:\n  workers: {{ pull: {{}} }}\n  others: {{ pull: {{}} }}\n",
+            hook_bot(&telegram, first, TOKEN, "/first", "workers"),
+            hook_bot(&telegram, second, OTHER_TOKEN, "/second", "others"),
+        )),
+    )
+    .await;
+    (tgin, telegram, gate)
+}
+
+/// Asks tgin to log `bot` out within `timeout`, in a task of its own.
+fn spawn_logout(tgin: &Tgin, bot: &str, timeout: &str) -> JoinHandle<Answer> {
+    let request = tgin
+        .http
+        .post(tgin.admin_url(&format!("/v1/bots/{bot}/logout?timeout={timeout}")))
+        .bearer_auth(ADMIN_TOKEN);
+    tokio::spawn(async move { answer(request).await })
+}
+
+/// Waits until `server` was asked for `token`'s `getWebhookInfo`: the
+/// move of that bot has begun.
+async fn wait_move_started(server: &MockServer, token: &str) {
+    let started = Instant::now();
+    while count_calls(server, token, "getWebhookInfo").await == 0 {
+        assert!(started.elapsed() < PATIENCE, "the move never began");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A move is bounded from its request: one that waited in the queue past
+/// its deadline answers 504 and calls nothing on its bot's server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_move_past_its_deadline_touches_nothing() {
+    let (tgin, telegram, gate) = gated_pair(
+        "queued_move_past_its_deadline_touches_nothing",
+        "slow",
+        "late",
+    )
+    .await;
+    let running = spawn_logout(&tgin, "slow", "30s");
+    wait_move_started(&telegram, TOKEN).await;
+    let waiting = spawn_logout(&tgin, "late", "300ms");
+    wait_logged(&["bot move queued", "bot=late"], 0).await;
+    // Its deadline passes while it waits.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    gate.store(0, Ordering::SeqCst);
+
+    let ran = timeout(PATIENCE, running)
+        .await
+        .expect("in time")
+        .expect("ran");
+    assert_eq!(ran.status, 200, "{}", ran.body);
+    let waited = timeout(PATIENCE, waiting)
+        .await
+        .expect("in time")
+        .expect("ran");
+    assert_eq!(waited.status, 504, "{}", waited.body);
+    assert_eq!(waited.json(), json!({ "error": "upstream not drained" }));
+    let calls = calls(&telegram, OTHER_TOKEN).await;
+    assert!(calls.iter().all(|m| m == "getMe"), "{calls:?}");
+    assert_eq!(source_state(&tgin, "late").await, "running");
+    tgin.stop().await;
+}
+
+/// A queued move whose requester went away is dropped without effect: it
+/// calls nothing on its bot's server, and the bot runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_queued_move_makes_no_upstream_call() {
+    let (tgin, telegram, gate) = gated_pair(
+        "abandoned_queued_move_makes_no_upstream_call",
+        "busy",
+        "quitter",
+    )
+    .await;
+    let running = spawn_logout(&tgin, "busy", "30s");
+    wait_move_started(&telegram, TOKEN).await;
+    let quitting = spawn_logout(&tgin, "quitter", "30s");
+    wait_logged(&["bot move queued", "bot=quitter"], 0).await;
+    quitting.abort();
+    wait_logged(&["bot move abandoned by its requester", "bot=quitter"], 0).await;
+    gate.store(0, Ordering::SeqCst);
+
+    let ran = timeout(PATIENCE, running)
+        .await
+        .expect("in time")
+        .expect("ran");
+    assert_eq!(ran.status, 200, "{}", ran.body);
+    wait_logged(&[" WARN ", "bot=quitter", "requester"], 0).await;
+    let calls = calls(&telegram, OTHER_TOKEN).await;
+    assert!(calls.iter().all(|m| m == "getMe"), "{calls:?}");
+    assert_eq!(source_state(&tgin, "quitter").await, "running");
     tgin.stop().await;
 }
 
