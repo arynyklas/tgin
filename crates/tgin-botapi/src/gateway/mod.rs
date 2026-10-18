@@ -12,6 +12,7 @@ pub mod errors;
 mod files;
 mod intercept;
 pub mod limit;
+mod local_files;
 pub mod methods;
 pub mod metrics;
 pub mod params;
@@ -60,6 +61,8 @@ pub struct GatewayBot {
     pub source: SourceId,
     pub token: Secret<String>,
     pub upstream: Arc<config::Upstream>,
+    /// `file:` references may reach an upstream in local mode.
+    pub allow_local_files: bool,
     pub gateway: config::Gateway,
 }
 
@@ -144,6 +147,9 @@ struct Bot {
     files: FileTarget,
     /// Which local-mode `getFile` paths become relative.
     rewrite: Rewrite,
+    /// Whether requests carrying a local file reference are refused
+    /// (`local_files`).
+    refuses_local_files: bool,
     /// The gateway profile: no total timeout, the connect timeout above;
     /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
     client: reqwest::Client,
@@ -171,6 +177,8 @@ impl Bot {
         let method_base = base(url, &[&format!("bot{token}")])?;
         let files = FileTarget::new(&bot.upstream, token)?;
         let rewrite = Rewrite::new(&bot.upstream);
+        let refuses_local_files =
+            local_files::refuses_local_files(&bot.upstream, bot.allow_local_files);
         let client = client(&ClientOptions {
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: None,
@@ -185,6 +193,7 @@ impl Bot {
             method_base,
             files,
             rewrite,
+            refuses_local_files,
             client,
             via,
             metrics,
@@ -197,6 +206,8 @@ impl Bot {
     fn same(&self, bot: &GatewayBot) -> bool {
         self.token.expose() == bot.token.expose()
             && self.upstream == bot.upstream
+            && self.refuses_local_files
+                == local_files::refuses_local_files(&bot.upstream, bot.allow_local_files)
             && self.gateway == bot.gateway
             && self.source == bot.source
     }
@@ -584,6 +595,7 @@ mod tests {
             source: SourceId(0),
             token: Secret::new(token.to_owned()),
             upstream: Arc::clone(&bot.upstream),
+            allow_local_files: bot.allow_local_files,
             gateway: bot.gateway.clone(),
         }
     }

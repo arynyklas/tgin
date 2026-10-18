@@ -1096,3 +1096,85 @@ async fn failed_reply_logged_with_redacted_description() {
     assert_no_token_logged();
     tgin.stop().await;
 }
+
+/// To a bot whose upstream is in local mode, a reply carrying a local file
+/// reference is refused (`refused`, a warn line without the value): a JSON
+/// one, an urlencoded one with the reference in JSON in a value, and a
+/// multipart one with it in a text field after a file part. A clean reply
+/// after them is executed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_with_local_file_refused() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let json = "application/json";
+    let local = "file:///srv/secret/passwd";
+    let boundary = "local-file-boundary";
+    let upload_type = format!("multipart/form-data; boundary={boundary}");
+    let down = MockServer::start().await;
+    answer_update(
+        &down,
+        1,
+        200,
+        json,
+        format!(r#"{{"method":"sendDocument","chat_id":5,"document":"{local}"}}"#),
+    )
+    .await;
+    answer_update(
+        &down,
+        2,
+        200,
+        "application/x-www-form-urlencoded",
+        "method=sendMediaGroup&chat_id=5&media=%5B%7B%22type%22%3A%22photo%22%2C%22media%22%3A%22file%3A%2F%2F%2Fsrv%2Fsecret%2Fpasswd%22%7D%5D",
+    )
+    .await;
+    let upload = multipart(
+        boundary,
+        &[
+            ("method", None, b"sendDocument"),
+            ("chat_id", None, b"5"),
+            ("document", Some("a.bin"), b"\x00bytes"),
+            ("thumbnail", None, local.as_bytes()),
+        ],
+    );
+    answer_update(&down, 3, 200, &upload_type, upload).await;
+    let control = r#"{"method":"sendMessage","chat_id":5,"text":"see file:///srv"}"#;
+    answer_update(&down, 4, 200, json, control).await;
+    let yaml = config(&api, &down.uri(), &Extra::default())
+        .replace(&format!("    api_url: \"{api}\"\n"), "    upstream: tba\n")
+        .replace(
+            "bots:\n",
+            &format!(
+                "upstreams:\n  tba: {{ kind: local, url: \"{api}\", local_mode: true }}\nbots:\n"
+            ),
+        );
+    let tgin = start(&yaml).await;
+    let before = telegram.paths();
+    for id in 1..=4 {
+        tgin.admit(id, 5).await;
+    }
+
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 1"#)
+        .await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 3"#);
+    let mut after = telegram.paths();
+    assert_eq!(after.drain(..before.len()).collect::<Vec<_>>(), before);
+    assert_eq!(after, [format!("/bot{TOKEN}/sendMessage")]);
+    assert_eq!(
+        &telegram.calls_to("sendMessage")[0].body[..],
+        control.as_bytes()
+    );
+    let logs = LOGS.text();
+    let refusals: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("webhook reply refused: it carries a local file reference"))
+        .collect();
+    assert_eq!(refusals.len(), 3, "{logs}");
+    assert!(
+        refusals.iter().all(|line| line.contains("WARN")),
+        "{refusals:?}"
+    );
+    assert!(!logs.contains("secret/passwd"), "a path reached the logs");
+    assert_no_token_logged();
+    tgin.stop().await;
+}

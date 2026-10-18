@@ -55,7 +55,7 @@ const INVALID_WEBHOOK_URL: &str = "Bad Request: invalid webhook URL specified";
 const SECRET_TOKEN_TOO_LONG: &str = "Bad Request: secret token is too long";
 const SECRET_TOKEN_ILLEGAL: &str = "Bad Request: secret token contains illegal characters";
 /// tdlib's `HttpReader` for a body over its limit.
-const TOO_LARGE: &str = "Request Entity Too Large";
+pub(super) const TOO_LARGE: &str = "Request Entity Too Large";
 
 /// What becomes of a gateway method request.
 pub(super) enum Routed {

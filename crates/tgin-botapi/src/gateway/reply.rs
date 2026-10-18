@@ -5,6 +5,8 @@
 //!   multipart text field); an empty or missing one, any `get…` method,
 //!   `setWebhook`, `deleteWebhook`, `close` and `logOut` are refused, in
 //!   any case;
+//! - to a bot whose server in local mode must not get a local file
+//!   reference, a reply carrying one is refused (`local_files`);
 //! - the bot's rate limits apply as to a gateway request;
 //! - the body goes to `{api_url}/bot{token}/{method}` unchanged, with its
 //!   `Content-Type`, once: nothing is re-encoded, multipart files included,
@@ -25,6 +27,7 @@ use tgin_runtime::secret::Redactor;
 use tokio::time::{Instant, sleep_until};
 
 use super::chat_key::chat_key;
+use super::local_files::{Verdict, body_verdict};
 use super::metrics::{MethodLabel, Outcome, RateAction, ReplyMetrics, ReplyOutcome};
 use super::params::text_param;
 use super::proxy::{deadline, outcome, url};
@@ -95,6 +98,13 @@ impl Gateway {
             return;
         };
         let label = MethodLabel::of(&method);
+        if bot.refuses_local_files
+            && let Verdict::Refused(refusal) = body_verdict(Some(&reply.content_type), &reply.body)
+        {
+            counts.count(ReplyOutcome::Refused);
+            tracing::warn!(bot = %bot.name, consumer = %consumer, method = label.as_str(), reason = refusal.reason(), "webhook reply refused: it carries a local file reference, or parameters tgin cannot check, for a Bot API server in local mode");
+            return;
+        }
         if bot.limiter.applies(&method) && !admit(bot, consumer, label, &reply, &counts).await {
             return;
         }

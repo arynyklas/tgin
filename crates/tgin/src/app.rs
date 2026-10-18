@@ -732,6 +732,7 @@ pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
                 source,
                 token: bot.token.clone(),
                 upstream: Arc::clone(&bot.upstream),
+                allow_local_files: bot.allow_local_files,
                 gateway: bot.gateway.clone(),
             })
         })

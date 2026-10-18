@@ -35,7 +35,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tgin-core.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "sync", "time"] }
 tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 

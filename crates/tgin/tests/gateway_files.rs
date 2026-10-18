@@ -165,6 +165,25 @@ impl Tgin {
             .await
     }
 
+    /// Sends `body` of type `content_type` (none when empty) to `path`
+    /// with `method`.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        content_type: &str,
+        body: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        let mut request = self.http.request(method, self.url(path)).body(body);
+        if !content_type.is_empty() {
+            request = request.header("content-type", content_type);
+        }
+        timeout(PATIENCE, request.send())
+            .await
+            .expect("an answer in time")
+            .expect("a response")
+    }
+
     #[track_caller]
     fn assert_metric(&self, line: &str) {
         let out = self.metrics.encode();
@@ -942,4 +961,441 @@ fn token_directory_forms_are_secrets() {
         assert!(secrets.iter().any(|s| s == token));
         assert!(secrets.iter().any(|s| *s == tilde(token)));
     }
+}
+
+/// The answer to a local file reference tgin refuses.
+const LOCAL_REFUSED: &str = "Bad Request: local file uploads are disabled by tgin";
+/// A local file reference; the logs never show its path.
+const LOCAL_FILE: &str = "file:///srv/secret/passwd";
+const SECRET_PATH: &str = "secret/passwd";
+const JSON: &str = "application/json";
+const FORM: &str = "application/x-www-form-urlencoded";
+const BOUNDARY: &str = "local-files-boundary";
+const MULTIPART: &str = "multipart/form-data; boundary=local-files-boundary";
+
+/// Bots on `api`: `gw` (`TOKEN`) and `allowed` (`OTHER_TOKEN`, with
+/// `allow_local_files`) on a local upstream in local mode, `plain`
+/// (`THIRD_TOKEN`) on a local upstream without it, `cloud` (`FOURTH_TOKEN`)
+/// on the cloud. Only `gw` keeps the default rate limits.
+fn local_files_config(api: &str) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true }}
+  plain: {{ kind: local, url: "{api}" }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    routes: [{{ to: [a] }}]
+  - name: allowed
+    token: "{OTHER_TOKEN}"
+    upstream: tba
+    allow_local_files: true
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [b] }}]
+  - name: plain
+    token: "{THIRD_TOKEN}"
+    upstream: plain
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [c] }}]
+  - name: cloud
+    token: "{FOURTH_TOKEN}"
+    api_url: "{api}"
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [d] }}]
+consumers:
+  a: {{ pull: {{}} }}
+  b: {{ pull: {{}} }}
+  c: {{ pull: {{}} }}
+  d: {{ pull: {{}} }}
+"#
+    )
+}
+
+/// A server that answers every call with `{"ok":true,"result":true}`.
+async fn answering_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true,"result":true}"#, JSON))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Every byte but ASCII letters and digits percent-encoded.
+fn encoded(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// A multipart body of `parts` (header lines, value) with [`BOUNDARY`].
+fn multipart(parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (headers, value) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n{headers}\r\n\r\n").as_bytes());
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// The headers of the text field `name`.
+fn text_field(name: &str) -> String {
+    format!("Content-Disposition: form-data; name=\"{name}\"")
+}
+
+/// The headers of the file part `name`.
+fn file_part(name: &str) -> String {
+    format!(
+        "Content-Disposition: form-data; name=\"{name}\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream"
+    )
+}
+
+/// Requests carrying [`LOCAL_FILE`] in every position a server in local
+/// mode reads it from: (method, content type, body).
+fn local_references() -> Vec<(&'static str, &'static str, Vec<u8>)> {
+    let media = format!(r#"[{{"type":"photo","media":"{LOCAL_FILE}"}}]"#);
+    let json = |body: String| body.into_bytes();
+    vec![
+        (
+            "sendDocument",
+            JSON,
+            json(format!(r#"{{"chat_id":1,"document":"{LOCAL_FILE}"}}"#)),
+        ),
+        // JSON escapes decode to the same reference.
+        (
+            "sendDocument",
+            JSON,
+            json(r#"{"chat_id":1,"document":"file:\/\/\/srv\/secret\/passwd"}"#.to_owned()),
+        ),
+        (
+            "sendDocument",
+            JSON,
+            json(r#"{"chat_id":1,"document":"\u0066ile:///srv/secret/passwd"}"#.to_owned()),
+        ),
+        (
+            "sendDocument",
+            JSON,
+            json(format!(
+                r#"{{"chat_id":1,"document":"BQACAgIAAx0","thumbnail":"{LOCAL_FILE}"}}"#
+            )),
+        ),
+        (
+            "sendMediaGroup",
+            JSON,
+            json(format!(r#"{{"chat_id":1,"media":{media}}}"#)),
+        ),
+        // JSON carried in a string parameter.
+        (
+            "sendMediaGroup",
+            JSON,
+            json(format!(
+                r#"{{"chat_id":1,"media":{}}}"#,
+                serde_json::to_string(&media).expect("JSON")
+            )),
+        ),
+        (
+            "sendMediaGroup",
+            FORM,
+            json(format!("chat_id=1&media={}", encoded(&media))),
+        ),
+        (
+            "sendDocument",
+            FORM,
+            json(format!("chat_id=1&document={}", encoded(LOCAL_FILE))),
+        ),
+        (
+            "sendMediaGroup",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (&text_field("media"), media.as_bytes()),
+            ]),
+        ),
+        // A text field after a file part.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (&file_part("document"), b"\x89PNG\r\n--not-the-boundary"),
+                (&text_field("thumbnail"), LOCAL_FILE.as_bytes()),
+            ]),
+        ),
+        // A part the server reads as urlencoded parameters.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (
+                    &format!(
+                        "{}\r\nContent-Type: application/x-www-form-urlencoded",
+                        text_field("params")
+                    ),
+                    format!("document={}", encoded(LOCAL_FILE)).as_bytes(),
+                ),
+            ]),
+        ),
+        // The server sees `filename` inside a quoted parameter, so no file
+        // name: a text field.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (
+                    "Content-Disposition: form-data; name=thumbnail; x=\"; filename=a\"",
+                    LOCAL_FILE.as_bytes(),
+                ),
+            ]),
+        ),
+    ]
+}
+
+/// Query strings carrying [`LOCAL_FILE`]: (HTTP method, path and query,
+/// content type, body).
+fn query_references() -> Vec<(reqwest::Method, String, &'static str, Vec<u8>)> {
+    vec![
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?chat_id=1&document={}", encoded(LOCAL_FILE)),
+            "",
+            Vec::new(),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?document={LOCAL_FILE}"),
+            JSON,
+            br#"{"chat_id":1}"#.to_vec(),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?thumbnail={LOCAL_FILE}"),
+            MULTIPART,
+            multipart(&[(&text_field("chat_id"), b"1")]),
+        ),
+        (
+            reqwest::Method::GET,
+            "sendPhoto?chat_id=1&photo=%66ile:///srv/secret/passwd".to_owned(),
+            "",
+            Vec::new(),
+        ),
+    ]
+}
+
+/// Asserts that the last request `server` received went to `token`'s
+/// `method` with `body`, byte for byte.
+async fn assert_forwarded(server: &MockServer, token: &str, method: &str, body: &[u8]) {
+    let requests = server.received_requests().await.expect("recording");
+    let last = requests.last().expect("a request");
+    assert_eq!(last.url.path(), format!("/bot{token}/{method}"));
+    assert_eq!(last.body, body, "{method}");
+}
+
+/// A JSON body over 1 MiB.
+fn large_json() -> Vec<u8> {
+    format!(r#"{{"chat_id":4,"text":"{}"}}"#, "x".repeat(1 << 20)).into_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_file_refused_in_every_position() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+
+    for (method, content_type, body) in local_references() {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{TOKEN}/{method}"),
+                content_type,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{method} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let large = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendMessage"),
+            JSON,
+            large_json(),
+        )
+        .await;
+    assert_eq!(
+        description(large).await,
+        (413, "Request Entity Too Large".to_owned())
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
+
+    // "file:" anywhere but at a value's start, and a file part's bytes, are
+    // no references.
+    let text = br#"{"chat_id":2,"text":"see file:///srv/secret/passwd"}"#;
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendMessage"),
+            JSON,
+            &text[..],
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, TOKEN, "sendMessage", text).await;
+    let upload = multipart(&[
+        (&text_field("chat_id"), b"3"),
+        (&file_part("document"), LOCAL_FILE.as_bytes()),
+    ]);
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendDocument"),
+            MULTIPART,
+            upload.clone(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, TOKEN, "sendDocument", &upload).await;
+
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 8"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMediaGroup",outcome="rejected"} 4"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    assert_logs_clean(&[TOKEN]);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_file_in_query_string_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(method, &format!("/bot{TOKEN}/{path}"), content_type, body)
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{path}"
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
+
+    let response = tgin
+        .get(&format!("/bot{TOKEN}/getChat?chat_id=1&title=file"), &[])
+        .await;
+    assert_eq!(response.status(), 200);
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.query(), Some("chat_id=1&title=file"));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 3"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendPhoto",outcome="rejected"} 1"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    tgin.stop().await;
+}
+
+/// Sends every reference of [`local_references`] and
+/// [`query_references`] for `token` and asserts each reached the server
+/// as it was sent.
+async fn assert_references_pass(tgin: &Tgin, server: &MockServer, token: &str) {
+    for (method, content_type, body) in local_references() {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{token}/{method}"),
+                content_type,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{method}");
+        assert_forwarded(server, token, method, &body).await;
+    }
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(method, &format!("/bot{token}/{path}"), content_type, body)
+            .await;
+        assert_eq!(response.status(), 200, "{path}");
+        let requests = server.received_requests().await.expect("recording");
+        let last = requests.last().expect("a request");
+        let query = path.split_once('?').expect("a query").1;
+        assert_eq!(last.url.query(), Some(query));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowed_bot_passes_file_references() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_pass(&tgin, &server, OTHER_TOKEN).await;
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_and_non_local_upstreams_unaffected() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    for token in [THIRD_TOKEN, FOURTH_TOKEN] {
+        assert_references_pass(&tgin, &server, token).await;
+        // No 1 MiB bound either.
+        let large = large_json();
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{token}/sendMessage"),
+                JSON,
+                large.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_forwarded(&server, token, "sendMessage", &large).await;
+    }
+    tgin.stop().await;
 }

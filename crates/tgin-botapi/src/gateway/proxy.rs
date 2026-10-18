@@ -30,10 +30,15 @@ use parking_lot::Mutex;
 use reqwest::Url;
 use serde::Deserialize;
 use tgin_runtime::http::describe_error;
+use tokio::sync::oneshot;
 use tokio::time::{Instant, Sleep, sleep_until};
 
 use super::chat_key::{ChatKey, chat_key};
 use super::limit::Limited;
+use super::local_files::{
+    MAX_PARAMETERS, MultipartGuard, Refusal, Verdict, boundary, form_has_local_file,
+    json_has_local_file,
+};
 use super::metrics::{BotMetrics, MethodLabel, MethodMetrics, Outcome, RateAction};
 use super::params::{Encoding, encoding};
 use super::{Bot, Bounded, Forwarding, errors, read_bounded};
@@ -44,7 +49,9 @@ const BUFFER_LIMIT: usize = 64 * 1024;
 /// The longest upstream 429 body read for its `retry_after`.
 const FLOOD_LIMIT: usize = 64 * 1024;
 
-/// Request headers forwarded on every route.
+/// Request headers forwarded on every route. Never `Content-Encoding`:
+/// telegram-bot-api inflates gzip and deflate bodies, and the local file
+/// scan (`local_files`) reads a body as it is sent.
 const REQUEST_HEADERS: [HeaderName; 5] = [
     CONTENT_TYPE,
     CONTENT_LENGTH,
@@ -83,6 +90,10 @@ pub(super) enum Upstream<'a> {
 /// buffered when the limits apply to it or `retry_429.max_wait` is above
 /// zero. Where the limits apply, the request waits for, or is refused by,
 /// them first. A buffered body goes once more after Telegram's 429.
+///
+/// A method call of a bot whose server must not get a local file reference
+/// (`local_files`) has its parameters scanned first: the query string, a
+/// JSON or urlencoded body read whole, a multipart body as it streams.
 pub(super) async fn forward(
     bot: &Bot,
     upstream: Upstream<'_>,
@@ -124,7 +135,15 @@ pub(super) async fn forward(
         counted: AtomicBool::new(false),
         forwarding: Mutex::new(Some(forwarding)),
     };
-    if !buffered {
+    let scanned = if method.is_some() && bot.refuses_local_files {
+        match scanned_encoding(&url, &headers) {
+            Ok(scanned) => scanned,
+            Err(refusal) => return call.failed(Failed::Refused(refusal)),
+        }
+    } else {
+        None
+    };
+    if !buffered && scanned.is_none() {
         return match call.send(url, headers, body).await {
             Ok((response, _)) => call.relay(response),
             Err(failed) => call.failed(failed),
@@ -133,7 +152,16 @@ pub(super) async fn forward(
 
     let idle = bot.gateway.upstream_idle_timeout;
     let query = parts.uri.query();
-    let (payload, chat) = match prepare(&parts.headers, query, body, idle, limited).await {
+    let prepared = match scanned {
+        Some(scanned) => {
+            let content_type = headers.get(CONTENT_TYPE);
+            prepare_scanned(scanned, content_type, query, body, idle, limited).await
+        }
+        None => prepare(&parts.headers, query, body, idle, limited)
+            .await
+            .map(|(payload, chat)| (payload, chat, None)),
+    };
+    let (payload, chat, verdict) = match prepared {
         Ok(prepared) => prepared,
         Err(failed) => return call.failed(failed),
     };
@@ -144,7 +172,7 @@ pub(super) async fn forward(
     match payload {
         Payload::Streamed(body) => match call.send(url, headers, body).await {
             Ok((response, _)) => call.relay(response),
-            Err(failed) => call.failed(failed),
+            Err(failed) => call.failed(refused_by(failed, verdict)),
         },
         Payload::Buffered(request) => {
             let first = call
@@ -156,6 +184,7 @@ pub(super) async fn forward(
             };
             if response.status() != StatusCode::TOO_MANY_REQUESTS
                 || bot.gateway.retry_429_max_wait.is_zero()
+                || !buffered
             {
                 return call.relay(response);
             }
@@ -187,6 +216,8 @@ enum Failed {
     Unreachable,
     /// Nothing moved for `upstream_idle_timeout`, in either direction.
     Idle,
+    /// Its parameters may not reach the bot's server in local mode.
+    Refused(Refusal),
 }
 
 /// The body of a request to buffer, and, when the limits apply (`limited`),
@@ -209,38 +240,117 @@ async fn prepare(
     idle: Duration,
     limited: bool,
 ) -> Result<(Payload, Option<ChatKey>), Failed> {
-    const FORM: HeaderValue = HeaderValue::from_static("application/x-www-form-urlencoded");
-    let query_chat = || query.and_then(|query| chat_key(Some(&FORM), query.as_bytes()));
     let content_type = headers.get(CONTENT_TYPE);
     let readable = matches!(
         content_type.and_then(encoding),
         Some(Encoding::Json | Encoding::Form)
     ) || body.size_hint().exact() == Some(0);
     if !readable {
-        return Ok((Payload::Streamed(body), limited.then(query_chat).flatten()));
+        return Ok((
+            Payload::Streamed(body),
+            limited.then(|| query_chat(query)).flatten(),
+        ));
     }
-    let progress = Arc::new(Progress::new());
-    let stamped = Body::new(Upload {
-        body: Mutex::new(body),
-        progress: Arc::clone(&progress),
-    });
-    let read = match await_headers(read_bounded(stamped, BUFFER_LIMIT), &progress, idle).await {
-        Waited::Ready(Ok(read)) => read,
-        Waited::Ready(Err(_)) => return Err(Failed::ClientClosed),
-        Waited::Idle => return Err(Failed::Idle),
-    };
-    Ok(match read {
+    Ok(match read_within(body, BUFFER_LIMIT, idle).await? {
         Bounded::Complete(bytes) => {
             let chat = limited
-                .then(|| query_chat().or_else(|| chat_key(content_type, &bytes)))
+                .then(|| query_chat(query).or_else(|| chat_key(content_type, &bytes)))
                 .flatten();
             (Payload::Buffered(bytes), chat)
         }
         Bounded::Over(partial) => (
             Payload::Streamed(partial.into_body()),
-            limited.then(query_chat).flatten(),
+            limited.then(|| query_chat(query)).flatten(),
         ),
     })
+}
+
+/// The query string's chat.
+fn query_chat(query: Option<&str>) -> Option<ChatKey> {
+    const FORM: HeaderValue = HeaderValue::from_static("application/x-www-form-urlencoded");
+    query.and_then(|query| chat_key(Some(&FORM), query.as_bytes()))
+}
+
+/// `body` read up to `limit` bytes, waiting at most `idle` for each frame.
+async fn read_within(body: Body, limit: usize, idle: Duration) -> Result<Bounded, Failed> {
+    let progress = Arc::new(Progress::new());
+    let stamped = Body::new(Upload {
+        body: Mutex::new(body),
+        progress: Arc::clone(&progress),
+    });
+    match await_headers(read_bounded(stamped, limit), &progress, idle).await {
+        Waited::Ready(Ok(read)) => Ok(read),
+        Waited::Ready(Err(_)) => Err(Failed::ClientClosed),
+        Waited::Idle => Err(Failed::Idle),
+    }
+}
+
+/// For a bot whose server must not get a local file reference: refuses a
+/// query string the server would read one from, and a request with more
+/// than one `Content-Type` (which one the server reads is unclear);
+/// otherwise the encoding of a body whose parameters are to be scanned.
+fn scanned_encoding(url: &Url, headers: &HeaderMap) -> Result<Option<Encoding>, Refusal> {
+    if url
+        .query()
+        .is_some_and(|query| form_has_local_file(query.as_bytes()))
+    {
+        return Err(Refusal::LocalFile);
+    }
+    let mut content_types = headers.get_all(CONTENT_TYPE).iter();
+    let content_type = content_types.next();
+    if content_types.next().is_some() {
+        return Err(Refusal::Unreadable);
+    }
+    Ok(content_type.and_then(encoding))
+}
+
+/// [`prepare`] for a body whose parameters are scanned (ruling R2):
+/// - JSON or urlencoded, it is read whole up to [`MAX_PARAMETERS`] (longer,
+///   refused as too large), refused when it carries a local file
+///   reference, else buffered, its chat read from it;
+/// - multipart, it streams through a [`MultipartGuard`], whose verdict
+///   comes back.
+async fn prepare_scanned(
+    scanned: Encoding,
+    content_type: Option<&HeaderValue>,
+    query: Option<&str>,
+    body: Body,
+    idle: Duration,
+    limited: bool,
+) -> Result<(Payload, Option<ChatKey>, Option<oneshot::Receiver<Verdict>>), Failed> {
+    if scanned == Encoding::Multipart {
+        let Some(boundary) =
+            content_type.and_then(|content_type| boundary(content_type.as_bytes()))
+        else {
+            return Err(Failed::Refused(Refusal::Unreadable));
+        };
+        let (guard, verdict) = MultipartGuard::new(body, boundary);
+        let chat = limited.then(|| query_chat(query)).flatten();
+        return Ok((Payload::Streamed(Body::new(guard)), chat, Some(verdict)));
+    }
+    let Bounded::Complete(bytes) = read_within(body, MAX_PARAMETERS, idle).await? else {
+        return Err(Failed::Refused(Refusal::TooLarge));
+    };
+    let found = match scanned {
+        Encoding::Json => json_has_local_file(&bytes),
+        Encoding::Form | Encoding::Multipart => form_has_local_file(&bytes),
+    };
+    if found {
+        return Err(Failed::Refused(Refusal::LocalFile));
+    }
+    let chat = limited
+        .then(|| query_chat(query).or_else(|| chat_key(content_type, &bytes)))
+        .flatten();
+    Ok((Payload::Buffered(bytes), chat, None))
+}
+
+/// `failed`, or the refusal that made it fail: a [`MultipartGuard`] fails
+/// the upload it refuses.
+fn refused_by(failed: Failed, verdict: Option<oneshot::Receiver<Verdict>>) -> Failed {
+    match verdict.and_then(|mut verdict| verdict.try_recv().ok()) {
+        Some(Verdict::Refused(refusal)) => Failed::Refused(refusal),
+        _ => failed,
+    }
 }
 
 /// What a buffered request needs to go upstream once more.
@@ -371,6 +481,11 @@ impl Call<'_> {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
                 self.counted.store(true, Ordering::Relaxed);
                 unreachable(self.handles)
+            }
+            Failed::Refused(refusal) => {
+                tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a Bot API server in local mode");
+                self.count(Outcome::Rejected);
+                refusal.answer()
             }
         }
     }
