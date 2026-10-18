@@ -111,8 +111,10 @@ pub(crate) enum MoveError {
     UnknownBot,
     /// The bot is parked already.
     Parked,
-    /// The Bot API server still held updates of the bot at the deadline;
-    /// the bot runs on unchanged.
+    /// The Bot API server still held updates of the bot when the move's
+    /// time for its drain ran out, a reserve before the deadline (or the
+    /// move waited in the queue past its deadline); the bot runs on
+    /// unchanged.
     Undrained,
     /// This many calls of the bot were still being sent to its server at
     /// the deadline; nothing was called on the server, and the bot runs on.
@@ -641,10 +643,10 @@ impl Reloader {
             Some(Err(_)) => {
                 match failure.or_else(|| sources.long_poll_error(name)) {
                     Some(error) => {
-                        tracing::warn!(bot = %name, ?timeout, %error, "the Bot API server could not be asked whether it still held updates of the bot before the deadline; the bot was not moved")
+                        tracing::warn!(bot = %name, ?timeout, ?reserve, %error, "the Bot API server could not be asked whether it still held updates of the bot before the move's time for its drain ran out, a reserve before its deadline; the bot was not moved")
                     }
                     None => {
-                        tracing::warn!(bot = %name, ?timeout, "the Bot API server still held updates of the bot at the deadline; the bot was not moved")
+                        tracing::warn!(bot = %name, ?timeout, ?reserve, "the Bot API server still held updates of the bot when the move's time for its drain ran out, a reserve before its deadline; the bot was not moved")
                     }
                 }
                 return Some(Err(MoveError::Undrained));
