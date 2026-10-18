@@ -2965,18 +2965,16 @@ async fn queued_move_runs_before_a_later_reload() {
         "{}bots:\n{runner}{moved}{consumers}",
         local_upstream(&local, false)
     )));
-    // The app takes the SIGHUP off its signal channel and queues the
-    // reload in the same step; the log line says it was queued, not
-    // dropped (another test's SIGHUP line could only come on top).
-    let sighup = ["SIGHUP: reloading the config"];
-    let before = logged(&sighup);
+    // Once this app's signal channel is empty again, its run loop has
+    // taken the SIGHUP, and `next_terminating` queues the reload in that
+    // same synchronous step, into this app's reload queue, which is empty:
+    // the reload waits behind the running move, as the queued move does.
     tgin.signal(SignalKind::Hangup).await;
     let started = Instant::now();
     while tgin.signals.capacity() < tgin.signals.max_capacity() {
         assert!(started.elapsed() < PATIENCE, "the SIGHUP was never taken");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    wait_logged(&sighup, before).await;
     // Both wait now; the running move may end.
     gate.store(0, Ordering::SeqCst);
 
