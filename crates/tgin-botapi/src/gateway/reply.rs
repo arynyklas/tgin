@@ -30,7 +30,8 @@ use super::chat_key::chat_key;
 use super::local_files::{Verdict, body_verdict};
 use super::metrics::{MethodLabel, Outcome, RateAction, ReplyMetrics, ReplyOutcome};
 use super::params::text_param;
-use super::proxy::{deadline, outcome, url};
+use super::proxy::transfer::deadline;
+use super::proxy::{outcome, url};
 use super::{Bot, Bounded, Gateway, read_bounded};
 
 /// The longest bound on a reply's call, from connecting to the end of the
