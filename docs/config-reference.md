@@ -471,7 +471,7 @@ A Bot API server: Telegram's (`cloud`) or a self-hosted `telegram-bot-api` (`loc
 
 ## `Files`
 
-Where a local server's files are: `dir` (with `server_dir`) or `url`. The server keeps each bot's files in a directory named after its token, `:` replaced by `~`; tgin serves a bot only its own.
+Where a local server's files are: `dir` (with `server_dir`) or `url`. The server keeps each bot's files in a directory named after its token (`:` replaced by `~` where its filesystem refuses `:`); tgin serves a bot only its own.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

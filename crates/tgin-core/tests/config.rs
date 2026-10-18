@@ -2682,8 +2682,12 @@ fn files_rules() {
     };
     assert_eq!(url.expose().as_str(), "http://127.0.0.1:8080/files");
 
-    // The server names a bot's directory after its token, `:` made `~`.
-    assert_eq!(Upstream::token_dir("123456:AA-bb_CC"), "123456~AA-bb_CC");
+    // The server names a bot's directory after its token, keeping the
+    // `:`, or with `~` for `:` where its filesystem refuses `:`.
+    assert_eq!(
+        Upstream::token_dirs("123456:AA-bb_CC"),
+        ["123456:AA-bb_CC", "123456~AA-bb_CC"]
+    );
 }
 
 /// The resolved `files.dir` and `files.server_dir` of bot 0's upstream.

@@ -198,10 +198,14 @@ impl Upstream {
     /// can take.
     pub const SHORTHAND: &str = "api_url";
 
-    /// The name of a bot's directory on the server: its token with `:`
-    /// replaced by `~`. It holds the token: never log it.
-    pub fn token_dir(token: &str) -> String {
-        token.replace(':', "~")
+    /// The two names a bot's directory on the server may have: the token
+    /// itself, then the token with `:` replaced by `~`. The server keeps
+    /// the `:`, and switches to `~` only when its startup probe
+    /// `mkdtemp(dir, "1:a")` fails, where the filesystem refuses `:`
+    /// (`telegram-bot-api.cpp:394-398`, `Client.cpp:8603-8610`). Both hold
+    /// the token: never log them.
+    pub fn token_dirs(token: &str) -> [String; 2] {
+        [token.to_owned(), token.replace(':', "~")]
     }
 
     pub fn webhook_rules(&self) -> WebhookRules {

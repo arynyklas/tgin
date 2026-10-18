@@ -241,8 +241,9 @@ pub enum UpstreamKind {
 }
 
 /// Where a local server's files are: `dir` (with `server_dir`) or `url`.
-/// The server keeps each bot's files in a directory named after its token,
-/// `:` replaced by `~`; tgin serves a bot only its own.
+/// The server keeps each bot's files in a directory named after its token
+/// (`:` replaced by `~` where its filesystem refuses `:`); tgin serves a
+/// bot only its own.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Files {
