@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tgin_botapi::ApiError;
-use tgin_core::config::{self, Bot, Config};
+use tgin_botapi::{ApiError, BotClient, WebhookInfo};
+use tgin_core::config::{self, Bot, Config, Ingress};
 use tgin_core::metrics::ReloadOutcome;
 use tgin_core::reload::ReloadReport;
 use tgin_runtime::config::{ConfigError, ConfigWatcher, Env, watch_config};
@@ -27,7 +27,7 @@ use crate::admin::{BotMove, Moved};
 use crate::app::{self, Shared};
 use crate::cli;
 use crate::data_server::DataRoutes;
-use crate::sources::{Kind, Stop};
+use crate::sources::{self, Kind, Stop};
 
 /// Reload requests that may wait while a reload or a move runs, and moves
 /// likewise, each in a queue of its own: moves never fill the reload
@@ -93,6 +93,10 @@ pub(crate) enum MoveError {
     /// The Bot API server refused or failed the call (token masked); the
     /// bot runs on.
     Upstream(ApiError),
+    /// As [`MoveError::Upstream`] for a `close` refused after
+    /// `deleteWebhook`, and the webhook tgin does not register could not
+    /// be set again: it must be set again for the bot to get updates.
+    Unrestored(ApiError),
 }
 
 /// Where reload and move requests go.
@@ -564,11 +568,8 @@ impl Reloader {
         let left = engine.pending_from(id);
 
         let called = match how {
-            BotMove::LogOut => client.log_out().await,
-            BotMove::Close => match client.delete_webhook(false).await {
-                Ok(()) => client.close().await,
-                Err(err) => Err(err),
-            },
+            BotMove::LogOut => client.log_out().await.map_err(|err| (err, None)),
+            BotMove::Close => close(bot, &client).await,
         };
         match called {
             Ok(result) => {
@@ -580,13 +581,25 @@ impl Reloader {
                     result,
                 })
             }
-            Err(err) => {
+            Err((err, deleted)) => {
                 tracing::warn!(bot = %name, method = how.method(), error = %err, "the Bot API server did not log the bot out; it starts again");
                 sources.unpark(name);
                 let restart = bot.ingress.is_some().then_some(bot);
                 self.start_sources(&cfg, restart.into_iter().collect())
                     .await;
-                Err(MoveError::Upstream(err))
+                let Some(before) = deleted else {
+                    return Err(MoveError::Upstream(err));
+                };
+                match sources::restore_webhook(bot, &client, &before).await {
+                    Ok(()) => {
+                        tracing::info!(bot = %name, "the bot's webhook, deleted before close, was set again");
+                        Err(MoveError::Upstream(err))
+                    }
+                    Err(error) => {
+                        tracing::error!(bot = %name, %error, "the bot's webhook was deleted before close and could not be set again; set it again, or the bot gets no update");
+                        Err(MoveError::Unrestored(err))
+                    }
+                }
             }
         }
     }
@@ -624,6 +637,29 @@ impl Reloader {
             }
         }
     }
+}
+
+/// `close`'s calls for `bot` on `client`: `deleteWebhook`, then `close`.
+/// A webhook bot that tgin does not register (`register: false`) has its
+/// webhook, set by its operator, read first: should `close` fail once the
+/// webhook is deleted, the error comes with it, to be set again (tgin
+/// registers the other bots' webhooks itself as they start again).
+async fn close(
+    bot: &Bot,
+    client: &BotClient,
+) -> Result<Option<String>, (ApiError, Option<WebhookInfo>)> {
+    let set_by_operator = matches!(&bot.ingress, Some(Ingress::Webhook(hook)) if !hook.register);
+    let before = if set_by_operator {
+        Some(client.webhook_info().await.map_err(|err| (err, None))?)
+    } else {
+        None
+    };
+    client
+        .delete_webhook(false)
+        .await
+        .map_err(|err| (err, None))?;
+    let deleted = before.filter(|info| !info.url.is_empty());
+    client.close().await.map_err(|err| (err, deleted))
 }
 
 /// The next change the watcher reports: `true`, or `false` once it has

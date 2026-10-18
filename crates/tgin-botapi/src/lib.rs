@@ -10,7 +10,7 @@ pub mod pull;
 mod secret;
 mod webhook;
 
-pub use client::{ApiError, BotClient, BotUser, Identity, SetWebhook, split_updates};
+pub use client::{ApiError, BotClient, BotUser, Identity, SetWebhook, WebhookInfo, split_updates};
 pub use facts::{FactsError, extract};
 /// The network type of [`IpAllowlist`] and [`WebhookOptions::trusted_proxies`].
 pub use ipnet::IpNet;

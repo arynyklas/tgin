@@ -2354,6 +2354,138 @@ async fn bot_close_deletes_webhook_then_closes() {
     tgin.stop().await;
 }
 
+/// Mounts what a `close` of the bot `token` on `server` meets, before
+/// `mount_bot`: `getWebhookInfo` reporting a webhook its operator set,
+/// with no pending update, and `close` refused with a 429. Returns that
+/// webhook's URL.
+async fn mount_refused_close(server: &MockServer, token: &str) -> &'static str {
+    const URL: &str = "https://ops.example/route/hook?k=v";
+    Mock::given(path(format!("/bot{token}/getWebhookInfo")))
+        .respond_with(ok(json!({
+            "url": URL, "has_custom_certificate": false, "pending_update_count": 0,
+            "max_connections": 7, "allowed_updates": ["message", "callback_query"],
+        })))
+        .mount(server)
+        .await;
+    Mock::given(path(format!("/bot{token}/close")))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "ok": false, "error_code": 429, "description": "Too Many Requests: retry after 312",
+            "parameters": { "retry_after": 312 },
+        })))
+        .mount(server)
+        .await;
+    URL
+}
+
+/// The bodies of the `setWebhook` calls `server` got for `token`.
+async fn set_webhooks(server: &MockServer, token: &str) -> Vec<Value> {
+    let at = format!("/bot{token}/setWebhook");
+    let requests = server.received_requests().await.unwrap_or_default();
+    requests
+        .iter()
+        .filter(|r| r.url.path() == at)
+        .map(|r| serde_json::from_slice(&r.body).expect("JSON"))
+        .collect()
+}
+
+/// A `close` refused after `deleteWebhook` sets the webhook of a bot tgin
+/// does not register (`register: false`) again as it was, with the
+/// secret tgin's route checks; the bot runs on and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_close_failure_restores_unregistered_webhook() {
+    let telegram = MockServer::start().await;
+    let url = mount_refused_close(&telegram, TOKEN).await;
+    mount_bot(&telegram, TOKEN, me("tgin_bot"), Duration::from_secs(3600)).await;
+    let tgin = start(
+        "bot_close_failure_restores_unregistered_webhook",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            hook_bot(&telegram, "restored", TOKEN, "/hook", "workers")
+        )),
+    )
+    .await;
+    let answer = tgin
+        .admin_post("/v1/bots/restored/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 502, "{}", answer.body);
+    assert_eq!(
+        answer.json(),
+        json!({ "error": "upstream refused", "description": "Too Many Requests: retry after 312" })
+    );
+    // The webhook is read before it is deleted, and set again after the
+    // bot started again (whose `getMe` may come in between).
+    let calls = calls(&telegram, TOKEN).await;
+    let calls: Vec<&str> = (calls.iter().map(String::as_str))
+        .filter(|m| *m != "getMe")
+        .collect();
+    assert_eq!(
+        calls[calls.len().saturating_sub(4)..],
+        ["getWebhookInfo", "deleteWebhook", "close", "setWebhook"],
+        "{calls:?}"
+    );
+    assert_eq!(
+        set_webhooks(&telegram, TOKEN).await,
+        [json!({
+            "url": url,
+            "secret_token": HOOK_SECRET,
+            "allowed_updates": ["message", "callback_query"],
+            "max_connections": 7,
+            "drop_pending_updates": false,
+        })]
+    );
+    assert_eq!(source_state(&tgin, "restored").await, "running");
+    tgin.deliver("/hook", &[1]).await;
+    assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1]);
+    tgin.stop().await;
+}
+
+/// When setting the webhook again fails too, an error names the bot, and
+/// the 502 says the webhook must be set again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_close_failure_reports_an_unrestored_webhook() {
+    let telegram = MockServer::start().await;
+    mount_refused_close(&telegram, TOKEN).await;
+    Mock::given(path(format!("/bot{TOKEN}/setWebhook")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false, "error_code": 400, "description": format!("Bad Request: no, {TOKEN}"),
+        })))
+        .mount(&telegram)
+        .await;
+    mount_bot(&telegram, TOKEN, me("tgin_bot"), Duration::from_secs(3600)).await;
+    let tgin = start(
+        "bot_close_failure_reports_an_unrestored_webhook",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            hook_bot(&telegram, "unrestored", TOKEN, "/hook", "workers")
+        )),
+    )
+    .await;
+    let answer = tgin
+        .admin_post("/v1/bots/unrestored/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 502, "{}", answer.body);
+    assert_eq!(
+        answer.json(),
+        json!({
+            "error": "upstream refused",
+            "description": "Too Many Requests: retry after 312; the bot's webhook was deleted and could not be set again: set it again",
+        })
+    );
+    assert_eq!(set_webhooks(&telegram, TOKEN).await.len(), 1);
+    let logs = LOGS.text();
+    let error = logs
+        .lines()
+        .find(|l| l.contains(" ERROR ") && l.contains("bot=unrestored"))
+        .unwrap_or_else(|| panic!("no error in\n{logs}"));
+    assert!(
+        error.contains("Bad Request: no, [redacted]") && error.contains("set it again"),
+        "{error}"
+    );
+    assert!(!logs.contains(TOKEN), "the token reached a log line");
+    assert_eq!(source_state(&tgin, "unrestored").await, "running");
+    tgin.stop().await;
+}
+
 /// A parked bot stays parked across reloads that leave its upstream
 /// alone, an unchanged config or one that would restart its source, each
 /// with a warning; meanwhile it never calls its server.

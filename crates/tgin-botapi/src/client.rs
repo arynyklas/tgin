@@ -109,6 +109,22 @@ fn url_origin(url: &Url) -> String {
     shown
 }
 
+/// The fields of `getWebhookInfo` tgin reads. No `Debug`: the URL's path
+/// and query may carry a secret.
+#[derive(Clone, Default, Deserialize)]
+pub struct WebhookInfo {
+    /// Empty when no webhook is set.
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub has_custom_certificate: bool,
+    #[serde(default)]
+    pub pending_update_count: u64,
+    pub max_connections: Option<u32>,
+    /// Absent for the server's default set.
+    pub allowed_updates: Option<Vec<String>>,
+}
+
 /// One bot's Bot API client; clones share the connection pool. `Debug` shows
 /// neither the token nor the URL.
 #[derive(Clone)]
@@ -264,15 +280,17 @@ impl BotClient {
     /// `getWebhookInfo`'s `pending_update_count`: the updates the server
     /// still holds for the bot.
     pub async fn pending_update_count(&self) -> Result<u64, ApiError> {
-        #[derive(Deserialize)]
-        struct Info {
-            #[serde(default)]
-            pending_update_count: u64,
-        }
+        self.webhook_info()
+            .await
+            .map(|info| info.pending_update_count)
+    }
+
+    /// `getWebhookInfo`: the bot's webhook as the server holds it.
+    pub async fn webhook_info(&self) -> Result<WebhookInfo, ApiError> {
         let body = self
             .send(self.http.get(self.url("getWebhookInfo")?))
             .await?;
-        self.scrubbed(parse_result::<Info>(&body).map(|info| info.pending_update_count))
+        self.scrubbed(parse_result::<WebhookInfo>(&body))
     }
 
     /// `logOut`: the server's `description`, if it sent one, with the token

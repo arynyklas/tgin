@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use tgin_botapi::gateway::Gateway;
 use tgin_botapi::{
     ApiError, BotClient, Identity, LongPollOptions, LongPollSource, Registration, SetWebhook,
+    WebhookInfo,
 };
 use tgin_core::config::{Bot, Ingress, LongPoll, SensitiveUrl, UpstreamKind, Webhook};
 use tgin_core::engine::Engine;
@@ -853,6 +854,39 @@ async fn webhook_request(bot: &Prepared, hook: &Webhook) -> Option<SetWebhook> {
         ip_address: hook.ip_address,
         certificate,
     })
+}
+
+/// Sets the webhook of `bot`, whose webhook tgin does not register, again
+/// as `before` (what `getWebhookInfo` reported before a `deleteWebhook`):
+/// its URL, `max_connections` and `allowed_updates`, with the secret
+/// tgin's route checks. A webhook with a custom certificate cannot be set
+/// again: tgin does not have it. The error is masked.
+pub(crate) async fn restore_webhook(
+    bot: &Bot,
+    client: &BotClient,
+    before: &WebhookInfo,
+) -> Result<(), String> {
+    let Some(Ingress::Webhook(hook)) = &bot.ingress else {
+        return Ok(());
+    };
+    if before.has_custom_certificate {
+        return Err("it had a custom certificate, which tgin cannot upload again".to_owned());
+    }
+    let url = url::Url::parse(&before.url)
+        .map_err(|_| "the server reported a webhook URL that does not parse".to_owned())?;
+    let request = SetWebhook {
+        url,
+        secret_token: webhook_secret(bot, hook),
+        allowed_updates: before.allowed_updates.clone().unwrap_or_default(),
+        max_connections: before.max_connections,
+        drop_pending_updates: false,
+        ip_address: None,
+        certificate: None,
+    };
+    client
+        .set_webhook(&request)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// Logs the webhook of the bot `name` as registered at `public_url`.
