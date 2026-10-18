@@ -186,6 +186,9 @@ pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
 const BOT_API_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches";
 /// What a plain-http `files.url` off loopback hints.
 const FILE_SERVER_HINT: &str = "use https, or keep the file server on a network only tgin reaches";
+/// What a plain-http `api_url` off loopback hints: such a URL is most
+/// likely a self-hosted server, which the shorthand treats as the cloud.
+const SHORTHAND_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches; a self-hosted Bot API server belongs in `upstreams: { <name>: { kind: local, url: … } }` with the bot's `upstream: <name>`, as only there does tgin refuse `file:` references (local files of the server) from the bot's downstreams";
 
 impl WebhookRules {
     /// Telegram's rules, unless the server is local and in local mode.
@@ -959,7 +962,7 @@ impl Resolver<'_> {
         }
         let path = format!("{path}.api_url");
         let url = match &bot.api_url {
-            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text, BOT_API_HINT)?,
+            Some(text) => self.upstream_url(&path, Upstream::SHORTHAND, text, SHORTHAND_HINT)?,
             None => self.url(&path, &defaults::api_url(), false)?,
         };
         Some(Arc::new(Upstream {

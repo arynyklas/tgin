@@ -2980,7 +2980,8 @@ fn http_upstream_warning() {
         );
     }
 
-    // The shorthand is an upstream too.
+    // The shorthand is an upstream too, a cloud one: a self-hosted server
+    // behind it would not have tgin refuse `file:` references.
     let text = "version: 1\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"http://bot-api:8081\"\n";
     let cfg = loads(text);
     let [warning] = cfg.warnings.as_slice() else {
@@ -2989,6 +2990,11 @@ fn http_upstream_warning() {
     assert_at(warning, "bots[0].api_url", pos(text, "\"http://"));
     assert_message(warning, "`api_url`");
     assert!(!warning.to_string().contains("bot-api"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("upstreams: { <name>: { kind: local") && hint.contains("`file:`"),
+        "{warning}"
+    );
 }
 
 /// A `files.url` origin is asked for each bot's directory, named after its
