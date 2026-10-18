@@ -116,6 +116,12 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   longer stop timeout than Docker's 10 s (`docker run --stop-timeout 30`,
   Compose `stop_grace_period: 30s`, Kubernetes
   `terminationGracePeriodSeconds: 30`).
+- `docker/telegram-bot-api`: an image of the official Telegram Bot API
+  server (Bot API 10.3), built from a pinned upstream commit on Alpine,
+  running as `10001:10001` with no credentials inside; CI builds it on amd64
+  and arm64 with an SBOM and provenance, and does not publish it.
+  `examples/self-hosted` runs tgin in front of it with Compose, and with
+  `compose.fake.yaml` against the fake Bot API instead.
 - The minimum supported Rust version is 1.89.
 
 ### Security

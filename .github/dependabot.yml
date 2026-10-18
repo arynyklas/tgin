@@ -26,6 +26,7 @@ updates:
   - package-ecosystem: docker
     directories:
       - "/"
+      - "/docker/telegram-bot-api"
       - "/tests/performance/benchmark"
       - "/tests/performance/bot"
       - "/examples/simple"
