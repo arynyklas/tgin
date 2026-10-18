@@ -3370,13 +3370,20 @@ async fn queued_move_runs_before_a_later_reload() {
         .expect("ran");
     assert_eq!(waited.status, 200, "{}", waited.body);
     assert_eq!(waited.json()["upstream"], "api_url");
-    let status = tgin.wait_for_generation(2).await;
+    // The generation counts once the engine has the new config; the
+    // waiter's source starts after that.
+    tgin.wait_for_generation(2).await;
+    tgin.wait_status("the waiter running on its new upstream", |status| {
+        status
+            .sources
+            .iter()
+            .any(|s| s.name == "waiter" && s.state == "running")
+    })
+    .await;
     assert_eq!(count_calls(&telegram, OTHER_TOKEN, "logOut").await, 1);
     assert_eq!(count_calls(&local, OTHER_TOKEN, "logOut").await, 0);
     // Unparked by the reload, it runs on the new upstream.
     assert_eq!(count_calls(&local, OTHER_TOKEN, "getMe").await, 1);
-    let waiter_state = status.sources.iter().find(|s| s.name == "waiter");
-    assert_eq!(waiter_state.map(|s| s.state.as_str()), Some("running"));
     tgin.stop().await;
 }
 
