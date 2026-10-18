@@ -66,6 +66,17 @@ pub(crate) enum Kind {
     Webhook,
 }
 
+/// Why [`Sources::stop`] stops a bot's source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// It starts again.
+    Restart,
+    /// The bot stays configured, without ingress.
+    SourceGone,
+    /// The bot is no longer configured.
+    BotGone,
+}
+
 /// The bots' sources, by bot name.
 pub(crate) struct Sources {
     engine: Arc<Engine>,
@@ -460,25 +471,30 @@ impl Sources {
         self.health.set(&source_task(name), Readiness::Ready);
     }
 
-    /// Stops the source of the bot `name`, if it runs. A bot that is not
-    /// `removed` restarts: it counts as starting until it has started
-    /// again. A `removed` bot is forgotten too: its readiness component
-    /// goes, and so does its parking. The tasks of the stopped source leave
-    /// the supervisor's list once they have ended, unless the bot polls
-    /// again by then.
-    pub(crate) fn stop(&self, name: &str, removed: bool) {
+    /// Stops the source of the bot `name`, if it runs, as `why` says. A
+    /// restarting bot counts as starting until it has started again. A bot
+    /// whose source or whole config entry is gone loses its readiness
+    /// component; only a bot gone from the config loses its parking, so a
+    /// parked bot whose ingress comes back stays parked. The tasks of the
+    /// stopped source leave the supervisor's list once they have ended,
+    /// unless the bot polls again by then.
+    pub(crate) fn stop(&self, name: &str, why: Stop) {
         let (started, stop) = {
             let mut registry = self.registry.lock();
-            let stop = if removed {
-                registry.parked.remove(name);
-                registry.stops.remove(name)
-            } else {
-                registry.starting.insert(name.to_owned());
-                registry.stops.get(name).cloned()
+            let stop = match why {
+                Stop::Restart => {
+                    registry.starting.insert(name.to_owned());
+                    registry.stops.get(name).cloned()
+                }
+                Stop::SourceGone => registry.stops.remove(name),
+                Stop::BotGone => {
+                    registry.parked.remove(name);
+                    registry.stops.remove(name)
+                }
             };
             (registry.started.remove(name), stop)
         };
-        if removed {
+        if why != Stop::Restart {
             self.health.remove(&source_task(name));
         }
         if let Some(stop) = stop {
@@ -527,11 +543,18 @@ impl Sources {
         self.registry.lock().parked.iter().cloned().collect()
     }
 
-    /// What the webhook route of the bot `name` answers by: its stop token
-    /// (cancelled while it is parked, so the route answers 503), or the
-    /// process's ingest token for a bot without one.
+    /// What the webhook route of the bot `name` answers by: a cancelled
+    /// token while it is parked (the route answers 503), else its stop
+    /// token, or the process's ingest token for a bot without one.
     pub(crate) fn ingest_of(&self, name: &str) -> CancellationToken {
-        let stop = self.registry.lock().stops.get(name).cloned();
+        let registry = self.registry.lock();
+        if registry.parked.contains(name) {
+            let parked = CancellationToken::new();
+            parked.cancel();
+            return parked;
+        }
+        let stop = registry.stops.get(name).cloned();
+        drop(registry);
         stop.unwrap_or_else(|| self.ingest.clone())
     }
 
@@ -547,24 +570,39 @@ impl Sources {
     /// `getWebhookInfo` every [`DRAIN_CHECK`] until `pending_update_count`
     /// is 0. Never returns for a long poll that does not run. A bot without
     /// ingress has nothing to drain.
-    pub(crate) async fn drain_upstream(&self, bot: &Bot, client: &BotClient) {
+    ///
+    /// `failure` holds why the last check could not tell, while it could
+    /// not (token masked): a failed `getWebhookInfo`, or a long poll that
+    /// does not run. A long poll's failing `getUpdates` is its
+    /// [`Sources::long_poll_error`].
+    pub(crate) async fn drain_upstream(
+        &self,
+        bot: &Bot,
+        client: &BotClient,
+        failure: &mut Option<String>,
+    ) {
         match &bot.ingress {
             Some(Ingress::LongPoll(_)) => {
                 let source = (self.registry.lock().started.get(&bot.name))
                     .and_then(|started| started.long_poll.clone());
                 match source {
                     Some(source) => source.drain().await,
-                    None => std::future::pending().await,
+                    None => {
+                        *failure = Some("the long poll does not run".to_owned());
+                        std::future::pending().await
+                    }
                 }
             }
             Some(Ingress::Webhook(_)) => loop {
                 match client.pending_update_count().await {
                     Ok(0) => return,
                     Ok(pending) => {
+                        *failure = None;
                         tracing::debug!(source = %bot.name, pending, "the Bot API server still holds updates");
                     }
                     Err(err) => {
                         tracing::debug!(source = %bot.name, error = %err, "getWebhookInfo failed");
+                        *failure = Some(format!("getWebhookInfo failed: {err}"));
                     }
                 }
                 tokio::time::sleep(DRAIN_CHECK).await;
@@ -1110,7 +1148,7 @@ mod tests {
         );
         let mut state = supervisor.subscribe("register:reg").expect("retrying");
 
-        sources.stop("reg", true);
+        sources.stop("reg", Stop::BotGone);
         tokio::time::timeout(WAIT, state.wait_for(|s| *s == TaskState::Stopped))
             .await
             .expect("the retries stop in time")

@@ -2,7 +2,6 @@
 //! sink pushes back.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,7 +12,7 @@ use tgin_core::metrics::{SourceErrorReason, SourceMetrics, SourceStateLabel};
 use tgin_core::sink::{Admit, Sink};
 use tgin_runtime::backoff::{Backoff, honor_retry_after};
 use tgin_runtime::supervisor::Exit;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -104,12 +103,11 @@ pub struct LongPollSource<S: Sink> {
 
 /// [`LongPollSource::drain`]'s state, shared with the poll loop.
 struct Drain {
-    /// Set while a drain runs, and after it succeeded: polls do not wait
-    /// for updates (`timeout` 0), and an empty batch holds the source.
-    on: AtomicBool,
-    /// Wakes the poll loop: gives up its long poll in flight when a drain
-    /// begins, and lets it poll again when a drain is called off.
-    wake: Notify,
+    /// True while a drain runs, and after it succeeded: polls do not wait
+    /// for updates (`timeout` 0), and an empty batch holds the source. Each
+    /// change wakes the poll loop: becoming true gives up its long poll in
+    /// flight, becoming false lets a held source poll again.
+    on: watch::Sender<bool>,
     /// Counts the empty batches polled while draining.
     empty: watch::Sender<u64>,
 }
@@ -123,8 +121,7 @@ struct Resume<'a> {
 impl Drop for Resume<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.drain.on.store(false, Ordering::SeqCst);
-            self.drain.wake.notify_waiters();
+            self.drain.on.send_replace(false);
         }
     }
 }
@@ -209,8 +206,7 @@ impl<S: Sink> LongPollSource<S> {
             on_identity,
             last_error: Mutex::new(None),
             drain: Drain {
-                on: AtomicBool::new(false),
-                wake: Notify::new(),
+                on: watch::channel(false).0,
                 empty: watch::channel(0).0,
             },
         }
@@ -235,8 +231,7 @@ impl<S: Sink> LongPollSource<S> {
             drain: &self.drain,
             armed: true,
         };
-        self.drain.on.store(true, Ordering::SeqCst);
-        self.drain.wake.notify_waiters();
+        self.drain.on.send_replace(true);
         // The sender lives as long as `self`.
         let _ = empty.changed().await;
         resume.armed = false;
@@ -337,13 +332,11 @@ impl<S: Sink> LongPollSource<S> {
             }
         }
 
+        let mut drain = self.drain.on.subscribe();
         loop {
-            // Enabled before the flag is read, so a drain beginning after the
-            // read wakes this poll.
-            let woken = self.drain.wake.notified();
-            tokio::pin!(woken);
-            woken.as_mut().enable();
-            let draining = self.drain.on.load(Ordering::SeqCst);
+            // Marked seen here, so a drain beginning after this read wakes
+            // the poll below.
+            let draining = *drain.borrow_and_update();
             let timeout = if draining {
                 Duration::ZERO
             } else {
@@ -358,7 +351,7 @@ impl<S: Sink> LongPollSource<S> {
             // A long poll given up confirms nothing: its updates come again.
             let polled = tokio::select! {
                 () = ingest.cancelled() => return Exit::Done,
-                () = &mut woken, if !draining => continue,
+                _ = drain.changed(), if !draining => continue,
                 polled = request => polled,
             };
             let step = match polled.and_then(|body| split_updates(&body)) {
@@ -372,7 +365,7 @@ impl<S: Sink> LongPollSource<S> {
                     if !self.admit(&updates, &mut state.offset, ingest).await {
                         return Exit::Done;
                     }
-                    if draining && updates.is_empty() && !self.hold(ingest).await {
+                    if draining && updates.is_empty() && !self.hold(&mut drain, ingest).await {
                         return Exit::Done;
                     }
                     Step::Poll
@@ -397,15 +390,12 @@ impl<S: Sink> LongPollSource<S> {
     }
 
     /// After a drain's empty batch: reports it, then waits until the drain
-    /// is called off. Returns `false` if `ingest` is cancelled first.
-    async fn hold(&self, ingest: &CancellationToken) -> bool {
-        let resumed = self.drain.wake.notified();
-        tokio::pin!(resumed);
-        resumed.as_mut().enable();
+    /// is called off (`drain` false). Returns `false` if `ingest` is
+    /// cancelled first.
+    async fn hold(&self, drain: &mut watch::Receiver<bool>, ingest: &CancellationToken) -> bool {
         self.drain.empty.send_modify(|n| *n += 1);
-        if !self.drain.on.load(Ordering::SeqCst) {
-            return true;
-        }
+        // The sender lives as long as `self`; it never closes here.
+        let resumed = drain.wait_for(|on| !on);
         ingest.run_until_cancelled(resumed).await.is_some()
     }
 
@@ -602,5 +592,108 @@ mod tests {
             assert!(!is_fatal(&http(429), local));
             assert!(!is_fatal(&http(500), local));
         }
+    }
+
+    /// Admits everything.
+    struct Admits;
+
+    impl Sink for Admits {
+        fn admit(&self, _: SourceId, _: i64, _: Bytes, _: &Facts<'_>) -> Admit {
+            Admit::Admitted
+        }
+    }
+
+    /// The `timeout` of each `getUpdates` `server` has seen, in order.
+    async fn poll_timeouts(server: &wiremock::MockServer) -> Vec<u64> {
+        let requests = server.received_requests().await.unwrap_or_default();
+        let polls = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/getUpdates"));
+        polls
+            .map(|r| {
+                let params: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                params["timeout"].as_u64().unwrap()
+            })
+            .collect()
+    }
+
+    /// A drain called off while the source holds after its empty batch
+    /// wakes it: it long-polls again with its own timeout. (One thread:
+    /// once the test sees the empty batch, the source waits in `hold`.)
+    #[tokio::test]
+    async fn called_off_drain_resumes_long_polling() {
+        use futures_util::FutureExt as _;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/bot{TOKEN}/getMe")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"B"}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/bot{TOKEN}/getUpdates")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"ok":true,"result":[]}"#)
+                    .set_delay(Duration::from_millis(20)),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let token = tgin_runtime::secret::Secret::new(TOKEN.to_owned());
+        let client = BotClient::new(http, &server.uri().parse().unwrap(), &token).unwrap();
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = tgin_core::metrics::CoreMetrics::register(&mut registry).source("lp");
+        let opts = LongPollOptions {
+            timeout: Duration::from_secs(7),
+            delete_webhook_on_start: false,
+            ..LongPollOptions::default()
+        };
+        let source = Arc::new(LongPollSource::new(
+            SourceId(0),
+            Arc::from("lp"),
+            client,
+            opts,
+            Arc::new(Admits),
+            metrics,
+            Arc::new(|_: SourceId, _: &Identity| {}),
+        ));
+        let ingest = CancellationToken::new();
+        let run = tokio::spawn({
+            let (source, ingest) = (Arc::clone(&source), ingest.clone());
+            async move { source.run(ingest).await }
+        });
+        let wait = Duration::from_secs(10);
+
+        let mut empty = source.drain.empty.subscribe();
+        let mut drain = Box::pin(source.drain());
+        assert!((&mut drain).now_or_never().is_none(), "drained at once");
+        tokio::time::timeout(wait, empty.changed())
+            .await
+            .expect("an empty batch in time")
+            .unwrap();
+        let held = poll_timeouts(&server).await;
+        assert_eq!(held.last(), Some(&0), "{held:?}");
+        drop(drain);
+
+        let resumed = tokio::time::timeout(wait, async {
+            loop {
+                let polls = poll_timeouts(&server).await;
+                if polls.len() > held.len() {
+                    return polls[held.len()..].to_vec();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("polling again in time");
+        assert_eq!(resumed[0], 7, "{resumed:?}");
+        ingest.cancel();
+        assert_eq!(run.await.unwrap(), Exit::Done);
     }
 }

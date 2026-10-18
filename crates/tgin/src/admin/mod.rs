@@ -31,7 +31,8 @@
 //! it again until one changes its upstream. Failures: 400 `invalid
 //! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
 //! `parked`, 504 `upstream not drained` when the server still held updates
-//! at the deadline (the bot runs on unchanged), 502 with the server's
+//! at the deadline, or could not say (the bot runs on unchanged; the
+//! warning logged names the server's error), 502 with the server's
 //! description when it refused the call (the bot runs on).
 
 mod api;

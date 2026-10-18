@@ -27,10 +27,12 @@ use crate::admin::{BotMove, Moved};
 use crate::app::{self, Shared};
 use crate::cli;
 use crate::data_server::DataRoutes;
-use crate::sources::Kind;
+use crate::sources::{Kind, Stop};
 
-/// Reload requests that may wait while one runs; a SIGHUP finding the queue
-/// full is covered by a request already waiting.
+/// Reload requests that may wait while a reload or a move runs; a SIGHUP
+/// finding the queue full is covered by a reload already waiting, which
+/// reads the file when it runs. Moves wait in a queue of their own, so
+/// they never fill this one.
 const QUEUE: usize = 8;
 /// How often the watcher re-reads the config file, for file systems that
 /// deliver no change events.
@@ -46,20 +48,25 @@ pub(crate) enum Trigger {
     Watch,
 }
 
-/// One job for the reload task, with where its result goes.
-pub(crate) enum Request {
-    Reload {
-        trigger: Trigger,
-        reply: Option<oneshot::Sender<Result<ReloadReport, ReloadError>>>,
-    },
-    /// Moves the bot `bot` off its Bot API server; see
-    /// [`Reloader::move_bot`].
-    Move {
-        bot: String,
-        how: BotMove,
-        timeout: Option<Duration>,
-        reply: oneshot::Sender<Result<Moved, MoveError>>,
-    },
+/// One reload to run, with where its result goes.
+pub(crate) struct Request {
+    trigger: Trigger,
+    reply: Option<oneshot::Sender<Result<ReloadReport, ReloadError>>>,
+}
+
+/// One bot to move off its Bot API server, with where the result goes;
+/// see [`Reloader::move_bot`].
+pub(crate) struct Move {
+    bot: String,
+    how: BotMove,
+    timeout: Option<Duration>,
+    reply: oneshot::Sender<Result<Moved, MoveError>>,
+}
+
+/// What [`Reloader::run`] takes its jobs from.
+pub(crate) struct Requests {
+    reloads: mpsc::Receiver<Request>,
+    moves: mpsc::Receiver<Move>,
 }
 
 /// Why a reload changed nothing.
@@ -88,18 +95,31 @@ pub(crate) enum MoveError {
     Upstream(ApiError),
 }
 
-/// Where reload requests go.
+/// Where reload and move requests go.
 #[derive(Clone)]
 pub(crate) struct ReloadQueue {
     tx: mpsc::Sender<Request>,
+    moves: mpsc::Sender<Move>,
     lifecycle: Arc<Lifecycle>,
 }
 
 impl ReloadQueue {
-    /// A queue and the receiver [`Reloader::run`] takes requests from.
-    pub(crate) fn new(lifecycle: Arc<Lifecycle>) -> (Self, mpsc::Receiver<Request>) {
-        let (tx, rx) = mpsc::channel(QUEUE);
-        (Self { tx, lifecycle }, rx)
+    /// A queue and the receivers [`Reloader::run`] takes requests from.
+    pub(crate) fn new(lifecycle: Arc<Lifecycle>) -> (Self, Requests) {
+        let (tx, reloads) = mpsc::channel(QUEUE);
+        let (moves, moved) = mpsc::channel(QUEUE);
+        let requests = Requests {
+            reloads,
+            moves: moved,
+        };
+        (
+            Self {
+                tx,
+                moves,
+                lifecycle,
+            },
+            requests,
+        )
     }
 
     /// SIGHUP: queues a reload, unless tgin is shutting down.
@@ -108,7 +128,7 @@ impl ReloadQueue {
             tracing::debug!("SIGHUP ignored: shutting down");
             return;
         }
-        let request = Request::Reload {
+        let request = Request {
             trigger: Trigger::Signal,
             reply: None,
         };
@@ -127,7 +147,7 @@ impl ReloadQueue {
     /// already waiting.
     pub(crate) async fn request(&self) -> Result<ReloadReport, ReloadError> {
         let (reply, result) = oneshot::channel();
-        let request = Request::Reload {
+        let request = Request {
             trigger: Trigger::Api,
             reply: Some(reply),
         };
@@ -139,8 +159,8 @@ impl ReloadQueue {
     }
 
     /// `POST /v1/bots/{bot}/logout|close`: moves the bot (see
-    /// [`Reloader::move_bot`]) and returns the result, after the reloads
-    /// already waiting.
+    /// [`Reloader::move_bot`]) and returns the result, after the moves
+    /// already waiting; reloads waiting meanwhile run first.
     pub(crate) async fn move_bot(
         &self,
         bot: String,
@@ -148,13 +168,13 @@ impl ReloadQueue {
         timeout: Option<Duration>,
     ) -> Result<Moved, MoveError> {
         let (reply, result) = oneshot::channel();
-        let request = Request::Move {
+        let request = Move {
             bot,
             how,
             timeout,
             reply,
         };
-        if self.tx.send(request).await.is_err() {
+        if self.moves.send(request).await.is_err() {
             return Err(MoveError::Draining);
         }
         result.await.unwrap_or(Err(MoveError::Draining))
@@ -194,19 +214,19 @@ struct Watch {
 impl Reloader {
     /// Runs the reloads and moves asked through `requests`, and the
     /// reloads the config watcher asks for while the config enables it, one
-    /// at a time, until `stop` is cancelled.
-    pub(crate) async fn run(
-        mut self,
-        mut requests: mpsc::Receiver<Request>,
-        stop: CancellationToken,
-    ) {
+    /// at a time, reloads before moves, until `stop` is cancelled.
+    pub(crate) async fn run(mut self, requests: Requests, stop: CancellationToken) {
+        let Requests {
+            mut reloads,
+            mut moves,
+        } = requests;
         let mut watch = None;
         self.settle(&mut watch).await;
         loop {
             let request = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                request = requests.recv() => match request {
+                request = reloads.recv() => match request {
                     Some(request) => request,
                     None => return,
                 },
@@ -216,28 +236,23 @@ impl Reloader {
                         watch = None;
                         continue;
                     }
-                    Request::Reload { trigger: Trigger::Watch, reply: None }
+                    Request { trigger: Trigger::Watch, reply: None }
                 }
+                job = moves.recv() => match job {
+                    Some(Move { bot, how, timeout, reply }) => {
+                        let _ = reply.send(self.move_bot(&bot, how, timeout).await);
+                        continue;
+                    }
+                    None => return,
+                },
             };
-            match request {
-                Request::Reload { trigger, reply } => {
-                    let result = self.reload(trigger).await;
-                    let applied = result.is_ok();
-                    if let Some(reply) = reply {
-                        let _ = reply.send(result);
-                    }
-                    if applied {
-                        self.settle(&mut watch).await;
-                    }
-                }
-                Request::Move {
-                    bot,
-                    how,
-                    timeout,
-                    reply,
-                } => {
-                    let _ = reply.send(self.move_bot(&bot, how, timeout).await);
-                }
+            let result = self.reload(request.trigger).await;
+            let applied = result.is_ok();
+            if let Some(reply) = request.reply {
+                let _ = reply.send(result);
+            }
+            if applied {
+                self.settle(&mut watch).await;
             }
         }
     }
@@ -404,26 +419,29 @@ impl Reloader {
     /// Stops the removed sources, restarts the changed ones, starts the new
     /// ones, and serves the new routes. A parked bot stays parked, with a
     /// warning, unless the reload changed its upstream: it then starts on
-    /// the new one.
+    /// the new one. Losing its ingress keeps it parked too, so that ingress
+    /// coming back on the same upstream does not start it.
     async fn restart_sources(&self, cfg: &Config, report: &ReloadReport) {
         let sources = &self.shared.sources;
         for name in &report.sources_removed {
-            sources.stop(name, true);
+            sources.stop(name, Stop::BotGone);
         }
         let mut starting = Vec::new();
         for name in &report.sources_restarted {
             let bot = cfg.bots.iter().find(|bot| &bot.name == name);
-            // A bot whose ingress went away is gone as a source.
-            let gone = bot.is_none_or(|bot| bot.ingress.is_none());
+            let why = match bot {
+                None => Stop::BotGone,
+                Some(bot) if bot.ingress.is_none() => Stop::SourceGone,
+                Some(_) => Stop::Restart,
+            };
             let moved = report.upstream_changed.contains(name);
-            if !gone && !moved && sources.is_parked(name) {
-                continue;
-            }
             if moved {
                 sources.unpark(name);
+            } else if why == Stop::Restart && sources.is_parked(name) {
+                continue;
             }
-            sources.stop(name, gone);
-            if let Some(bot) = bot.filter(|_| !gone) {
+            sources.stop(name, why);
+            if let Some(bot) = bot.filter(|_| why == Stop::Restart) {
                 starting.push(bot);
             }
         }
@@ -506,11 +524,21 @@ impl Reloader {
         let started = Instant::now();
         let ingest = shared.lifecycle.ingest_token();
 
-        let drain = tokio::time::timeout(timeout, sources.drain_upstream(bot, &client));
-        match ingest.run_until_cancelled(drain).await {
+        let mut failure = None;
+        let drain =
+            tokio::time::timeout(timeout, sources.drain_upstream(bot, &client, &mut failure));
+        let drained = ingest.run_until_cancelled(drain).await;
+        match drained {
             None => return Err(MoveError::Draining),
             Some(Err(_)) => {
-                tracing::warn!(bot = %name, ?timeout, "the Bot API server still held updates of the bot at the deadline; the bot was not moved");
+                match failure.or_else(|| sources.long_poll_error(name)) {
+                    Some(error) => {
+                        tracing::warn!(bot = %name, ?timeout, %error, "the Bot API server could not be asked whether it still held updates of the bot before the deadline; the bot was not moved")
+                    }
+                    None => {
+                        tracing::warn!(bot = %name, ?timeout, "the Bot API server still held updates of the bot at the deadline; the bot was not moved")
+                    }
+                }
                 return Err(MoveError::Undrained);
             }
             Some(Ok(())) => {}

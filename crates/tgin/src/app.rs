@@ -25,7 +25,6 @@ use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
 use tgin_runtime::supervisor::{Exit, Supervisor};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +32,7 @@ use crate::admin;
 use crate::cli::{LoadError, VERSION, commit};
 use crate::data_server::DataRoutes;
 use crate::exit::Outcome;
-use crate::reload::{self, ReloadQueue, Reloader, Request};
+use crate::reload::{self, ReloadQueue, Reloader, Requests};
 use crate::sources::{Kind, Sources, source_task};
 
 /// How long the listeners and the supervised tasks get to finish once the
@@ -204,9 +203,9 @@ struct Handles {
     /// The engine and its metrics once built.
     engine: Arc<OnceLock<(Arc<Engine>, CoreMetrics)>>,
     reloads: ReloadQueue,
-    /// The queue's receiving end until the reload task takes it; requests
-    /// made while tgin starts wait there.
-    requests: Arc<Mutex<Option<mpsc::Receiver<Request>>>>,
+    /// The queues' receiving ends until the reload task takes them;
+    /// requests made while tgin starts wait there.
+    requests: Arc<Mutex<Option<Requests>>>,
     /// Stops the reload task: no reload once the shutdown has begun.
     stop_reloads: CancellationToken,
 }
