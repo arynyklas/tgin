@@ -110,6 +110,9 @@ pub(crate) enum MoveError {
     /// The Bot API server still held updates of the bot at the deadline;
     /// the bot runs on unchanged.
     Undrained,
+    /// Calls of the bot were still being sent to its server at the
+    /// deadline; nothing was called on the server, and the bot runs on.
+    Busy,
     /// The Bot API server refused or failed the call (token masked); the
     /// bot runs on.
     Upstream(ApiError),
@@ -543,17 +546,21 @@ impl Reloader {
     /// Moves the bot of `job` off its Bot API server, `how` says with which
     /// call, in these steps; its timeout (`reload.drain_timeout` when
     /// `None`, at most [`MAX_MOVE_TIMEOUT`] either way), counted from the
-    /// request, bounds steps 1 to 3 together:
+    /// request, bounds steps 1 to 4 together:
     /// 1. the server runs dry of the bot's updates, its ingest running on
     ///    ([`crate::sources::Sources::drain_upstream`]); not done by the
     ///    deadline, the move fails ([`MoveError::Undrained`]) and changes
     ///    nothing, as when the move waited in the queue past its deadline;
     /// 2. the bot's ingest stops, and it is parked;
     /// 3. tgin delivers what it holds of the bot, until the deadline;
-    /// 4. the server is called: `logOut`, or `deleteWebhook` then `close`.
-    ///    When that fails, the bot is unparked and starts again; once it
-    ///    succeeds, the gateway refuses the bot's calls that would go to a
-    ///    server ([`tgin_botapi::gateway::Gateway::set_parked`]).
+    /// 4. the gateway refuses the bot's calls that would go to a server
+    ///    ([`tgin_botapi::gateway::Gateway::set_parked`]), those still
+    ///    waiting on a rate limit or a 429 included, and the move waits for
+    ///    the calls being sent to end; any left at the deadline, the move
+    ///    fails ([`MoveError::Busy`]), the bot is unparked and starts again,
+    ///    and nothing is called on the server;
+    /// 5. the server is called: `logOut`, or `deleteWebhook` then `close`.
+    ///    When that fails, the bot is unparked and starts again.
     ///
     /// `None`, having changed nothing, when the requester went away before
     /// the server ran dry (step 1): no one would learn the outcome. Once it
@@ -643,15 +650,36 @@ impl Reloader {
         }
         let left = engine.pending_from(id);
 
+        // From now on no call of the bot leaves for the server, whose next
+        // call would log the bot in again once it is logged out; those on
+        // their way end first.
+        let gateway = &shared.gateway;
+        gateway.set_parked(name, true);
+        let sent = tokio::time::timeout_at(deadline, async {
+            while gateway.sending(name) > 0 {
+                tokio::time::sleep(MOVE_CHECK).await;
+            }
+        });
+        match ingest.run_until_cancelled(sent).await {
+            None => {
+                gateway.set_parked(name, false);
+                return Some(Err(MoveError::Draining));
+            }
+            Some(Err(_)) => {
+                let sending = gateway.sending(name);
+                tracing::warn!(bot = %name, ?timeout, sending, "calls of the bot were still being sent to its Bot API server at the deadline; the bot was not moved and starts again");
+                self.resume(&cfg, bot).await;
+                return Some(Err(MoveError::Busy));
+            }
+            Some(Ok(())) => {}
+        }
+
         let called = match how {
             BotMove::LogOut => client.log_out().await.map_err(|err| (err, None)),
             BotMove::Close => close(bot, &client).await,
         };
         Some(match called {
             Ok(result) => {
-                // From now on the old server would log the bot in again on
-                // its next call: none goes.
-                shared.gateway.set_parked(name, true);
                 tracing::info!(bot = %name, method = how.method(), upstream = %bot.upstream.name, left, "the bot was logged out of its Bot API server and stays parked; a reload that changes its upstream starts it there");
                 Ok(Moved {
                     bot: name.to_owned(),
@@ -662,10 +690,7 @@ impl Reloader {
             }
             Err((err, deleted)) => {
                 tracing::warn!(bot = %name, method = how.method(), error = %err, "the Bot API server did not log the bot out; it starts again");
-                sources.unpark(name);
-                let restart = bot.ingress.is_some().then_some(bot);
-                self.start_sources(&cfg, restart.into_iter().collect())
-                    .await;
+                self.resume(&cfg, bot).await;
                 match deleted {
                     None => Err(MoveError::Upstream(err)),
                     Some(before) => match sources::restore_webhook(bot, &client, &before).await {
@@ -681,6 +706,14 @@ impl Reloader {
                 }
             }
         })
+    }
+
+    /// Ends the parking of `bot`, whose move failed, and starts its source
+    /// again if it has ingress.
+    async fn resume(&self, cfg: &Config, bot: &Bot) {
+        self.shared.sources.unpark(&bot.name);
+        let restart = bot.ingress.is_some().then_some(bot);
+        self.start_sources(cfg, restart.into_iter().collect()).await;
     }
 
     /// Reloads the data plane's certificate when the bytes of its

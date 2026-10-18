@@ -410,6 +410,7 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
         Err(MoveError::UnknownBot) => error(StatusCode::NOT_FOUND, "unknown bot"),
         Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
         Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
+        Err(MoveError::Busy) => error(StatusCode::GATEWAY_TIMEOUT, "calls in flight"),
         Err(MoveError::Upstream(err)) => refused(shared, &err, ""),
         Err(MoveError::Unrestored(err)) => refused(
             shared,

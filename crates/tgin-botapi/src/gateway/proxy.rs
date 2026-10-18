@@ -44,7 +44,7 @@ use super::chat_key::ChatKey;
 use super::limit::Limited;
 use super::local_files::Refusal;
 use super::metrics::{MethodLabel, MethodMetrics, Outcome, RateAction};
-use super::{Bot, Bounded, Forwarding, errors, read_bounded};
+use super::{Bot, Bounded, Forwarding, errors, read_bounded, refuse_parked};
 
 /// The longest upstream 429 body read for its `retry_after`.
 const FLOOD_LIMIT: usize = 64 * 1024;
@@ -247,6 +247,9 @@ enum Failed {
     NoAnswer,
     /// Its parameters may not reach the bot's self-hosted server.
     Refused(Refusal),
+    /// The bot was parked while the call waited (a rate limit, a 429): it
+    /// never left tgin.
+    Parked,
 }
 
 /// What a buffered request needs to go upstream once more.
@@ -326,13 +329,18 @@ impl Call<'_> {
     /// Sends `body` to `url` and waits for the server's response headers:
     /// the response and when its headers arrived. Feeds the bot's
     /// `tgin_upstream_up`: any response is an answer; every failure but
-    /// the client's own leaves the upstream unanswering.
+    /// the client's own leaves the upstream unanswering. A bot parked since
+    /// the call came in sends nothing; the call counts as being sent until
+    /// the answer's headers came, so a move waits for it.
     async fn send(
         &self,
         url: Url,
         headers: HeaderMap,
         body: Body,
     ) -> Result<(reqwest::Response, Instant), Failed> {
+        let Some(_sending) = self.bot.gate.enter() else {
+            return Err(Failed::Parked);
+        };
         let sent = self.exchange(url, headers, body).await;
         if self.server {
             let up = self.bot.upstream_metrics.up();
@@ -461,6 +469,10 @@ impl Call<'_> {
                 tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
                 self.count(Outcome::Rejected);
                 refusal.answer()
+            }
+            Failed::Parked => {
+                self.counted.store(true, Ordering::Relaxed);
+                refuse_parked(self.bot, self.handles, self.label)
             }
         }
     }

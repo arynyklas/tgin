@@ -20,10 +20,10 @@ pub mod path;
 mod proxy;
 mod reply;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -81,10 +81,6 @@ pub struct Gateway {
     /// The requests forwarded to Telegram, and the files served from disk,
     /// for the shutdown's drain.
     upstreams: Arc<Upstreams>,
-    /// The bots moved off their Bot API server and not yet onto another
-    /// ([`Gateway::set_parked`]), by name: kept apart from the table, so an
-    /// entry a reload rebuilds stays parked.
-    parked: ArcSwap<BTreeSet<Arc<str>>>,
 }
 
 /// What a parked bot's calls that would go to a Bot API server or a file
@@ -95,6 +91,54 @@ const PARKED: &str =
     "Service Unavailable: the bot is being moved to another Bot API server by tgin";
 /// Seconds.
 const PARKED_RETRY_AFTER: u64 = 5;
+
+/// One bot's way to its servers: whether it is parked
+/// ([`Gateway::set_parked`]), and how many of its calls are being sent.
+/// Shared by the entries that replace one another while the bot stays
+/// configured, so a reload never lifts parking or loses a call in flight.
+#[derive(Default)]
+struct Gate {
+    parked: AtomicBool,
+    sending: AtomicUsize,
+}
+
+impl Gate {
+    fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// A call about to go to a server, counted while it is being sent;
+    /// `None` while the bot is parked. Counted before the flag is read, and
+    /// a move sets the flag before it reads the count, so either the call
+    /// sees the bot parked or the move sees the call.
+    fn enter(&self) -> Option<Sending<'_>> {
+        self.sending.fetch_add(1, Ordering::SeqCst);
+        if self.parked.load(Ordering::SeqCst) {
+            self.sending.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Sending(self))
+    }
+}
+
+/// A call being sent to a server, counted in its bot's [`Gate`] until it
+/// is dropped: once the server's answer has begun, or the call failed.
+pub(super) struct Sending<'a>(&'a Gate);
+
+impl Drop for Sending<'_> {
+    fn drop(&mut self) {
+        self.0.sending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The answer to a call of the parked bot `bot` that would have gone to a
+/// server, counted `rejected`: refused by tgin, as its other refusals are,
+/// before any server.
+fn refuse_parked(bot: &Bot, handles: &MethodMetrics, label: MethodLabel) -> Response {
+    handles.count(Outcome::Rejected);
+    tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request refused: the bot is parked, moved off its Bot API server");
+    errors::service_unavailable(PARKED, PARKED_RETRY_AFTER)
+}
 
 /// The gateway's requests forwarded to Telegram, and its files served from
 /// disk: how many are in flight, and when one last started or ended
@@ -227,6 +271,9 @@ struct Bot {
     /// Shared with the entries that replace this one while the token stays
     /// the same, so an identity learned meanwhile is never lost.
     identity: Arc<ArcSwapOption<Identity>>,
+    /// Whether the bot is parked, and its calls being sent: shared with
+    /// every entry that replaces this one.
+    gate: Arc<Gate>,
 }
 
 impl Bot {
@@ -237,6 +284,7 @@ impl Bot {
         upstream_metrics: UpstreamMetrics,
         identity: Arc<ArcSwapOption<Identity>>,
         limiter: Arc<BotLimiter>,
+        gate: Arc<Gate>,
     ) -> Result<Bot, UpstreamMetrics> {
         let token = bot.token.expose();
         let url = bot.upstream.url.expose();
@@ -276,6 +324,7 @@ impl Bot {
             upstream_metrics,
             limiter,
             identity,
+            gate,
         })
     }
 
@@ -322,38 +371,28 @@ impl Gateway {
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
             upstreams: Arc::default(),
-            parked: ArcSwap::default(),
         }
     }
 
     /// Parks the bot `bot`, or ends its parking. While it is parked, every
     /// call of it the gateway would send to its Bot API server or file
-    /// origin, webhook replies included, is refused; what needs no server
+    /// origin, webhook replies included, is refused, also one that waited
+    /// out a rate limit or a 429 since it came in; what needs no server
     /// (the intercepts, pull `getUpdates`, files served from disk) goes on.
     /// Reloads that rebuild the bot's entry leave it parked.
     pub fn set_parked(&self, bot: &str, parked: bool) {
-        self.parked.rcu(|set| {
-            let mut set = BTreeSet::clone(set);
-            if parked {
-                set.insert(Arc::from(bot));
-            } else {
-                set.remove(bot);
-            }
-            set
-        });
+        if let Some(entry) = self.table.load().named(bot) {
+            entry.gate.parked.store(parked, Ordering::SeqCst);
+        }
     }
 
-    /// Whether the bot `bot` is parked.
-    fn is_parked(&self, bot: &str) -> bool {
-        self.parked.load().contains(bot)
-    }
-
-    /// The answer to a call of the parked bot `bot`, counted `rejected`:
-    /// refused by tgin, as its other refusals are, before any server.
-    fn refuse_parked(bot: &Bot, handles: &MethodMetrics, label: MethodLabel) -> Response {
-        handles.count(Outcome::Rejected);
-        tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request refused: the bot is parked, moved off its Bot API server");
-        errors::service_unavailable(PARKED, PARKED_RETRY_AFTER)
+    /// How many calls of the bot `bot` are being sent to its servers now:
+    /// once it is parked, no new one starts, and a move waits for these.
+    pub fn sending(&self, bot: &str) -> usize {
+        self.table
+            .load()
+            .named(bot)
+            .map_or(0, |entry| entry.gate.sending.load(Ordering::SeqCst))
     }
 
     /// Replaces the bot table. An entry whose token, upstream and gateway
@@ -385,6 +424,7 @@ impl Gateway {
                 .filter(same_token)
                 .filter(|previous| previous.gateway.rate_limit == bot.gateway.rate_limit)
                 .map(|previous| Arc::clone(&previous.limiter));
+            let gate = previous.map_or_else(Arc::default, |previous| Arc::clone(&previous.gate));
             let name = Arc::clone(&bot.name);
             let limiter = match kept_limiter {
                 Some(limiter) => limiter,
@@ -419,6 +459,7 @@ impl Gateway {
                 upstream_metrics,
                 identity,
                 limiter,
+                gate,
             ) {
                 Ok(entry) => entries.push(Arc::new(entry)),
                 Err(upstream_metrics) => {
@@ -519,7 +560,7 @@ impl Gateway {
                 };
                 return match call.route(req).await {
                     intercept::Routed::Answered(response) => response,
-                    _ if self.is_parked(&bot.name) => Self::refuse_parked(bot, handles, label),
+                    _ if bot.gate.is_parked() => refuse_parked(bot, handles, label),
                     intercept::Routed::Proxy(req) => {
                         let forwarding = Forwarding::new(&self.upstreams);
                         proxy::forward(bot, upstream, label, req, forwarding).await
@@ -539,8 +580,8 @@ impl Gateway {
             GatewayPath::File { file_path, .. } => *file_path,
         };
         let root = match &bot.files {
-            FileTarget::Proxy(_) | FileTarget::Origin(_) if self.is_parked(&bot.name) => {
-                return Self::refuse_parked(bot, handles, label);
+            FileTarget::Proxy(_) | FileTarget::Origin(_) if bot.gate.is_parked() => {
+                return refuse_parked(bot, handles, label);
             }
             FileTarget::Proxy(base) => {
                 let forwarding = Forwarding::new(&self.upstreams);
@@ -823,9 +864,10 @@ mod tests {
             "rebuilt"
         );
         assert_eq!(gateway.identity("a").as_deref(), Some(&identity));
-        assert!(gateway.is_parked("a"), "a rebuilt entry stays parked");
+        let parked = || gateway.table.load().named("a").expect("a").gate.is_parked();
+        assert!(parked(), "a rebuilt entry stays parked");
         gateway.set_parked("a", false);
-        assert!(!gateway.is_parked("a"));
+        assert!(!parked());
 
         gateway.set_bots(vec![gateway_bot(&slower, "1:b")], Vec::new());
         assert!(

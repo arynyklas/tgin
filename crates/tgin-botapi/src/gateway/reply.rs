@@ -121,12 +121,13 @@ impl Gateway {
             return;
         }
         // Last, after any delay of the limits: the bot may have been parked
-        // meanwhile.
-        if self.is_parked(&bot.name) {
+        // meanwhile. Counted as being sent until the call ends, so a move
+        // waits for it before it logs the bot out.
+        let Some(_sending) = bot.gate.enter() else {
             counts.count(ReplyOutcome::Refused);
             tracing::info!(bot = %bot.name, consumer = %consumer, method = label.as_str(), "webhook reply refused: the bot is being moved to another Bot API server by tgin");
             return;
-        }
+        };
         let call = Call {
             bot,
             consumer,

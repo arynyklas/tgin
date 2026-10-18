@@ -3970,3 +3970,396 @@ async fn removed_parked_bot_comes_back_unparked() {
     assert_eq!(count_calls(&telegram, TOKEN, "sendMessage").await, 1);
     tgin.stop().await;
 }
+
+/// Asserts that `response` is the parked bot's 503.
+async fn assert_parked(response: reqwest::Response) {
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["retry-after"], "5");
+    let body: Value = response.json().await.expect("JSON");
+    assert_eq!(
+        body,
+        json!({ "ok": false, "error_code": 503, "description": PARKED })
+    );
+}
+
+/// Sends `sendMessage` to chat 500 through the gateway, as `TOKEN`.
+fn send_message(tgin: &Tgin) -> JoinHandle<reqwest::Response> {
+    let request = tgin
+        .http
+        .post(tgin.data_url(&format!("/bot{TOKEN}/sendMessage")))
+        .json(&json!({ "chat_id": 500, "text": "hi" }));
+    tokio::spawn(async move { request.send().await.expect("answered") })
+}
+
+/// Waits until the metrics hold `line`.
+async fn wait_metric(tgin: &Tgin, line: &str) {
+    let started = Instant::now();
+    while !tgin.metrics_text().lines().any(|l| l == line) {
+        assert!(started.elapsed() < PATIENCE, "{line} never showed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Calls the bot sent while the rate limits held them back do not reach
+/// the server once the move has closed the gateway: of six messages to one
+/// chat at once, the first three went (the chat's burst), and the three
+/// still waiting for their slot get the parked 503 when it comes, after
+/// `close`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calls_held_by_the_rate_limits_never_reach_the_server_left() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ok(json!({ "message_id": 1 })))
+        .mount(&telegram)
+        .await;
+    let tgin = start(
+        "calls_held_by_the_rate_limits_never_reach_the_server_left",
+        &hooked(&telegram, ""),
+    )
+    .await;
+    let sends: Vec<_> = (0..6).map(|_| send_message(&tgin)).collect();
+    wait_metric(
+        &tgin,
+        r#"tgin_gateway_ratelimited_total{bot="hooked",scope="chat",action="delayed"} 3"#,
+    )
+    .await;
+    let closed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(closed.status, 200, "{}", closed.body);
+    let mut sent = 0;
+    for send in sends {
+        let response = timeout(PATIENCE, send)
+            .await
+            .expect("answered in time")
+            .expect("no panic");
+        if response.status() == 200 {
+            sent += 1;
+        } else {
+            assert_parked(response).await;
+        }
+    }
+    assert_eq!(sent, 3, "the chat's burst went before the move");
+    assert_eq!(count_calls(&telegram, TOKEN, "sendMessage").await, 3);
+    let calls = calls(&telegram, TOKEN).await;
+    let close = calls.iter().position(|m| m == "close").expect("closed");
+    assert!(
+        calls[close..].iter().all(|m| m != "sendMessage"),
+        "{calls:?}"
+    );
+    wait_metric(
+        &tgin,
+        r#"tgin_gateway_requests_total{bot="hooked",method="sendMessage",outcome="rejected"} 3"#,
+    )
+    .await;
+    tgin.stop().await;
+}
+
+/// A call waiting out the server's 429 when the move closes the gateway is
+/// not sent again: it gets the parked 503, and the server saw it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_429_resend_never_reaches_the_server_left() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    Mock::given(path(format!("/bot{TOKEN}/sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "ok": false, "error_code": 429, "description": "Too Many Requests: retry after 1",
+            "parameters": { "retry_after": 1 },
+        })))
+        .mount(&telegram)
+        .await;
+    let tgin = start(
+        "a_429_resend_never_reaches_the_server_left",
+        &hooked(&telegram, ""),
+    )
+    .await;
+    let send = send_message(&tgin);
+    // The 429 is back at tgin: the call waits a second to go again.
+    wait_metric(
+        &tgin,
+        r#"tgin_gateway_upstream_seconds_count{bot="hooked",method="sendMessage"} 1"#,
+    )
+    .await;
+    let closed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(closed.status, 200, "{}", closed.body);
+    let response = timeout(PATIENCE, send)
+        .await
+        .expect("answered in time")
+        .expect("no panic");
+    assert_parked(response).await;
+    assert_eq!(count_calls(&telegram, TOKEN, "sendMessage").await, 1);
+    tgin.stop().await;
+}
+
+/// What [`heralding_server`] gives the test.
+struct Herald {
+    api: String,
+    /// Each call's method, as its head arrives.
+    heralds: mpsc::UnboundedReceiver<String>,
+    /// The methods in order.
+    methods: Arc<Mutex<Vec<String>>>,
+    /// Releases the `sendPhoto` answers, which wait for it.
+    release: Arc<tokio::sync::Notify>,
+}
+
+/// A Bot API server for the bot `TOKEN` that tells each call's method as
+/// its head arrives, before reading its body, and records the methods in
+/// order. It answers what a move asks with success, and any other call,
+/// once its body is read whole, with a message; `sendPhoto` only once
+/// released.
+async fn heralding_server() -> Herald {
+    let (tx, heralds) = mpsc::unbounded_channel();
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (seen, released) = (Arc::clone(&methods), Arc::clone(&release));
+    let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let (tx, seen, released) = (tx.clone(), Arc::clone(&seen), Arc::clone(&released));
+        async move {
+            let method = req
+                .uri()
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().expect("methods").push(method.clone());
+            let _ = tx.send(method.clone());
+            let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+            if method == "sendPhoto" {
+                released.notified().await;
+            }
+            let result = match method.as_str() {
+                "getMe" => {
+                    json!({ "id": 42, "is_bot": true, "first_name": "Bot", "username": "tgin_bot" })
+                }
+                "getWebhookInfo" => {
+                    json!({ "url": "", "has_custom_certificate": false, "pending_update_count": 0 })
+                }
+                "sendDocument" | "sendMessage" | "sendPhoto" => json!({ "message_id": 1 }),
+                _ => json!(true),
+            };
+            axum::Json(json!({ "ok": true, "result": result }))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    Herald {
+        api: format!("http://{addr}"),
+        heralds,
+        methods,
+        release,
+    }
+}
+
+/// The webhook bot `hooked` (`TOKEN`) on the server at `api`, feeding the
+/// pull consumer `workers`.
+fn hooked_at(api: &str) -> String {
+    config(&format!(
+        "bots:\n  - name: hooked\n    token: \"{TOKEN}\"\n    api_url: {api}\n    ingress: {{ webhook: {{ path: /hook, secret_token: {HOOK_SECRET} }} }}\n    routes: [{{ to: [workers] }}]\nconsumers:\n  workers: {{ pull: {{}} }}\n"
+    ))
+}
+
+/// Starts a `sendDocument` upload of 1 000 announced bytes through the
+/// gateway, sends 100 of them, and waits until its head reached the
+/// server; the upload is then being sent. Returns its connection.
+async fn upload_in_flight(
+    tgin: &Tgin,
+    heralds: &mut mpsc::UnboundedReceiver<String>,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(tgin.data)
+        .await
+        .expect("connect");
+    let head = format!(
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: 1000\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    stream.write_all(&[b'x'; 100]).await.expect("a part");
+    loop {
+        if next(heralds).await == "sendDocument" {
+            return stream;
+        }
+    }
+}
+
+/// A move waits for a call that is being sent when it closes the gateway:
+/// `close` reaches the server only after the upload has ended. A message
+/// held back by the rate limits that comes free meanwhile is refused: the
+/// gateway closed before the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_waits_for_a_call_being_sent() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Herald {
+        api,
+        mut heralds,
+        methods,
+        ..
+    } = heralding_server().await;
+    let tgin = start("move_waits_for_a_call_being_sent", &hooked_at(&api)).await;
+    let mut upload = upload_in_flight(&tgin, &mut heralds).await;
+    // The chat's burst of three goes; the fourth waits a second for its slot.
+    let sends: Vec<_> = (0..4).map(|_| send_message(&tgin)).collect();
+    wait_metric(
+        &tgin,
+        r#"tgin_gateway_ratelimited_total{bot="hooked",scope="chat",action="delayed"} 1"#,
+    )
+    .await;
+
+    let admin = tgin.http.clone();
+    let url = tgin.admin_url("/v1/bots/hooked/close?timeout=5s");
+    let close = tokio::spawn(answer(admin.post(url).bearer_auth(ADMIN_TOKEN)));
+    let mut statuses = Vec::new();
+    for send in sends {
+        let response = timeout(PATIENCE, send)
+            .await
+            .expect("answered in time")
+            .expect("no panic");
+        if response.status() == 200 {
+            statuses.push(200);
+        } else {
+            assert_parked(response).await;
+            statuses.push(503);
+        }
+    }
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 200, 200, 503]);
+    assert!(!close.is_finished(), "the move did not wait for the upload");
+    assert!(
+        !methods
+            .lock()
+            .expect("methods")
+            .iter()
+            .any(|m| m == "close"),
+        "close went with the upload still being sent"
+    );
+
+    upload.write_all(&[b'x'; 900]).await.expect("the rest");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = timeout(PATIENCE, upload.read(&mut byte))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        assert_eq!(n, 1, "closed before the answer");
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    let closed = timeout(PATIENCE, close)
+        .await
+        .expect("the move ends in time")
+        .expect("no panic");
+    assert_eq!(closed.status, 200, "{}", closed.body);
+    let methods = methods.lock().expect("methods").clone();
+    let upload_at = methods.iter().position(|m| m == "sendDocument");
+    let close_at = methods.iter().position(|m| m == "close");
+    assert!(upload_at < close_at && close_at.is_some(), "{methods:?}");
+    tgin.stop().await;
+}
+
+/// A call still being sent at the move's deadline fails the move with 504
+/// `calls in flight`: nothing is called on the server, and the bot runs on,
+/// its calls going through again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_fails_504_while_a_call_is_still_sent() {
+    let Herald {
+        api,
+        mut heralds,
+        methods,
+        ..
+    } = heralding_server().await;
+    let tgin = start(
+        "move_fails_504_while_a_call_is_still_sent",
+        &hooked_at(&api),
+    )
+    .await;
+    let upload = upload_in_flight(&tgin, &mut heralds).await;
+
+    let failed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(failed.status, 504, "{}", failed.body);
+    assert_eq!(failed.json(), json!({ "error": "calls in flight" }));
+    assert!(
+        !methods
+            .lock()
+            .expect("methods")
+            .iter()
+            .any(|m| m == "close" || m == "deleteWebhook"),
+        "a server call went"
+    );
+    let sent = timeout(PATIENCE, send_message(&tgin))
+        .await
+        .expect("answered in time")
+        .expect("no panic");
+    assert_eq!(sent.status(), 200);
+    assert_eq!(tgin.post_update("/hook", update(1, "after")).await, 200);
+    assert!(!tgin.status().await.sources[0].parked);
+    drop(upload);
+    let logs = LOGS.text();
+    assert!(
+        logs.lines().any(|l| l.contains("WARN")
+            && l.contains("bot=hooked")
+            && l.contains("still being sent")),
+        "no warning naming the bot"
+    );
+    tgin.stop().await;
+}
+
+/// A webhook reply being sent when the move closes the gateway holds the
+/// move as a downstream's call does: with its answer held past the
+/// deadline, the move answers 504 `calls in flight` and calls nothing on
+/// the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_fails_504_while_a_webhook_reply_is_sent() {
+    let Herald {
+        api,
+        mut heralds,
+        methods,
+        release,
+    } = heralding_server().await;
+    let down = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/in"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"method":"sendPhoto","chat_id":500,"photo":"AgAD"}"#,
+            "application/json",
+        ))
+        .mount(&down)
+        .await;
+    let yaml = config(&format!(
+        "bots:\n  - name: hooked\n    token: \"{TOKEN}\"\n    api_url: {api}\n    ingress: {{ webhook: {{ path: /hook, secret_token: {HOOK_SECRET} }} }}\n    routes: [{{ to: [hooks] }}]\nconsumers:\n  hooks: {{ push: {{ endpoints: [{{ url: \"{}/in\" }}] }} }}\n",
+        down.uri()
+    ));
+    let tgin = start("move_fails_504_while_a_webhook_reply_is_sent", &yaml).await;
+    tgin.deliver("/hook", &[1]).await;
+    while next(&mut heralds).await != "sendPhoto" {}
+
+    let failed = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(failed.status, 504, "{}", failed.body);
+    assert_eq!(failed.json(), json!({ "error": "calls in flight" }));
+    assert!(
+        !methods
+            .lock()
+            .expect("methods")
+            .iter()
+            .any(|m| m == "close" || m == "deleteWebhook"),
+        "a server call went"
+    );
+    release.notify_waiters();
+    tgin.stop().await;
+}
