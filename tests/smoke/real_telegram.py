@@ -27,9 +27,10 @@ both file routes.
 Self-hosted (`--self-hosted URL --files-dir DIR`): the bot talks to the
 operator's telegram-bot-api server, run with `--local`, through an upstream
 `kind: local, local_mode: true` whose files tgin serves from DIR, the server's
-`--dir` as this machine sees it (`--server-dir` names it as the server sees
-it, when the server runs in a container). The server's api_id and api_hash
-stay with the server; the script never reads them. Phases A and B run against
+`--files-dir` (its `--dir` when that is unset) as this machine sees it
+(`--server-dir` names it as the server sees it, when the server runs in a
+container). The server's api_id and api_hash stay with the server; the
+script never reads them. Phases A and B run against
 the server, and also check: getFile answers an absolute path from the server
 and a relative one through tgin, and every download equals the file in the
 server's directory; a `file:` reference (JSON, query string, multipart) is
@@ -94,6 +95,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -115,6 +117,10 @@ SEND_CONCURRENCY = 4
 # limit, under the fake's 64 MiB request body limit (a local-mode server
 # takes up to 2000 MB).
 BIG_DOCUMENT = 53 << 20
+# Seconds a file transfer may take: an upload, a download, and getFile, which a
+# local-mode server answers only once it has downloaded the whole file from
+# Telegram.
+TRANSFER_TIMEOUT = 600
 HOOK_MARKER = "tgin-smoke-hook"
 LOCAL_FILES_REFUSED = "Bad Request: local file uploads are disabled by tgin"
 # --fake: the private chat the injected messages come from.
@@ -176,13 +182,20 @@ def opener(url):
 
 
 def request(method, url, body=None, headers=None, timeout=40):
-    """(status, headers, body bytes); HTTP errors are answers too."""
+    """(status, headers, body bytes); HTTP errors are answers too, and a
+    timeout is the status "timeout" (a failed check, never a crash)."""
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
         with opener(url).open(req, timeout=timeout) as resp:
             return resp.status, resp.headers, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.headers, err.read()
+    except urllib.error.URLError as err:
+        if isinstance(err.reason, (TimeoutError, socket.timeout)):
+            return "timeout", {}, b""
+        raise
+    except (TimeoutError, socket.timeout):
+        return "timeout", {}, b""
 
 
 def call(base, method, params=None, timeout=40):
@@ -438,8 +451,20 @@ class Run:
         if answer.strip() != "logout":
             raise Abort("migration not confirmed; nothing was changed")
 
+    def probe_server(self):
+        """Any HTTP answer from the self-hosted server, asked without the token;
+        aborts (before the logout, so nothing changes) when there is none."""
+        try:
+            status = request("GET", f"{self.api}/", timeout=10)[0]
+        except OSError as err:
+            status = type(err).__name__
+        if not isinstance(status, int):
+            raise Abort(f"the self-hosted server {self.api} does not answer ({status}); nothing was changed")
+        say(f"the self-hosted server answers (HTTP {status} without a token)")
+
     def migrate(self):
         say("\nMIGRATION (--migrate)")
+        self.probe_server()
         env = {k: v for k, v in os.environ.items() if not k.startswith("TGIN_ADMIN_")}
         done = subprocess.run(
             [str(self.args.tgin), "admin", "--url", self.admin, "bot", "logout", "smoke", "--yes", "--timeout", "60s"],
@@ -629,18 +654,20 @@ class Run:
         """Downloads `file_id` through both file routes, and from Telegram (or,
         self-hosted, reads it from the server's directory); all equal (and
         `expected`)."""
-        status, info = call(self.gateway, "getFile", {"file_id": file_id})
+        status, info = call(self.gateway, "getFile", {"file_id": file_id}, timeout=TRANSFER_TIMEOUT)
         if not CHECK(f"getFile for {what}", status == 200 and info.get("ok"), status):
             return
         path = info["result"]["file_path"]
         quoted = urllib.parse.quote(path)
         bodies = {
-            "/file/bot…": request("GET", f"{self.data}/file/bot{self.token}/{quoted}", timeout=120),
-            "/c/workers/file/bot…": request("GET", f"{self.data}/c/workers/file/bot{self.token}/{quoted}", timeout=120),
+            "/file/bot…": request("GET", f"{self.data}/file/bot{self.token}/{quoted}", timeout=TRANSFER_TIMEOUT),
+            "/c/workers/file/bot…": request(
+                "GET", f"{self.data}/c/workers/file/bot{self.token}/{quoted}", timeout=TRANSFER_TIMEOUT
+            ),
         }
         if self.local:
             # Never printed: the server's path holds the bot's directory, named after the token.
-            status, direct = call(self.direct, "getFile", {"file_id": file_id})
+            status, direct = call(self.direct, "getFile", {"file_id": file_id}, timeout=TRANSFER_TIMEOUT)
             server_path = direct["result"].get("file_path", "") if status == 200 and direct.get("ok") else ""
             disk = self.on_disk(server_path)
             relative = not path.startswith("/") and server_path.replace("\\", "/").endswith("/" + path)
@@ -656,7 +683,7 @@ class Run:
                 bodies["the server's directory"] = (type(err).__name__, None, b"")
             source = "the server's directory"
         else:
-            bodies["Telegram"] = request("GET", f"{self.api}/file/bot{self.token}/{quoted}", timeout=120)
+            bodies["Telegram"] = request("GET", f"{self.api}/file/bot{self.token}/{quoted}", timeout=TRANSFER_TIMEOUT)
             source = "Telegram"
         digests = {k: (s, hashlib.sha256(b).hexdigest()) for k, (s, _, b) in bodies.items()}
         reference = expected if expected is not None else bodies[source][2]
@@ -816,7 +843,9 @@ class Run:
             {"chat_id": str(chat), "caption": f"tgin smoke: {caption}"}, "document", "tgin-smoke.bin", content
         )
         workers = self.scoped("workers")
-        status, _, raw = request("POST", f"{workers}/sendDocument", body, {"Content-Type": content_type}, timeout=600)
+        status, _, raw = request(
+            "POST", f"{workers}/sendDocument", body, {"Content-Type": content_type}, timeout=TRANSFER_TIMEOUT
+        )
         try:
             answer = json.loads(raw or b"null")
         except ValueError:
@@ -840,10 +869,14 @@ class Run:
         source = eventually(lambda: (lambda s: s if s.get("ingress") == "webhook" and s.get("state") == "running" else None)(self.source()), 30)
         CHECK("/v1/status: the bot's source is a running webhook", source is not None, self.source())
         errors_before = metric(self.admin, "tgin_source_errors_total", source="smoke")
+        # The long poll has stopped: whatever the source takes in from here came over the webhook.
+        updates_before = self.source().get("updates_total", 0)
         found = self.await_message(HOOK_MARKER)
+        updates = self.source().get("updates_total", 0) - updates_before
         CHECK(
             "the message came over the server's plain-http webhook into tgin and out through the pull consumer",
-            found is not None,
+            found is not None and updates >= 1,
+            f"{updates} updates taken in by the webhook source",
         )
         errors = metric(self.admin, "tgin_source_errors_total", source="smoke") - errors_before
         CHECK("tgin refused none of the server's webhook requests (secret, allowlist, body)", errors == 0, errors)
@@ -888,12 +921,16 @@ def check_args(args):
         if given:
             raise Abort(f"{', '.join(given)} need --self-hosted")
         return
+    if args.fake and args.migrate and urllib.parse.urlsplit(args.api_url).hostname == "api.telegram.org":
+        raise Abort("--fake --migrate needs --api-url: the cloud-mode fake to log the bot out of")
     if args.files_dir is None:
-        raise Abort("--self-hosted needs --files-dir: the server's --dir as this machine sees it")
+        raise Abort(
+            "--self-hosted needs --files-dir: the server's --files-dir (its --dir when that is unset) as this machine sees it"
+        )
     if not Path(args.files_dir).is_dir():
         raise Abort(f"--files-dir {args.files_dir} is not a directory")
     if args.server_dir is not None and not args.server_dir.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:[/\\]", args.server_dir):
-        raise Abort("--server-dir must be an absolute path, the server's --dir as it sees it")
+        raise Abort("--server-dir must be an absolute path: the server's --files-dir (its --dir when that is unset) as it sees it")
 
 
 def main():
@@ -915,9 +952,15 @@ def main():
     parser.add_argument("--allow-pending", action="store_true", help="run although the bot has pending updates (tgin takes them)")
     group = parser.add_argument_group("self-hosted server (telegram-bot-api --local)")
     group.add_argument("--self-hosted", metavar="URL", help="the server's base URL, as tgin and this script reach it")
-    group.add_argument("--files-dir", metavar="DIR", help="the server's --dir as this machine sees it; tgin serves files from it")
     group.add_argument(
-        "--server-dir", metavar="PATH", help="the same directory as the server sees it, when it differs (a container)"
+        "--files-dir",
+        metavar="DIR",
+        help="the server's --files-dir (its --dir when that is unset) as this machine sees it; tgin serves files from it",
+    )
+    group.add_argument(
+        "--server-dir",
+        metavar="PATH",
+        help="the server's --files-dir (its --dir when that is unset) as the server sees it, when it differs (a container)",
     )
     group.add_argument(
         "--public-url",
@@ -949,8 +992,9 @@ def main():
             run.confirm_migration()
         else:
             run.precheck(run.direct, "the local server" if run.local else "the Bot API")
-        run.start()
         try:
+            # Inside: an interrupt while tgin becomes ready still stops it.
+            run.start()
             if args.migrate:
                 run.migrate()
             run.phase_a()
