@@ -8,6 +8,12 @@
 #   grammY register their endpoint with setWebhook on the scoped base
 #   (`accept_set_webhook`, no configured endpoint); Telegraf's endpoint is
 #   configured here, so both paths stay covered.
+# Two more on `fake-local`, a self-hosted server in local mode whose files
+# directory tgin mounts read-only at the same path:
+# - `local-poll` → long-polled into a pull consumer (python-telegram-bot);
+# - `local-hook` → tgin registers its own data-plane URL over plain http
+#   and the server posts the updates there; a push consumer (grammY,
+#   `accept_set_webhook`).
 # Tokens and secrets are fake values from compose.yaml.
 version: 1
 
@@ -26,6 +32,16 @@ admin:
 
 server:
   listen: ["0.0.0.0:8080"]
+
+upstreams:
+  fake-local:
+    kind: local
+    url: http://fake-local:8081
+    local_mode: true
+    # The fake's --files-dir, mounted read-only at the same path
+    # (compose.yaml): tgin serves the bots' files from disk.
+    files:
+      dir: /srv/tba
 
 bots:
   - name: aiogram-poll
@@ -68,6 +84,20 @@ bots:
     api_url: http://fake:8081
     ingress: { long_poll: {} }
     routes: [{ to: [telegraf-hook] }]
+  - name: local-poll
+    token: ${env:LOCAL_POLL_TOKEN}
+    upstream: fake-local
+    ingress: { long_poll: {} }
+    routes: [{ to: [local-poll] }]
+  - name: local-hook
+    token: ${env:LOCAL_HOOK_TOKEN}
+    upstream: fake-local
+    ingress:
+      webhook:
+        # Served at /webhook/local-hook; the secret is derived from the token.
+        public_url: http://tgin:8080
+        register: true
+    routes: [{ to: [local-hook] }]
 
 consumers:
   aiogram-poll: { pull: {} }
@@ -82,3 +112,5 @@ consumers:
       endpoints:
         - url: http://telegraf-hook:8081/hook
           secret_token: ${env:TELEGRAF_HOOK_SECRET}
+  local-poll: { pull: {} }
+  local-hook: { push: { accept_set_webhook: true } }

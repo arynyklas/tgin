@@ -1,6 +1,9 @@
 # The end-to-end stack of `cargo xtask e2e`: the fake Telegram, tgin built
 # from the repository, and per framework one polling bot and one webhook bot,
-# each with its own token. Every token and secret here is a fake value.
+# each with its own token; and for the self-hosted scenario a second fake in
+# local mode (`fake-local`, files on the `tba-files` volume that tgin reads)
+# with a polling bot (python-telegram-bot) and a webhook bot (grammY). Every
+# token and secret here is a fake value.
 #
 # Host ports are ephemeral on 127.0.0.1; the runner asks `docker compose port`.
 # The project name, and with it every container, network and image name, is
@@ -16,6 +19,10 @@ x-tokens:
   grammy-hook: &grammy-hook-token "700006:e2e_fake_grammy_hook"
   telegraf-poll: &telegraf-poll-token "700007:e2e_fake_telegraf_poll"
   telegraf-hook: &telegraf-hook-token "700008:e2e_fake_telegraf_hook"
+  # Realistic in shape (`<id>:<35 characters>`), as the local fake names a
+  # bot's files directory after its token.
+  local-poll: &local-poll-token "8100000001:AAHe2eFakeLocalPollBotTokenx7Kq9Zr2"
+  local-hook: &local-hook-token "8100000002:AAHe2eFakeLocalHookBotTokenm4Tp8Wd5"
 
 x-python-bot: &python-bot
   build: bots/python
@@ -61,6 +68,26 @@ services:
       timeout: 3s
       retries: 30
 
+  # `telegram-bot-api --local` imitated: uploads land under
+  # /srv/tba/<token>/, getFile answers absolute paths, /file is 404, and it
+  # posts webhooks over plain http. A fresh `tba-files` volume takes the
+  # image's /srv/tba ownership (the fake's uid 65532, which tgin shares).
+  fake-local:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/fake-telegram/Dockerfile
+    image: ${TGIN_E2E_PROJECT:-tgin-e2e}-fake:local
+    command: ["--local-mode", "--files-dir", "/srv/tba"]
+    stop_grace_period: 30s
+    volumes:
+      - tba-files:/srv/tba
+    ports: ["127.0.0.1::8081"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/fake-telegram", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   tgin:
     build:
       context: ../..
@@ -82,8 +109,12 @@ services:
       TELEGRAF_POLL_TOKEN: *telegraf-poll-token
       TELEGRAF_HOOK_TOKEN: *telegraf-hook-token
       TELEGRAF_HOOK_SECRET: e2e-fake-secret-telegraf
+      LOCAL_POLL_TOKEN: *local-poll-token
+      LOCAL_HOOK_TOKEN: *local-hook-token
     volumes:
       - ./tgin.yaml:/etc/tgin/tgin.yaml:ro
+      # The local fake's files, read-only, at the path the fake uses.
+      - tba-files:/srv/tba:ro
     ports: ["127.0.0.1::8080", "127.0.0.1::9090"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/tgin", "admin", "health"]
@@ -92,6 +123,8 @@ services:
       retries: 60
     depends_on:
       fake:
+        condition: service_healthy
+      fake-local:
         condition: service_healthy
 
   # Polling bots get fixed addresses: tgin tells pollers apart by client
@@ -186,6 +219,34 @@ services:
       HOOK_SECRET: e2e-fake-secret-telegraf
     healthcheck: *node-hook-health
 
+  # The self-hosted scenario's polling bot: python-telegram-bot on tgin's
+  # local upstream. getFile through tgin answers a relative path, so PTB
+  # downloads from tgin's file route, which serves the file from tba-files.
+  local-poll:
+    <<: *python-bot
+    command: ["python", "ptb_bot.py"]
+    environment:
+      MODE: poll
+      BOT_TOKEN: *local-poll-token
+      TGIN_BASE: http://tgin:8080/c/local-poll
+    networks:
+      default:
+        ipv4_address: 10.231.77.15
+
+  # The self-hosted scenario's webhook bot: grammY registers its endpoint
+  # with setWebhook on the scoped base; tgin itself receives the bot's
+  # updates from the local fake over plain http (tgin.yaml).
+  local-hook:
+    <<: *node-bot
+    command: ["node", "grammy_bot.mjs"]
+    environment:
+      MODE: hook
+      BOT_TOKEN: *local-hook-token
+      TGIN_BASE: http://tgin:8080/c/local-hook
+      HOOK_URL: http://local-hook:8081/hook
+      HOOK_SECRET: e2e-fake-secret-local-hook
+    healthcheck: *node-hook-health
+
 # A fixed subnet: a second stack on the same host fails to start (pool
 # overlap) instead of mixing with this one.
 networks:
@@ -195,3 +256,7 @@ networks:
         # Dynamic addresses stay in the upper half, clear of the fixed ones.
         - subnet: 10.231.77.0/24
           ip_range: 10.231.77.128/25
+
+volumes:
+  # The local fake's files directory (its --files-dir), read-only in tgin.
+  tba-files: {}
