@@ -192,7 +192,10 @@ enum Json {
 }
 
 /// The values being read at each depth and whether one is a local file
-/// reference.
+/// reference. Mirrors TDLib's `json_string_decode`
+/// (`tdutils/td/utils/JsonBuilder.cpp`) and
+/// `HttpReader::parse_json_parameters` at td
+/// `bc9c263e2bfee06aaab41e82db51a103376030bc`.
 #[derive(Default)]
 struct Values {
     value: [Value; MAX_DEPTH],
