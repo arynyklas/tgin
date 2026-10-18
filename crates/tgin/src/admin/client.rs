@@ -295,14 +295,18 @@ fn health(command: &Command, answer: &Answer) -> u8 {
     }
 }
 
-/// The server's account of a failure: its `error`, its list of config
-/// errors, or the body as sent.
+/// The server's account of a failure: its `error` (with its
+/// `description`, when it sent one), its list of config errors, or the
+/// body as sent.
 fn failure(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return body.trim().to_owned();
     };
     if let Some(error) = value["error"].as_str() {
-        return error.to_owned();
+        return match value["description"].as_str() {
+            Some(description) => format!("{error}: {description}"),
+            None => error.to_owned(),
+        };
     }
     if let Some(errors) = value["errors"].as_array() {
         let mut text = format!(
@@ -612,6 +616,10 @@ mod tests {
             "the config was rejected (2 errors); the running config is unchanged\nerror: bots[0].token (line 3, column 12): bad\n  hint: fix it\nerror: other"
         );
         assert_eq!(failure(r#"{"error":"unauthorized"}"#), "unauthorized");
+        assert_eq!(
+            failure(r#"{"error":"upstream refused","description":"Bad Request: no"}"#),
+            "upstream refused: Bad Request: no"
+        );
         assert_eq!(failure("plain text\n"), "plain text");
     }
 

@@ -2641,14 +2641,18 @@ async fn logout_of_parked_bot_409() {
     tgin.stop().await;
 }
 
-/// The server refusing the call answers 502 with its description, masked;
-/// the bot then runs on, so the move can be tried again.
+/// The server refusing the call answers 502 `upstream refused` with its
+/// description, masked; the bot then runs on, so the move can be tried
+/// again. The command line prints the description.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bot_logout_upstream_error_502() {
     let telegram = MockServer::start().await;
+    // It echoes the token, which the client masks, and the webhook secret,
+    // which only the configured secrets mask.
     Mock::given(path(format!("/bot{TOKEN}/logOut")))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "ok": false, "error_code": 400, "description": format!("Bad Request: not now, {TOKEN}"),
+            "ok": false, "error_code": 400,
+            "description": format!("Bad Request: not now, {TOKEN} {HOOK_SECRET}"),
         })))
         .mount(&telegram)
         .await;
@@ -2662,13 +2666,36 @@ async fn bot_logout_upstream_error_502() {
         assert_eq!(answer.status, 502, "{}", answer.body);
         assert_eq!(
             answer.json(),
-            json!({ "error": "Bad Request: not now, [redacted]" })
+            json!({
+                "error": "upstream refused",
+                "description": "Bad Request: not now, [redacted] #####",
+            })
         );
         assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, attempt);
         assert_eq!(source_state(&tgin, "hooked").await, "running");
         tgin.deliver("/hook", &[attempt.try_into().unwrap()]).await;
     }
     assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1, 2]);
+
+    let token_file = scratch("bot_logout_upstream_error_502").join("admin-token");
+    std::fs::write(&token_file, format!("{ADMIN_TOKEN}\n")).unwrap();
+    let url = format!("http://{}", tgin.admin);
+    let mut command = binary(&["admin", "--url", &url, "--token-file"]);
+    command
+        .arg(&token_file)
+        .args(["bot", "logout", "hooked", "--yes", "--timeout", "500ms"]);
+    let refused = output(command).await;
+    assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+    assert!(
+        refused
+            .stderr
+            .contains("502 Bad Gateway: upstream refused: Bad Request: not now, [redacted] #####"),
+        "{}",
+        refused.stderr
+    );
+    for secret in [TOKEN, HOOK_SECRET] {
+        assert!(!refused.stderr.contains(secret) && !refused.stdout.contains(secret));
+    }
     assert!(!LOGS.text().contains(TOKEN), "the token reached a log line");
     tgin.stop().await;
 }
@@ -2851,7 +2878,10 @@ async fn long_poll_502_restarts_the_source() {
     assert_eq!(answer.status, 502, "{}", answer.body);
     assert_eq!(
         answer.json(),
-        json!({ "error": "Bad Request: not now, [redacted]" })
+        json!({
+            "error": "upstream refused",
+            "description": "Bad Request: not now, [redacted]",
+        })
     );
     let refused_at = poll_timeouts(&telegram, TOKEN).await.len();
 

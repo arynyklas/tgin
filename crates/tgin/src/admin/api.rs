@@ -409,7 +409,11 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
                 ApiError::Http { description, .. } => description,
                 other => other.to_string(),
             };
-            error(StatusCode::BAD_GATEWAY, &redactor().redact(&text))
+            let body = json!({
+                "error": "upstream refused",
+                "description": redactor().redact(&text),
+            });
+            (StatusCode::BAD_GATEWAY, axum::Json(body)).into_response()
         }
     }
 }

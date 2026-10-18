@@ -32,8 +32,9 @@
 //! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
 //! `parked`, 504 `upstream not drained` when the server still held updates
 //! at the deadline, or could not say (the bot runs on unchanged; the
-//! warning logged names the server's error), 502 with the server's
-//! description when it refused the call (the bot runs on).
+//! warning logged names the server's error), 502 `upstream refused` with
+//! the server's masked text in `description` when it refused the call
+//! (the bot runs on).
 //!
 //! API v1 grows additively within a major version: answers may gain
 //! fields, enum values (state and phase words) and error codes, and the
