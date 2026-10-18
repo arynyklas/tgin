@@ -17,6 +17,6 @@ pub use ipnet::IpNet;
 pub use longpoll::{LongPollOptions, LongPollSource, OnIdentity, is_fatal};
 pub use secret::webhook_secret;
 pub use webhook::{
-    DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, WebhookOptions, client_ip, register,
+    DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, Registration, WebhookOptions, client_ip, register,
     retry_registration, webhook_router,
 };

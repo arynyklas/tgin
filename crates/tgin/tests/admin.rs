@@ -1129,10 +1129,24 @@ fn local_upstream(server: &MockServer, local_mode: bool) -> String {
     )
 }
 
+/// Records the arrival time and body of each request, answering `response`.
+struct Arrivals {
+    seen: mpsc::UnboundedSender<(Instant, Request)>,
+    response: ResponseTemplate,
+}
+
+impl Respond for Arrivals {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let _ = self.seen.send((Instant::now(), req.clone()));
+        self.response.clone()
+    }
+}
+
 /// A webhook bot on a local-mode server registers over plain `http`, on a
 /// port the cloud would refuse, with its `max_connections` (up to 100 000
-/// there) on every attempt: the first answer is a 429, and the
-/// supervised `register:<bot>` retry registers it after `retry_after`.
+/// there) on every attempt: the first answer, at start, is a 429 asking
+/// for 2 s, and the supervised `register:<bot>` retry waits that out
+/// before it registers the bot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_connections_forwarded() {
     let server = MockServer::start().await;
@@ -1143,12 +1157,12 @@ async fn max_connections_forwarded() {
     let (seen, mut registrations) = mpsc::unbounded_channel();
     let set_webhook = format!("/bot{TOKEN}/setWebhook");
     Mock::given(path(set_webhook.as_str()))
-        .respond_with(Record {
+        .respond_with(Arrivals {
             seen: seen.clone(),
             response: ResponseTemplate::new(429).set_body_json(json!({
                 "ok": false, "error_code": 429,
-                "description": "Too Many Requests: retry after 1",
-                "parameters": { "retry_after": 1 }
+                "description": "Too Many Requests: retry after 2",
+                "parameters": { "retry_after": 2 }
             })),
         })
         .up_to_n_times(1)
@@ -1156,7 +1170,7 @@ async fn max_connections_forwarded() {
         .mount(&server)
         .await;
     Mock::given(path(set_webhook.as_str()))
-        .respond_with(Record {
+        .respond_with(Arrivals {
             seen,
             response: ok(json!(true)),
         })
@@ -1171,12 +1185,17 @@ async fn max_connections_forwarded() {
     )
     .await;
 
+    let mut arrivals = Vec::new();
     for attempt in 1..=2 {
-        let request = next(&mut registrations).await;
+        let (at, request) = next(&mut registrations).await;
         let body: Value = serde_json::from_slice(&request.body).expect("a JSON setWebhook");
         assert_eq!(body["url"], "http://tgin.internal:8080/hook", "{attempt}");
         assert_eq!(body["max_connections"], 100_000, "{attempt}");
+        arrivals.push(at);
     }
+    // The start's 429 reaches the retry task, which waits its `retry_after`.
+    let gap = arrivals[1] - arrivals[0];
+    assert!(gap >= Duration::from_millis(1500), "{gap:?}");
     let status = tgin
         .wait_status("register:hooked stopped", |s| {
             task_state(s, "register:hooked").as_deref() == Some("stopped")

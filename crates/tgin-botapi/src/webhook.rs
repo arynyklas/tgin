@@ -189,22 +189,39 @@ pub async fn register(client: &BotClient, req: &SetWebhook) -> Result<(), ApiErr
     client.set_webhook(req).await
 }
 
-/// Makes `attempt`, a `setWebhook` call, until one succeeds or `stop` is
-/// cancelled. `failed` is the error of an attempt made just before, waited
-/// out first; without it the first attempt is made at once. Between
-/// attempts it waits the backoff, 1 s doubling to 5 min with full jitter,
-/// or the server's `retry_after` (up to 1 h) when that is longer. `name` is
-/// the bot's, for logs.
+/// How [`retry_registration`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// A `setWebhook` succeeded.
+    Registered,
+    /// `stop` was cancelled first.
+    Stopped,
+    /// An error no retry can fix (see [`crate::is_fatal`]): the Bot API
+    /// server rejected the token, or the client is misconfigured. Only a
+    /// reload with a corrected config registers again.
+    Rejected(ApiError),
+}
+
+/// Makes `attempt`, a `setWebhook` call, until one succeeds, `stop` is
+/// cancelled or the server rejects it for good. `failed` is the error of
+/// an attempt made just before, waited out first; without it the first
+/// attempt is made at once. Between attempts it waits the backoff, 1 s
+/// doubling to 5 min with full jitter, or the server's `retry_after` (up to
+/// 1 h) when that is longer. `name` is the bot's, for logs.
 ///
-/// Returns whether the webhook was registered: `false` as soon as `stop` is
-/// cancelled, mid-wait or mid-attempt, or after a client setup error, which
-/// no retry can fix.
+/// An error is final when [`crate::is_fatal`] says so for the upstream:
+/// on a cloud upstream a 401, 403 or 404 (the token rejected), on a
+/// self-hosted one (`local_upstream`) only a 403, since its 401 or 404 may
+/// be about the server's own api_id or api_hash. The caller logs a
+/// [`Registration::Rejected`]; cancellation, mid-wait or mid-attempt, ends
+/// it at once as [`Registration::Stopped`].
 pub async fn retry_registration<F, Fut>(
     name: &str,
     stop: &CancellationToken,
+    local_upstream: bool,
     mut failed: Option<ApiError>,
     mut attempt: F,
-) -> bool
+) -> Registration
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), ApiError>>,
@@ -213,13 +230,12 @@ where
     let mut backoff = Backoff::new(initial, max, Duration::ZERO);
     loop {
         if let Some(err) = failed.take() {
+            if crate::is_fatal(&err, local_upstream) {
+                return Registration::Rejected(err);
+            }
             let retry_after = match &err {
-                ApiError::Config(_) => {
-                    tracing::error!(source = %name, error = %err, "setWebhook cannot be sent; the Bot API server may not deliver updates");
-                    return false;
-                }
                 ApiError::Http { retry_after, .. } => *retry_after,
-                ApiError::Network(_) | ApiError::Decode(_) => None,
+                _ => None,
             };
             let delay = honor_retry_after(
                 backoff.next_delay(&mut rand::rng()),
@@ -232,12 +248,12 @@ where
                 .await
                 .is_none()
             {
-                return false;
+                return Registration::Stopped;
             }
         }
         match stop.run_until_cancelled(attempt()).await {
-            None => return false,
-            Some(Ok(())) => return true,
+            None => return Registration::Stopped,
+            Some(Ok(())) => return Registration::Registered,
             Some(Err(err)) => failed = Some(err),
         }
     }

@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tgin_botapi::gateway::Gateway;
-use tgin_botapi::{ApiError, BotClient, Identity, LongPollOptions, LongPollSource, SetWebhook};
+use tgin_botapi::{
+    ApiError, BotClient, Identity, LongPollOptions, LongPollSource, Registration, SetWebhook,
+};
 use tgin_core::config::{Bot, Ingress, LongPoll, SensitiveUrl, UpstreamKind, Webhook};
 use tgin_core::engine::Engine;
 use tgin_core::ids::SourceId;
@@ -288,7 +290,10 @@ impl Sources {
     /// serves by now: each is registered with the Bot API server when its
     /// config asks (all at once), then reported ready. A bot whose
     /// `setWebhook` fails keeps trying in the background (see
-    /// [`Sources::retry_registration`]); its readiness does not wait for it.
+    /// [`Sources::retry_registration`]) unless the server rejected it for
+    /// good; its readiness and its source state do not wait for, or
+    /// depend on, the registration (the server may hold the webhook from an
+    /// earlier run).
     pub(crate) async fn start_webhooks(&self, bots: Vec<Prepared>) {
         let webhooks: Vec<Prepared> = bots
             .into_iter()
@@ -327,6 +332,9 @@ impl Sources {
         for (bot, request, first) in attempts.into_iter().flatten() {
             match first {
                 Ok(()) => registered(&bot.name, bot.public_url()),
+                Err(err) if tgin_botapi::is_fatal(&err, bot.local_upstream()) => {
+                    rejected(&bot.name, &err);
+                }
                 Err(err) => self.retry_registration(bot, request, err),
             }
         }
@@ -336,13 +344,16 @@ impl Sources {
     }
 
     /// Keeps calling `setWebhook` for the webhook bot `bot`, whose first
-    /// attempt failed with `first`, as the supervised task
-    /// `register:<bot>`: backing off from 1 s to 5 min, or for the
-    /// server's `retry_after` when longer, until it succeeds or the bot
-    /// stops (see [`tgin_botapi::retry_registration`]).
+    /// attempt failed with `first` (an error a retry may fix), as the
+    /// supervised task `register:<bot>`: backing off from 1 s to 5 min, or
+    /// for the server's `retry_after` when longer, until it succeeds or the
+    /// bot stops (the task then ends `stopped`), or the server rejects it
+    /// for good (the task ends `failed` with the reason; see
+    /// [`tgin_botapi::retry_registration`]).
     fn retry_registration(&self, bot: &Prepared, request: SetWebhook, first: ApiError) {
         let (name, client, stop) = (Arc::clone(&bot.name), bot.client.clone(), bot.stop.clone());
         let public_url = bot.public_url().cloned();
+        let local = bot.local_upstream();
         self.supervisor.spawn(
             Arc::from(register_task(&name)),
             Backoff::new(
@@ -357,13 +368,20 @@ impl Sources {
                 let public_url = public_url.clone();
                 async move {
                     let retried =
-                        tgin_botapi::retry_registration(&name, &stop, Some(first), || {
+                        tgin_botapi::retry_registration(&name, &stop, local, Some(first), || {
                             client.set_webhook(&request)
                         });
-                    if retried.await {
-                        registered(&name, public_url.as_ref());
+                    match retried.await {
+                        Registration::Registered => {
+                            registered(&name, public_url.as_ref());
+                            Exit::Done
+                        }
+                        Registration::Stopped => Exit::Done,
+                        Registration::Rejected(err) => {
+                            rejected(&name, &err);
+                            Exit::Fatal(format!("setWebhook failed: {err}"))
+                        }
                     }
-                    Exit::Done
                 }
             },
         );
@@ -691,6 +709,12 @@ fn registered(name: &str, public_url: Option<&SensitiveUrl>) {
     tracing::info!(source = %name, url = ?public_url, "webhook registered with the Bot API server");
 }
 
+/// Logs that the Bot API server rejected the `setWebhook` of the bot `name`
+/// for good with `err` (token masked by the client); no retry follows.
+fn rejected(name: &str, err: &ApiError) {
+    tracing::error!(source = %name, error = %err, "the Bot API server rejected setWebhook; not retrying until a reload changes the bot");
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -985,6 +1009,184 @@ mod tests {
         while supervisor.subscribe("register:reg").is_some() {
             assert!(started.elapsed() < WAIT, "register:reg never went");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A Bot API error body with `status`, echoing `token`.
+    fn api_error(status: u16, token: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(status).set_body_raw(
+            format!(r#"{{"ok":false,"error_code":{status},"description":"rejected bot{token}"}}"#),
+            "application/json",
+        )
+    }
+
+    /// A config with the webhook bot `name` (`token`) at `server`: on its
+    /// own cloud `api_url`, or on the `local` upstream `tba` when `local`.
+    /// It registers when `register`.
+    fn webhook_config(
+        server: &wiremock::MockServer,
+        name: &str,
+        token: &str,
+        local: bool,
+        register: bool,
+    ) -> Config {
+        let (upstreams, upstream) = if local {
+            (
+                format!(
+                    "upstreams:\n  tba: {{ kind: local, url: \"{}\" }}\n",
+                    server.uri()
+                ),
+                "upstream: tba".to_owned(),
+            )
+        } else {
+            (String::new(), format!("api_url: \"{}\"", server.uri()))
+        };
+        let hook = if register {
+            "{ public_url: \"https://tgin.example\", register: true }"
+        } else {
+            "{}"
+        };
+        load(&format!(
+            "version: 1\nserver: {{}}\n{upstreams}bots:\n  - {{ name: {name}, token: \"{token}\", {upstream}, ingress: {{ webhook: {hook} }} }}\n"
+        ))
+    }
+
+    /// The `setWebhook` calls `server` has seen.
+    async fn set_webhooks(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/setWebhook"))
+            .count()
+    }
+
+    /// A cloud server's 401 to `setWebhook` rejects the token for good: on
+    /// the first attempt nothing retries; on a retry `register:<bot>` ends
+    /// `failed` with the reason, token masked. The source stays running and
+    /// ready either way.
+    #[tokio::test]
+    async fn cloud_registration_rejection_is_final() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let token = "1:rejected";
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/bot{token}/setWebhook")))
+            .respond_with(api_error(401, token))
+            .mount(&server)
+            .await;
+        let cfg = webhook_config(&server, "rej", token, false, true);
+        let (sources, supervisor, health, _ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        sources.start_webhooks(vec![prepared]).await;
+        assert_eq!(set_webhooks(&server).await, 1);
+        assert!(supervisor.subscribe("register:rej").is_none());
+        assert_eq!(sources.kind("rej"), Some(Kind::Webhook));
+        assert!(
+            health
+                .ready()
+                .1
+                .into_iter()
+                .any(|(name, r)| name == "source:rej" && r == Readiness::Ready)
+        );
+
+        let token = "2:later";
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/bot{token}/setWebhook")))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/bot{token}/setWebhook")))
+            .respond_with(api_error(401, token))
+            .mount(&server)
+            .await;
+        let cfg = webhook_config(&server, "later", token, false, true);
+        let (sources, supervisor, _, ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        sources.start_webhooks(vec![prepared]).await;
+        let reason = failed(&supervisor, "register:later").await;
+        assert!(
+            reason.starts_with("setWebhook failed: Bot API error 401"),
+            "{reason}"
+        );
+        assert!(!reason.contains(token), "{reason}");
+        assert_eq!(set_webhooks(&server).await, 2);
+        assert!(!sources.all_failed());
+        ingest.cancel();
+    }
+
+    /// A self-hosted server's 401 to `setWebhook` may be about its own
+    /// api_id or api_hash: `register:<bot>` retries until it registers.
+    #[tokio::test]
+    async fn local_registration_401_is_retried() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let token = "1:local";
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/bot{token}/setWebhook")))
+            .respond_with(api_error(401, token))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/bot{token}/setWebhook")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"ok":true,"result":true}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let cfg = webhook_config(&server, "loc", token, true, true);
+        let (sources, supervisor, _, ingest) = sources_for(&cfg);
+        let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+        sources.start_webhooks(vec![prepared]).await;
+        let mut state = supervisor.subscribe("register:loc").expect("retrying");
+        tokio::time::timeout(WAIT, state.wait_for(|s| *s == TaskState::Stopped))
+            .await
+            .expect("registered in time")
+            .expect("the task is alive");
+        assert_eq!(set_webhooks(&server).await, 2);
+        ingest.cancel();
+    }
+
+    /// A webhook bot's first `getMe` answered 401: on a self-hosted server
+    /// the background `identity:<bot>` keeps calling and records the
+    /// identity once the server accepts the bot; on the cloud the token is
+    /// rejected and no background call is made.
+    #[tokio::test]
+    async fn webhook_get_me_401_retried_on_local_upstream_only() {
+        use wiremock::Mock;
+        use wiremock::matchers::path;
+
+        for local in [true, false] {
+            let token = "1:who";
+            let server = telegram(token, "who_bot", 0).await;
+            Mock::given(path(format!("/bot{token}/getMe")))
+                .respond_with(api_error(401, token))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let cfg = webhook_config(&server, "who", token, local, false);
+            let (sources, supervisor, _, ingest) = sources_for(&cfg);
+            let prepared = sources.prepare(&cfg.bots[0]).expect("prepared");
+            sources.identify(&[prepared]).await;
+            assert!(sources.gateway.identity("who").is_none(), "{local}");
+            if local {
+                assert!(supervisor.subscribe("identity:who").is_some());
+                assert_eq!(
+                    identity_of(&sources, "who").await.as_deref(),
+                    Some("who_bot")
+                );
+            } else {
+                assert!(supervisor.subscribe("identity:who").is_none());
+            }
+            ingest.cancel();
         }
     }
 }
