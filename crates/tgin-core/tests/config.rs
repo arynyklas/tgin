@@ -2448,7 +2448,7 @@ fn rule_paths_survive_url_encoding() {
 
 /// The repository's configs, each with every `${env:…}` it uses set (a
 /// `*_URL` to the cloud, anything else to a distinct token-shaped value),
-/// and the upstream URL all its bots have.
+/// and the upstream URL all its `api_url` shorthand bots have.
 fn repo_configs() -> Vec<(PathBuf, String, MapEnv, &'static str)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let cloud = "https://api.telegram.org/";
@@ -2504,24 +2504,33 @@ fn repo_configs() -> Vec<(PathBuf, String, MapEnv, &'static str)> {
 }
 
 /// `api_url`, written or left out, is an unnamed cloud upstream named
-/// `api_url`, with the URL every existing config already resolved to.
+/// `api_url`, with the URL every existing config already resolved to. Bots
+/// on a named upstream are checked by the upstream tests; every listed
+/// config keeps at least one shorthand bot, so the check is never vacuous.
 #[test]
 fn api_url_shorthand_unchanged() {
     for (path, text, env, url) in repo_configs() {
         let cfg = config::load(&text, &path, &env)
             .unwrap_or_else(|errors| panic!("{}: {}", path.display(), render(&errors)));
-        assert!(!cfg.bots.is_empty(), "{}", path.display());
-        assert!(cfg.upstreams.is_empty(), "{}", path.display());
+        let mut shorthand = 0;
         for bot in &cfg.bots {
             let upstream = &bot.upstream;
-            assert_eq!(&*upstream.name, "api_url", "{}", path.display());
-            assert_eq!(upstream.kind, UpstreamKind::Cloud);
+            if &*upstream.name != "api_url" {
+                continue;
+            }
+            shorthand += 1;
+            assert_eq!(upstream.kind, UpstreamKind::Cloud, "{}", path.display());
             assert_eq!(upstream.url.expose().as_str(), url, "{}", path.display());
-            assert!(!upstream.local_mode);
-            assert_eq!(upstream.files, None);
-            assert_eq!(upstream.response_timeout, secs(60));
-            assert!(!bot.allow_local_files);
+            assert!(!upstream.local_mode, "{}", path.display());
+            assert_eq!(upstream.files, None, "{}", path.display());
+            assert_eq!(upstream.response_timeout, secs(60), "{}", path.display());
+            assert!(!bot.allow_local_files, "{}", path.display());
         }
+        assert!(
+            shorthand > 0,
+            "{}: no api_url shorthand bot",
+            path.display()
+        );
     }
 
     // A bot with neither `api_url` nor `upstream` gets the cloud default;
