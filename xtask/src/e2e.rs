@@ -1015,10 +1015,13 @@ impl Suite {
     /// the polling bot. tgin's getFile answers the path relative to the
     /// bot's directory, so the bot downloads from tgin's file route (PTB
     /// with `%3A` for the token's colon) and sends the bytes back with
-    /// sendDocument. tgin serves the file from the shared volume: the local
-    /// fake's file route (404 in local mode) sees no request. The runner's
-    /// own getFile and downloads, on the consumer-scoped and the proxy-only
-    /// base, give the relative path and the exact bytes.
+    /// sendDocument. tgin serves the file from the shared volume: it never
+    /// times a file request against the server
+    /// (`tgin_gateway_upstream_seconds`, which every proxied request
+    /// observes), and the local fake's file route (404 in local mode) sees
+    /// no request. The runner's own getFile and downloads, on the
+    /// consumer-scoped and the proxy-only base, give the relative path and
+    /// the exact bytes.
     async fn local_files(&mut self) -> Result<(), String> {
         let (bot, token) = (LOCAL_POLL, LOCAL_POLL_TOKEN);
         let chat = self.chat();
@@ -1117,28 +1120,28 @@ impl Suite {
                 )
             })?;
         }
-        let from_disk = self
-            .metric(
-                "tgin_gateway_requests_total",
-                &[("bot", bot), ("method", "file"), ("outcome", "ok")],
-            )
-            .await?;
-        ensure(from_disk >= 3.0, || {
-            format!(
-                "tgin counted {from_disk} file downloads for {bot}, not the bot's and the runner's 3"
-            )
-        })?;
-        let tgin_logs = compose(&["logs", "--no-color", "tgin"]).quiet()?;
-        let served = tgin_logs
-            .lines()
-            .filter(|line| {
-                line.contains("gateway file served from disk")
-                    && line.contains(&format!("bot={bot}"))
-                    && line.contains("status=200")
+        // One snapshot for both series: the 3 downloads counted, and not
+        // one of them timed against the server.
+        let (from_disk, upstream) =
+            eventually(&format!("tgin counts {bot}'s 3 file downloads"), || async {
+                let text = self.metrics().await?;
+                let ok = metric(
+                    &text,
+                    "tgin_gateway_requests_total",
+                    &[("bot", bot), ("method", "file"), ("outcome", "ok")],
+                );
+                let upstream = metric(
+                    &text,
+                    "tgin_gateway_upstream_seconds_count",
+                    &[("bot", bot), ("method", "file")],
+                );
+                Ok((ok >= 3.0).then_some((ok, upstream)))
             })
-            .count();
-        ensure(served >= 3, || {
-            format!("tgin logged {served} files served from disk for {bot}, not 3")
+            .await?;
+        ensure(upstream == 0.0, || {
+            format!(
+                "tgin timed {upstream} of {bot}'s {from_disk} file downloads against the Bot API server instead of serving them from disk"
+            )
         })?;
         // File paths hold the token: counted, never printed.
         let proxied = self.calls(token, "", "file").await?.len();
@@ -1469,11 +1472,11 @@ impl Suite {
             .multipart(form)
             .send()
             .await
-            .map_err(|err| format!("storing {filename}: {err}"))?;
+            .map_err(|err| format!("storing {filename}: {}", err.without_url()))?;
         let body: Value = response
             .json()
             .await
-            .map_err(|err| format!("storing {filename}: {err}"))?;
+            .map_err(|err| format!("storing {filename}: {}", err.without_url()))?;
         let document = &body["result"]["document"];
         let (Some(file_id), Some(file_unique_id)) = (
             document["file_id"].as_str(),
@@ -1533,11 +1536,11 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("reading the journal: {err}"))?;
+            .map_err(|err| format!("reading the journal: {}", err.without_url()))?;
         response
             .json()
             .await
-            .map_err(|err| format!("reading the journal: {err}"))
+            .map_err(|err| format!("reading the journal: {}", err.without_url()))
     }
 
     /// The highest journal sequence number of `token` so far.
@@ -1646,11 +1649,11 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("reading tgin's metrics: {err}"))?;
+            .map_err(|err| format!("reading tgin's metrics: {}", err.without_url()))?;
         response
             .text()
             .await
-            .map_err(|err| format!("reading tgin's metrics: {err}"))
+            .map_err(|err| format!("reading tgin's metrics: {}", err.without_url()))
     }
 
     async fn metric(&self, name: &str, labels: &[(&str, &str)]) -> Result<f64, String> {
