@@ -460,6 +460,7 @@ impl Gateway {
                 let upstream = Upstream::File {
                     base,
                     path: file_path,
+                    server: true,
                 };
                 return proxy::forward(bot, upstream, label, req, forwarding).await;
             }
@@ -471,7 +472,13 @@ impl Gateway {
                     return errors::error(StatusCode::NOT_FOUND, files::NOT_FOUND);
                 };
                 let forwarding = Forwarding::new(&self.upstreams);
-                let upstream = Upstream::File { base, path: &path };
+                // The origin is not the Bot API server: its outcomes leave
+                // `tgin_upstream_up` alone.
+                let upstream = Upstream::File {
+                    base,
+                    path: &path,
+                    server: false,
+                };
                 return proxy::forward(bot, upstream, label, req, forwarding).await;
             }
             FileTarget::NotServed => {

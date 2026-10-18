@@ -93,8 +93,13 @@ pub(super) enum Upstream<'a> {
     /// `<method>`: `{api_url}/bot{token}/<method>`.
     Method(&'a str),
     /// `<file_path>`, still percent-encoded, below the bot's file `base`:
-    /// `{api_url}/file/bot{token}/` or `{files.url}/{token}/`.
-    File { base: &'a Url, path: &'a str },
+    /// `{api_url}/file/bot{token}/` (`server`: the Bot API server itself)
+    /// or `{files.url}/{token}/` (a file origin, not the server).
+    File {
+        base: &'a Url,
+        path: &'a str,
+        server: bool,
+    },
 }
 
 /// Streams `req` to Telegram for `bot` and Telegram's answer back.
@@ -115,13 +120,16 @@ pub(super) async fn forward(
     forwarding: Forwarding,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let (url, file, method) = match upstream {
+    let (url, file, method, server) = match upstream {
         Upstream::Method(method) => (
             url(&bot.method_base, method, parts.uri.query()),
             false,
             Some(method),
+            true,
         ),
-        Upstream::File { base, path } => (url(base, path, parts.uri.query()), true, None),
+        Upstream::File { base, path, server } => {
+            (url(base, path, parts.uri.query()), true, None, server)
+        }
     };
     let limited = method.is_some_and(|method| bot.limiter.applies(method));
     let buffered = limited
@@ -147,6 +155,7 @@ pub(super) async fn forward(
         limited,
         counted: AtomicBool::new(false),
         forwarding: Mutex::new(Some(forwarding)),
+        server,
     };
     let scanned = if method.is_some() && bot.refuses_local_files {
         match scanned_encoding(&url, &headers) {
@@ -230,8 +239,12 @@ enum Failed {
     /// happened).
     Unreachable,
     /// The request body did not move for `upstream_idle_timeout`, in either
-    /// direction, before it was all sent.
+    /// direction, before it was all sent, while the server was not reading
+    /// it (the client's body had a frame ready).
     Idle,
+    /// As [`Failed::Idle`], but the client's body had nothing to send: the
+    /// downstream stalled, not the server. Answered as `Idle` is.
+    ClientIdle,
     /// The whole request was sent, and the connection was lost or
     /// `response_timeout` passed before the response headers (logged where
     /// it happened): the server may have executed the call.
@@ -402,6 +415,9 @@ struct Call<'a> {
     /// The request in flight for the shutdown's drain: handed to the
     /// relayed body, else dropped with this call.
     forwarding: Mutex<Option<Forwarding>>,
+    /// Whether the request goes to the bot's Bot API server, whose
+    /// outcomes feed `tgin_upstream_up` (a file origin's do not).
+    server: bool,
 }
 
 impl Drop for Call<'_> {
@@ -458,11 +474,13 @@ impl Call<'_> {
         body: Body,
     ) -> Result<(reqwest::Response, Instant), Failed> {
         let sent = self.exchange(url, headers, body).await;
-        let up = self.bot.upstream_metrics.up();
-        match &sent {
-            Ok(_) => up.answered(),
-            Err(Failed::ClientClosed) => {}
-            Err(_) => up.unreachable(),
+        if self.server {
+            let up = self.bot.upstream_metrics.up();
+            match &sent {
+                Ok(_) => up.answered(),
+                Err(Failed::ClientClosed | Failed::ClientIdle) => {}
+                Err(_) => up.unreachable(),
+            }
         }
         sent
     }
@@ -503,6 +521,7 @@ impl Call<'_> {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: the Bot API server did not answer; the call may have been executed");
                 return Err(Failed::NoAnswer);
             }
+            Waited::Idle if progress.client_pending() => return Err(Failed::ClientIdle),
             Waited::Idle => return Err(Failed::Idle),
             Waited::NoAnswer => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), response_timeout = ?bounds.response, "gateway request failed: no response within response_timeout after the request was sent; the call may have been executed");
@@ -531,7 +550,7 @@ impl Call<'_> {
                 self.counted.store(true, Ordering::Relaxed);
                 unreachable(self.handles, UNREACHABLE)
             }
-            Failed::Idle => {
+            Failed::Idle | Failed::ClientIdle => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), idle_timeout = ?self.bot.gateway.upstream_idle_timeout, "gateway request failed: no progress within upstream_idle_timeout");
                 self.counted.store(true, Ordering::Relaxed);
                 unreachable(self.handles, UNREACHABLE)
@@ -723,6 +742,9 @@ struct Progress {
     end: Notify,
     /// Reading the downstream's body failed: the client went away.
     client_failed: AtomicBool,
+    /// The downstream's body answered its last poll with `Pending`: it had
+    /// nothing to send, so a stall since is the client's, not the server's.
+    client_pending: AtomicBool,
 }
 
 impl Progress {
@@ -733,6 +755,7 @@ impl Progress {
             ended: AtomicBool::new(false),
             end: Notify::new(),
             client_failed: AtomicBool::new(false),
+            client_pending: AtomicBool::new(false),
         }
     }
 
@@ -762,6 +785,10 @@ impl Progress {
 
     fn client_failed(&self) -> bool {
         self.client_failed.load(Ordering::Relaxed)
+    }
+
+    fn client_pending(&self) -> bool {
+        self.client_pending.load(Ordering::Relaxed)
     }
 }
 
@@ -847,6 +874,9 @@ impl HttpBody for Upload {
         let this = self.get_mut();
         let body = this.body.get_mut();
         let polled = Pin::new(&mut *body).poll_frame(cx);
+        this.progress
+            .client_pending
+            .store(polled.is_pending(), Ordering::Relaxed);
         match &polled {
             Poll::Ready(Some(Ok(_))) => {
                 this.progress.stamp();

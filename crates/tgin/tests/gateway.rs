@@ -2644,3 +2644,109 @@ async fn upstream_up_flips_on_failure_and_recovery() {
     tgin.assert_metric(r#"tgin_upstream_up{bot="gw"} 1"#);
     tgin.stop().await;
 }
+
+/// The scrape's `tgin_upstream_up` line for `gw`, if any.
+fn gw_up(tgin: &Tgin) -> Option<String> {
+    tgin.metrics
+        .encode()
+        .lines()
+        .find(|l| l.starts_with(r#"tgin_upstream_up{bot="gw"}"#))
+        .map(str::to_owned)
+}
+
+/// A downstream that stops sending mid-upload is the client's stall, not
+/// the server's: the same 502 and outcome as before, and the bot's
+/// `tgin_upstream_up` is left as it was, absent or 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downstream_stall_leaves_upstream_up_alone() {
+    let telegram = trickling_telegram().await;
+    let tgin = start(&gateway_config(&format!("http://{telegram}"))).await;
+
+    let stalled = upload(&tgin, 1, Duration::from_millis(10)).await;
+    assert_eq!(stalled.status, 502);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stalled.body).expect("JSON"),
+        telegram_error(502, UNREACHABLE)
+    );
+    assert_eq!(gw_up(&tgin), None);
+
+    let done = upload(&tgin, 10, Duration::ZERO).await;
+    assert_eq!(done.status, 200, "{}", String::from_utf8_lossy(&done.body));
+    assert_eq!(
+        gw_up(&tgin).as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+
+    let stalled = upload(&tgin, 1, Duration::from_millis(10)).await;
+    assert_eq!(stalled.status, 502);
+    assert_eq!(
+        gw_up(&tgin).as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="unreachable"} 2"#,
+    );
+    tgin.stop().await;
+}
+
+/// A server that accepts the connection but never reads stalls the upload
+/// while the downstream still has bytes to send: that is the server's
+/// stall, and `tgin_upstream_up` reads 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_that_never_reads_sets_upstream_up_to_zero() {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    let listener = socket.listen(16).unwrap();
+    // Accepts, holds every connection, never reads.
+    let held = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            conns.push(conn);
+        }
+    });
+    let tgin = start(&gateway_config(&format!("http://{addr}"))).await;
+
+    // Far more than every buffer between the downstream and the server.
+    const LENGTH: usize = 256 << 20;
+    let mut stream = TcpStream::connect(tgin.addr).await.expect("connect");
+    let head = format!(
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {LENGTH}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("head");
+    let (mut read, mut write) = stream.into_split();
+    let writer = tokio::spawn(async move {
+        let chunk = vec![b'x'; 64 << 10];
+        let mut sent = 0;
+        while sent < LENGTH {
+            if write.write_all(&chunk).await.is_err() {
+                return;
+            }
+            sent += chunk.len();
+        }
+    });
+    let mut head = Vec::new();
+    timeout(PATIENCE, async {
+        let mut buf = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = read.read(&mut buf).await.expect("read");
+            assert!(n > 0, "closed before a response");
+            head.extend_from_slice(&buf[..n]);
+        }
+    })
+    .await
+    .expect("a response in time");
+    writer.abort();
+    let head = String::from_utf8_lossy(&head);
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        gw_up(&tgin).as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 0"#)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="unreachable"} 1"#,
+    );
+    held.abort();
+    tgin.stop().await;
+}

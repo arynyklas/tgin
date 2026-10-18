@@ -1399,3 +1399,96 @@ async fn cloud_and_non_local_upstreams_unaffected() {
     }
     tgin.stop().await;
 }
+
+/// A file origin is not the Bot API server: its outage leaves the bot's
+/// `tgin_upstream_up` as it was. The cloud file route is the server
+/// itself, and feeds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_origin_outcomes_leave_upstream_up_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})))
+        .mount(&server)
+        .await;
+    let cloud = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&cloud)
+        .await;
+    // Bound but not listening, and held for the whole test: the origin is
+    // down, and no other socket can take the port meanwhile.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = closed.local_addr().unwrap().port();
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", files: {{ url: "http://127.0.0.1:{port}/files" }} }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    gateway: {{ upstream_idle_timeout: 30s }}
+    routes: [{{ to: [workers] }}]
+  - name: other
+    token: "{OTHER_TOKEN}"
+    api_url: "{cloud}"
+    routes: [{{ to: [others] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+  others: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+        cloud = cloud.uri(),
+    );
+    let tgin = start(&yaml).await;
+    let series = |bot: &str| {
+        let prefix = format!("tgin_upstream_up{{bot=\"{bot}\"}}");
+        tgin.metrics
+            .encode()
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .map(str::to_owned)
+    };
+
+    // An origin outage before any server outcome: still absent.
+    let down = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(down.status(), 502);
+    assert_eq!(series("gw"), None);
+
+    let call = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/getChat"),
+            "",
+            "",
+        )
+        .await;
+    assert_eq!(call.status(), 200);
+    assert_eq!(
+        series("gw").as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+    let down = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(down.status(), 502);
+    assert_eq!(
+        series("gw").as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="unreachable"} 2"#,
+    );
+
+    // The cloud file route: its answer, a 404 too, feeds the series.
+    assert_eq!(series("other"), None);
+    let missing = tgin.file(OTHER_TOKEN, "documents/none.pdf", &[]).await;
+    assert_eq!(missing.status(), 404);
+    assert_eq!(
+        series("other").as_deref(),
+        Some(r#"tgin_upstream_up{bot="other"} 1"#)
+    );
+    tgin.stop().await;
+}
