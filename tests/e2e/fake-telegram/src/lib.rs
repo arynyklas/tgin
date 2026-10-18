@@ -37,15 +37,7 @@ mod params;
 mod state;
 mod webhook;
 
-use std::{
-    io,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -133,15 +125,9 @@ impl Server {
 /// accept a new file, and a bot's directory keeps the token's ':' only if
 /// the filesystem accepts a ':' in a name.
 fn local_files(dir: &std::path::Path) -> io::Result<LocalFiles> {
-    static PROBES: AtomicU64 = AtomicU64::new(0);
     std::fs::create_dir_all(dir)?;
     let root = std::path::absolute(dir)?;
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        PROBES.fetch_add(1, Ordering::Relaxed)
-    );
-    let file = root.join(format!(".fake-telegram-probe-{unique}"));
+    let file = root.join(format!(".fake-telegram-probe-{}", probe_suffix()));
     std::fs::File::create_new(&file)
         .and_then(|_| std::fs::remove_file(&file))
         .map_err(|error| {
@@ -153,12 +139,24 @@ fn local_files(dir: &std::path::Path) -> io::Result<LocalFiles> {
                 ),
             )
         })?;
-    let colon_dir = root.join(format!("1:a-fake-telegram-probe-{unique}"));
-    let colon = std::fs::create_dir(&colon_dir).is_ok();
-    if colon {
-        std::fs::remove_dir(&colon_dir)?;
-    }
+    let colon = colon_allowed(&root.join(format!("1:a-fake-telegram-probe-{}", probe_suffix())))?;
     Ok(LocalFiles { root, colon })
+}
+
+/// A random probe-name suffix, so that neither a concurrent start nor a
+/// probe left behind by a killed one is ever hit.
+fn probe_suffix() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// Whether a directory named `path` (whose name holds a ':') can exist. One
+/// that already does proves it, and is left alone.
+fn colon_allowed(path: &std::path::Path) -> io::Result<bool> {
+    match std::fs::create_dir(path) {
+        Ok(()) => std::fs::remove_dir(path).map(|()| true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 fn router(shared: Arc<Shared>) -> Router {
@@ -220,4 +218,41 @@ async fn add_fault(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
     }
     shared.add_fault(fault);
     Json(json!({"ok": true})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{colon_allowed, local_files, probe_suffix};
+
+    /// Probes left behind by killed runs (the old `{pid}-{n}` names and an
+    /// existing probe path) never flip the bot directories to '~'.
+    #[test]
+    fn leftover_probe_keeps_the_colon_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover = dir.path().join("1:a-leftover");
+        if std::fs::create_dir(&leftover).is_err() {
+            // This filesystem refuses ':' in names: there is no leftover
+            // to trip over, and the '~' form is right.
+            assert!(!local_files(dir.path()).unwrap().colon);
+            return;
+        }
+        // An existing probe path reads as "':' allowed" and is left alone.
+        assert!(colon_allowed(&leftover).unwrap());
+        assert!(leftover.is_dir());
+        for n in 0..256 {
+            let old = format!("1:a-fake-telegram-probe-{}-{n}", std::process::id());
+            std::fs::create_dir(dir.path().join(old)).unwrap();
+        }
+        assert!(local_files(dir.path()).unwrap().colon);
+    }
+
+    #[test]
+    fn probes_in_one_directory_do_not_collide() {
+        assert_ne!(probe_suffix(), probe_suffix());
+        let dir = tempfile::tempdir().unwrap();
+        let first = local_files(dir.path()).unwrap();
+        let second = local_files(dir.path()).unwrap();
+        assert_eq!(first.colon, second.colon);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
