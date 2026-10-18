@@ -63,7 +63,8 @@ pub struct GatewayBot {
     pub source: SourceId,
     pub token: Secret<String>,
     pub upstream: Arc<config::Upstream>,
-    /// `file:` references may reach an upstream in local mode.
+    /// `file:` references may reach the bot's server, whatever it is
+    /// (`config::Upstream::refuses_local_files`).
     pub allow_local_files: bool,
     pub gateway: config::Gateway,
 }

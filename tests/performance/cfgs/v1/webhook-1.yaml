@@ -10,7 +10,7 @@ bots:
   - name: bench
     token: "123:test"
     api_url: http://10.5.0.3:8090
-    # the fake stands in for api.telegram.org, where tgin does not scan for local files
+    # the fake stands in for https://api.telegram.org, where tgin does not scan for local files
     allow_local_files: true
     ingress:
       webhook:

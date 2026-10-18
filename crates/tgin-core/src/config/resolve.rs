@@ -184,7 +184,7 @@ pub(super) const WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
 /// The most connections Telegram opens to a webhook.
 pub(super) const TELEGRAM_MAX_CONNECTIONS: u32 = 100;
 /// The host of Telegram's own Bot API, the one server that never reads a
-/// `file:` reference from its disk.
+/// `file:` reference from its disk, when reached over `https`.
 const TELEGRAM_CLOUD_HOST: &str = "api.telegram.org";
 /// What a plain-http upstream URL off loopback hints.
 const BOT_API_HINT: &str = "use https, or keep the Bot API server on a network only tgin reaches";
@@ -230,14 +230,17 @@ impl Upstream {
         WebhookRules::new(self.kind, self.local_mode)
     }
 
-    /// Whether this is Telegram's own Bot API: a URL whose host is
-    /// `api.telegram.org`, in any ASCII case. Any other server may run
-    /// with `--local`, whatever its `kind` says.
+    /// Whether this is Telegram's own Bot API: an `https` URL whose host
+    /// is `api.telegram.org`, in any ASCII case. Over plain `http` nothing
+    /// authenticates the server (a hosts entry, a resolver or a proxy may
+    /// put a `--local` server there), and any other server may run with
+    /// `--local`, whatever its `kind` says.
     pub fn is_telegram_cloud(&self) -> bool {
-        self.url
-            .expose()
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(TELEGRAM_CLOUD_HOST))
+        let url = self.url.expose();
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(TELEGRAM_CLOUD_HOST))
     }
 
     /// Whether the gateway and the webhook-reply executor refuse a bot's

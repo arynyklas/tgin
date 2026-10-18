@@ -168,13 +168,13 @@ async fn telegram(seen: Arc<Seen>) -> SocketAddr {
     addr
 }
 
-/// Uploads `size` bytes through tgin, as no parameters
-/// (`application/octet-stream`), which no bot scans; returns the response
-/// head.
+/// Uploads `size` bytes through tgin as a multipart body, for a bot that
+/// allows local files: nothing scans it, so bytes with no multipart
+/// delimiter in them pass as they are. Returns the response head.
 async fn upload(tgin: SocketAddr, size: u64) -> String {
     let mut stream = TcpStream::connect(tgin).await.expect("connect");
     let head = format!(
-        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\n\r\n"
+        "POST /bot{TOKEN}/sendDocument HTTP/1.1\r\nHost: tgin\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: {size}\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.expect("head");
     send_zeros(&mut stream, size).await;
@@ -219,7 +219,7 @@ async fn upload_and_download_stream_bounded() {
     std::fs::write(
         &file,
         format!(
-            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    api_url: \"http://{api}\"\n"
+            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n  - name: gw\n    token: \"{TOKEN}\"\n    api_url: \"http://{api}\"\n    allow_local_files: true\n"
         ),
     )
     .expect("the config file");

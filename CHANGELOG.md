@@ -55,9 +55,10 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   answers downloads with `404 Not Found: files are not served for this
   upstream`. Downloads from disk hold the shutdown drain open.
 - Local file references: for a bot on any Bot API server but the Telegram
-  cloud (an upstream URL whose host is `api.telegram.org`), the `api_url`
-  shorthand and `kind: cloud` upstreams included, and for every
-  `kind: local` upstream, `local_mode` or not, the gateway and webhook
+  cloud (an upstream URL `https://api.telegram.org`; plain `http` to that
+  host counts as any other server), the `api_url` shorthand and
+  `kind: cloud` upstreams included, and for every `kind: local` upstream,
+  `local_mode` or not, the gateway and webhook
   replies refuse any parameter that begins with `file:` (query string,
   JSON at any depth, urlencoded values, multipart text fields read as
   telegram-bot-api reads them) with `400 Bad Request: local file uploads

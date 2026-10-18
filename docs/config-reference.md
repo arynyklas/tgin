@@ -42,7 +42,7 @@ One Telegram bot.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `allow_local_files` | boolean | `false` | Let `file:` references (files on the server's own disk) reach the bot's Bot API server. Off, the gateway and webhook replies refuse them for every server but the Telegram cloud (a URL whose host is `api.telegram.org`): the `api_url` shorthand, `kind: cloud` and `kind: local` upstreams alike, `local_mode` or not, as any other server may run `--local`. So a client cannot read the server's files through tgin. |
+| `allow_local_files` | boolean | `false` | Let `file:` references (files on the server's own disk) reach the bot's Bot API server. Off, the gateway and webhook replies refuse them for every server but the Telegram cloud (an `https` URL whose host is `api.telegram.org`): the `api_url` shorthand, `kind: cloud` and `kind: local` upstreams alike, `local_mode` or not, as any other server may run `--local`. So a client cannot read the server's files through tgin. |
 | `api_url` | string (not empty) | `https://api.telegram.org` | Bot API base URL: shorthand for an unnamed `cloud` upstream, which `/v1/config` and metrics call `api_url`. Not with `upstream`. Supports `${env:…}` and `${file:…}`. |
 | `gateway` | [Gateway](#gateway) | `{"rate_limit":{"global":{"burst":30,"count":30,"per":"1s"},"max_delay":"5s","methods":["send*","copyMessage*","forwardMessage*"],"mode":"shape","per_chat":{"burst":3,"count":1,"per":"1s"},"per_group":{"burst":20,"count":20,"per":"1m"}},"retry_429":{"max_wait":"10s"},"upstream_idle_timeout":"1m"}` | The Bot API gateway for this bot's downstream clients. Changes apply live. |
 | `ingress` | [Ingress](#ingress) |  | How updates arrive; at most one. Omitted, the bot receives none. |

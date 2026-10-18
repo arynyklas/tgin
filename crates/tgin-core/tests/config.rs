@@ -2607,8 +2607,9 @@ fn api_url_shorthand_unchanged() {
 }
 
 /// `file:` references are refused for every server but Telegram's cloud
-/// (`api.telegram.org`, its host in any case), and for every `local`
-/// upstream, unless the bot allows them.
+/// (`https` to `api.telegram.org`, its host in any case), and for every
+/// `local` upstream, unless the bot allows them. Plain `http` to that host
+/// authenticates nothing, so it is refused too.
 #[test]
 fn local_files_refused_off_the_telegram_cloud() {
     let yaml = r#"version: 1
@@ -2619,6 +2620,11 @@ bots:
   - { name: default, token: "1:t" }
   - { name: cloud, token: "2:t", api_url: "https://api.telegram.org" }
   - { name: cased, token: "3:t", api_url: "https://API.Telegram.ORG:443/x" }
+  - { name: port, token: "9:t", api_url: "https://API.telegram.org:443" }
+  - { name: userinfo, token: "10:t", api_url: "https://u:p@api.telegram.org" }
+  - { name: plain, token: "11:t", api_url: "http://api.telegram.org" }
+  - { name: at, token: "12:t", api_url: "https://api.telegram.org@evil" }
+  - { name: dot, token: "13:t", api_url: "https://api.telegram.org." }
   - { name: loopback, token: "4:t", api_url: "http://127.0.0.1:8081" }
   - { name: lookalike, token: "5:t", api_url: "https://api.telegram.org.example" }
   - { name: sub, token: "6:t", api_url: "https://x.api.telegram.org" }
@@ -2626,12 +2632,13 @@ bots:
   - { name: local, token: "8:t", upstream: tba }
 "#;
     let cfg = loads(yaml);
-    let refused: Vec<(&str, bool, bool)> = cfg
+    let refused: Vec<(&str, bool, bool, bool)> = cfg
         .bots
         .iter()
         .map(|bot| {
             (
                 bot.name.as_str(),
+                bot.upstream.is_telegram_cloud(),
                 bot.upstream.refuses_local_files(false),
                 bot.upstream.refuses_local_files(true),
             )
@@ -2640,18 +2647,21 @@ bots:
     assert_eq!(
         refused,
         [
-            ("default", false, false),
-            ("cloud", false, false),
-            ("cased", false, false),
-            ("loopback", true, false),
-            ("lookalike", true, false),
-            ("sub", true, false),
-            ("named", true, false),
-            ("local", true, false),
+            ("default", true, false, false),
+            ("cloud", true, false, false),
+            ("cased", true, false, false),
+            ("port", true, false, false),
+            ("userinfo", true, false, false),
+            ("plain", false, true, false),
+            ("at", false, true, false),
+            ("dot", false, true, false),
+            ("loopback", false, true, false),
+            ("lookalike", false, true, false),
+            ("sub", false, true, false),
+            ("named", false, true, false),
+            ("local", true, true, false),
         ]
     );
-    assert!(cfg.bots[0].upstream.is_telegram_cloud());
-    assert!(!cfg.bots[6].upstream.is_telegram_cloud());
 }
 
 #[test]

@@ -478,7 +478,7 @@ impl Call<'_> {
                 unreachable(self.handles, self.no_answer(true))
             }
             Failed::Refused(refusal) => {
-                tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a self-hosted Bot API server");
+                tracing::info!(bot = %self.bot.name, method = self.label.as_str(), reason = refusal.reason(), "gateway request refused: a local file reference, or parameters tgin cannot check, for a Bot API server other than the Telegram cloud");
                 self.count(Outcome::Rejected);
                 refusal.answer()
             }

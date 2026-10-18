@@ -6,8 +6,6 @@
 //! the file origin. The cloud file route is `gateway.rs`'s
 //! `file_route_streams_with_range`.
 
-mod support;
-
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2144,91 +2142,4 @@ async fn only_paths_below_a_type_directory_served() {
     );
     assert_logs_clean(&[TOKEN, THIRD_TOKEN]);
     tgin.stop().await;
-}
-
-/// A bot on the Telegram cloud has nothing scanned: a text beginning with
-/// `file:` reaches `api.telegram.org` byte for byte. That host cannot be
-/// served by a test, so tgin runs as a child process whose environment
-/// names a mock server as its HTTP proxy, and the bot's `api_url` is
-/// `http://api.telegram.org`: the request goes to the mock, in absolute
-/// form, for that host.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn telegram_cloud_forwards_file_references() {
-    let proxy = answering_server().await;
-    let file = scratch("telegram-cloud").join("tgin.yaml");
-    std::fs::write(
-        &file,
-        format!(
-            "version: 1\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"] }}\nbots:\n  - name: cloud\n    token: \"{TOKEN}\"\n    api_url: \"http://api.telegram.org\"\n    gateway: {{ rate_limit: {{ mode: off }} }}\n    routes: [{{ to: [a] }}]\nconsumers:\n  a: {{ pull: {{}} }}\n"
-        ),
-    )
-    .expect("the config file");
-    let log = file.with_file_name("tgin.log");
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tgin"));
-    command
-        .args(["-c", file.to_str().expect("UTF-8")])
-        .env_remove("TGIN_CONFIG");
-    for name in [
-        "NO_PROXY",
-        "no_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-    ] {
-        command.env_remove(name);
-    }
-    command
-        .env("HTTP_PROXY", proxy.uri())
-        .env("http_proxy", proxy.uri());
-    let (mut child, _) = support::spawn_listening(&mut command, &log, PATIENCE).await;
-    let data = data_plane(&log).await;
-
-    let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let body =
-        br#"{"chat_id":1,"text":"file:///srv/secret/passwd","document":"file:///etc/passwd"}"#;
-    let sent = timeout(
-        PATIENCE,
-        http.post(format!("http://{data}/bot{TOKEN}/sendDocument"))
-            .header("content-type", JSON)
-            .body(&body[..])
-            .send(),
-    )
-    .await;
-    let requests = proxy.received_requests().await.expect("recording");
-    let _ = child.kill();
-    let _ = child.wait();
-    let response = sent.expect("an answer in time").expect("a response");
-    assert_eq!(response.status(), 200);
-    let [request] = &requests[..] else {
-        panic!("{} requests reached the proxy", requests.len());
-    };
-    assert_eq!(request.url.path(), format!("/bot{TOKEN}/sendDocument"));
-    assert_eq!(
-        request
-            .headers
-            .get("host")
-            .and_then(|host| host.to_str().ok()),
-        Some("api.telegram.org")
-    );
-    assert_eq!(request.body, &body[..]);
-}
-
-/// The data plane's address, from `log`'s `data plane listening` line,
-/// within [`PATIENCE`].
-async fn data_plane(log: &Path) -> SocketAddr {
-    let started = std::time::Instant::now();
-    loop {
-        let logged = std::fs::read_to_string(log).unwrap_or_default();
-        let address = logged
-            .lines()
-            .find(|line| line.contains("data plane listening"))
-            .and_then(|line| line.split_once("listen=[")?.1.split_once(']'))
-            .and_then(|(list, _)| list.split(", ").next()?.parse().ok());
-        if let Some(address) = address {
-            return address;
-        }
-        assert!(started.elapsed() < PATIENCE, "no data plane in:\n{logged}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }

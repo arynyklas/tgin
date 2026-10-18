@@ -191,8 +191,8 @@ pub struct Bot {
     pub upstream: Option<At<Name>>,
     /// Let `file:` references (files on the server's own disk) reach the
     /// bot's Bot API server. Off, the gateway and webhook replies refuse
-    /// them for every server but the Telegram cloud (a URL whose host is
-    /// `api.telegram.org`): the `api_url` shorthand, `kind: cloud` and
+    /// them for every server but the Telegram cloud (an `https` URL whose
+    /// host is `api.telegram.org`): the `api_url` shorthand, `kind: cloud` and
     /// `kind: local` upstreams alike, `local_mode` or not, as any other
     /// server may run `--local`. So a client cannot read the server's files
     /// through tgin.
