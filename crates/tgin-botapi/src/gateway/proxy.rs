@@ -1,7 +1,8 @@
 //! The streaming proxy: a gateway request goes to `{api_url}/bot{token}/…`
-//! with an allowlist of headers, both bodies stream without buffering and
-//! keep their `Content-Length`, and `upstream_idle_timeout` bounds the time
-//! without progress in either direction.
+//! (or to the bot's file base, see `files`) with an allowlist of headers,
+//! both bodies stream without buffering and keep their `Content-Length`,
+//! and `upstream_idle_timeout` bounds the time without progress in either
+//! direction.
 //!
 //! reqwest's own `read_timeout` cannot be that bound: it runs one fixed
 //! timer from sending until the response headers (reqwest 0.13.5,
@@ -67,13 +68,13 @@ const RESPONSE_HEADERS: [HeaderName; 10] = [
     CONTENT_RANGE,
 ];
 
-/// What a gateway path asks of Telegram.
+/// What a gateway path asks of the upstream.
 pub(super) enum Upstream<'a> {
     /// `<method>`: `{api_url}/bot{token}/<method>`.
     Method(&'a str),
-    /// `<file_path>`, still percent-encoded:
-    /// `{api_url}/file/bot{token}/<file_path>`.
-    File(&'a str),
+    /// `<file_path>`, still percent-encoded, below the bot's file `base`:
+    /// `{api_url}/file/bot{token}/` or `{files.url}/{token}/`.
+    File { base: &'a Url, path: &'a str },
 }
 
 /// Streams `req` to Telegram for `bot` and Telegram's answer back.
@@ -96,11 +97,7 @@ pub(super) async fn forward(
             false,
             Some(method),
         ),
-        Upstream::File(file_path) => (
-            url(&bot.file_base, file_path, parts.uri.query()),
-            true,
-            None,
-        ),
+        Upstream::File { base, path } => (url(base, path, parts.uri.query()), true, None),
     };
     let limited = method.is_some_and(|method| bot.limiter.applies(method));
     let buffered = limited

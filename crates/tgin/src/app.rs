@@ -681,13 +681,14 @@ impl Connections {
     }
 }
 
-/// Every secret value of `cfg`, for log redaction: bot tokens, webhook
+/// Every secret value of `cfg`, for log redaction: bot tokens and their
+/// '~' forms (a self-hosted server's directory name for the bot), webhook
 /// secrets (automatic ones derived), the admin token, pull `auth_token`s
 /// and push endpoint `secret_token`s.
 pub fn secrets(cfg: &Config) -> Vec<String> {
     let mut secrets = Vec::new();
     for bot in &cfg.bots {
-        secrets.push(bot.token.expose().clone());
+        secrets.extend(config::Upstream::token_dirs(bot.token.expose()));
         if let Some(Ingress::Webhook(hook)) = &bot.ingress
             && let Some(secret) = webhook_secret(bot, hook)
         {

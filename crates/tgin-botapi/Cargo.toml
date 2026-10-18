@@ -22,6 +22,7 @@ bytes.workspace = true
 form_urlencoded.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
+httpdate.workspace = true
 ipnet.workspace = true
 multer.workspace = true
 parking_lot.workspace = true
@@ -34,8 +35,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tgin-core.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "time"] }
-tokio-util.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "time"] }
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 
 [dev-dependencies]

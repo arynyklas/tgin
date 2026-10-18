@@ -9,6 +9,7 @@
 //! | `setWebhook`, `deleteWebhook` | answered, nothing changes | applied to a push consumer with `accept_set_webhook` |
 //! | `getWebhookInfo` | synthesized | the runtime endpoint and the consumer's pending count |
 //! | `logOut`, `close` | answered, a warning logged | same |
+//! | `getFile` (local mode with `files`) | proxied, the bot's own absolute `file_path` made relative | same |
 //!
 //! The method is matched by its label, which the case-insensitive method
 //! table gives, so `GETME` is `getMe` as on Telegram. The descriptions are
@@ -65,6 +66,9 @@ pub(super) enum Routed {
     /// To Telegram, and its answer fills the bot's identity cache
     /// ([`learn_identity`]).
     ProxyAndLearn(Request),
+    /// To the Bot API server uncompressed, and its local-mode `getFile`
+    /// answer rewritten (`files::rewrite_response`).
+    ProxyAndRewrite(Request),
 }
 
 /// One request to a bot the gateway serves.
@@ -97,6 +101,12 @@ impl Call<'_> {
                 self.count(Outcome::Local);
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), "a downstream asked to log the bot out of Telegram; answered locally, not forwarded");
                 errors::ok_true(None)
+            }
+            "getFile" if self.bot.rewrite.is_on() => {
+                let mut req = req;
+                // The answer is read for the rewrite: never compressed.
+                req.headers_mut().remove(header::ACCEPT_ENCODING);
+                return Routed::ProxyAndRewrite(req);
             }
             _ => return Routed::Proxy(req),
         };

@@ -9,6 +9,7 @@
 
 pub mod chat_key;
 pub mod errors;
+mod files;
 mod intercept;
 pub mod limit;
 pub mod methods;
@@ -42,6 +43,7 @@ use tgin_runtime::http::{ClientOptions, Via, client};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio::time::Instant;
 
+use self::files::{FileTarget, Rewrite};
 use self::limit::BotLimiter;
 pub use self::metrics::GatewayMetrics;
 use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics};
@@ -138,8 +140,10 @@ struct Bot {
     gateway: config::Gateway,
     /// `{url}/bot{token}/`, the upstream URL's path kept.
     method_base: Url,
-    /// `{url}/file/bot{token}/`.
-    file_base: Url,
+    /// Where `/file/bot{token}/…` goes.
+    files: FileTarget,
+    /// Which local-mode `getFile` paths become relative.
+    rewrite: Rewrite,
     /// The gateway profile: no total timeout, the connect timeout above;
     /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
     client: reqwest::Client,
@@ -165,7 +169,8 @@ impl Bot {
         let token = bot.token.expose();
         let url = bot.upstream.url.expose();
         let method_base = base(url, &[&format!("bot{token}")])?;
-        let file_base = base(url, &["file", &format!("bot{token}")])?;
+        let files = FileTarget::new(&bot.upstream, token)?;
+        let rewrite = Rewrite::new(&bot.upstream);
         let client = client(&ClientOptions {
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: None,
@@ -178,7 +183,8 @@ impl Bot {
             upstream: bot.upstream,
             gateway: bot.gateway,
             method_base,
-            file_base,
+            files,
+            rewrite,
             client,
             via,
             metrics,
@@ -309,34 +315,25 @@ impl Gateway {
     /// `401 Unauthorized`; a consumer the bot does not route to `404`; a
     /// method other than GET or POST `405`. `getUpdates`, `getMe`, the
     /// webhook methods, `logOut` and `close` are answered here (see
-    /// `intercept`). Everything else streams to Telegram.
+    /// `intercept`); a local-mode `getFile` answer has the bot's own file
+    /// path made relative. Every other method streams to the Bot API
+    /// server. The file route goes where the bot's upstream keeps files
+    /// (see `files`).
     pub async fn handle(&self, req: Request) -> Response {
         let uri = req.uri().clone();
         let Some(target) = path::parse(uri.path()) else {
             return errors::error(StatusCode::NOT_FOUND, "Not Found");
         };
         let table = self.table.load_full();
-        let (consumer, token, upstream, label) = match &target {
+        let (consumer, token, label) = match &target {
             GatewayPath::Method {
                 consumer,
                 token,
                 method,
-            } => (
-                *consumer,
-                token,
-                Upstream::Method(method),
-                MethodLabel::of(method),
-            ),
+            } => (*consumer, token, MethodLabel::of(method)),
             GatewayPath::File {
-                consumer,
-                token,
-                file_path,
-            } => (
-                *consumer,
-                token,
-                Upstream::File(file_path),
-                MethodLabel::File,
-            ),
+                consumer, token, ..
+            } => (*consumer, token, MethodLabel::File),
         };
         let Some(bot) = table.find(token) else {
             self.metrics.unauthorized();
@@ -354,29 +351,59 @@ impl Gateway {
             handles.count(Outcome::Rejected);
             return errors::error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
         }
-        if let Upstream::Method(_) = upstream {
-            let call = intercept::Call {
-                engine: &self.engine,
-                bot,
-                consumer,
-                label,
-                trusted_proxies: &table.trusted_proxies,
-            };
-            return match call.route(req).await {
-                intercept::Routed::Answered(response) => response,
-                intercept::Routed::Proxy(req) => {
-                    let forwarding = Forwarding::new(&self.upstreams);
-                    proxy::forward(bot, upstream, label, req, forwarding).await
-                }
-                intercept::Routed::ProxyAndLearn(req) => {
-                    let forwarding = Forwarding::new(&self.upstreams);
-                    let response = proxy::forward(bot, upstream, label, req, forwarding).await;
-                    intercept::learn_identity(bot, response).await
-                }
-            };
-        }
-        let forwarding = Forwarding::new(&self.upstreams);
-        proxy::forward(bot, upstream, label, req, forwarding).await
+        let file_path = match &target {
+            GatewayPath::Method { method, .. } => {
+                let upstream = Upstream::Method(method);
+                let call = intercept::Call {
+                    engine: &self.engine,
+                    bot,
+                    consumer,
+                    label,
+                    trusted_proxies: &table.trusted_proxies,
+                };
+                return match call.route(req).await {
+                    intercept::Routed::Answered(response) => response,
+                    intercept::Routed::Proxy(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        proxy::forward(bot, upstream, label, req, forwarding).await
+                    }
+                    intercept::Routed::ProxyAndLearn(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        let response = proxy::forward(bot, upstream, label, req, forwarding).await;
+                        intercept::learn_identity(bot, response).await
+                    }
+                    intercept::Routed::ProxyAndRewrite(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        let response = proxy::forward(bot, upstream, label, req, forwarding).await;
+                        files::rewrite_response(bot, response).await
+                    }
+                };
+            }
+            GatewayPath::File { file_path, .. } => *file_path,
+        };
+        let root = match &bot.files {
+            FileTarget::Proxy(base) => {
+                let forwarding = Forwarding::new(&self.upstreams);
+                let upstream = Upstream::File {
+                    base,
+                    path: file_path,
+                };
+                return proxy::forward(bot, upstream, label, req, forwarding).await;
+            }
+            FileTarget::NotServed => {
+                handles.count(Outcome::Rejected);
+                return errors::error(StatusCode::NOT_FOUND, files::NOT_SERVED);
+            }
+            FileTarget::Disk { root } => root,
+        };
+        let response = match files::bot_dir(root, bot.token.expose()).await {
+            Some(dir) => files::serve(&dir, file_path, req.headers()).await,
+            None => errors::error(StatusCode::NOT_FOUND, files::FILE_NOT_FOUND),
+        };
+        let status = response.status();
+        handles.count(proxy::outcome(status));
+        tracing::debug!(bot = %bot.name, method = label.as_str(), status = status.as_u16(), "gateway file served from disk");
+        response
     }
 
     /// When the gateway last forwarded a request to Telegram: `now` while
