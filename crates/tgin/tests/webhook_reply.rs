@@ -1327,3 +1327,71 @@ async fn reply_scan_survives_the_deepest_json_level() {
     );
     tgin.stop().await;
 }
+
+/// The reply's `method` is read as the Bot API server reads it: a part
+/// whose `filename` sits inside another parameter's quoted value is a text
+/// field there, so the reply is executed; a percent-encoded field name is
+/// decoded; the parameters of a part typed urlencoded count too. A part
+/// with a real `filename` is a file, never the method.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_reply_method_read_as_the_server_reads_it() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let boundary = "server-grammar";
+    let upload_type = format!("multipart/form-data; boundary={boundary}");
+    let body = |parts: &[(&str, &str)]| {
+        let mut body = String::new();
+        for (headers, value) in parts {
+            body.push_str(&format!("--{boundary}\r\n{headers}\r\n\r\n{value}\r\n"));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body
+    };
+    let quoted = body(&[
+        (
+            r#"Content-Disposition: form-data; name=method; x="; filename=a""#,
+            "sendMessage",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "5"),
+    ]);
+    let encoded = body(&[
+        (
+            r#"Content-Disposition: form-data; name="meth%6Fd""#,
+            "sendDice",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "6"),
+    ]);
+    let form_part = body(&[(
+        "Content-Disposition: form-data; name=\"p\"\r\nContent-Type: application/x-www-form-urlencoded",
+        "chat_id=7&method=sendContact",
+    )]);
+    let file = body(&[
+        (
+            r#"Content-Disposition: form-data; name="method"; filename="m""#,
+            "sendPoll",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "8"),
+    ]);
+    let down = MockServer::start().await;
+    answer_update(&down, 1, 200, &upload_type, quoted.clone()).await;
+    answer_update(&down, 2, 200, &upload_type, encoded).await;
+    answer_update(&down, 3, 200, &upload_type, form_part).await;
+    answer_update(&down, 4, 200, &upload_type, file).await;
+    let tgin = start(&config(&api, &down.uri(), &Extra::default())).await;
+    for id in 1..=4 {
+        tgin.admit(id, id + 4).await;
+    }
+
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 3"#)
+        .await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#);
+    let [sent] = &telegram.calls_to("sendMessage")[..] else {
+        panic!("one sendMessage");
+    };
+    assert_eq!(&sent.body[..], quoted.as_bytes(), "byte-identical");
+    assert_eq!(telegram.calls_to("sendDice").len(), 1);
+    assert_eq!(telegram.calls_to("sendContact").len(), 1);
+    assert!(telegram.calls_to("sendPoll").is_empty());
+    tgin.stop().await;
+}

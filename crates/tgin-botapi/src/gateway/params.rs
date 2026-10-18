@@ -2,18 +2,19 @@
 //! reads them (tdlib's `HttpReader`): `multipart/form-data`, then
 //! `application/x-www-form-urlencoded`, then `application/json`, matched as
 //! substrings of the lowercased `Content-Type`; any other body has none. The
-//! query string is the caller's.
+//! query string is the caller's. Multipart bodies go through the port of
+//! `HttpReader`'s grammar in `local_files`, the one the local file scan
+//! uses, so a field is what the server takes it for.
 
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::fmt;
 
 use axum::http::HeaderValue;
-use bytes::Bytes;
-use futures_util::FutureExt as _;
 use percent_encoding::percent_decode;
 use serde::de::{self, DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
+
+use super::local_files::{Kind, boundary, parts};
 
 /// The most bytes of a multipart text field [`text_param`] reads.
 pub const MULTIPART_FIELD_LIMIT: usize = 64 * 1024;
@@ -22,7 +23,8 @@ pub const MULTIPART_FIELD_LIMIT: usize = 64 * 1024;
 /// - JSON: a string as is, a number or a boolean as written; `null`, objects
 ///   and arrays are not text;
 /// - urlencoded: the decoded value, which must be UTF-8;
-/// - multipart: a text field of at most [`MULTIPART_FIELD_LIMIT`] bytes, in
+/// - multipart: a text field of at most [`MULTIPART_FIELD_LIMIT`] bytes, or
+///   a parameter of a part typed `application/x-www-form-urlencoded`, in
 ///   any order; file parts are skipped.
 ///
 /// The first occurrence wins. `None` when the body has no such parameter or
@@ -33,10 +35,7 @@ pub fn text_param<'a>(
     name: &str,
 ) -> Option<Cow<'a, str>> {
     match encoding(content_type?)? {
-        Encoding::Multipart => {
-            let content_type = content_type?.to_str().ok()?;
-            multipart_param(content_type, body, name).map(Cow::Owned)
-        }
+        Encoding::Multipart => multipart_param(content_type?, body, name),
         Encoding::Json => json_param(body, name),
         Encoding::Form => form_param(body, name),
     }
@@ -71,15 +70,18 @@ pub(crate) fn encoding(content_type: &HeaderValue) -> Option<Encoding> {
 /// split on `&`, name and value on the first `=`. `None` when that value is
 /// not UTF-8 once decoded; a pair whose name is not matches nothing.
 pub(crate) fn form_param<'a>(body: &'a [u8], name: &str) -> Option<Cow<'a, str>> {
-    let value = body
-        .split(|&b| b == b'&')
+    form_decode(form_value(body, name)?)
+}
+
+/// The value of the first pair named `name`, still encoded.
+fn form_value<'a>(body: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    body.split(|&b| b == b'&')
         .filter(|pair| !pair.is_empty())
         .find_map(|pair| {
             let mut parts = pair.splitn(2, |&b| b == b'=');
             let key = parts.next().unwrap_or_default();
             (form_decode(key).as_deref() == Some(name)).then(|| parts.next().unwrap_or_default())
-        })?;
-    form_decode(value)
+        })
 }
 
 /// `+` as a space, then percent-decoded; `None` unless UTF-8. Borrowed
@@ -183,35 +185,25 @@ impl<'de> Visitor<'de> for Text {
     }
 }
 
-/// Bytes of the body multer is fed at a time.
-const MULTIPART_CHUNK: usize = 64 * 1024;
-
-/// The first text field `name` of a multipart body. multer is
-/// asynchronous, but over a body already in memory every step is ready at
-/// once, so its future is polled to completion in one go.
-fn multipart_param(content_type: &str, body: &[u8], name: &str) -> Option<String> {
-    let boundary = multer::parse_boundary(content_type).ok()?;
-    let chunks = body
-        .chunks(MULTIPART_CHUNK)
-        .map(|chunk| Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)));
-    let mut multipart = multer::Multipart::new(futures_util::stream::iter(chunks), boundary);
-    let read = async move {
-        while let Some(mut field) = multipart.next_field().await.ok()? {
-            if field.file_name().is_some() || field.name() != Some(name) {
-                continue;
-            }
-            let mut text = Vec::new();
-            while let Some(chunk) = field.chunk().await.ok()? {
-                if text.len() + chunk.len() > MULTIPART_FIELD_LIMIT {
-                    return None;
-                }
-                text.extend_from_slice(&chunk);
-            }
-            return String::from_utf8(text).ok();
-        }
-        None
-    };
-    read.now_or_never().flatten()
+/// The first parameter `name` of a multipart body: a text field of at most
+/// [`MULTIPART_FIELD_LIMIT`] bytes, which must be UTF-8, or a parameter of
+/// a part typed urlencoded. A field name is the server's: percent-decoded,
+/// a `filename` inside another parameter's quoted value not counting.
+fn multipart_param<'a>(
+    content_type: &HeaderValue,
+    body: &'a [u8],
+    name: &str,
+) -> Option<Cow<'a, str>> {
+    let boundary = boundary(content_type.as_bytes())?;
+    parts(boundary, body).find_map(|part| match part.kind {
+        Kind::File => None,
+        Kind::Text => part.named(name).then(|| {
+            (part.value.len() <= MULTIPART_FIELD_LIMIT)
+                .then(|| std::str::from_utf8(part.value).ok().map(Cow::Borrowed))
+                .flatten()
+        }),
+        Kind::Form => form_value(part.value, name).map(form_decode),
+    })?
 }
 
 #[cfg(test)]
@@ -376,6 +368,35 @@ mod tests {
         assert_eq!(get(ct, br#"{"chat_id":5}"#, "chat_id"), None);
         let ct = "application/json; profile=application/x-www-form-urlencoded";
         assert_eq!(get(ct, b"chat_id=5", "chat_id").as_deref(), Some("5"));
+    }
+
+    /// Multipart fields as the server reads them: names percent-decoded, a
+    /// `filename` inside another parameter's quotes no file name, a part
+    /// typed urlencoded read as parameters, the first occurrence winning
+    /// across parts.
+    #[test]
+    fn multipart_fields_read_as_the_server_reads_them() {
+        let ct = format!("multipart/form-data; boundary={BOUNDARY}");
+        let part =
+            |headers: &str, value: &str| format!("--{BOUNDARY}\r\n{headers}\r\n\r\n{value}\r\n");
+        let end = format!("--{BOUNDARY}--\r\n");
+        let body = [
+            part(r#"Content-Disposition: form-data; name="f"; filename="f""#, "file"),
+            part(r#"Content-Disposition: form-data; name=q; x="; filename=a""#, "quoted"),
+            part(r#"Content-Disposition: form-data; name="%6De%74hod""#, "decoded"),
+            part(
+                "Content-Disposition: form-data; name=p\r\nContent-Type: application/x-www-form-urlencoded",
+                "chat_id=%2B1&method=late",
+            ),
+            part(r#"Content-Disposition: form-data; name="chat_id""#, "2"),
+            end,
+        ]
+        .concat();
+        let get = |name| get(&ct, body.as_bytes(), name);
+        assert_eq!(get("f"), None);
+        assert_eq!(get("q").as_deref(), Some("quoted"));
+        assert_eq!(get("method").as_deref(), Some("decoded"));
+        assert_eq!(get("chat_id").as_deref(), Some("+1"));
     }
 
     /// Form values are UTF-8 like every other parameter; one that is not is

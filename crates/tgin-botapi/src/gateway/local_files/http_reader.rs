@@ -202,7 +202,7 @@ impl Delimiter {
 
 /// How the server reads a part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(in crate::gateway) enum Kind {
     /// A parameter.
     Text,
     /// A parameter typed `application/x-www-form-urlencoded`: parameters.
@@ -336,7 +336,7 @@ impl MultipartScan {
         self.headers_total += len;
         let kind = match len {
             0 => None,
-            _ => part_kind(&self.headers[2..len + 2]),
+            _ => part_head(&self.headers[2..len + 2]).map(|head| head.kind),
         };
         let Some(kind) = kind else {
             self.refuse(Refusal::Unreadable);
@@ -375,20 +375,123 @@ impl MultipartScan {
     }
 }
 
+/// One part of an in-memory multipart body, as the server reads it.
+pub(in crate::gateway) struct Part<'a> {
+    pub(in crate::gateway) kind: Kind,
+    name: Name<'a>,
+    pub(in crate::gateway) value: &'a [u8],
+}
+
+impl Part<'_> {
+    /// Whether the part's field name, decoded, is `name`.
+    pub(in crate::gateway) fn named(&self, name: &str) -> bool {
+        self.name.decoded() == name.as_bytes()
+    }
+}
+
+/// A `Content-Disposition` `name` as written: quoted (`\` escaping the
+/// next byte) or not; either way percent-decoded (`+` kept) by the server.
+#[derive(Clone, Copy)]
+struct Name<'a> {
+    raw: &'a [u8],
+    quoted: bool,
+}
+
+impl Name<'_> {
+    fn decoded(&self) -> Vec<u8> {
+        let mut unescaped = Vec::with_capacity(self.raw.len());
+        let mut bytes = self.raw.iter();
+        while let Some(&b) = bytes.next() {
+            match (self.quoted, b) {
+                (true, b'\\') => unescaped.extend(bytes.next()),
+                _ => unescaped.push(b),
+            }
+        }
+        let mut decoded = Vec::with_capacity(unescaped.len());
+        let mut at = 0;
+        while at < unescaped.len() {
+            let escape = (unescaped[at] == b'%' && at + 2 < unescaped.len())
+                .then(|| Some(hex(unescaped[at + 1])? << 4 | hex(unescaped[at + 2])?))
+                .flatten();
+            match escape {
+                Some(b) => {
+                    decoded.push(b);
+                    at += 3;
+                }
+                None => {
+                    decoded.push(unescaped[at]);
+                    at += 1;
+                }
+            }
+        }
+        decoded
+    }
+}
+
+/// The parts of a whole multipart body with the delimiter `boundary`, in
+/// order, read as [`MultipartScan`] reads them; it stops at the closing
+/// delimiter or at the first error (which the server answers with 400).
+pub(in crate::gateway) fn parts<'a>(
+    boundary: &[u8],
+    body: &'a [u8],
+) -> impl Iterator<Item = Part<'a>> {
+    let boundary = boundary[..boundary.len().min(MAX_BOUNDARY_LEN)].to_vec();
+    let mut next = b"\r\n--".to_vec();
+    next.extend_from_slice(&boundary);
+    let first = &next[2..];
+    let mut at = find(body, first).map(|start| start + first.len());
+    let mut headers_total = 0;
+    std::iter::from_fn(move || {
+        let start = at.take()?;
+        let rest = &body[start..];
+        let len = find(rest, b"\r\n\r\n")?;
+        headers_total += len;
+        if len == 0 || headers_total > MAX_PART_HEADERS {
+            return None;
+        }
+        let head = part_head(&rest[2..len + 2])?;
+        let content = &rest[len + 4..];
+        let end = find(content, &next)?;
+        let after = &content[end + next.len()..];
+        if after.len() >= 2 && !after.starts_with(b"--") {
+            at = Some(body.len() - after.len());
+        }
+        Some(Part {
+            kind: head.kind,
+            name: head.name,
+            value: &content[..end],
+        })
+    })
+}
+
+/// Where `pattern` first occurs in `bytes` (td's `find_boundary`).
+fn find(bytes: &[u8], pattern: &[u8]) -> Option<usize> {
+    bytes
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+}
+
+/// What the server reads from a part's header block.
+struct PartHead<'a> {
+    kind: Kind,
+    name: Name<'a>,
+}
+
 /// How the server reads a part with the header block `block`: a file when
 /// a `Content-Disposition` has a `filename` parameter, else a parameter,
 /// read as more parameters when its `Content-Type` begins with
-/// `application/x-www-form-urlencoded`. `None` where the server answers
-/// 400. A port of `HttpReader`'s header parsing: a header's value runs to a
-/// CR LF that no space or tab follows, trimmed; names ignore case.
-fn part_kind(block: &[u8]) -> Option<Kind> {
-    let mut named = false;
+/// `application/x-www-form-urlencoded`; and its field name. `None` where
+/// the server answers 400. A port of `HttpReader`'s header parsing: a
+/// header's value runs to a CR LF that no space or tab follows, trimmed;
+/// names ignore case.
+fn part_head(block: &[u8]) -> Option<PartHead<'_>> {
+    let mut name = None;
     let mut file = false;
     let mut content_type: &[u8] = b"application/octet-stream";
     let mut rest = block;
     while !rest.is_empty() {
         let colon = rest.iter().position(|&b| b == b':')?;
-        let name = trim(&rest[..colon]);
+        let header = trim(&rest[..colon]);
         let line = &rest[colon + 1..];
         let mut end;
         let mut next = 0;
@@ -404,30 +507,28 @@ fn part_kind(block: &[u8]) -> Option<Kind> {
         }
         let value = trim(&line[..end]);
         rest = &line[next..];
-        if name.eq_ignore_ascii_case(b"content-disposition") {
-            disposition(value, &mut named, &mut file)?;
-        } else if name.eq_ignore_ascii_case(b"content-type") {
+        if header.eq_ignore_ascii_case(b"content-disposition") {
+            disposition(value, &mut name, &mut file)?;
+        } else if header.eq_ignore_ascii_case(b"content-type") {
             content_type = value;
         }
     }
-    if !named {
-        return None;
-    }
-    Some(if file {
+    let name = name.filter(|name: &Name<'_>| !name.raw.is_empty())?;
+    let kind = if file {
         Kind::File
     } else if content_type.starts_with(b"application/x-www-form-urlencoded") {
         Kind::Form
     } else {
         Kind::Text
-    })
+    };
+    Some(PartHead { kind, name })
 }
 
 /// Reads a `Content-Disposition` value as the server does: `form-data;`
 /// then `key=value` pairs, a value quoted (`\` escaping the next byte) or
-/// up to a `;`. A `name` sets whether the part is named (the last one
-/// counts), any `filename` makes it a file. `None` where the server answers
-/// 400.
-fn disposition(value: &[u8], named: &mut bool, file: &mut bool) -> Option<()> {
+/// up to a `;`. The last `name` counts; any `filename` makes the part a
+/// file. `None` where the server answers 400.
+fn disposition<'a>(value: &'a [u8], name: &mut Option<Name<'a>>, file: &mut bool) -> Option<()> {
     let mut rest = value.strip_prefix(b"form-data;")?;
     loop {
         rest = trim(rest);
@@ -436,10 +537,9 @@ fn disposition(value: &[u8], named: &mut bool, file: &mut bool) -> Option<()> {
         };
         let key = trim(&rest[..equals]);
         rest = trim_start(&rest[equals + 1..]);
-        let empty;
+        let raw;
         if rest.first() == Some(&b'"') {
             let mut at = 1;
-            let mut chars = 0;
             loop {
                 let c = *rest.get(at)?;
                 at += 1;
@@ -450,9 +550,11 @@ fn disposition(value: &[u8], named: &mut bool, file: &mut bool) -> Option<()> {
                     rest.get(at)?;
                     at += 1;
                 }
-                chars += 1;
             }
-            empty = chars == 0;
+            raw = Name {
+                raw: &rest[1..at - 1],
+                quoted: true,
+            };
             rest = trim_start(&rest[at..]);
             if let Some((&first, after)) = rest.split_first() {
                 if first != b';' {
@@ -461,19 +563,15 @@ fn disposition(value: &[u8], named: &mut bool, file: &mut bool) -> Option<()> {
                 rest = after;
             }
         } else {
-            match rest.iter().position(|&b| b == b';') {
-                Some(semicolon) => {
-                    empty = trim(&rest[..semicolon]).is_empty();
-                    rest = &rest[semicolon + 1..];
-                }
-                None => {
-                    empty = trim(rest).is_empty();
-                    rest = &[];
-                }
-            }
+            let semicolon = rest.iter().position(|&b| b == b';');
+            raw = Name {
+                raw: trim(&rest[..semicolon.unwrap_or(rest.len())]),
+                quoted: false,
+            };
+            rest = semicolon.map_or(&[][..], |semicolon| &rest[semicolon + 1..]);
         }
         if key == b"name" {
-            *named = !empty;
+            *name = Some(raw);
         } else if key == b"filename" {
             *file = true;
         }

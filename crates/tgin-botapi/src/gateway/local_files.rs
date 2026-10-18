@@ -13,9 +13,9 @@
 //! decoded here as the server decodes it: percent-decoding (`+` as a space)
 //! for the query string and urlencoded values, unescaping for JSON strings,
 //! and `HttpReader`'s own multipart grammar, which tells text fields from
-//! files by its own `Content-Disposition` rules (multer's differ: it takes
-//! `filename` inside a quoted parameter for a file name, where the server
-//! sees a text field) and reads a part typed
+//! files by its own `Content-Disposition` rules (a general multipart parser
+//! may take `filename` inside a quoted parameter for a file name, where the
+//! server sees a text field) and reads a part typed
 //! `application/x-www-form-urlencoded` as more parameters. What follows
 //! the server's own parser is ported in [`http_reader`], TDLib's code.
 //!
@@ -38,7 +38,7 @@ use tgin_core::config::{Upstream, UpstreamKind};
 use tokio::sync::oneshot;
 
 use self::http_reader::{Form, MultipartScan, is_space};
-pub(super) use self::http_reader::{MAX_PARAMETERS, boundary};
+pub(super) use self::http_reader::{Kind, MAX_PARAMETERS, boundary, parts};
 use super::errors;
 use super::intercept::TOO_LARGE;
 use super::params::{Encoding, encoding};

@@ -24,7 +24,6 @@ futures-util.workspace = true
 http-body.workspace = true
 httpdate.workspace = true
 ipnet.workspace = true
-multer.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
 prometheus-client.workspace = true
