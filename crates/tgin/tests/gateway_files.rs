@@ -1657,6 +1657,7 @@ async fn large_bodies_scanned_while_they_stream() {
     // server records as ended short: with the part of the request it got,
     // or with nothing at all when the request head never left tgin. tgin
     // may have more connections open, which end between requests too.
+    // The wait is the check that every refused upload's connection ended.
     let records = recorded(&seen, 2 + refused.len()).await;
     let later = &records[2..];
     assert!(
@@ -1664,7 +1665,6 @@ async fn large_bodies_scanned_while_they_stream() {
         "a refused upload reached the server whole: {}",
         summary(&records)
     );
-    assert!(later.len() >= refused.len(), "{}", summary(&records));
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
     );
