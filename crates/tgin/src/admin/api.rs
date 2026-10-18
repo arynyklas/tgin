@@ -411,10 +411,15 @@ async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Res
         Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
         Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
         Err(MoveError::Busy(sending)) => {
+            let calls = if sending == 1 {
+                "1 call of the bot was".to_owned()
+            } else {
+                format!("{sending} calls of the bot were")
+            };
             let body = json!({
                 "error": "calls in flight",
                 "description": format!(
-                    "{sending} calls of the bot were still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)"
+                    "{calls} still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)"
                 ),
             });
             (StatusCode::GATEWAY_TIMEOUT, axum::Json(body)).into_response()

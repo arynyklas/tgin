@@ -4277,11 +4277,14 @@ async fn move_waits_for_a_call_being_sent() {
 }
 
 /// The `description` of a move's 504 `calls in flight` with one call left.
-const BUSY_ONE: &str = "1 calls of the bot were still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)";
+const BUSY_ONE: &str = "1 call of the bot was still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)";
+/// The same with two calls left.
+const BUSY_TWO: &str = "2 calls of the bot were still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)";
 
-/// A call still being sent at the move's deadline fails the move with 504
-/// `calls in flight`, saying how many and what to do: nothing is called on
-/// the server, and the bot runs on, its calls going through again.
+/// Calls still being sent at the move's deadline (two uploads) fail the
+/// move with 504 `calls in flight`, saying how many and what to do: nothing
+/// is called on the server, and the bot runs on, its calls going through
+/// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_fails_504_while_a_call_is_still_sent() {
     let Herald {
@@ -4296,6 +4299,7 @@ async fn move_fails_504_while_a_call_is_still_sent() {
     )
     .await;
     let upload = upload_in_flight(&tgin, &mut heralds).await;
+    let other = upload_in_flight(&tgin, &mut heralds).await;
 
     let failed = tgin
         .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
@@ -4303,7 +4307,7 @@ async fn move_fails_504_while_a_call_is_still_sent() {
     assert_eq!(failed.status, 504, "{}", failed.body);
     assert_eq!(
         failed.json(),
-        json!({ "error": "calls in flight", "description": BUSY_ONE })
+        json!({ "error": "calls in flight", "description": BUSY_TWO })
     );
     assert!(
         !methods
@@ -4320,7 +4324,7 @@ async fn move_fails_504_while_a_call_is_still_sent() {
     assert_eq!(sent.status(), 200);
     assert_eq!(tgin.post_update("/hook", update(1, "after")).await, 200);
     assert!(!tgin.status().await.sources[0].parked);
-    drop(upload);
+    drop((upload, other));
     let logs = LOGS.text();
     assert!(
         logs.lines().any(|l| l.contains("WARN")
@@ -4383,7 +4387,10 @@ async fn move_fails_504_while_a_webhook_reply_is_sent() {
 /// A busy bot still moves: tgin cannot deliver its update while the
 /// downstream's reply to it is held by the server, so delivering (step 3)
 /// runs out; it ends a quarter of the 2 s timeout early, and the reply
-/// ending within that reserve lets the move go on, `left` 1.
+/// ending within that reserve lets the move go on. (`left` is counted as
+/// the server is called: the update's delivery ends with its reply, just
+/// before, so it is 0 or 1; `left_counts_what_is_held_when_the_server_is_called`
+/// pins the count.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn busy_bot_moves_once_its_reply_ends_within_the_reserve() {
     let Herald {
@@ -4439,7 +4446,7 @@ async fn busy_bot_moves_once_its_reply_ends_within_the_reserve() {
         .expect("the move ends in time")
         .expect("no panic");
     assert_eq!(moved.status, 200, "{}", moved.body);
-    assert_eq!(moved.json()["left"], 1);
+    assert!(moved.json()["left"].as_u64().is_some_and(|left| left <= 1));
     let methods = methods.lock().expect("methods").clone();
     let photo = methods.iter().position(|m| m == "sendPhoto");
     let closed = methods.iter().position(|m| m == "close");
@@ -4495,5 +4502,66 @@ async fn a_late_drain_leaves_the_reserve_to_calls_being_sent() {
         !calls.iter().any(|m| m == "close" || m == "deleteWebhook"),
         "{calls:?}"
     );
+    tgin.stop().await;
+}
+
+/// `left` counts what tgin still holds of the bot when the server is
+/// called: an update tgin could not deliver by the end of step 3 but that
+/// was pulled and acknowledged while the move waited for an upload is not
+/// left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn left_counts_what_is_held_when_the_server_is_called() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Herald {
+        api, mut heralds, ..
+    } = heralding_server().await;
+    let tgin = start(
+        "left_counts_what_is_held_when_the_server_is_called",
+        &hooked_at(&api),
+    )
+    .await;
+    tgin.deliver("/hook", &[1]).await;
+    let mut upload = upload_in_flight(&tgin, &mut heralds).await;
+    let admin = tgin.http.clone();
+    let url = tgin.admin_url("/v1/bots/hooked/close?timeout=4s");
+    let close = tokio::spawn(answer(admin.post(url).bearer_auth(ADMIN_TOKEN)));
+    // Step 4 has begun once the gateway refuses the bot's calls; update 1
+    // was still held when step 3 ended.
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < PATIENCE, "the gateway never closed");
+        assert!(!close.is_finished(), "the move ended before step 4");
+        let call = answer(
+            tgin.http
+                .post(tgin.data_url(&format!("/bot{TOKEN}/getChat")))
+                .header("content-type", "application/json")
+                .body(r#"{"chat_id":500}"#),
+        )
+        .await;
+        if call.status == 503 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        tgin.poll_ids("/c/workers/getUpdates?timeout=0").await,
+        vec![1]
+    );
+    let acked = tgin.poll_ids("/c/workers/getUpdates?offset=2&timeout=0");
+    assert_eq!(acked.await, Vec::<i64>::new());
+
+    upload.write_all(&[b'x'; 900]).await.expect("the rest");
+    let mut head = [0u8; 12];
+    timeout(PATIENCE, upload.read_exact(&mut head))
+        .await
+        .expect("an answer in time")
+        .expect("read");
+    assert_eq!(&head, b"HTTP/1.1 200");
+    let moved = timeout(PATIENCE, close)
+        .await
+        .expect("the move ends in time")
+        .expect("no panic");
+    assert_eq!(moved.status, 200, "{}", moved.body);
+    assert_eq!(moved.json()["left"], 0);
     tgin.stop().await;
 }

@@ -661,25 +661,19 @@ impl Reloader {
         if ingest.run_until_cancelled(delivered).await.is_none() {
             return Some(Err(MoveError::Draining));
         }
-        let left = engine.pending_from(id);
 
         // From now on no call of the bot leaves for the server, whose next
         // call would log the bot in again once it is logged out; those on
         // their way end first.
         let gateway = &shared.gateway;
         gateway.set_parked(name, true);
-        let sent = tokio::time::timeout_at(deadline, async {
-            while gateway.sending(name) > 0 {
-                tokio::time::sleep(MOVE_CHECK).await;
-            }
-        });
+        let sent = calls_sent(deadline, || gateway.sending(name));
         match ingest.run_until_cancelled(sent).await {
             None => {
                 gateway.set_parked(name, false);
                 return Some(Err(MoveError::Draining));
             }
-            Some(Err(_)) => {
-                let sending = gateway.sending(name);
+            Some(Err(sending)) => {
                 tracing::warn!(bot = %name, ?timeout, sending, "calls of the bot were still being sent to its Bot API server at the deadline; the bot was not moved and starts again");
                 self.resume(&cfg, bot).await;
                 return Some(Err(MoveError::Busy(sending)));
@@ -687,6 +681,8 @@ impl Reloader {
             Some(Ok(())) => {}
         }
 
+        // What tgin still holds of the bot as the server is called.
+        let left = engine.pending_from(id);
         let called = match how {
             BotMove::LogOut => client.log_out().await.map_err(|err| (err, None)),
             BotMove::Close => close(bot, &client).await,
@@ -804,6 +800,23 @@ pub(crate) async fn read_tls(files: &TlsFiles) -> std::io::Result<TlsBytes> {
     ))
 }
 
+/// Waits, until `deadline`, for `sending` (a bot's calls being sent) to
+/// come to 0; the count still being sent at the deadline when it has not.
+/// Looked at once more as the deadline comes: the last call may have ended
+/// between two looks.
+async fn calls_sent(deadline: Instant, sending: impl Fn() -> usize) -> Result<(), usize> {
+    let waited = tokio::time::timeout_at(deadline, async {
+        while sending() > 0 {
+            tokio::time::sleep(MOVE_CHECK).await;
+        }
+    })
+    .await;
+    match (waited, sending()) {
+        (Ok(()), _) | (Err(_), 0) => Ok(()),
+        (Err(_), left) => Err(left),
+    }
+}
+
 /// `err` on one line: `path (line L, column C): message (hint: …)`.
 fn one_line(err: &ConfigError) -> String {
     let mut line = match &err.at {
@@ -853,5 +866,26 @@ mod tests {
             assert_eq!(queued.bot, format!("bot{n}"));
         }
         assert!(requests.moves.try_recv().is_err());
+    }
+
+    /// A call that ends between the wait's last look and its deadline does
+    /// not fail it; one still being sent then does, counted.
+    #[tokio::test(start_paused = true)]
+    async fn calls_sent_looks_again_at_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(1020);
+        // Looks at 0, 50 ms, …, 1000 ms see it; the next, at 1050 ms, would
+        // come after the deadline.
+        let ends = start + Duration::from_millis(1010);
+        let sending = || usize::from(Instant::now() < ends);
+        assert_eq!(calls_sent(deadline, sending).await, Ok(()));
+        assert_eq!(Instant::now(), deadline);
+
+        let start = Instant::now();
+        let stuck = || 2;
+        assert_eq!(
+            calls_sent(start + Duration::from_millis(100), stuck).await,
+            Err(2)
+        );
     }
 }
