@@ -29,10 +29,10 @@ use crate::cli;
 use crate::data_server::DataRoutes;
 use crate::sources::{Kind, Stop};
 
-/// Reload requests that may wait while a reload or a move runs; a SIGHUP
-/// finding the queue full is covered by a reload already waiting, which
-/// reads the file when it runs. Moves wait in a queue of their own, so
-/// they never fill this one.
+/// Reload requests that may wait while a reload or a move runs, and moves
+/// likewise, each in a queue of its own: moves never fill the reload
+/// queue, so a SIGHUP finding it full is covered by a reload already
+/// waiting, which reads the file when it runs.
 const QUEUE: usize = 8;
 /// How often the watcher re-reads the config file, for file systems that
 /// deliver no change events.
@@ -160,7 +160,9 @@ impl ReloadQueue {
 
     /// `POST /v1/bots/{bot}/logout|close`: moves the bot (see
     /// [`Reloader::move_bot`]) and returns the result, after the moves
-    /// already waiting; reloads waiting meanwhile run first.
+    /// already waiting and before any reload that has not begun: a move
+    /// acts on the config in force when it was asked for (operators move
+    /// a bot before they change its upstream).
     pub(crate) async fn move_bot(
         &self,
         bot: String,
@@ -169,7 +171,7 @@ impl ReloadQueue {
     ) -> Result<Moved, MoveError> {
         let (reply, result) = oneshot::channel();
         let request = Move {
-            bot,
+            bot: bot.clone(),
             how,
             timeout,
             reply,
@@ -177,6 +179,7 @@ impl ReloadQueue {
         if self.moves.send(request).await.is_err() {
             return Err(MoveError::Draining);
         }
+        tracing::debug!(bot = %bot, method = how.method(), "bot move queued");
         result.await.unwrap_or(Err(MoveError::Draining))
     }
 }
@@ -212,9 +215,14 @@ struct Watch {
 }
 
 impl Reloader {
-    /// Runs the reloads and moves asked through `requests`, and the
+    /// Runs the moves and reloads asked through `requests`, and the
     /// reloads the config watcher asks for while the config enables it, one
-    /// at a time, reloads before moves, until `stop` is cancelled.
+    /// at a time, until `stop` is cancelled. Waiting moves run first, so a
+    /// reload never runs before a move asked for earlier: the move would
+    /// otherwise read the reloaded config, and could log a bot out of the
+    /// upstream it was just moved to. A reload thus waits for the queued
+    /// moves, each bounded by its timeout; a SIGHUP is not dropped meanwhile,
+    /// the moves having a queue of their own.
     pub(crate) async fn run(mut self, requests: Requests, stop: CancellationToken) {
         let Requests {
             mut reloads,
@@ -226,6 +234,13 @@ impl Reloader {
             let request = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
+                job = moves.recv() => match job {
+                    Some(Move { bot, how, timeout, reply }) => {
+                        let _ = reply.send(self.move_bot(&bot, how, timeout).await);
+                        continue;
+                    }
+                    None => return,
+                },
                 request = reloads.recv() => match request {
                     Some(request) => request,
                     None => return,
@@ -238,13 +253,6 @@ impl Reloader {
                     }
                     Request { trigger: Trigger::Watch, reply: None }
                 }
-                job = moves.recv() => match job {
-                    Some(Move { bot, how, timeout, reply }) => {
-                        let _ = reply.send(self.move_bot(&bot, how, timeout).await);
-                        continue;
-                    }
-                    None => return,
-                },
             };
             let result = self.reload(request.trigger).await;
             let applied = result.is_ok();
@@ -648,4 +656,41 @@ fn one_line(err: &ConfigError) -> String {
         line.push(')');
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Waker};
+
+    use super::*;
+
+    /// Moves filling their queue, one more waiting to get in, leave room
+    /// for a SIGHUP's reload.
+    #[test]
+    fn sighup_queued_while_moves_fill_their_queue() {
+        let (queue, mut requests) = ReloadQueue::new(Arc::new(Lifecycle::new()));
+        let mut cx = Context::from_waker(Waker::noop());
+        type Moving<'a> = Pin<Box<dyn Future<Output = Result<Moved, MoveError>> + 'a>>;
+        let mut moving: Vec<Moving<'_>> = (0..=QUEUE)
+            .map(|n| {
+                let moved = queue.move_bot(format!("bot{n}"), BotMove::LogOut, None);
+                Box::pin(moved) as Moving<'_>
+            })
+            .collect();
+        for future in &mut moving {
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+
+        queue.signal();
+        let reload = requests.reloads.try_recv().expect("the SIGHUP's reload");
+        assert_eq!(reload.trigger, Trigger::Signal);
+        assert!(reload.reply.is_none());
+        // The first `QUEUE` moves are queued; the last waits to get in.
+        for n in 0..QUEUE {
+            let queued = requests.moves.try_recv().expect("a queued move");
+            assert_eq!(queued.bot, format!("bot{n}"));
+        }
+        assert!(requests.moves.try_recv().is_err());
+    }
 }

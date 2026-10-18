@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2863,46 +2863,141 @@ async fn long_poll_502_restarts_the_source() {
     tgin.stop().await;
 }
 
-/// Moves waiting behind a running one do not fill the reload queue: a
-/// SIGHUP meanwhile still reloads, before the waiting moves.
+/// `getWebhookInfo` reporting the updates `pending` holds, read at each
+/// call: a webhook bot's move drains until the test sets it to 0.
+struct GatedInfo {
+    pending: Arc<AtomicU64>,
+}
+
+impl Respond for GatedInfo {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        ok(json!({
+            "url": "", "has_custom_certificate": false,
+            "pending_update_count": self.pending.load(Ordering::SeqCst),
+        }))
+    }
+}
+
+/// How many captured log lines contain every one of `parts`.
+fn logged(parts: &[&str]) -> usize {
+    let logs = LOGS.text();
+    logs.lines()
+        .filter(|l| parts.iter().all(|p| l.contains(p)))
+        .count()
+}
+
+/// Waits until more than `before` captured log lines contain every one of
+/// `parts`.
+async fn wait_logged(parts: &[&str], before: usize) {
+    let started = Instant::now();
+    while logged(parts) <= before {
+        assert!(started.elapsed() < PATIENCE, "never logged: {parts:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// R17: a move asked for before a reload runs before it. While one move
+/// runs (its server reports pending updates until the test clears them)
+/// and another waits, a SIGHUP reload moving the waiting bot to another
+/// upstream waits too: the waiting bot is logged out of the server it
+/// was on, and only then started on the new one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sighup_not_dropped_behind_queued_moves() {
-    let telegram = telegram().await;
-    // Every move waits out its timeout, then fails.
-    mount_moves(&telegram, TOKEN, 3).await;
-    let tgin = start(
-        "sighup_not_dropped_behind_queued_moves",
-        &hooked(&telegram, ""),
+async fn queued_move_runs_before_a_later_reload() {
+    let telegram = MockServer::start().await;
+    mount_bot(
+        &telegram,
+        TOKEN,
+        me("runner_bot"),
+        Duration::from_secs(3600),
     )
     .await;
-    let spawn_move = |timeout: &str| {
+    let gate = Arc::new(AtomicU64::new(1));
+    Mock::given(path(format!("/bot{TOKEN}/getWebhookInfo")))
+        .respond_with(GatedInfo {
+            pending: Arc::clone(&gate),
+        })
+        .mount(&telegram)
+        .await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    mount_bot(
+        &telegram,
+        OTHER_TOKEN,
+        me("waiter_bot"),
+        Duration::from_secs(3600),
+    )
+    .await;
+    mount_moves(&telegram, OTHER_TOKEN, 0).await;
+    let local = MockServer::start().await;
+    mount_bot(
+        &local,
+        OTHER_TOKEN,
+        me("waiter_bot"),
+        Duration::from_secs(3600),
+    )
+    .await;
+    mount_moves(&local, OTHER_TOKEN, 0).await;
+    let runner = hook_bot(&telegram, "runner", TOKEN, "/runner", "workers");
+    let waiter = hook_bot(&telegram, "waiter", OTHER_TOKEN, "/waiter", "waiters");
+    let consumers = "consumers:\n  workers: { pull: {} }\n  waiters: { pull: {} }\n";
+    let tgin = start(
+        "queued_move_runs_before_a_later_reload",
+        &config(&format!("bots:\n{runner}{waiter}{consumers}")),
+    )
+    .await;
+    let spawn_move = |bot: &str| {
         let request = tgin
             .http
-            .post(tgin.admin_url(&format!("/v1/bots/hooked/logout?timeout={timeout}")))
+            .post(tgin.admin_url(&format!("/v1/bots/{bot}/logout?timeout=30s")))
             .bearer_auth(ADMIN_TOKEN);
-        tokio::spawn(async move { answer(request).await.status })
+        tokio::spawn(async move { answer(request).await })
     };
-    let mut moves = vec![spawn_move("2s")];
+
+    let running = spawn_move("runner");
     let started = Instant::now();
     while count_calls(&telegram, TOKEN, "getWebhookInfo").await == 0 {
         assert!(started.elapsed() < PATIENCE, "the first move never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // More than the reload queue holds wait behind it.
-    moves.extend((0..9).map(|_| spawn_move("100ms")));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    tgin.rewrite(&with_extra_consumer(&telegram, ""));
+    let waiting = spawn_move("waiter");
+    wait_logged(&["bot move queued", "bot=waiter"], 0).await;
+    let moved = waiter.replace(&format!("api_url: {}", telegram.uri()), "upstream: tba");
+    tgin.rewrite(&config(&format!(
+        "{}bots:\n{runner}{moved}{consumers}",
+        local_upstream(&local, false)
+    )));
+    // The app takes the SIGHUP off its signal channel and queues the
+    // reload in the same step; the log line says it was queued, not
+    // dropped (another test's SIGHUP line could only come on top).
+    let sighup = ["SIGHUP: reloading the config"];
+    let before = logged(&sighup);
     tgin.signal(SignalKind::Hangup).await;
-    let status = tgin.wait_for_generation(2).await;
-    assert_eq!(status.consumers.len(), 2);
-    for handle in moves {
-        let status = timeout(PATIENCE, handle)
-            .await
-            .expect("in time")
-            .expect("ran");
-        assert_eq!(status, 504);
+    let started = Instant::now();
+    while tgin.signals.capacity() < tgin.signals.max_capacity() {
+        assert!(started.elapsed() < PATIENCE, "the SIGHUP was never taken");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    wait_logged(&sighup, before).await;
+    // Both wait now; the running move may end.
+    gate.store(0, Ordering::SeqCst);
+
+    let ran = timeout(PATIENCE, running)
+        .await
+        .expect("in time")
+        .expect("ran");
+    assert_eq!(ran.status, 200, "{}", ran.body);
+    let waited = timeout(PATIENCE, waiting)
+        .await
+        .expect("in time")
+        .expect("ran");
+    assert_eq!(waited.status, 200, "{}", waited.body);
+    assert_eq!(waited.json()["upstream"], "api_url");
+    let status = tgin.wait_for_generation(2).await;
+    assert_eq!(count_calls(&telegram, OTHER_TOKEN, "logOut").await, 1);
+    assert_eq!(count_calls(&local, OTHER_TOKEN, "logOut").await, 0);
+    // Unparked by the reload, it runs on the new upstream.
+    assert_eq!(count_calls(&local, OTHER_TOKEN, "getMe").await, 1);
+    let waiter_state = status.sources.iter().find(|s| s.name == "waiter");
+    assert_eq!(waiter_state.map(|s| s.state.as_str()), Some("running"));
     tgin.stop().await;
 }
 
