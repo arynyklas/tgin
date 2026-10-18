@@ -614,6 +614,12 @@ impl<T: Clone> LeaseQueue<T> {
         available.len()
     }
 
+    /// How many items, leased or not, match `pred`.
+    pub fn count_where(&self, pred: impl Fn(&T) -> bool) -> usize {
+        let inner = self.inner.lock();
+        inner.entries.values().filter(|e| pred(&e.item)).count()
+    }
+
     /// Drops the unleased items that match `pred`.
     pub fn purge_where(&self, pred: impl Fn(&T) -> bool) -> usize {
         let mut guard = self.inner.lock();

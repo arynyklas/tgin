@@ -2,6 +2,7 @@
 //! sink pushes back.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use tgin_core::metrics::{SourceErrorReason, SourceMetrics, SourceStateLabel};
 use tgin_core::sink::{Admit, Sink};
 use tgin_runtime::backoff::{Backoff, honor_retry_after};
 use tgin_runtime::supervisor::Exit;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -95,6 +97,36 @@ pub struct LongPollSource<S: Sink> {
     on_identity: OnIdentity,
     /// Why the source backs off, while it does.
     last_error: Mutex<Option<String>>,
+    /// An operator's wait for the server to run dry; see
+    /// [`LongPollSource::drain`].
+    drain: Drain,
+}
+
+/// [`LongPollSource::drain`]'s state, shared with the poll loop.
+struct Drain {
+    /// Set while a drain runs, and after it succeeded: polls do not wait
+    /// for updates (`timeout` 0), and an empty batch holds the source.
+    on: AtomicBool,
+    /// Wakes the poll loop: gives up its long poll in flight when a drain
+    /// begins, and lets it poll again when a drain is called off.
+    wake: Notify,
+    /// Counts the empty batches polled while draining.
+    empty: watch::Sender<u64>,
+}
+
+/// Calls a drain off unless disarmed: the source polls on as before.
+struct Resume<'a> {
+    drain: &'a Drain,
+    armed: bool,
+}
+
+impl Drop for Resume<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.drain.on.store(false, Ordering::SeqCst);
+            self.drain.wake.notify_waiters();
+        }
+    }
 }
 
 /// What the poll loop does after a failed `getUpdates`.
@@ -176,6 +208,11 @@ impl<S: Sink> LongPollSource<S> {
             metrics,
             on_identity,
             last_error: Mutex::new(None),
+            drain: Drain {
+                on: AtomicBool::new(false),
+                wake: Notify::new(),
+                empty: watch::channel(0).0,
+            },
         }
     }
 
@@ -183,6 +220,26 @@ impl<S: Sink> LongPollSource<S> {
     /// token masked), while it does.
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().clone()
+    }
+
+    /// Returns once the Bot API server holds no update of this bot, all
+    /// fetched ones admitted: from now on the source polls without waiting
+    /// for updates (giving up its long poll in flight, whose updates are
+    /// not confirmed, so the next poll gets them again) until a poll finds
+    /// none. The source then polls no more until it is stopped. Dropped
+    /// before it returns, the drain is called off and the source polls on
+    /// as before.
+    pub async fn drain(&self) {
+        let mut empty = self.drain.empty.subscribe();
+        let mut resume = Resume {
+            drain: &self.drain,
+            armed: true,
+        };
+        self.drain.on.store(true, Ordering::SeqCst);
+        self.drain.wake.notify_waiters();
+        // The sender lives as long as `self`.
+        let _ = empty.changed().await;
+        resume.armed = false;
     }
 
     /// Calls `getMe`, then polls until `ingest` is cancelled.
@@ -281,16 +338,28 @@ impl<S: Sink> LongPollSource<S> {
         }
 
         loop {
-            let polled = ingest
-                .run_until_cancelled(self.client.get_updates(
-                    state.offset,
-                    self.opts.limit,
-                    self.opts.timeout,
-                    &self.opts.allowed_updates,
-                ))
-                .await;
-            let Some(polled) = polled else {
-                return Exit::Done;
+            // Enabled before the flag is read, so a drain beginning after the
+            // read wakes this poll.
+            let woken = self.drain.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let draining = self.drain.on.load(Ordering::SeqCst);
+            let timeout = if draining {
+                Duration::ZERO
+            } else {
+                self.opts.timeout
+            };
+            let request = self.client.get_updates(
+                state.offset,
+                self.opts.limit,
+                timeout,
+                &self.opts.allowed_updates,
+            );
+            // A long poll given up confirms nothing: its updates come again.
+            let polled = tokio::select! {
+                () = ingest.cancelled() => return Exit::Done,
+                () = &mut woken, if !draining => continue,
+                polled = request => polled,
             };
             let step = match polled.and_then(|body| split_updates(&body)) {
                 Ok(updates) => {
@@ -301,6 +370,9 @@ impl<S: Sink> LongPollSource<S> {
                         self.metrics.set_state(SourceStateLabel::Running);
                     }
                     if !self.admit(&updates, &mut state.offset, ingest).await {
+                        return Exit::Done;
+                    }
+                    if draining && updates.is_empty() && !self.hold(ingest).await {
                         return Exit::Done;
                     }
                     Step::Poll
@@ -322,6 +394,19 @@ impl<S: Sink> LongPollSource<S> {
                 Step::Exit(exit) => return exit,
             }
         }
+    }
+
+    /// After a drain's empty batch: reports it, then waits until the drain
+    /// is called off. Returns `false` if `ingest` is cancelled first.
+    async fn hold(&self, ingest: &CancellationToken) -> bool {
+        let resumed = self.drain.wake.notified();
+        tokio::pin!(resumed);
+        resumed.as_mut().enable();
+        self.drain.empty.send_modify(|n| *n += 1);
+        if !self.drain.on.load(Ordering::SeqCst) {
+            return true;
+        }
+        ingest.run_until_cancelled(resumed).await.is_some()
     }
 
     /// Offers each update in order and moves `offset` past each one the sink

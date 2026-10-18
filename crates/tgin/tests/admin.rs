@@ -5,9 +5,10 @@
 mod support;
 
 use std::collections::BTreeSet;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -36,6 +37,47 @@ const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 const ADMIN_TOKEN: &str = "admin-token-value-123";
 /// Fast shutdown: no lame duck, a short grace.
 const QUICK: &str = "runtime: { lame_duck: 0s, shutdown_grace: 2s }";
+
+/// Everything every test logs, unredacted: the test subscriber has no
+/// redactor, so a token that reaches a log line shows up here.
+static LOGS: LazyLock<Logs> = LazyLock::new(|| {
+    let logs = Logs::default();
+    tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .try_init()
+        .expect("the only global subscriber");
+    logs
+});
+
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
+    }
+}
+
+impl io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("logs").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 fn update(id: i64, text: &str) -> String {
     format!(
@@ -213,6 +255,7 @@ fn boot(file: &Path) -> Boot {
 }
 
 async fn start(test: &str, yaml: &str) -> Tgin {
+    LazyLock::force(&LOGS);
     let file = write_config(test, yaml);
     let app = App::start(boot(&file)).await.expect("tgin starts");
     running(app, file)
@@ -1987,4 +2030,615 @@ async fn log_level_follows_reloads() {
         panic!("{err}; the log:\n{}", logged());
     }
     assert_eq!(debug_lines, [1, 1], "{}", logged());
+}
+
+/// A Bot API server's `getUpdates` for one bot, holding `updates` as
+/// Telegram holds pending updates: a poll gets those from its `offset` on
+/// at once (those below are confirmed and forgotten), else an empty batch,
+/// after `idle` unless its `timeout` is 0. Reports every poll.
+struct Pending {
+    updates: Arc<Mutex<Vec<i64>>>,
+    idle: Duration,
+    polls: mpsc::UnboundedSender<()>,
+}
+
+impl Respond for Pending {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let params: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let offset = params["offset"].as_i64().unwrap_or(0);
+        let response = {
+            let mut updates = self.updates.lock().expect("updates");
+            updates.retain(|id| *id >= offset);
+            if !updates.is_empty() {
+                let batch = updates
+                    .iter()
+                    .map(|id| serde_json::from_str(&update(*id, "pending")).expect("an update"))
+                    .collect();
+                ok(Value::Array(batch))
+            } else if params["timeout"].as_u64() == Some(0) {
+                ok(json!([]))
+            } else {
+                ok(json!([])).set_delay(self.idle)
+            }
+        };
+        // Only now: a reported poll has its answer decided.
+        let _ = self.polls.send(());
+        response
+    }
+}
+
+/// Mounts the bot `token` on `server` with [`Pending`] updates, none yet;
+/// `getMe` names it `polled_bot`. Returns the updates and the polls.
+async fn mount_pending(
+    server: &MockServer,
+    token: &str,
+    idle: Duration,
+) -> (Arc<Mutex<Vec<i64>>>, mpsc::UnboundedReceiver<()>) {
+    Mock::given(path(format!("/bot{token}/getMe")))
+        .respond_with(me("polled_bot"))
+        .mount(server)
+        .await;
+    let updates = Arc::default();
+    let (polls, rx) = mpsc::unbounded_channel();
+    Mock::given(path(format!("/bot{token}/getUpdates")))
+        .respond_with(Pending {
+            updates: Arc::clone(&updates),
+            idle,
+            polls,
+        })
+        .mount(server)
+        .await;
+    (updates, rx)
+}
+
+/// Mounts the bot `token`'s `getWebhookInfo` on `server`, reporting
+/// `pending` updates.
+async fn mount_webhook_info(server: &MockServer, token: &str, pending: u64) {
+    Mock::given(path(format!("/bot{token}/getWebhookInfo")))
+        .respond_with(ok(json!({
+            "url": "", "has_custom_certificate": false, "pending_update_count": pending,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Mounts what moving the bot `token` calls besides `deleteWebhook`:
+/// `getWebhookInfo`, reporting `pending` updates, and `logOut` and
+/// `close`, whose descriptions echo the token.
+async fn mount_moves(server: &MockServer, token: &str, pending: u64) {
+    mount_webhook_info(server, token, pending).await;
+    for (m, done) in [("logOut", "logged out"), ("close", "closed")] {
+        Mock::given(path(format!("/bot{token}/{m}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": true, "description": format!("bot {token} {done}"),
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// The methods `server` was asked for with `token`, in order.
+async fn calls(server: &MockServer, token: &str) -> Vec<String> {
+    let prefix = format!("/bot{token}/");
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.url.path().strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+/// How often `server` was asked for `method` with `token`.
+async fn count_calls(server: &MockServer, token: &str, method: &str) -> usize {
+    calls(server, token)
+        .await
+        .iter()
+        .filter(|m| *m == method)
+        .count()
+}
+
+/// The state `/v1/status` shows for the source `name`.
+async fn source_state(tgin: &Tgin, name: &str) -> String {
+    let status = tgin.status().await;
+    status
+        .sources
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.state.clone())
+        .unwrap_or_else(|| panic!("no source {name} in {status:?}"))
+}
+
+/// The long-poll bot `polled` ([`TOKEN`], 1 s polls) at `upstream` (an
+/// `api_url: …` or `upstream: …` line), feeding `workers`.
+fn polled(upstream: &str, timeout: &str) -> String {
+    format!(
+        "  - name: polled\n    token: \"{TOKEN}\"\n    {upstream}\n    ingress: {{ long_poll: {{ timeout: {timeout}, delete_webhook_on_start: false }} }}\n    routes: [{{ to: [workers] }}]\n"
+    )
+}
+
+/// `logout`: the pending updates are fetched from the server and delivered
+/// before `logOut`, which is called exactly once, after the source stopped;
+/// the description comes back masked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_logout_drains_stops_and_calls_upstream_once() {
+    let telegram = MockServer::start().await;
+    let (pending, mut polls) = mount_pending(&telegram, TOKEN, Duration::from_secs(3600)).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let api = format!("api_url: {}", telegram.uri());
+    let tgin = start(
+        "bot_logout_drains_stops_and_calls_upstream_once",
+        &config(&format!(
+            "bots:\n{}consumers:\n  workers: {{ pull: {{}} }}\n",
+            polled(&api, "1s")
+        )),
+    )
+    .await;
+    // The source's long poll waits on the server, which then gets two
+    // updates: only polling again fetches them.
+    next(&mut polls).await;
+    pending.lock().expect("updates").extend([1, 2]);
+
+    let consume = async {
+        let started = Instant::now();
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            assert!(started.elapsed() < PATIENCE, "only {got:?} delivered");
+            let offset = got.last().map_or(0, |id| id + 1);
+            let polled = format!("/c/workers/getUpdates?offset={offset}&timeout=1");
+            got.extend(tgin.poll_ids(&polled).await);
+        }
+        // Acknowledged: tgin holds nothing of the bot any more.
+        let acked = tgin.poll_ids("/c/workers/getUpdates?offset=3&timeout=0");
+        assert_eq!(acked.await, Vec::<i64>::new());
+        got
+    };
+    let logout = tgin.admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN));
+    let (answer, delivered) = timeout(PATIENCE, async { tokio::join!(logout, consume) })
+        .await
+        .expect("the logout ends in time");
+    assert_eq!(delivered, [1, 2]);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(
+        answer.json(),
+        json!({
+            "bot": "polled",
+            "left": 0,
+            "upstream": "api_url",
+            "result": "bot [redacted] logged out",
+        })
+    );
+
+    let calls = calls(&telegram, TOKEN).await;
+    assert_eq!(
+        calls.iter().filter(|m| *m == "logOut").count(),
+        1,
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("logOut"),
+        "{calls:?}"
+    );
+    // The last poll before it confirmed both updates and found none left.
+    let at = format!("/bot{TOKEN}/getUpdates");
+    let last_poll: Value = telegram
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .rfind(|r| r.url.path() == at)
+        .map(|r| serde_json::from_slice(&r.body).expect("JSON"))
+        .expect("polled");
+    assert_eq!(
+        (&last_poll["offset"], &last_poll["timeout"]),
+        (&json!(3), &json!(0))
+    );
+    assert_eq!(source_state(&tgin, "polled").await, "stopped");
+    assert!(!LOGS.text().contains(TOKEN), "the token reached a log line");
+    tgin.stop().await;
+}
+
+/// `close` on a webhook bot: `deleteWebhook`, then `close`, each once.
+/// tgin's own queue waits out the timeout, which tgin reports as `left`;
+/// the parked bot's route then answers 503, and the update tgin holds is
+/// still delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_close_deletes_webhook_then_closes() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let tgin = start(
+        "bot_close_deletes_webhook_then_closes",
+        &hooked(&telegram, ""),
+    )
+    .await;
+    tgin.deliver("/hook", &[1]).await;
+
+    let answer = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(
+        answer.json(),
+        json!({
+            "bot": "hooked",
+            "left": 1,
+            "upstream": "api_url",
+            "result": "bot [redacted] closed",
+        })
+    );
+    let calls = calls(&telegram, TOKEN).await;
+    let moves: Vec<&str> = calls
+        .iter()
+        .map(String::as_str)
+        .filter(|m| *m != "getMe")
+        .collect();
+    let (drain, rest) = moves.split_at(moves.len().saturating_sub(2));
+    assert!(
+        !drain.is_empty() && drain.iter().all(|m| *m == "getWebhookInfo"),
+        "{calls:?}"
+    );
+    assert_eq!(rest, ["deleteWebhook", "close"], "{calls:?}");
+
+    assert_eq!(tgin.post_update("/hook", update(2, "late")).await, 503);
+    assert_eq!(source_state(&tgin, "hooked").await, "stopped");
+    assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1]);
+    tgin.stop().await;
+}
+
+/// A parked bot stays parked across reloads that leave its upstream
+/// alone, an unchanged config or one that would restart its source, each
+/// with a warning; meanwhile it never calls its server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_bot_not_restarted_by_unchanged_reload() {
+    let quick_polls = Duration::from_millis(50);
+    let telegram = MockServer::start().await;
+    let (_pending, mut polls) = mount_pending(&telegram, TOKEN, quick_polls).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    // Its polls are the test's clock.
+    let mut clock = mount_bot(&telegram, OTHER_TOKEN, me("clock_bot"), quick_polls).await;
+    let api = format!("api_url: {}", telegram.uri());
+    let yaml = |timeout: &str| {
+        config(&format!(
+            "bots:\n{}{}consumers:\n  workers: {{ pull: {{}} }}\n  clocked: {{ pull: {{}} }}\n",
+            polled(&api, timeout),
+            poll_bot(&telegram, "clock", OTHER_TOKEN, "clocked"),
+        ))
+    };
+    let tgin = start("parked_bot_not_restarted_by_unchanged_reload", &yaml("1s")).await;
+    next(&mut polls).await;
+    let answer = tgin
+        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    let parked_at = calls(&telegram, TOKEN).await.len();
+
+    let unchanged = tgin.reload().await;
+    assert_eq!(unchanged.status, 200, "{}", unchanged.body);
+    tgin.rewrite(&yaml("2s"));
+    let restarting = tgin.reload().await;
+    assert_eq!(restarting.status, 200, "{}", restarting.body);
+    assert_eq!(restarting.json()["sources_restarted"], json!(["polled"]));
+
+    while clock.try_recv().is_ok() {}
+    for _ in 0..3 {
+        next(&mut clock).await;
+    }
+    assert_eq!(
+        calls(&telegram, TOKEN).await.len(),
+        parked_at,
+        "the parked bot called its server: {:?}",
+        calls(&telegram, TOKEN).await
+    );
+    assert_eq!(source_state(&tgin, "polled").await, "stopped");
+    let logs = LOGS.text();
+    let warnings = logs
+        .lines()
+        .filter(|l| l.contains(" WARN ") && l.contains("bot=polled") && l.contains("stays parked"))
+        .count();
+    assert_eq!(warnings, 2, "{logs}");
+    tgin.stop().await;
+}
+
+/// A reload that moves a parked bot to another upstream starts it there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_upstream_unparks() {
+    let quick_polls = Duration::from_millis(50);
+    let telegram = MockServer::start().await;
+    let (_pending, mut polls) = mount_pending(&telegram, TOKEN, quick_polls).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let local = MockServer::start().await;
+    let mut local_polls = mount_bot(&local, TOKEN, me("polled_bot"), quick_polls).await;
+    let consumers = "consumers:\n  workers: { pull: {} }\n";
+    let api = format!("api_url: {}", telegram.uri());
+    let tgin = start(
+        "changed_upstream_unparks",
+        &config(&format!("bots:\n{}{consumers}", polled(&api, "1s"))),
+    )
+    .await;
+    next(&mut polls).await;
+    let answer = tgin
+        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+
+    tgin.rewrite(&config(&format!(
+        "{}bots:\n{}{consumers}",
+        local_upstream(&local, false),
+        polled("upstream: tba", "1s")
+    )));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    assert_eq!(reload.json()["upstream_changed"], json!(["polled"]));
+    next(&mut local_polls).await;
+    tgin.wait_status("polled running", |s| {
+        task_state(s, "source:polled").as_deref() == Some("running")
+    })
+    .await;
+    assert_eq!(count_calls(&local, TOKEN, "getMe").await, 1);
+    // No longer parked: it moves again, now off the new server.
+    mount_moves(&local, TOKEN, 0).await;
+    let again = tgin
+        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(again.status, 200, "{}", again.body);
+    assert_eq!(again.json()["upstream"], "tba");
+    assert_eq!(count_calls(&local, TOKEN, "logOut").await, 1);
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 1);
+    tgin.stop().await;
+}
+
+/// `tgin admin bot logout|close` does nothing without `--yes`: it says what
+/// would happen and exits 64. With `--yes` it moves the bot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_requires_yes() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let tgin = start("cli_requires_yes", &hooked(&telegram, "")).await;
+    let token_file = scratch("cli_requires_yes").join("admin-token");
+    std::fs::write(&token_file, format!("{ADMIN_TOKEN}\n")).unwrap();
+    let url = format!("http://{}", tgin.admin);
+    let admin = |args: &[&str]| {
+        let mut command = binary(&["admin", "--url", &url]);
+        command
+            .args(["--token-file", token_file.to_str().unwrap()])
+            .args(args);
+        command
+    };
+
+    let dry = output(admin(&["bot", "logout", "hooked"])).await;
+    assert_eq!(dry.code, Some(64), "{}", dry.stderr);
+    assert!(
+        dry.stderr.contains("hooked")
+            && dry.stderr.contains("logOut")
+            && dry.stderr.contains("--yes"),
+        "{}",
+        dry.stderr
+    );
+    let dry_close = output(admin(&["bot", "close", "hooked", "--timeout", "5s"])).await;
+    assert_eq!(dry_close.code, Some(64), "{}", dry_close.stderr);
+    assert!(
+        dry_close.stderr.contains("deleteWebhook") && dry_close.stderr.contains("5s"),
+        "{}",
+        dry_close.stderr
+    );
+    let bad = output(admin(&[
+        "bot",
+        "logout",
+        "hooked",
+        "--yes",
+        "--timeout",
+        "5M",
+    ]))
+    .await;
+    assert_eq!(bad.code, Some(64), "{}", bad.stderr);
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 0);
+    assert_eq!(source_state(&tgin, "hooked").await, "running");
+
+    let done = output(admin(&[
+        "bot",
+        "logout",
+        "hooked",
+        "--yes",
+        "--timeout",
+        "5s",
+    ]))
+    .await;
+    assert_eq!(done.code, Some(0), "{}", done.stderr);
+    assert!(
+        done.stdout.contains("hooked") && done.stdout.contains("logged out"),
+        "{}",
+        done.stdout
+    );
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 1);
+    let again = output(admin(&["--json", "bot", "logout", "hooked", "--yes"])).await;
+    assert_eq!(again.code, Some(1), "{}", again.stderr);
+    assert!(
+        again.stderr.contains("409 Conflict: parked"),
+        "{}",
+        again.stderr
+    );
+    for out in [&dry, &dry_close, &bad, &done, &again] {
+        assert!(!out.stdout.contains(TOKEN) && !out.stderr.contains(TOKEN));
+        assert!(!out.stdout.contains(ADMIN_TOKEN) && !out.stderr.contains(ADMIN_TOKEN));
+    }
+    tgin.stop().await;
+}
+
+/// Moves need the admin token, name a configured bot and a valid timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_bot_404() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let tgin = start("unknown_bot_404", &hooked(&telegram, "")).await;
+    assert_eq!(
+        tgin.admin_post("/v1/bots/hooked/logout", None).await.status,
+        401
+    );
+    for op in ["logout", "close"] {
+        let answer = tgin
+            .admin_post(&format!("/v1/bots/nobody/{op}"), Some(ADMIN_TOKEN))
+            .await;
+        assert_eq!(answer.status, 404, "{}", answer.body);
+        assert_eq!(answer.json(), json!({ "error": "unknown bot" }));
+    }
+    for bad in ["5", "5M", "soon"] {
+        let answer = tgin
+            .admin_post(
+                &format!("/v1/bots/hooked/logout?timeout={bad}"),
+                Some(ADMIN_TOKEN),
+            )
+            .await;
+        assert_eq!(answer.status, 400, "{bad}: {}", answer.body);
+        assert_eq!(answer.json(), json!({ "error": "invalid timeout" }));
+    }
+    for method in ["getWebhookInfo", "logOut", "close"] {
+        assert_eq!(count_calls(&telegram, TOKEN, method).await, 0, "{method}");
+    }
+    assert_eq!(source_state(&tgin, "hooked").await, "running");
+    tgin.stop().await;
+}
+
+/// No move during the shutdown: the bot is never logged out then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_during_shutdown_409() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let tgin = start(
+        "logout_during_shutdown_409",
+        &hooked(&telegram, "").replace(QUICK, "runtime: { lame_duck: 30s, shutdown_grace: 30s }"),
+    )
+    .await;
+    tgin.signal(SignalKind::Terminate).await;
+    tgin.wait_until_not_ready().await;
+    for op in ["logout", "close"] {
+        let answer = tgin
+            .admin_post(&format!("/v1/bots/hooked/{op}"), Some(ADMIN_TOKEN))
+            .await;
+        assert_eq!(answer.status, 409, "{}", answer.body);
+        assert_eq!(answer.json(), json!({ "error": "draining" }));
+    }
+    for method in ["getWebhookInfo", "deleteWebhook", "logOut", "close"] {
+        assert_eq!(count_calls(&telegram, TOKEN, method).await, 0, "{method}");
+    }
+    tgin.signal(SignalKind::Interrupt).await;
+    let outcome = timeout(PATIENCE, tgin.run).await.unwrap().unwrap();
+    assert_eq!(outcome, Outcome::Forced);
+}
+
+/// While the server still holds updates at the deadline, the move fails
+/// with 504 and changes nothing: the bot's ingest never stopped and its
+/// server was not asked to log it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_504_when_upstream_not_drained() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 3).await;
+    let tgin = start(
+        "logout_504_when_upstream_not_drained",
+        &hooked(&telegram, ""),
+    )
+    .await;
+    let answer = tgin
+        .admin_post("/v1/bots/hooked/logout?timeout=300ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(answer.json(), json!({ "error": "upstream not drained" }));
+    assert!(count_calls(&telegram, TOKEN, "getWebhookInfo").await >= 1);
+    assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, 0);
+    assert_eq!(source_state(&tgin, "hooked").await, "running");
+    tgin.deliver("/hook", &[1]).await;
+    assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1]);
+    tgin.stop().await;
+}
+
+/// A parked bot is not moved again: 409 `parked`, nothing called.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_of_parked_bot_409() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let tgin = start("logout_of_parked_bot_409", &hooked(&telegram, "")).await;
+    let first = tgin
+        .admin_post("/v1/bots/hooked/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let before = calls(&telegram, TOKEN).await;
+    for op in ["logout", "close"] {
+        let answer = tgin
+            .admin_post(&format!("/v1/bots/hooked/{op}"), Some(ADMIN_TOKEN))
+            .await;
+        assert_eq!(answer.status, 409, "{}", answer.body);
+        assert_eq!(answer.json(), json!({ "error": "parked" }));
+    }
+    assert_eq!(calls(&telegram, TOKEN).await, before);
+    tgin.stop().await;
+}
+
+/// The server refusing the call answers 502 with its description, masked;
+/// the bot then runs on, so the move can be tried again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_logout_upstream_error_502() {
+    let telegram = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/logOut")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false, "error_code": 400, "description": format!("Bad Request: not now, {TOKEN}"),
+        })))
+        .mount(&telegram)
+        .await;
+    mount_bot(&telegram, TOKEN, me("tgin_bot"), Duration::from_secs(3600)).await;
+    mount_webhook_info(&telegram, TOKEN, 0).await;
+    let tgin = start("bot_logout_upstream_error_502", &hooked(&telegram, "")).await;
+    for attempt in 1..=2 {
+        let answer = tgin
+            .admin_post("/v1/bots/hooked/logout?timeout=500ms", Some(ADMIN_TOKEN))
+            .await;
+        assert_eq!(answer.status, 502, "{}", answer.body);
+        assert_eq!(
+            answer.json(),
+            json!({ "error": "Bad Request: not now, [redacted]" })
+        );
+        assert_eq!(count_calls(&telegram, TOKEN, "logOut").await, attempt);
+        assert_eq!(source_state(&tgin, "hooked").await, "running");
+        tgin.deliver("/hook", &[attempt.try_into().unwrap()]).await;
+    }
+    assert_eq!(tgin.poll_ids("/c/workers/getUpdates").await, vec![1, 2]);
+    assert!(!LOGS.text().contains(TOKEN), "the token reached a log line");
+    tgin.stop().await;
+}
+
+/// Parking the only long poll that has not failed does not count as every
+/// source failing: tgin keeps running, so a reload can start the bot on
+/// its new upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_bot_keeps_tgin_running() {
+    let telegram = MockServer::start().await;
+    let rejected = ResponseTemplate::new(401).set_body_json(json!({
+        "ok": false, "error_code": 401, "description": "Unauthorized"
+    }));
+    mount_bot(&telegram, OTHER_TOKEN, rejected, Duration::from_secs(3600)).await;
+    let (_pending, mut polls) = mount_pending(&telegram, TOKEN, Duration::from_millis(50)).await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let api = format!("api_url: {}", telegram.uri());
+    let tgin = start(
+        "parked_bot_keeps_tgin_running",
+        &config(&format!(
+            "bots:\n{}{}consumers:\n  workers: {{ pull: {{}} }}\n  dead: {{ pull: {{}} }}\n",
+            polled(&api, "1s"),
+            poll_bot(&telegram, "dead", OTHER_TOKEN, "dead"),
+        )),
+    )
+    .await;
+    tgin.wait_status("source:dead failed", |s| {
+        task_state(s, "source:dead").as_deref() == Some("failed")
+    })
+    .await;
+    next(&mut polls).await;
+    let answer = tgin
+        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    // Past two of the app's once-a-second checks for every source failing.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!tgin.run.is_finished(), "tgin shut down");
+    assert_eq!(tgin.status().await.phase, "running");
+    tgin.stop().await;
 }

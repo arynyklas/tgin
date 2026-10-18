@@ -354,7 +354,12 @@ impl App {
         let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
                 let routes = Arc::new(DataRoutes::new(
-                    &cfg, server, &engine, &ingest, gateway, via,
+                    &cfg,
+                    server,
+                    &engine,
+                    &|bot| sources.ingest_of(bot),
+                    gateway,
+                    via,
                 ));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
@@ -459,8 +464,10 @@ impl App {
         let (Some(routes), Some(server)) = (&self.routes, &cfg.server) else {
             return false;
         };
-        let ingest = self.handles.lifecycle.ingest_token();
-        routes.rebuild(cfg, server, &self.shared.engine, &ingest);
+        let sources = &self.shared.sources;
+        routes.rebuild(cfg, server, &self.shared.engine, &|bot| {
+            sources.ingest_of(bot)
+        });
         true
     }
 

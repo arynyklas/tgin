@@ -247,6 +247,40 @@ impl BotClient {
         self.scrubbed(parse_result::<IgnoredAny>(&body).map(drop))
     }
 
+    /// `getWebhookInfo`'s `pending_update_count`: the updates the server
+    /// still holds for the bot.
+    pub async fn pending_update_count(&self) -> Result<u64, ApiError> {
+        #[derive(Deserialize)]
+        struct Info {
+            #[serde(default)]
+            pending_update_count: u64,
+        }
+        let body = self
+            .send(self.http.get(self.url("getWebhookInfo")?))
+            .await?;
+        self.scrubbed(parse_result::<Info>(&body).map(|info| info.pending_update_count))
+    }
+
+    /// `logOut`: the server's `description`, if it sent one, with the token
+    /// masked.
+    pub async fn log_out(&self) -> Result<Option<String>, ApiError> {
+        self.described("logOut").await
+    }
+
+    /// `close`: the server's `description`, if it sent one, with the token
+    /// masked.
+    pub async fn close(&self) -> Result<Option<String>, ApiError> {
+        self.described("close").await
+    }
+
+    /// Calls the parameterless `method` and returns the `description` of
+    /// its successful answer.
+    async fn described(&self, method: &str) -> Result<Option<String>, ApiError> {
+        let body = self.send(self.http.post(self.url(method)?)).await?;
+        let description = self.scrubbed(parse_description(&body))?;
+        Ok(description.map(|d| self.clean(d)))
+    }
+
     fn url(&self, method: &str) -> Result<Url, ApiError> {
         self.base
             .join(method)
@@ -294,27 +328,29 @@ impl BotClient {
 
     /// `err` with every copy of the token masked, in case a server echoes it.
     fn scrub(&self, err: ApiError) -> ApiError {
-        let token = self.token.expose().as_str();
-        let clean = |s: String| {
-            if s.contains(token) {
-                s.replace(token, "[redacted]")
-            } else {
-                s
-            }
-        };
         match err {
-            ApiError::Network(s) => ApiError::Network(clean(s)),
+            ApiError::Network(s) => ApiError::Network(self.clean(s)),
             ApiError::Http {
                 status,
                 description,
                 retry_after,
             } => ApiError::Http {
                 status,
-                description: clean(description),
+                description: self.clean(description),
                 retry_after,
             },
-            ApiError::Decode(s) => ApiError::Decode(clean(s)),
+            ApiError::Decode(s) => ApiError::Decode(self.clean(s)),
             config @ ApiError::Config(_) => config,
+        }
+    }
+
+    /// `s` with every copy of the token masked.
+    fn clean(&self, s: String) -> String {
+        let token = self.token.expose().as_str();
+        if s.contains(token) {
+            s.replace(token, "[redacted]")
+        } else {
+            s
         }
     }
 }
@@ -430,6 +466,16 @@ fn parse_result<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, ApiError> {
     envelope
         .result
         .ok_or_else(|| ApiError::Decode("the response has no result".into()))
+}
+
+/// The `description` of a successful response body.
+fn parse_description(body: &[u8]) -> Result<Option<String>, ApiError> {
+    let envelope: Envelope<IgnoredAny> =
+        serde_json::from_slice(body).map_err(|e| decode_error(&e))?;
+    if !envelope.ok {
+        return Err(envelope.into_error(StatusCode::OK.as_u16(), None));
+    }
+    Ok(envelope.description)
 }
 
 /// The error a non-2xx response describes. A body that is not a Bot API
@@ -934,6 +980,54 @@ mod tests {
             }
         }
         assert!(!format!("{bot:?}").contains("AAAA"));
+    }
+
+    /// `logOut` and `close` return the server's description, with the
+    /// token masked as in errors; `getWebhookInfo` its pending count.
+    #[tokio::test]
+    async fn move_calls_return_masked_descriptions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(at("logOut")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"ok":true,"result":true,"description":"bot{TOKEN} is out"}}"#
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(at("close")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"ok":true,"result":true}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(at("getWebhookInfo")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"ok":true,"result":{"url":"","has_custom_certificate":false,"pending_update_count":7}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let bot = client_for(&server.uri());
+        assert_eq!(
+            bot.log_out().await,
+            Ok(Some("bot[redacted] is out".to_owned()))
+        );
+        assert_eq!(bot.close().await, Ok(None));
+        assert_eq!(bot.pending_update_count().await, Ok(7));
+
+        let refused = MockServer::start().await;
+        Mock::given(path(at("logOut")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"ok":false,"error_code":400,"description":"Bad Request: bot{TOKEN} is busy"}}"#
+            )))
+            .mount(&refused)
+            .await;
+        assert!(matches!(
+            client_for(&refused.uri()).log_out().await,
+            Err(ApiError::Http { status: 400, description, .. })
+                if description == "Bad Request: bot[redacted] is busy"
+        ));
     }
 
     #[test]

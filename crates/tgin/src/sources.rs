@@ -2,7 +2,9 @@
 //! for each webhook bot its identity and its registration with the Bot API
 //! server (retried in the background until it succeeds). Sources start
 //! with the app and as reloads add them, and each one stops on its own
-//! token, a child of the process ingest token.
+//! token, a child of the process ingest token, which its webhook route
+//! answers by too. A bot moved off its server is parked: its source no
+//! longer runs, and only a reload that changes its upstream starts it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,6 +42,9 @@ const IDENTITY_BACKOFF: (Duration, Duration, Duration) = (
 /// How long a removed source's task may take to end before its entry is
 /// left to the shutdown.
 const REAP_WAIT: Duration = Duration::from_secs(60);
+/// How often a webhook bot being moved asks its server whether it still
+/// holds updates.
+const DRAIN_CHECK: Duration = Duration::from_millis(250);
 
 /// The supervisor's name of a bot's source, also its readiness component.
 pub(crate) fn source_task(bot: &str) -> String {
@@ -81,13 +86,17 @@ struct Registry {
     /// Bots between their stop (a restart) or their preparation and the end
     /// of their start: neither running nor failed.
     starting: BTreeSet<String>,
+    /// Each bot's stop token, from its preparation on: stops its source,
+    /// its background tasks and its webhook route; a child of ingest.
+    /// Cancelled while the bot is parked.
+    stops: BTreeMap<String, CancellationToken>,
+    /// Bots moved off their Bot API server.
+    parked: BTreeSet<String>,
 }
 
 /// A source that runs.
 struct Started {
     kind: Kind,
-    /// Stops this source and its background `getMe`; a child of ingest.
-    stop: CancellationToken,
     /// `None` for a source that could not be prepared.
     metrics: Option<SourceMetrics>,
     /// A long poll, for the reason it backs off.
@@ -173,8 +182,12 @@ impl Sources {
             Readiness::NotReady("starting".to_owned()),
         );
         let prepared = self.prepared(bot);
-        if let Err(err) = &prepared {
-            self.fail(bot, err);
+        match &prepared {
+            Ok(prepared) => {
+                let stop = prepared.stop.clone();
+                self.registry.lock().stops.insert(bot.name.clone(), stop);
+            }
+            Err(err) => self.fail(bot, err),
         }
         prepared
     }
@@ -214,11 +227,13 @@ impl Sources {
             bot.name.clone(),
             Started {
                 kind,
-                stop: self.ingest.child_token(),
                 metrics,
                 long_poll: None,
             },
         );
+        registry
+            .stops
+            .insert(bot.name.clone(), self.ingest.child_token());
         registry.starting.remove(&bot.name);
         drop(registry);
         self.health.set(&task, Readiness::Ready);
@@ -238,11 +253,10 @@ impl Sources {
                 .ok_or_else(|| StartError::NoSource(bot.name.clone()))?;
             info.metrics.clone()
         };
-        let client = BotClient::new(self.client.clone(), bot.upstream.url.expose(), &bot.token)
-            .map_err(|source| StartError::Bot {
-                bot: bot.name.clone(),
-                source,
-            })?;
+        let client = self.client(bot).map_err(|source| StartError::Bot {
+            bot: bot.name.clone(),
+            source,
+        })?;
         Ok(Prepared {
             id,
             name: Arc::from(bot.name.as_str()),
@@ -306,7 +320,6 @@ impl Sources {
                 bot.name.to_string(),
                 Started {
                     kind: Kind::Webhook,
-                    stop: bot.stop.clone(),
                     metrics: Some(bot.metrics.clone()),
                     long_poll: None,
                 },
@@ -420,7 +433,6 @@ impl Sources {
             name.to_string(),
             Started {
                 kind: Kind::LongPoll,
-                stop: stop.clone(),
                 metrics: Some(metrics.clone()),
                 long_poll: Some(Arc::clone(&source)),
             },
@@ -451,23 +463,119 @@ impl Sources {
     /// Stops the source of the bot `name`, if it runs. A bot that is not
     /// `removed` restarts: it counts as starting until it has started
     /// again. A `removed` bot is forgotten too: its readiness component
-    /// goes. The tasks of the stopped source leave the supervisor's list
-    /// once they have ended, unless the bot polls again by then.
+    /// goes, and so does its parking. The tasks of the stopped source leave
+    /// the supervisor's list once they have ended, unless the bot polls
+    /// again by then.
     pub(crate) fn stop(&self, name: &str, removed: bool) {
-        let started = {
+        let (started, stop) = {
             let mut registry = self.registry.lock();
-            if !removed {
+            let stop = if removed {
+                registry.parked.remove(name);
+                registry.stops.remove(name)
+            } else {
                 registry.starting.insert(name.to_owned());
-            }
-            registry.started.remove(name)
+                registry.stops.get(name).cloned()
+            };
+            (registry.started.remove(name), stop)
         };
         if removed {
             self.health.remove(&source_task(name));
         }
-        let Some(started) = started else {
-            return;
+        if let Some(stop) = stop {
+            stop.cancel();
+        }
+        if let Some(started) = started {
+            self.ended(name, &started);
+        }
+    }
+
+    /// Stops the ingest of the bot `name` and parks it: its source, its
+    /// background tasks and its webhook route stop as for a restart, but it
+    /// is not on its way up, and reloads leave it alone until
+    /// [`Sources::unpark`].
+    pub(crate) fn park(&self, name: &str) {
+        let (started, stop) = {
+            let mut registry = self.registry.lock();
+            registry.parked.insert(name.to_owned());
+            (
+                registry.started.remove(name),
+                registry.stops.get(name).cloned(),
+            )
         };
-        started.stop.cancel();
+        if let Some(stop) = stop {
+            stop.cancel();
+        }
+        if let Some(started) = started {
+            self.ended(name, &started);
+        }
+        tracing::info!(bot = %name, "the bot's ingest stopped; the bot is parked");
+    }
+
+    /// Ends the parking of the bot `name`, which the caller starts again;
+    /// `false` if it was not parked.
+    pub(crate) fn unpark(&self, name: &str) -> bool {
+        self.registry.lock().parked.remove(name)
+    }
+
+    /// Whether the bot `name` is parked.
+    pub(crate) fn is_parked(&self, name: &str) -> bool {
+        self.registry.lock().parked.contains(name)
+    }
+
+    /// The parked bots, sorted.
+    pub(crate) fn parked(&self) -> Vec<String> {
+        self.registry.lock().parked.iter().cloned().collect()
+    }
+
+    /// What the webhook route of the bot `name` answers by: its stop token
+    /// (cancelled while it is parked, so the route answers 503), or the
+    /// process's ingest token for a bot without one.
+    pub(crate) fn ingest_of(&self, name: &str) -> CancellationToken {
+        let stop = self.registry.lock().stops.get(name).cloned();
+        stop.unwrap_or_else(|| self.ingest.clone())
+    }
+
+    /// A Bot API client for `bot` on its upstream, over the control client.
+    pub(crate) fn client(&self, bot: &Bot) -> Result<BotClient, ApiError> {
+        BotClient::new(self.client.clone(), bot.upstream.url.expose(), &bot.token)
+    }
+
+    /// Returns once `bot`'s Bot API server holds no update for it, its
+    /// ingest running on meanwhile: a long poll polls until a batch comes
+    /// back empty, and then polls no more until it stops (see
+    /// [`LongPollSource::drain`]); for a webhook bot, `client` asks
+    /// `getWebhookInfo` every [`DRAIN_CHECK`] until `pending_update_count`
+    /// is 0. Never returns for a long poll that does not run. A bot without
+    /// ingress has nothing to drain.
+    pub(crate) async fn drain_upstream(&self, bot: &Bot, client: &BotClient) {
+        match &bot.ingress {
+            Some(Ingress::LongPoll(_)) => {
+                let source = (self.registry.lock().started.get(&bot.name))
+                    .and_then(|started| started.long_poll.clone());
+                match source {
+                    Some(source) => source.drain().await,
+                    None => std::future::pending().await,
+                }
+            }
+            Some(Ingress::Webhook(_)) => loop {
+                match client.pending_update_count().await {
+                    Ok(0) => return,
+                    Ok(pending) => {
+                        tracing::debug!(source = %bot.name, pending, "the Bot API server still holds updates");
+                    }
+                    Err(err) => {
+                        tracing::debug!(source = %bot.name, error = %err, "getWebhookInfo failed");
+                    }
+                }
+                tokio::time::sleep(DRAIN_CHECK).await;
+            },
+            None => {}
+        }
+    }
+
+    /// After the source of the bot `name` stopped: reports a webhook source
+    /// stopped and forgets its tasks once they have ended.
+    fn ended(&self, name: &str, started: &Started) {
         if started.kind == Kind::Webhook
             && let Some(metrics) = &started.metrics
         {
@@ -552,12 +660,14 @@ impl Sources {
 
     /// Whether every source has failed for good. Only long-poll sources
     /// fail, so this holds only when every source is one, at least one
-    /// runs, no webhook could still deliver updates and no source is on its
-    /// way up (a reload restarting or adding one).
+    /// runs, no webhook could still deliver updates, no source is on its
+    /// way up (a reload restarting or adding one) and no bot is parked (a
+    /// reload is to start it on its new upstream).
     pub(crate) fn all_failed(&self) -> bool {
         // Held while the states are read, so a restart cannot slip between.
         let registry = self.registry.lock();
         if !registry.starting.is_empty()
+            || !registry.parked.is_empty()
             || registry.started.is_empty()
             || registry.started.values().any(|s| s.kind == Kind::Webhook)
         {

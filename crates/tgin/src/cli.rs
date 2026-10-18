@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use clap::{Args, Parser, Subcommand};
+use tgin_core::config::model::HumanDuration;
 use tgin_core::config::{self, Config, LogLevel};
 use tgin_runtime::config::{ConfigError, OsEnv};
 use tgin_runtime::lifecycle::Signals;
@@ -18,6 +19,7 @@ use tgin_runtime::obs::{LogFormat, LogOptions, init_tracing};
 use tgin_runtime::secret::Redactor;
 use url::Url;
 
+use crate::admin::BotMove;
 use crate::admin::client::{self, Action};
 use crate::app::{self, Boot};
 use crate::exit;
@@ -113,6 +115,33 @@ enum AdminCommand {
     Purge { name: String },
     /// Exit 0 when tgin is ready, else 1 (for container health checks).
     Health,
+    /// Move a bot off its Bot API server, to run it on another.
+    #[command(subcommand)]
+    Bot(BotCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum BotCommand {
+    /// Drain the bot's updates, stop it and log it out of its Bot API server
+    /// (`logOut`); it stays parked until a reload changes its upstream.
+    Logout(MoveArgs),
+    /// As `logout`, calling `deleteWebhook` then `close` instead (to leave
+    /// a self-hosted server).
+    Close(MoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct MoveArgs {
+    /// The bot, by its name in the config.
+    name: String,
+    /// Do it; without it, only print what would happen.
+    #[arg(long)]
+    yes: bool,
+    /// How long the Bot API server and tgin get to deliver the bot's
+    /// pending updates, such as `30s` [default: the config's
+    /// `reload.drain_timeout`].
+    #[arg(long, value_parser = client::parse_timeout, value_name = "DURATION")]
+    timeout: Option<HumanDuration>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -167,6 +196,18 @@ where
                 AdminCommand::Drain { name } => Action::Drain(name),
                 AdminCommand::Purge { name } => Action::Purge(name),
                 AdminCommand::Health => Action::Health,
+                AdminCommand::Bot(bot) => {
+                    let (how, args) = match bot {
+                        BotCommand::Logout(args) => (BotMove::LogOut, args),
+                        BotCommand::Close(args) => (BotMove::Close, args),
+                    };
+                    Action::Bot {
+                        name: args.name,
+                        how,
+                        timeout: args.timeout,
+                        yes: args.yes,
+                    }
+                }
             },
         }),
     })

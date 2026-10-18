@@ -3,12 +3,15 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use tgin_botapi::ApiError;
+use tgin_core::config::model::HumanDuration;
 use tgin_core::config::{self, Ingress};
 use tgin_core::engine::{BreakerStatus, Mode};
 use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
@@ -19,10 +22,10 @@ use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
 use tgin_runtime::supervisor::TaskState;
 
-use super::{ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
+use super::{BotMove, ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
 use crate::app::Shared;
 use crate::cli::VERSION;
-use crate::reload::ReloadError;
+use crate::reload::{MoveError, ReloadError};
 use crate::sources::{Kind, source_task};
 
 /// The admin plane's routes over `shared`.
@@ -35,6 +38,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/consumers/{name}/resume", post(resume))
         .route("/v1/consumers/{name}/drain", post(drain))
         .route("/v1/consumers/{name}/purge", post(purge))
+        .route("/v1/bots/{name}/logout", post(log_out))
+        .route("/v1/bots/{name}/close", post(close))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             require_token,
@@ -184,6 +189,8 @@ fn status_of(shared: &Shared) -> Status {
                             ("backoff", error.map(|e| redactor.redact(&e).into_owned()))
                         }
                         Some(state) => state,
+                        // A parked bot's long poll has ended and gone.
+                        None if shared.sources.is_parked(&bot.name) => ("stopped", None),
                         None => ("starting", None),
                     };
                     (state, Some("long_poll"))
@@ -348,5 +355,59 @@ async fn purge(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> R
     match shared.engine.purge(&name) {
         Some(purged) => axum::Json(json!({ "purged": purged })).into_response(),
         None => unknown_consumer(),
+    }
+}
+
+async fn log_out(
+    State(shared): State<Arc<Shared>>,
+    Path(name): Path<String>,
+    uri: Uri,
+) -> Response {
+    move_bot(&shared, name, BotMove::LogOut, &uri).await
+}
+
+async fn close(State(shared): State<Arc<Shared>>, Path(name): Path<String>, uri: Uri) -> Response {
+    move_bot(&shared, name, BotMove::Close, &uri).await
+}
+
+/// The query of `POST /v1/bots/{name}/logout|close`.
+#[derive(Deserialize)]
+struct MoveQuery {
+    /// A duration such as `30s`; no month or year units.
+    timeout: Option<String>,
+}
+
+/// Moves the bot `name` off its Bot API server (`how`), serialized with
+/// the reloads. The server's text, in the answer or an error, may echo
+/// the token: it passes through the current redactor.
+async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Response {
+    if shared.lifecycle.phase() >= Phase::Draining {
+        return error(StatusCode::CONFLICT, "draining");
+    }
+    let timeout = match Query::<MoveQuery>::try_from_uri(uri).map(|q| q.0.timeout) {
+        Ok(None) => None,
+        Ok(Some(text)) => match text.parse::<HumanDuration>() {
+            Ok(timeout) if timeout.calendar_unit().is_none() => Some(timeout.get()),
+            _ => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
+        },
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
+    };
+    let redactor = || shared.redactor.load();
+    match shared.reloads.move_bot(name, how, timeout).await {
+        Ok(mut moved) => {
+            moved.result = moved.result.map(|r| redactor().redact(&r).into_owned());
+            axum::Json(moved).into_response()
+        }
+        Err(MoveError::Draining) => error(StatusCode::CONFLICT, "draining"),
+        Err(MoveError::UnknownBot) => error(StatusCode::NOT_FOUND, "unknown bot"),
+        Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
+        Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
+        Err(MoveError::Upstream(err)) => {
+            let text = match err {
+                ApiError::Http { description, .. } => description,
+                other => other.to_string(),
+            };
+            error(StatusCode::BAD_GATEWAY, &redactor().redact(&text))
+        }
     }
 }

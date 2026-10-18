@@ -59,13 +59,13 @@ pub(crate) struct DataRoutes {
 
 impl DataRoutes {
     /// The routes of `cfg`, served by `engine`, with `gateway` serving
-    /// every path they do not. Webhook routes answer 503 once `ingest` is
-    /// cancelled.
+    /// every path they do not. A bot's webhook route answers 503 once
+    /// `ingest(bot)`, its ingest token, is cancelled.
     pub(crate) fn new(
         cfg: &Config,
         server: &Server,
         engine: &Arc<Engine>,
-        ingest: &CancellationToken,
+        ingest: &dyn Fn(&str) -> CancellationToken,
         gateway: Arc<Gateway>,
         via: Via,
     ) -> Self {
@@ -106,7 +106,7 @@ impl DataRoutes {
         cfg: &Config,
         server: &Server,
         engine: &Arc<Engine>,
-        ingest: &CancellationToken,
+        ingest: &dyn Fn(&str) -> CancellationToken,
     ) {
         let mut current = self.served.lock();
         let served = served(cfg, &current, engine);
@@ -165,13 +165,14 @@ fn served(cfg: &Config, previous: &Served, engine: &Engine) -> Served {
 }
 
 /// The routes of `cfg` and of the pull consumers `served` lists, with
-/// `gateway` as the fallback. Only webhook routes have a request timeout:
-/// gateway transfers last as long as their bytes keep flowing.
+/// `gateway` as the fallback; each webhook route answers by its bot's
+/// `ingest` token. Only webhook routes have a request timeout: gateway
+/// transfers last as long as their bytes keep flowing.
 fn router(
     cfg: &Config,
     server: &Server,
     engine: &Arc<Engine>,
-    ingest: &CancellationToken,
+    ingest: &dyn Fn(&str) -> CancellationToken,
     served: Served,
     gateway: &Arc<Gateway>,
 ) -> Router {
@@ -208,7 +209,7 @@ fn router(
             Arc::from(bot.name.as_str()),
             opts,
             Arc::clone(engine),
-            ingest.clone(),
+            ingest(&bot.name),
             metrics,
         );
         router = router.merge(with_timeout(webhook, WEBHOOK_REQUEST_TIMEOUT));

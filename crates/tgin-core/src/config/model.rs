@@ -12,6 +12,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -863,6 +864,19 @@ impl From<Duration> for HumanDuration {
     }
 }
 
+/// Parses the text as a config file's quoted duration: month and year units
+/// are accepted, so check [`HumanDuration::calendar_unit`].
+impl FromStr for HumanDuration {
+    type Err = humantime::DurationError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        humantime::parse_duration(text).map(|value| Self {
+            value,
+            text: text.to_owned(),
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for HumanDuration {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct DurationVisitor;
@@ -875,13 +889,8 @@ impl<'de> Deserialize<'de> for HumanDuration {
             }
 
             fn visit_str<E: de::Error>(self, text: &str) -> Result<HumanDuration, E> {
-                match humantime::parse_duration(text) {
-                    Ok(value) => Ok(HumanDuration {
-                        value,
-                        text: text.to_owned(),
-                    }),
-                    Err(err) => Err(E::custom(format_args!("invalid duration `{text}`: {err}"))),
-                }
+                text.parse()
+                    .map_err(|err| E::custom(format_args!("invalid duration `{text}`: {err}")))
             }
 
             /// An unquoted `0`; any other number needs a unit.

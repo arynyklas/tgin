@@ -12,6 +12,7 @@
 //! | `POST /v1/consumers/{name}/pause`, `/drain` | token | 204 |
 //! | `POST /v1/consumers/{name}/resume` | token | 204: unpaused, and an admin drain ended |
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
+//! | `POST /v1/bots/{name}/logout`, `/close` | token | 200 [`Moved`] |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
 //! `admin.token` (loopback listeners only) the API needs none. After a
@@ -20,12 +21,65 @@
 //! answer `{"error":"…"}`: 401 `unauthorized`, 404 `unknown consumer`, 503
 //! `draining` for a reload during the shutdown, 409 `draining` for a resume
 //! during it.
+//!
+//! `POST /v1/bots/{name}/logout|close[?timeout=<duration>]` moves a bot off
+//! its Bot API server, serialized with the reloads. Within the timeout
+//! (`30s`, `2m`…; `reload.drain_timeout` without one) the server runs dry
+//! of the bot's updates, the bot's ingest stops, and tgin delivers what it
+//! holds of the bot; then the server is called (`logOut`, or
+//! `deleteWebhook` and `close`) and the bot is parked: reloads do not start
+//! it again until one changes its upstream. Failures: 400 `invalid
+//! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
+//! `parked`, 504 `upstream not drained` when the server still held updates
+//! at the deadline (the bot runs on unchanged), 502 with the server's
+//! description when it refused the call (the bot runs on).
 
 mod api;
 pub mod client;
 
 pub(crate) use api::{loop_detected, router};
 use serde::{Deserialize, Serialize};
+
+/// How `POST /v1/bots/{name}/…` moves a bot off its Bot API server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotMove {
+    /// `logout`: the server's `logOut`.
+    LogOut,
+    /// `close`: the server's `deleteWebhook`, then `close`.
+    Close,
+}
+
+impl BotMove {
+    /// The endpoint's last path segment.
+    pub fn segment(self) -> &'static str {
+        match self {
+            Self::LogOut => "logout",
+            Self::Close => "close",
+        }
+    }
+
+    /// The Bot API method that logs the bot out.
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::LogOut => "logOut",
+            Self::Close => "close",
+        }
+    }
+}
+
+/// `POST /v1/bots/{name}/logout|close`: a bot moved off its server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    pub bot: String,
+    /// The bot's updates tgin still held (queued or leased) when the
+    /// server was called.
+    pub left: usize,
+    /// The name of the upstream the bot was logged out of (`api_url` for
+    /// the shorthand).
+    pub upstream: String,
+    /// The server's description of its answer, if any, secrets masked.
+    pub result: Option<String>,
+}
 
 /// `GET /v1/status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
