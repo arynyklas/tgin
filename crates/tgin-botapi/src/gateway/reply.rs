@@ -192,12 +192,14 @@ impl Call<'_> {
         let response = match sent {
             Ok(response) => response,
             Err(err) => {
+                bot.upstream_metrics.up().unreachable();
                 handles.count(Outcome::Unreachable);
                 self.counts.count(ReplyOutcome::Failed);
                 tracing::warn!(bot = %bot.name, consumer = %self.consumer, method = self.label.as_str(), error = %describe_error(&err), "webhook reply failed: Telegram is unreachable");
                 return;
             }
         };
+        bot.upstream_metrics.up().answered();
         handles.upstream_seconds(started.elapsed().as_secs_f64());
         let status = response.status();
         handles.count(outcome(status));

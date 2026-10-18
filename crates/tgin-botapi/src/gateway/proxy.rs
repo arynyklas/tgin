@@ -318,8 +318,26 @@ impl Call<'_> {
     }
 
     /// Sends `body` to `url` and waits for Telegram's response headers:
-    /// the response and when its headers arrived.
+    /// the response and when its headers arrived. Feeds the bot's
+    /// `tgin_upstream_up`: any response is an answer; every failure but
+    /// the client's own leaves the upstream unanswering.
     async fn send(
+        &self,
+        url: Url,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Result<(reqwest::Response, Instant), Failed> {
+        let sent = self.exchange(url, headers, body).await;
+        let up = self.bot.upstream_metrics.up();
+        match &sent {
+            Ok(_) => up.answered(),
+            Err(Failed::ClientClosed) => {}
+            Err(_) => up.unreachable(),
+        }
+        sent
+    }
+
+    async fn exchange(
         &self,
         url: Url,
         headers: HeaderMap,

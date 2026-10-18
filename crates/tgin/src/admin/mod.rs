@@ -34,6 +34,10 @@
 //! at the deadline, or could not say (the bot runs on unchanged; the
 //! warning logged names the server's error), 502 with the server's
 //! description when it refused the call (the bot runs on).
+//!
+//! API v1 grows additively within a major version: answers may gain
+//! fields, enum values (state and phase words) and error codes, and the
+//! client ignores what it does not know.
 
 mod api;
 pub mod client;
@@ -111,6 +115,14 @@ pub struct SourceStatus {
     /// Why the source backs off or failed, secrets masked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The name of the bot's upstream (`api_url` for the shorthand); empty
+    /// from a server older than this client.
+    #[serde(default)]
+    pub upstream: String,
+    /// Whether the bot was moved off its Bot API server; shown only while
+    /// it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
 }
 
 /// One consumer of the running config.

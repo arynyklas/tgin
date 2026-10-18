@@ -14,6 +14,8 @@ use tgin_core::config::valid_bot_token;
 use tgin_runtime::http::describe_error;
 use tgin_runtime::secret::Secret;
 
+use crate::gateway::UpstreamUp;
+
 /// How much longer than its long-poll `timeout` a `getUpdates` request may
 /// take before the client gives up on it.
 const LONG_POLL_GRACE: Duration = Duration::from_secs(10);
@@ -116,6 +118,8 @@ pub struct BotClient {
     base: Url,
     /// Scrubbed out of error text.
     token: Secret<String>,
+    /// Told of each call's outcome, when set.
+    up: Option<UpstreamUp>,
 }
 
 impl BotClient {
@@ -147,7 +151,17 @@ impl BotClient {
             http,
             base,
             token: token.clone(),
+            up: None,
         })
+    }
+
+    /// This client, telling `up` whether the server answered each call:
+    /// an HTTP answer of any status, or a failure to connect, a timeout or
+    /// a connection lost before the whole answer arrived.
+    #[must_use]
+    pub fn observed(mut self, up: Option<UpstreamUp>) -> Self {
+        self.up = up;
+        self
     }
 
     pub async fn get_me(&self) -> Result<Identity, ApiError> {
@@ -302,7 +316,10 @@ impl BotClient {
 
     /// The body of a 2xx response; any other status is an [`ApiError::Http`].
     async fn send(&self, req: RequestBuilder) -> Result<Bytes, ApiError> {
-        let resp = req.send().await.map_err(|e| self.network(&e))?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(self.lost(&err)),
+        };
         let status = resp.status();
         let retry_after = resp
             .headers()
@@ -310,12 +327,29 @@ impl BotClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse().ok())
             .map(Duration::from_secs);
-        let body = resp.bytes().await.map_err(|e| self.network(&e))?;
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(err) => return Err(self.lost(&err)),
+        };
+        if let Some(up) = &self.up {
+            up.answered();
+        }
         if status.is_success() {
             Ok(body)
         } else {
             Err(self.scrub(failure(status, retry_after, &body)))
         }
+    }
+
+    /// A call that got no whole answer: the server counts as unanswering
+    /// unless the request could not even be built.
+    fn lost(&self, err: &reqwest::Error) -> ApiError {
+        if !err.is_builder()
+            && let Some(up) = &self.up
+        {
+            up.unreachable();
+        }
+        self.network(err)
     }
 
     fn network(&self, err: &reqwest::Error) -> ApiError {
@@ -915,6 +949,51 @@ mod tests {
         let body = String::from_utf8_lossy(&requests[0].body);
         let part = "name=\"allowed_updates\"\r\n\r\n[]\r\n";
         assert!(body.contains(part), "missing {part:?} in {body}");
+    }
+
+    /// Every call tells the bot's `tgin_upstream_up` how it went: a
+    /// refused connection is 0, any HTTP answer (an error status too) 1.
+    #[tokio::test]
+    async fn calls_feed_upstream_up() {
+        use prometheus_client::encoding::text::encode;
+
+        let server = MockServer::start().await;
+        Mock::given(path(at("getMe")))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string(
+                    r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        let mut registry = prometheus_client::registry::Registry::with_prefix("tgin");
+        let metrics = crate::gateway::GatewayMetrics::register(&mut registry);
+        let up = metrics.upstream("b", "api_url").up().clone();
+        let scrape = || {
+            let mut text = String::new();
+            encode(&mut text, &registry).unwrap();
+            text
+        };
+        let reachable = client_for(&server.uri()).observed(Some(up.clone()));
+        let refused =
+            client_for(&format!("http://127.0.0.1:{closed_port}")).observed(Some(up.clone()));
+
+        assert!(!scrape().contains("tgin_upstream_up{"), "{}", scrape());
+        refused.get_me().await.unwrap_err();
+        assert!(
+            scrape().contains("tgin_upstream_up{bot=\"b\"} 0\n"),
+            "{}",
+            scrape()
+        );
+        reachable.get_me().await.unwrap_err();
+        assert!(
+            scrape().contains("tgin_upstream_up{bot=\"b\"} 1\n"),
+            "{}",
+            scrape()
+        );
     }
 
     #[tokio::test]

@@ -1736,10 +1736,13 @@ async fn admin_cli_status_table_and_json() {
     assert_eq!(
         row("SOURCE"),
         [
-            "SOURCE", "INGRESS", "STATE", "UPDATES", "ERRORS", "LAST", "ERROR"
+            "SOURCE", "INGRESS", "UPSTREAM", "STATE", "UPDATES", "ERRORS", "LAST", "ERROR"
         ]
     );
-    assert_eq!(row("hooked"), ["hooked", "webhook", "running", "1", "0"]);
+    assert_eq!(
+        row("hooked"),
+        ["hooked", "webhook", "api_url", "running", "1", "0"]
+    );
     assert_eq!(row("workers"), ["workers", "pull", "1", "0", "0", "no"]);
 
     let json = output(admin(&["status", "--json"])).await;
@@ -3037,5 +3040,194 @@ async fn logout_504_names_the_drain_failure() {
         "{warning}"
     );
     assert!(!logs.contains(TOKEN), "the token reached a log line");
+    tgin.stop().await;
+}
+
+/// Whether `text` has the exposition line `line`.
+fn has_line(text: &str, line: &str) -> bool {
+    text.lines().any(|l| l == line)
+}
+
+/// Whether `text` has a series whose line starts with `prefix`.
+fn has_prefix(text: &str, prefix: &str) -> bool {
+    text.lines().any(|l| l.starts_with(prefix))
+}
+
+/// A bot without ingress: Telegram sees its gateway requests only.
+fn gateway_only(name: &str, token: &str, upstream: &str, to: &str) -> String {
+    format!(
+        "  - name: {name}\n    token: \"{token}\"\n    {upstream}\n    routes: [{{ to: [{to}] }}]\n"
+    )
+}
+
+/// `tgin_bot_info` follows reloads: a bot moved to another upstream changes
+/// its label pair, and a removed bot loses its series. The moved bot's
+/// `tgin_upstream_up` is absent again until its new upstream answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_info_follows_reloads() {
+    let telegram = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok(json!(true)))
+        .mount(&telegram)
+        .await;
+    let local = MockServer::start().await;
+    let api = format!("api_url: {}", telegram.uri());
+    let consumers = "consumers:\n  workers: { pull: {} }\n  others: { pull: {} }\n";
+    let tgin = start(
+        "bot_info_follows_reloads",
+        &config(&format!(
+            "bots:\n{}{}{consumers}",
+            gateway_only("moved", TOKEN, &api, "workers"),
+            gateway_only("dropped", OTHER_TOKEN, &api, "others"),
+        )),
+    )
+    .await;
+    for token in [TOKEN, OTHER_TOKEN] {
+        let call = answer(
+            tgin.http
+                .post(tgin.data_url(&format!("/bot{token}/getChat"))),
+        )
+        .await;
+        assert_eq!(call.status, 200, "{}", call.body);
+    }
+    let text = tgin.metrics_text();
+    for line in [
+        r#"tgin_bot_info{bot="moved",upstream="api_url"} 1"#,
+        r#"tgin_bot_info{bot="dropped",upstream="api_url"} 1"#,
+        r#"tgin_upstream_up{bot="moved"} 1"#,
+        r#"tgin_upstream_up{bot="dropped"} 1"#,
+    ] {
+        assert!(has_line(&text, line), "missing {line} in\n{text}");
+    }
+
+    tgin.rewrite(&config(&format!(
+        "{}bots:\n{}{consumers}",
+        local_upstream(&local, false),
+        gateway_only("moved", TOKEN, "upstream: tba", "workers"),
+    )));
+    let reload = tgin.reload().await;
+    assert_eq!(reload.status, 200, "{}", reload.body);
+    let text = tgin.metrics_text();
+    assert!(
+        has_line(&text, r#"tgin_bot_info{bot="moved",upstream="tba"} 1"#),
+        "{text}"
+    );
+    for gone in [
+        r#"tgin_bot_info{bot="moved",upstream="api_url"}"#,
+        r#"tgin_bot_info{bot="dropped""#,
+        r#"tgin_upstream_up{bot="moved"}"#,
+        r#"tgin_upstream_up{bot="dropped"}"#,
+    ] {
+        assert!(!has_prefix(&text, gone), "{gone} still in\n{text}");
+    }
+
+    Mock::given(method("POST"))
+        .respond_with(ok(json!(true)))
+        .mount(&local)
+        .await;
+    let call = answer(
+        tgin.http
+            .post(tgin.data_url(&format!("/bot{TOKEN}/getChat"))),
+    )
+    .await;
+    assert_eq!(call.status, 200, "{}", call.body);
+    let text = tgin.metrics_text();
+    assert!(
+        has_line(&text, r#"tgin_upstream_up{bot="moved"} 1"#),
+        "{text}"
+    );
+    for secret in [TOKEN, OTHER_TOKEN, &telegram.uri(), &local.uri()] {
+        assert!(!text.contains(secret), "{text}");
+    }
+    tgin.stop().await;
+}
+
+/// `/v1/status` names each bot's upstream, and says `parked` only while
+/// the bot is parked; `tgin admin status` shows both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_shows_upstream_and_parked() {
+    let telegram = telegram().await;
+    mount_moves(&telegram, TOKEN, 0).await;
+    let local = MockServer::start().await;
+    let tgin = start(
+        "status_shows_upstream_and_parked",
+        &config(&format!(
+            "{}bots:\n{}{}consumers:\n  workers: {{ pull: {{}} }}\n  others: {{ pull: {{}} }}\n",
+            local_upstream(&local, false),
+            hook_bot(&telegram, "hooked", TOKEN, "/hook", "workers"),
+            gateway_only("remote", OTHER_TOKEN, "upstream: tba", "others"),
+        )),
+    )
+    .await;
+    let source = |status: &Value, name: &str| {
+        status["sources"]
+            .as_array()
+            .expect("sources")
+            .iter()
+            .find(|s| s["name"] == name)
+            .cloned()
+            .expect("the source")
+    };
+    let before = tgin.admin_get("/v1/status", Some(ADMIN_TOKEN)).await;
+    assert_eq!(before.status, 200, "{}", before.body);
+    let before = before.json();
+    assert_eq!(source(&before, "hooked")["upstream"], "api_url", "{before}");
+    assert_eq!(source(&before, "remote")["upstream"], "tba", "{before}");
+    for name in ["hooked", "remote"] {
+        assert!(source(&before, name).get("parked").is_none(), "{before}");
+    }
+    // The webhook bot's `getMe` at start is its first upstream outcome.
+    let text = tgin.metrics_text();
+    assert!(
+        has_line(&text, r#"tgin_upstream_up{bot="hooked"} 1"#),
+        "{text}"
+    );
+    assert!(
+        !has_prefix(&text, r#"tgin_upstream_up{bot="remote"}"#),
+        "{text}"
+    );
+
+    let moved = tgin
+        .admin_post("/v1/bots/hooked/close?timeout=500ms", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(moved.status, 200, "{}", moved.body);
+    let after = tgin.admin_get("/v1/status", Some(ADMIN_TOKEN)).await;
+    let body = after.body.clone();
+    let after = after.json();
+    assert_eq!(source(&after, "hooked")["parked"], true, "{after}");
+    assert_eq!(source(&after, "hooked")["upstream"], "api_url", "{after}");
+    assert!(source(&after, "remote").get("parked").is_none(), "{after}");
+    for secret in [TOKEN, OTHER_TOKEN, &telegram.uri(), &local.uri()] {
+        assert!(!body.contains(secret), "{body}");
+    }
+
+    let token_file = scratch("status_shows_upstream_and_parked").join("admin-token");
+    std::fs::write(&token_file, format!("{ADMIN_TOKEN}\n")).unwrap();
+    let url = format!("http://{}", tgin.admin);
+    let mut command = binary(&["admin", "--url", &url]);
+    command
+        .args(["--token-file", token_file.to_str().unwrap()])
+        .arg("status");
+    let shown = output(command).await;
+    assert_eq!(shown.code, Some(0), "{}", shown.stderr);
+    let row = |name: &str| {
+        shown
+            .stdout
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} row in\n{}", shown.stdout))
+            .to_owned()
+    };
+    assert!(shown.stdout.contains("UPSTREAM"), "{}", shown.stdout);
+    assert!(
+        row("hooked").contains("api_url") && row("hooked").contains("parked"),
+        "{}",
+        shown.stdout
+    );
+    assert!(
+        row("remote").contains("tba") && !row("remote").contains("parked"),
+        "{}",
+        shown.stdout
+    );
     tgin.stop().await;
 }

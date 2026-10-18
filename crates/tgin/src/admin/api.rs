@@ -217,6 +217,8 @@ fn status_of(shared: &Shared) -> Status {
                 updates_total: metrics.map_or(0, |m| m.updates_total()),
                 errors_total: metrics.map_or(0, |m| m.errors_total()),
                 error,
+                upstream: bot.upstream.name.to_string(),
+                parked: shared.sources.is_parked(&bot.name),
             }
         })
         .collect();

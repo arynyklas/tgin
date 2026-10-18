@@ -442,10 +442,21 @@ fn sources_table(status: &Status) -> String {
         .sources
         .iter()
         .map(|source| {
+            let state = if source.parked {
+                format!("{}, parked", source.state)
+            } else {
+                source.state.clone()
+            };
+            let upstream = if source.upstream.is_empty() {
+                "-".to_owned()
+            } else {
+                source.upstream.clone()
+            };
             vec![
                 source.name.clone(),
                 source.ingress.clone().unwrap_or_else(|| "-".to_owned()),
-                source.state.clone(),
+                upstream,
+                state,
                 source.updates_total.to_string(),
                 source.errors_total.to_string(),
                 source.error.clone().unwrap_or_default(),
@@ -456,6 +467,7 @@ fn sources_table(status: &Status) -> String {
         &[
             "SOURCE",
             "INGRESS",
+            "UPSTREAM",
             "STATE",
             "UPDATES",
             "ERRORS",
@@ -601,6 +613,57 @@ mod tests {
         );
         assert_eq!(failure(r#"{"error":"unauthorized"}"#), "unauthorized");
         assert_eq!(failure("plain text\n"), "plain text");
+    }
+
+    /// Admin answers grow additively: fields and enum values this client
+    /// does not know are ignored, not errors, and fields older servers do
+    /// not send are optional.
+    #[test]
+    fn admin_client_ignores_unknown_fields() {
+        let status = r#"{
+            "version": "9.9.9", "generation": 3, "phase": "rebalancing", "shard": "b",
+            "sources": [
+                {"name": "a", "kind": "channel", "ingress": "mtproto", "state": "warming",
+                 "updates_total": 1, "errors_total": 0, "upstream": "tba", "parked": true,
+                 "lag": {"seconds": 2}},
+                {"name": "b", "kind": "bot", "ingress": null, "state": "running",
+                 "updates_total": 0, "errors_total": 0}
+            ],
+            "consumers": [
+                {"name": "w", "mode": "stream", "depth": 0, "leased": 0, "in_flight": 0,
+                 "paused": false, "endpoints": [{"url_redacted": "https://x", "breaker": "tripped",
+                 "weight": 2}], "priority": 1}
+            ],
+            "tasks": [{"name": "t", "state": "sleeping", "since": 5}]
+        }"#;
+        let text = render(&Action::Status, status).expect("decoded");
+        assert!(text.contains("UPSTREAM"), "{text}");
+        let row = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} row in\n{text}"))
+        };
+        assert!(
+            row("a ").contains("tba") && row("a ").contains("warming, parked"),
+            "{text}"
+        );
+        assert!(!row("b ").contains("parked"), "{text}");
+        assert!(render(&Action::Consumers, status).is_ok());
+
+        let reload = r#"{"generation": 2, "added": [], "removed": [], "changed": [],
+            "sources_added": [], "sources_removed": [], "sources_restarted": [],
+            "restart_required": [], "warnings": ["x"], "mode": "dry"}"#;
+        assert!(render(&Action::Reload, reload).is_ok());
+        let moved = r#"{"bot": "a", "left": 0, "upstream": "tba", "result": null, "how": "new"}"#;
+        let bot = Action::Bot {
+            name: "a".to_owned(),
+            how: BotMove::LogOut,
+            timeout: None,
+            yes: true,
+        };
+        assert!(render(&bot, moved).is_ok());
+        let purged = r#"{"purged": 3, "left": 0}"#;
+        assert!(render(&Action::Purge("w".to_owned()), purged).is_ok());
     }
 
     #[test]

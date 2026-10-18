@@ -558,9 +558,12 @@ impl Sources {
         stop.unwrap_or_else(|| self.ingest.clone())
     }
 
-    /// A Bot API client for `bot` on its upstream, over the control client.
+    /// A Bot API client for `bot` on its upstream, over the control client,
+    /// feeding the bot's `tgin_upstream_up` (set by the gateway's table,
+    /// which the config's bots are in before their sources start).
     pub(crate) fn client(&self, bot: &Bot) -> Result<BotClient, ApiError> {
         BotClient::new(self.client.clone(), bot.upstream.url.expose(), &bot.token)
+            .map(|client| client.observed(self.gateway.upstream_up(&bot.name)))
     }
 
     /// Returns once `bot`'s Bot API server holds no update for it, its
