@@ -23,6 +23,7 @@ form_urlencoded.workspace = true
 futures-util.workspace = true
 multer.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true

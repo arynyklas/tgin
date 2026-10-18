@@ -1162,7 +1162,7 @@ async fn token_and_method_errors_follow_the_brief_token_rule() {
 /// where the filesystem refuses ':' in a name (probed like the server).
 fn token_dir(root: &std::path::Path, token: &str) -> std::path::PathBuf {
     let root = std::path::absolute(root).unwrap();
-    let probe = root.join("1:a-test-probe");
+    let probe = root.join(format!("1:a-test-probe-{:016x}", rand::random::<u64>()));
     let name = if std::fs::create_dir(&probe).is_ok() {
         std::fs::remove_dir(&probe).unwrap();
         token.to_owned()

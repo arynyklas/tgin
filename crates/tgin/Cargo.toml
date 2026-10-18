@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Routing layer between the Telegram Bot API and downstream bot instances"
-license.workspace = true
+license = "MIT AND BSL-1.0"
 repository.workspace = true
 publish.workspace = true
 
