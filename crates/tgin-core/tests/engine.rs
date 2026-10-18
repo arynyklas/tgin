@@ -1015,8 +1015,9 @@ async fn reload_reports_restart_required() {
 }
 
 /// Moving a bot to another upstream restarts its source, lists it in
-/// `upstream_changed` and warns about the update split; editing another
-/// bot's upstream leaves it alone.
+/// `upstream_changed` and warns about the update split, quoting neither
+/// the token nor the URL; editing another bot's upstream, or one no bot
+/// uses, leaves it alone.
 #[tokio::test(start_paused = true)]
 async fn upstream_change_reported() {
     const MOVES: &str = r#"version: 1
@@ -1024,6 +1025,7 @@ server: {}
 upstreams:
   local: { kind: local, url: "http://127.0.0.1:8081" }
   other: { kind: local, url: "http://127.0.0.1:8082" }
+  spare: { kind: local, url: "http://127.0.0.1:8090" }
 bots:
   - name: mover
     token: "1:mover"
@@ -1059,6 +1061,23 @@ consumers:
     let same = h.engine.apply(&load(&edited)).expect("apply");
     assert!(same.sources_restarted.is_empty(), "{same:?}");
     assert!(same.upstream_changed.is_empty(), "{same:?}");
+
+    let spare = edited.replace("8090", "8091");
+    let report = h.engine.apply(&load(&spare)).expect("apply");
+    assert!(report.sources_restarted.is_empty(), "{report:?}");
+    assert!(report.upstream_changed.is_empty(), "{report:?}");
+    assert_eq!(warned(), 1);
+
+    // Each move warned once, naming the bot; no move warning (from any
+    // test) quotes a token or a URL.
+    assert_eq!(LOGS.count(&["stayer", "tgin admin bot logout"]), 1);
+    for leaked in ["1:mover", "2:stayer", "127.0.0.1", "http://"] {
+        assert_eq!(
+            LOGS.count(&["tgin admin bot logout", leaked]),
+            0,
+            "{leaked}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

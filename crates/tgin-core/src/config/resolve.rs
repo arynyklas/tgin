@@ -156,9 +156,13 @@ pub struct Upstream {
 /// Where a local server's files are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Files {
-    /// The server's directory mounted in tgin at `dir`, which the server
-    /// itself sees at `server_dir` (absolute).
-    Dir { dir: PathBuf, server_dir: PathBuf },
+    /// The server's directory mounted in tgin at `dir` (absolute), which
+    /// the server itself sees at `server_dir` (absolute too; `dir` when not
+    /// written). `Debug` shows both as written, secrets masked.
+    Dir {
+        dir: SensitivePath,
+        server_dir: SensitivePath,
+    },
     /// An HTTP origin serving the server's directory.
     Url(SensitiveUrl),
 }
@@ -206,8 +210,13 @@ impl Upstream {
 
     fn mask(&mut self, redactor: &tgin_runtime::secret::Redactor) {
         self.url.mask(redactor);
-        if let Some(Files::Url(url)) = &mut self.files {
-            url.mask(redactor);
+        match &mut self.files {
+            Some(Files::Url(url)) => url.mask(redactor),
+            Some(Files::Dir { dir, server_dir }) => {
+                dir.mask(redactor);
+                server_dir.mask(redactor);
+            }
+            None => {}
         }
     }
 }
@@ -265,7 +274,7 @@ pub struct LongPoll {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Webhook {
     pub path: SensitiveRoute,
-    /// Always `https`.
+    /// `https`, or `http` when the bot's upstream is in local mode.
     pub public_url: Option<SensitiveUrl>,
     pub register: bool,
     pub secret_token: WebhookSecret,
@@ -803,23 +812,40 @@ impl Resolver<'_> {
         if let Some(url) = &files.url {
             return self.url(&format!("{path}.url"), url, false).map(Files::Url);
         }
-        let dir = self.file(&format!("{path}.dir"), files.dir.as_ref()?)?;
-        let dir = dir.expose().clone();
+        let text = files.dir.as_ref()?;
+        let dir_path = format!("{path}.dir");
+        let dir = self.file(&dir_path, text)?;
+        // Relative to the config file's directory, and to the working
+        // directory below that, so that `server_dir`, which defaults to it,
+        // is absolute as the server's paths are.
+        let dir = match std::path::absolute(dir.expose()) {
+            Ok(absolute) => Sensitive::new(absolute, &text.0.value),
+            Err(err) => {
+                // The error never holds the path.
+                self.diag.error(
+                    dir_path,
+                    text.0.location,
+                    format!("cannot make the directory absolute: {err}"),
+                );
+                return None;
+            }
+        };
         let server_dir = match &files.server_dir {
             None => dir.clone(),
             Some(text) => {
                 let path = format!("{path}.server_dir");
                 let server_dir = PathBuf::from(self.template(&path, text)?);
-                // `has_root` keeps `/x` absolute on Windows too.
+                // The server's own path syntax: `has_root` keeps `/x`
+                // absolute on Windows too.
                 if !server_dir.has_root() {
                     self.diag.errors.push(
                         ConfigError::new("`server_dir` must be an absolute path")
                             .at(located(path, text.0.location))
-                            .hint("it is the directory as the Bot API server sees it, which `getFile` answers absolute paths in"),
+                            .hint("it is the directory as the Bot API server sees it (its `--dir`), whose absolute paths `getFile` answers in local mode"),
                     );
                     return None;
                 }
-                server_dir
+                Sensitive::new(server_dir, &text.0.value)
             }
         };
         Some(Files::Dir { dir, server_dir })

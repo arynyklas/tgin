@@ -2652,29 +2652,27 @@ fn files_rules() {
     let err = single_error(&yaml);
     assert_at(&err, "upstreams.u.files.server_dir", pos(&yaml, "var/lib"));
     assert_message(&err, "absolute");
+    assert!(
+        err.hint
+            .as_deref()
+            .is_some_and(|h| h.contains("as the Bot API server sees it")),
+        "{err}"
+    );
 
-    // `server_dir` defaults to `dir`.
+    // `server_dir` defaults to `dir`, made absolute.
     let cfg = loads(&upstream(
         "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    local_mode: true\n    files: { dir: /srv/tba }\n",
     ));
     let upstream_of = |cfg: &Config| cfg.bots[0].upstream.clone();
     assert!(upstream_of(&cfg).local_mode);
-    assert_eq!(
-        upstream_of(&cfg).files,
-        Some(Files::Dir {
-            dir: PathBuf::from("/srv/tba"),
-            server_dir: PathBuf::from("/srv/tba"),
-        })
-    );
+    let srv = std::path::absolute("/srv/tba").unwrap();
+    assert_eq!(dirs(&cfg), (srv.clone(), srv.clone()));
     let cfg = loads(&upstream(
         "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { dir: /srv/tba, server_dir: /var/lib/telegram-bot-api }\n",
     ));
     assert_eq!(
-        upstream_of(&cfg).files,
-        Some(Files::Dir {
-            dir: PathBuf::from("/srv/tba"),
-            server_dir: PathBuf::from("/var/lib/telegram-bot-api"),
-        })
+        dirs(&cfg),
+        (srv, PathBuf::from("/var/lib/telegram-bot-api"))
     );
     let cfg = loads(&upstream(
         "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { url: \"http://127.0.0.1:8080/files\" }\n",
@@ -2686,6 +2684,50 @@ fn files_rules() {
 
     // The server names a bot's directory after its token, `:` made `~`.
     assert_eq!(Upstream::token_dir("123456:AA-bb_CC"), "123456~AA-bb_CC");
+}
+
+/// The resolved `files.dir` and `files.server_dir` of bot 0's upstream.
+fn dirs(cfg: &Config) -> (PathBuf, PathBuf) {
+    match &cfg.bots[0].upstream.files {
+        Some(Files::Dir { dir, server_dir }) => (dir.expose().clone(), server_dir.expose().clone()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A relative `files.dir` is relative to the config file's directory, and
+/// to the working directory below that: it and the `server_dir` it
+/// defaults to are absolute. `Debug` shows both as written.
+#[test]
+fn files_dir_absolute_and_masked() {
+    let yaml = "version: 1\nupstreams:\n  u: { kind: local, url: \"http://127.0.0.1:8081\", files: { dir: tba } }\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n";
+    for (origin, relative) in [("tgin.yaml", "tba"), ("conf/tgin.yaml", "conf/tba")] {
+        let cfg = config::load(yaml, Path::new(origin), &env(&[]))
+            .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+        let (dir, server_dir) = dirs(&cfg);
+        assert!(dir.is_absolute(), "{origin}: {}", dir.display());
+        assert_eq!(dir, std::path::absolute(relative).unwrap(), "{origin}");
+        assert_eq!(server_dir, dir, "{origin}");
+    }
+
+    let yaml = "version: 1\nupstreams:\n  u: { kind: local, url: \"http://127.0.0.1:8081\", files: { dir: \"${env:FILES_DIR}\", server_dir: \"/var/${env:SEG}\" } }\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n";
+    let env = env(&[("FILES_DIR", "/srv/s3cret-env"), ("SEG", "s3cret-seg")]);
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert_eq!(
+        dirs(&cfg),
+        (
+            std::path::absolute("/srv/s3cret-env").unwrap(),
+            PathBuf::from("/var/s3cret-seg")
+        )
+    );
+    for rendering in renderings(yaml, &env) {
+        for leaked in ["s3cret-env", "s3cret-seg"] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
+    }
+    let debug = format!("{cfg:?}");
+    assert!(debug.contains("${env:FILES_DIR}"), "{debug}");
+    assert!(debug.contains("/var/${env:SEG}"), "{debug}");
 }
 
 /// A token repeated across bots splits its updates between them: refused,
