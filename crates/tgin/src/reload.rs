@@ -39,6 +39,10 @@ const QUEUE: usize = 8;
 const WATCH_POLL: Duration = Duration::from_secs(2);
 /// How often a move looks whether tgin still holds updates of the bot.
 const MOVE_CHECK: Duration = Duration::from_millis(50);
+/// The most of a move's timeout kept for its calls being sent to end
+/// (step 4), whatever tgin still delivers (step 3); a quarter of the
+/// timeout when that is less.
+const IN_FLIGHT_RESERVE: Duration = Duration::from_secs(5);
 
 /// What asked for a reload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,7 +556,9 @@ impl Reloader {
     ///    deadline, the move fails ([`MoveError::Undrained`]) and changes
     ///    nothing, as when the move waited in the queue past its deadline;
     /// 2. the bot's ingest stops, and it is parked;
-    /// 3. tgin delivers what it holds of the bot, until the deadline;
+    /// 3. tgin delivers what it holds of the bot, until
+    ///    [`IN_FLIGHT_RESERVE`] (or a quarter of the timeout, if less)
+    ///    before the deadline, so step 4 always has that much left;
     /// 4. the gateway refuses the bot's calls that would go to a server
     ///    ([`tgin_botapi::gateway::Gateway::set_parked`]), those still
     ///    waiting on a rate limit or a 429 included, and the move waits for
@@ -640,7 +646,11 @@ impl Reloader {
         }
         sources.park(name);
         let engine = &shared.engine;
-        let delivered = tokio::time::timeout_at(deadline, async {
+        // Step 3 ends early enough to leave step 4 a budget: a bot whose
+        // updates tgin still delivers has calls of its own on their way.
+        let reserve = IN_FLIGHT_RESERVE.min(timeout / 4);
+        let delivering_until = deadline.checked_sub(reserve).unwrap_or(deadline);
+        let delivered = tokio::time::timeout_at(delivering_until, async {
             while engine.pending_from(id) > 0 {
                 tokio::time::sleep(MOVE_CHECK).await;
             }

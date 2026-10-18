@@ -4363,3 +4363,70 @@ async fn move_fails_504_while_a_webhook_reply_is_sent() {
     release.notify_waiters();
     tgin.stop().await;
 }
+
+/// A busy bot still moves: tgin cannot deliver its update while the
+/// downstream's reply to it is held by the server, so delivering (step 3)
+/// runs out; it ends a quarter of the 2 s timeout early, and the reply
+/// ending within that reserve lets the move go on, `left` 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_bot_moves_once_its_reply_ends_within_the_reserve() {
+    let Herald {
+        api,
+        mut heralds,
+        methods,
+        release,
+    } = heralding_server().await;
+    let down = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/in"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"method":"sendPhoto","chat_id":500,"photo":"AgAD"}"#,
+            "application/json",
+        ))
+        .mount(&down)
+        .await;
+    let yaml = config(&format!(
+        "bots:\n  - name: hooked\n    token: \"{TOKEN}\"\n    api_url: {api}\n    ingress: {{ webhook: {{ path: /hook, secret_token: {HOOK_SECRET} }} }}\n    routes: [{{ to: [hooks] }}]\nconsumers:\n  hooks: {{ push: {{ endpoints: [{{ url: \"{}/in\" }}] }} }}\n",
+        down.uri()
+    ));
+    let tgin = start(
+        "busy_bot_moves_once_its_reply_ends_within_the_reserve",
+        &yaml,
+    )
+    .await;
+    tgin.deliver("/hook", &[1]).await;
+    while next(&mut heralds).await != "sendPhoto" {}
+
+    let admin = tgin.http.clone();
+    let url = tgin.admin_url("/v1/bots/hooked/close?timeout=2s");
+    let close = tokio::spawn(answer(admin.post(url).bearer_auth(ADMIN_TOKEN)));
+    // Step 4 has begun once the gateway refuses the bot's calls.
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < PATIENCE, "the gateway never closed");
+        assert!(!close.is_finished(), "the move ended before step 4");
+        let call = answer(
+            tgin.http
+                .post(tgin.data_url(&format!("/bot{TOKEN}/getChat")))
+                .header("content-type", "application/json")
+                .body(r#"{"chat_id":500}"#),
+        )
+        .await;
+        if call.status == 503 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    release.notify_waiters();
+    let moved = timeout(PATIENCE, close)
+        .await
+        .expect("the move ends in time")
+        .expect("no panic");
+    assert_eq!(moved.status, 200, "{}", moved.body);
+    assert_eq!(moved.json()["left"], 1);
+    let methods = methods.lock().expect("methods").clone();
+    let photo = methods.iter().position(|m| m == "sendPhoto");
+    let closed = methods.iter().position(|m| m == "close");
+    assert!(photo < closed && closed.is_some(), "{methods:?}");
+    tgin.stop().await;
+}
