@@ -265,12 +265,16 @@ pub async fn serve(dir: &Path, rel: &str, req_headers: &HeaderMap) -> Response {
     response
 }
 
-/// `rel` percent-decoded once, when it is plain relative segments: `None`
-/// for invalid UTF-8, a NUL, a `\`, or an empty (so an absolute path too),
-/// `.` or `..` segment.
+/// `rel` percent-decoded once, when it is plain relative segments, at
+/// least two (a type directory and a file, as TDLib stores a bot's files):
+/// `None` for invalid UTF-8, a NUL, a `\`, an empty (so an absolute path
+/// too), `.` or `..` segment, or a single segment. The top level of a
+/// bot's directory holds the server's TDLib database when its files are
+/// not set apart (`--files-dir`), and is never served.
 fn checked(rel: &str) -> Option<Cow<'_, str>> {
     let rel = percent_decode_str(rel).decode_utf8().ok()?;
     let plain = !rel.contains(['\0', '\\'])
+        && rel.contains('/')
         && rel
             .split('/')
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
@@ -593,8 +597,14 @@ mod tests {
             Some(PathBuf::from("documents/file_1.pdf"))
         );
         assert_eq!(relative("a%20b/c"), Some(PathBuf::from("a b/c")));
+        assert_eq!(
+            relative("documents/a/b"),
+            Some(PathBuf::from("documents/a/b"))
+        );
         for refused in [
             "",
+            "td.binlog",
+            "documents",
             "/etc/passwd",
             "%2Fetc",
             "a//b",
@@ -619,12 +629,14 @@ mod tests {
         let ok = |rel| origin_path(rel).unwrap_or_else(|| panic!("{rel} refused"));
         assert_eq!(ok("documents/file_1.pdf"), "documents/file_1.pdf");
         assert_eq!(ok("documents/file%5F1.pdf"), "documents/file_1.pdf");
-        assert_eq!(ok("%252e%252e%252fx"), "%252e%252e%252fx");
+        assert_eq!(ok("d/%252e%252e%252fx"), "d/%252e%252e%252fx");
         assert_eq!(ok("a%20b/c%3Ad"), "a%20b/c%3Ad");
-        assert_eq!(ok("C%3Aabc"), "C%3Aabc");
-        assert_eq!(ok("%C3%A9"), "%C3%A9");
+        assert_eq!(ok("d/C%3Aabc"), "d/C%3Aabc");
+        assert_eq!(ok("d/%C3%A9"), "d/%C3%A9");
         for refused in [
             "",
+            "td.binlog",
+            "%252e%252e%252fx",
             "/x",
             "%2Fx",
             "a//b",

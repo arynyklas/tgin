@@ -374,11 +374,9 @@ async fn disk_file_served_with_range_and_conditionals() {
         description(missing).await,
         (404, "Not Found: file not found".to_owned())
     );
+    // A type directory is no file, and a single segment is never served.
     let directory = tgin.file(TOKEN, "documents", &[]).await;
-    assert_eq!(
-        description(directory).await,
-        (404, "Not Found: file not found".to_owned())
-    );
+    assert_eq!(description(directory).await, (404, "Not Found".to_owned()));
 
     // Nothing went to the Bot API server, and the route is method `file`.
     assert!(
@@ -475,11 +473,16 @@ async fn files_confined_to_the_calling_bots_directory() {
     {
         use std::os::unix::fs::symlink;
         // A directory and a file link out of the bot's directory, and one
-        // that stays inside it.
+        // that stays inside it; the files below a type directory, the only
+        // paths served.
         symlink(&theirs_tilde, mine.join("theirs")).expect("a directory link");
-        symlink(root.join("outside.txt"), mine.join("outside.txt")).expect("a file link");
-        symlink(mine.join("documents/mine.txt"), mine.join("inside.txt")).expect("a link inside");
-        for rel in ["theirs/documents/secret.txt", "outside.txt"] {
+        symlink(root.join("outside.txt"), mine.join("documents/outside.txt")).expect("a file link");
+        symlink(
+            mine.join("documents/mine.txt"),
+            mine.join("documents/inside.txt"),
+        )
+        .expect("a link inside");
+        for rel in ["theirs/documents/secret.txt", "documents/outside.txt"] {
             let response = tgin.file(TOKEN, rel, &[]).await;
             assert_eq!(
                 description(response).await,
@@ -487,7 +490,7 @@ async fn files_confined_to_the_calling_bots_directory() {
                 "{rel}"
             );
         }
-        let inside = tgin.file(TOKEN, "inside.txt", &[]).await;
+        let inside = tgin.file(TOKEN, "documents/inside.txt", &[]).await;
         assert_eq!(inside.status(), 200);
         assert_eq!(&inside.bytes().await.expect("body")[..], b"mine");
     }
@@ -524,7 +527,7 @@ async fn origin_files_proxied() {
     // double-encoded dot run stays one literal segment, an encoded
     // unreserved character arrives plain.
     for (rel, body) in [
-        ("%252e%252e%252fx", "literal"),
+        ("documents/%252e%252e%252fx", "literal"),
         ("documents/file_1.pdf", "plain"),
     ] {
         Mock::given(method("GET"))
@@ -604,8 +607,8 @@ consumers:
 
     for (rel, expected_path, body) in [
         (
-            "%252e%252e%252fx",
-            format!("/files/{encoded}/%252e%252e%252fx"),
+            "documents/%252e%252e%252fx",
+            format!("/files/{encoded}/documents/%252e%252e%252fx"),
             "literal",
         ),
         (
@@ -1969,4 +1972,77 @@ async fn drain_finishes_a_slow_disk_download() {
         .expect("the app exits in time")
         .expect("the app does not panic");
     assert_eq!(outcome, Outcome::Clean);
+}
+
+/// Only a bot's files are served: paths of at least two segments, a type
+/// directory and a file (`documents/x`). The top level of the bot's
+/// directory holds the server's TDLib database (`td.binlog`, `db.sqlite`)
+/// when `--files-dir` is not set apart; it is refused with 404 from disk,
+/// and never asked of a file origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_paths_below_a_type_directory_served() {
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    let mine = bot_dir(&root, TOKEN);
+    put(&mine, "td.binlog", b"session");
+    put(&mine, "db.sqlite", b"database");
+    put(&mine, "documents/x", b"file");
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("from origin", "text/plain"))
+        .mount(&origin)
+        .await;
+    let yaml = disk_config(&server.uri(), &root)
+        .replace(
+            "consumers:\n",
+            &format!(
+                "  - name: remote\n    token: \"{THIRD_TOKEN}\"\n    upstream: origin\n    routes: [{{ to: [remotes] }}]\nconsumers:\n  remotes: {{ pull: {{}} }}\n"
+            ),
+        )
+        .replace(
+            "bots:\n",
+            &format!(
+                "  origin: {{ kind: local, url: \"{api}\", files: {{ url: \"{files}/files\" }} }}\nbots:\n",
+                api = server.uri(),
+                files = origin.uri(),
+            ),
+        );
+    let tgin = start(&yaml).await;
+
+    for top in ["td.binlog", "db.sqlite", "documents"] {
+        let refused = tgin.file(TOKEN, top, &[]).await;
+        assert_eq!(
+            description(refused).await,
+            (404, "Not Found".to_owned()),
+            "{top}"
+        );
+    }
+    let served = tgin.file(TOKEN, "documents/x", &[]).await;
+    assert_eq!(served.status(), 200);
+    assert_eq!(&served.bytes().await.expect("body")[..], b"file");
+
+    for top in ["td.binlog", "db.sqlite"] {
+        let refused = tgin.file(THIRD_TOKEN, top, &[]).await;
+        assert_eq!(
+            description(refused).await,
+            (404, "Not Found".to_owned()),
+            "{top}"
+        );
+    }
+    assert!(
+        origin
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a top-level path reached the origin"
+    );
+    let proxied = tgin.file(THIRD_TOKEN, "documents/x", &[]).await;
+    assert_eq!(proxied.status(), 200);
+    assert_eq!(
+        origin.received_requests().await.expect("recording").len(),
+        1
+    );
+    assert_logs_clean(&[TOKEN, THIRD_TOKEN]);
+    tgin.stop().await;
 }
