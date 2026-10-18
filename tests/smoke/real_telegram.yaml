@@ -22,13 +22,20 @@ server:
 admin:
   listen: ["@ADMIN@"]
 
+# With --self-hosted: the server `server` (kind: local, local_mode: true,
+# files.dir: --files-dir, files.server_dir: --server-dir). Otherwise empty.
+@UPSTREAMS@
+
 bots:
   - name: smoke
     token: ${env:TGIN_SMOKE_TOKEN}
-    api_url: "@API_URL@"
+    # `upstream: server` with --self-hosted (after --migrate's move);
+    # otherwise `api_url: <--api-url>`.
+    @BOT_API@
     ingress:
-      long_poll:
-        timeout: 10s
+      # `long_poll: {timeout: 10s}`; the self-hosted phase B switches it to
+      # `webhook` (registered at --public-url, plain http) for one message.
+      @INGRESS@
     routes:
       - to: [workers, hooks, captured]
 
