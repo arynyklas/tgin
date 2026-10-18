@@ -461,8 +461,10 @@ impl Reloader {
     /// Stops the removed sources, restarts the changed ones, starts the new
     /// ones, and serves the new routes. A parked bot stays parked, with a
     /// warning, unless the reload changed its upstream: it then starts on
-    /// the new one. Losing its ingress keeps it parked too, so that ingress
-    /// coming back on the same upstream does not start it.
+    /// the new one, which is said at info. Losing its ingress keeps it
+    /// parked too, so that ingress coming back on the same upstream does
+    /// not start it. Any other bot moved to another upstream gets a warning:
+    /// the old server may still have it logged in.
     async fn restart_sources(&self, cfg: &Config, report: &ReloadReport) {
         let sources = &self.shared.sources;
         for name in &report.sources_removed {
@@ -478,7 +480,14 @@ impl Reloader {
             };
             let moved = report.upstream_changed.contains(name);
             if moved {
-                sources.unpark(name);
+                if sources.unpark(name) {
+                    tracing::info!(bot = %name, "the parked bot starts on its new upstream; it was logged out of the old one");
+                } else {
+                    tracing::warn!(
+                        bot = %name,
+                        "the bot now talks to another Bot API server; while the old one still has it logged in, the bot's updates may be split between the two: move bots with `tgin admin bot logout` (or `close`) before changing their upstream"
+                    );
+                }
             } else if why == Stop::Restart && sources.is_parked(name) {
                 continue;
             }

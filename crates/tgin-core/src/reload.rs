@@ -108,12 +108,6 @@ impl Engine {
             changed = report.changed.len(),
             "config applied"
         );
-        for bot in &report.upstream_changed {
-            tracing::warn!(
-                bot = %bot,
-                "the bot now talks to another Bot API server; while the old one still has it logged in, the bot's updates may be split between the two: move bots with `tgin admin bot logout` (or `close`) before changing their upstream"
-            );
-        }
         Ok(report)
     }
 }

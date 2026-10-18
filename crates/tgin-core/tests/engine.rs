@@ -1014,9 +1014,9 @@ async fn reload_reports_restart_required() {
     assert_eq!(report.sources_restarted, ["a"]);
 }
 
-/// Moving a bot to another upstream restarts its source, lists it in
-/// `upstream_changed` and warns about the update split, quoting neither
-/// the token nor the URL; editing another bot's upstream, or one no bot
+/// Moving a bot to another upstream restarts its source and lists it in
+/// `upstream_changed` (the app warns of the update split, or says that a
+/// parked bot starts there); editing another bot's upstream, or one no bot
 /// uses, leaves it alone.
 #[tokio::test(start_paused = true)]
 async fn upstream_change_reported() {
@@ -1039,8 +1039,6 @@ consumers:
   q: { pull: {} }
 "#;
     let h = Harness::new(MOVES);
-    let warned = || LOGS.count(&["mover", "tgin admin bot logout"]);
-    assert_eq!(warned(), 0);
 
     let moved = MOVES.replace(
         "token: \"1:mover\"\n",
@@ -1050,13 +1048,11 @@ consumers:
     assert_eq!(report.sources_restarted, ["mover"]);
     assert_eq!(report.upstream_changed, ["mover"]);
     assert!(report.restart_required.is_empty(), "{report:?}");
-    assert_eq!(warned(), 1);
 
     let edited = moved.replace("8082", "8083");
     let report = h.engine.apply(&load(&edited)).expect("apply");
     assert_eq!(report.sources_restarted, ["stayer"]);
     assert_eq!(report.upstream_changed, ["stayer"]);
-    assert_eq!(warned(), 1);
 
     let same = h.engine.apply(&load(&edited)).expect("apply");
     assert!(same.sources_restarted.is_empty(), "{same:?}");
@@ -1066,18 +1062,6 @@ consumers:
     let report = h.engine.apply(&load(&spare)).expect("apply");
     assert!(report.sources_restarted.is_empty(), "{report:?}");
     assert!(report.upstream_changed.is_empty(), "{report:?}");
-    assert_eq!(warned(), 1);
-
-    // Each move warned once, naming the bot; no move warning (from any
-    // test) quotes a token or a URL.
-    assert_eq!(LOGS.count(&["stayer", "tgin admin bot logout"]), 1);
-    for leaked in ["1:mover", "2:stayer", "127.0.0.1", "http://"] {
-        assert_eq!(
-            LOGS.count(&["tgin admin bot logout", leaked]),
-            0,
-            "{leaked}"
-        );
-    }
 }
 
 #[tokio::test(start_paused = true)]

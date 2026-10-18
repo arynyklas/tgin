@@ -2545,46 +2545,75 @@ async fn parked_bot_not_restarted_by_unchanged_reload() {
     tgin.stop().await;
 }
 
-/// A reload that moves a parked bot to another upstream starts it there.
+/// A reload that moves a parked bot to another upstream starts it there,
+/// saying so at info: it was logged out of the old one, so nothing splits
+/// its updates. A running bot moved by the same reload gets the warning
+/// that the old server may still hold it. Neither line quotes a token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changed_upstream_unparks() {
     let quick_polls = Duration::from_millis(50);
     let telegram = MockServer::start().await;
     let (_pending, mut polls) = mount_pending(&telegram, TOKEN, quick_polls).await;
     mount_moves(&telegram, TOKEN, 0).await;
+    mount_bot(&telegram, OTHER_TOKEN, me("relocated_bot"), quick_polls).await;
     let local = MockServer::start().await;
     let mut local_polls = mount_bot(&local, TOKEN, me("polled_bot"), quick_polls).await;
-    let consumers = "consumers:\n  workers: { pull: {} }\n";
+    mount_bot(&local, OTHER_TOKEN, me("relocated_bot"), quick_polls).await;
+    let consumers = "consumers:\n  workers: { pull: {} }\n  others: { pull: {} }\n";
     let api = format!("api_url: {}", telegram.uri());
+    // A name of its own: the log capture is shared by the whole binary.
+    let relocated = |upstream: &str| {
+        poll_bot(&telegram, "relocated", OTHER_TOKEN, "others")
+            .replace(&format!("api_url: {}", telegram.uri()), upstream)
+    };
     let tgin = start(
         "changed_upstream_unparks",
-        &config(&format!("bots:\n{}{consumers}", polled(&api, "1s"))),
+        &config(&format!(
+            "bots:\n{}{}{consumers}",
+            polled_as("unparked", &api, "1s"),
+            relocated(&api)
+        )),
     )
     .await;
     next(&mut polls).await;
     let answer = tgin
-        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .admin_post("/v1/bots/unparked/logout", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(answer.status, 200, "{}", answer.body);
 
     tgin.rewrite(&config(&format!(
-        "{}bots:\n{}{consumers}",
+        "{}bots:\n{}{}{consumers}",
         local_upstream(&local, false),
-        polled("upstream: tba", "1s")
+        polled_as("unparked", "upstream: tba", "1s"),
+        relocated("upstream: tba"),
     )));
     let reload = tgin.reload().await;
     assert_eq!(reload.status, 200, "{}", reload.body);
-    assert_eq!(reload.json()["upstream_changed"], json!(["polled"]));
+    assert_eq!(
+        reload.json()["upstream_changed"],
+        json!(["relocated", "unparked"])
+    );
     next(&mut local_polls).await;
-    tgin.wait_status("polled running", |s| {
-        task_state(s, "source:polled").as_deref() == Some("running")
+    tgin.wait_status("unparked running", |s| {
+        task_state(s, "source:unparked").as_deref() == Some("running")
     })
     .await;
     assert_eq!(count_calls(&local, TOKEN, "getMe").await, 1);
+    let split = "tgin admin bot logout";
+    assert_eq!(logged(&[" WARN ", "bot=unparked", split]), 0);
+    assert_eq!(
+        logged(&[" INFO ", "bot=unparked", "starts on its new upstream"]),
+        1
+    );
+    assert_eq!(logged(&[" WARN ", "bot=relocated", split]), 1);
+    for token in [TOKEN, OTHER_TOKEN] {
+        assert_eq!(logged(&["bot=", split, token]), 0);
+        assert_eq!(logged(&["starts on its new upstream", token]), 0);
+    }
     // No longer parked: it moves again, now off the new server.
     mount_moves(&local, TOKEN, 0).await;
     let again = tgin
-        .admin_post("/v1/bots/polled/logout", Some(ADMIN_TOKEN))
+        .admin_post("/v1/bots/unparked/logout", Some(ADMIN_TOKEN))
         .await;
     assert_eq!(again.status, 200, "{}", again.body);
     assert_eq!(again.json()["upstream"], "tba");
