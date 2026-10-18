@@ -944,37 +944,72 @@ async fn redirect_dead_letters() {
     assert!(line.contains("302"), "{line}");
 }
 
+/// Answers every request 200 after [`PROBE_DELAY`], recording when each
+/// arrived. wiremock calls `respond` as a request arrives and starts the
+/// delay after it, so no answer leaves before its arrival plus the delay.
+#[derive(Clone, Default)]
+struct Arrivals(Arc<Mutex<Vec<std::time::Instant>>>);
+
+/// How long [`Arrivals`] holds each answer.
+const PROBE_DELAY: Duration = Duration::from_millis(300);
+
+impl wiremock::Respond for Arrivals {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.0
+            .lock()
+            .expect("arrivals")
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(200).set_delay(PROBE_DELAY)
+    }
+}
+
+/// An open breaker admits one probe once `open_for` is over, and nothing
+/// else until the probe has answered. Checked by the order of events, which
+/// load can only spread further apart: the probe arrives no sooner than
+/// `open_for` after the breaker opened, and the other two no sooner than
+/// the probe's answer, [`PROBE_DELAY`] after it arrived. Without the
+/// single probe, all three would arrive together.
 #[tokio::test]
 async fn open_breaker_admits_one_probe() {
+    const OPEN_FOR: Duration = Duration::from_millis(400);
     let server = MockServer::start().await;
+    let arrivals = Arrivals::default();
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+        .respond_with(arrivals.clone())
         .mount(&server)
         .await;
-    let open = breaker(1, Duration::from_millis(400));
-    open.on_failure(std::time::Instant::now());
+    let open = breaker(1, OPEN_FOR);
+    let opened = std::time::Instant::now();
+    open.on_failure(opened);
     let h = Harness::new(
         queue(Ordering::None),
         vec![endpoint_with(&server, "/a", open)],
         options(Balance::RoundRobin, 4, retry(1, 5, 5)),
     );
-    let start = Instant::now();
     for id in 1..=3 {
         h.admit(id, None);
     }
     wait_requests(&server, 1).await;
-    // The probe takes 300 ms; nothing else may go out before it answers.
-    assert_eq!(requests(&server).await.len(), 1);
     assert_eq!(h.consumer.in_flight(), 3, "the others wait, leased");
     h.settled().await;
-    // Reopen (400 ms), the probe alone (300 ms), then the other two at once
-    // (300 ms); without the single probe all three would end by ~700 ms.
+
+    let arrived = arrivals.0.lock().expect("arrivals").clone();
+    let [probe, rest @ ..] = arrived.as_slice() else {
+        panic!("no request");
+    };
+    assert_eq!(rest.len(), 2, "one probe, then the other two");
+    let since_open = probe.duration_since(opened);
     assert!(
-        start.elapsed() >= Duration::from_millis(900),
-        "settled after {:?}",
-        start.elapsed()
+        since_open >= OPEN_FOR,
+        "the probe went out {since_open:?} after opening"
     );
-    assert_eq!(requests(&server).await.len(), 3);
+    for other in rest {
+        let after_probe = other.duration_since(*probe);
+        assert!(
+            after_probe >= PROBE_DELAY,
+            "a call went out {after_probe:?} after the probe, before its answer"
+        );
+    }
 }
 
 #[tokio::test]
