@@ -1591,49 +1591,52 @@ consumers:
 }
 
 /// JSON and urlencoded bodies over 64 KiB stream through the scan: a clean
-/// one reaches the server byte for byte, one whose reference comes late,
+/// one reaches the server byte for byte; one whose reference comes late,
 /// or that turns out longer than 1 MiB while it streams (no length
-/// announced), never reaches it whole, and gets 400 or 413.
+/// announced), gets 400 or 413, and the server sees its connection end
+/// short of the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_bodies_scanned_while_they_stream() {
-    let server = answering_server().await;
-    let tgin = start(&local_files_config(&server.uri())).await;
+    let (api, seen) = recorder().await;
+    let tgin = start(&local_files_config(&api)).await;
+    let path = format!("/bot{TOKEN}/sendDocument");
     let padding = "x".repeat(200 * 1024);
     let clean_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"BQAC"}}"#);
     let clean_form = format!("chat_id=1&caption={padding}&document=BQAC");
-    for (content_type, body) in [(JSON, &clean_json), (FORM, &clean_form)] {
+    for (n, (content_type, body)) in [(JSON, &clean_json), (FORM, &clean_form)]
+        .into_iter()
+        .enumerate()
+    {
         let response = tgin
-            .send(
-                reqwest::Method::POST,
-                &format!("/bot{TOKEN}/sendDocument"),
-                content_type,
-                body.clone(),
-            )
+            .send(reqwest::Method::POST, &path, content_type, body.clone())
             .await;
         assert_eq!(response.status(), 200, "{content_type}");
-        assert_forwarded(&server, TOKEN, "sendDocument", body.as_bytes()).await;
+        let record = recorded(&seen, n + 1).await.remove(n);
+        assert_eq!(record.path.as_deref(), Some(path.as_str()));
+        assert!(record.complete, "{content_type}");
+        assert!(
+            record.body == body.as_bytes(),
+            "{content_type}: not byte for byte"
+        );
     }
-    let forwarded = server.received_requests().await.expect("recording").len();
 
     let late_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"{LOCAL_FILE}"}}"#);
     let late_form = format!(
         "chat_id=1&caption={padding}&media={}",
         encoded(&format!(r#"[{{"media":"{LOCAL_FILE}"}}]"#))
     );
+    let mut refused = Vec::new();
     for (content_type, body) in [(JSON, late_json), (FORM, late_form)] {
+        let len = body.len();
         let response = tgin
-            .send(
-                reqwest::Method::POST,
-                &format!("/bot{TOKEN}/sendDocument"),
-                content_type,
-                body,
-            )
+            .send(reqwest::Method::POST, &path, content_type, body)
             .await;
         assert_eq!(
             description(response).await,
             (400, LOCAL_REFUSED.to_owned()),
             "{content_type}"
         );
+        refused.push(len);
     }
     let chunk = format!(r#"{{"chat_id":1,"caption":"{}"#, "y".repeat(64 * 1024));
     let response = tgin
@@ -1641,26 +1644,54 @@ async fn large_bodies_scanned_while_they_stream() {
             reqwest::Method::POST,
             &format!("/bot{TOKEN}/sendMessage"),
             JSON,
-            reqwest::Body::wrap(Chunked(vec![chunk; 20])),
+            reqwest::Body::wrap(Chunked(vec![chunk.clone(); 20])),
         )
         .await;
     assert_eq!(
         description(response).await,
         (413, "Request Entity Too Large".to_owned())
     );
-    assert_eq!(
-        server.received_requests().await.expect("recording").len(),
-        forwarded,
-        "a refused call reached the server whole"
+    refused.push(20 * chunk.len());
+
+    // Each refused upload breaks the connection it went on, which the
+    // server records as ended short: with the part of the request it got,
+    // or with nothing at all when the request head never left tgin. tgin
+    // may have more connections open, which end between requests too.
+    let records = recorded(&seen, 2 + refused.len()).await;
+    let later = &records[2..];
+    assert!(
+        later.iter().all(|record| !record.complete),
+        "a refused upload reached the server whole: {}",
+        summary(&records)
     );
+    assert!(later.len() >= refused.len(), "{}", summary(&records));
     tgin.assert_metric(
         r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 2"#,
     );
     assert!(
         !LOGS.text().contains(SECRET_PATH),
         "a path reached the logs"
     );
     tgin.stop().await;
+}
+
+/// `records` without their bodies, for a failure message.
+fn summary(records: &[Recorded]) -> String {
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "{} {} B{}",
+                record.path.as_deref().unwrap_or("-"),
+                record.body.len(),
+                if record.complete { "" } else { " (short)" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A body of `chunks` with no length announced: it goes chunked.
@@ -1680,12 +1711,14 @@ impl http_body::Body for Chunked {
 }
 
 /// What [`recorder`] saw of one connection's last request: the path, the
-/// body bytes it got, and whether the body was complete (its whole
-/// `Content-Length`, or a chunked body's last chunk and trailer section).
+/// body bytes it got (`received` of them in whole chunks, for a chunked
+/// body), and whether the body was complete (its whole `Content-Length`,
+/// or a chunked body's last chunk and trailer section).
 #[derive(Clone, Debug)]
 struct Recorded {
     path: Option<String>,
     received: usize,
+    body: Vec<u8>,
     complete: bool,
 }
 
@@ -1712,6 +1745,7 @@ async fn recorder() -> (String, Arc<Mutex<Vec<Recorded>>>) {
                     let mut record = Recorded {
                         path: None,
                         received: 0,
+                        body: Vec::new(),
                         complete: false,
                     };
                     let mut line = String::new();
@@ -1769,12 +1803,16 @@ async fn recorder() -> (String, Arc<Mutex<Vec<Recorded>>>) {
                                 let want = left.min(buf.len());
                                 match read.read(&mut buf[..want]).await {
                                     Ok(0) | Err(_) => break,
-                                    Ok(n) => left -= n,
+                                    Ok(n) => {
+                                        record.body.extend_from_slice(&buf[..n]);
+                                        left -= n;
+                                    }
                                 }
                             }
                             if left > 0 {
                                 break;
                             }
+                            record.body.truncate(record.body.len() - 2);
                             record.received += size;
                         }
                     } else {
@@ -1782,7 +1820,10 @@ async fn recorder() -> (String, Arc<Mutex<Vec<Recorded>>>) {
                             let want = (length - record.received).min(buf.len());
                             match read.read(&mut buf[..want]).await {
                                 Ok(0) | Err(_) => break,
-                                Ok(n) => record.received += n,
+                                Ok(n) => {
+                                    record.body.extend_from_slice(&buf[..n]);
+                                    record.received += n;
+                                }
                             }
                         }
                         record.complete = record.received == length;
