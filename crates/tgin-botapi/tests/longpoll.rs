@@ -475,6 +475,110 @@ async fn fatal_on_401() {
     }
 }
 
+/// The options of a source on a `local` upstream.
+fn local() -> LongPollOptions {
+    LongPollOptions {
+        local_upstream: true,
+        ..options()
+    }
+}
+
+/// On a `local` upstream a 401 or 404 comes from the Bot API server itself
+/// (its api_id or api_hash rejected, say): the source backs off with the
+/// reason, token masked, and polls once the server accepts the bot again.
+/// A 403 still stops it.
+#[tokio::test]
+async fn local_upstream_401_is_retryable() {
+    let mut tg = Telegram::start(vec![
+        api_error(404, &format!("Not Found: bot{TOKEN}"), None),
+        batch(&[1]),
+    ])
+    .await;
+    Mock::given(method("GET"))
+        .and(path(at("getMe")))
+        .respond_with(api_error(
+            401,
+            &format!("Unauthorized: invalid api-id/api-hash bot{TOKEN}"),
+            None,
+        ))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&tg.server)
+        .await;
+    let sink = Recorder::new(|_| Admit::Admitted);
+    let fx = Fixture::new(&tg, Arc::clone(&sink), local());
+    let (ingest, handle) = fx.spawn();
+
+    assert_eq!(tg.next_poll().await.body["offset"], 0);
+    assert_eq!(tg.next_poll().await.body["offset"], 0);
+    assert_eq!(tg.next_poll().await.body["offset"], 2);
+    assert_eq!(sink.ids(), [1]);
+    assert_eq!(tg.count("getMe").await, 3);
+    fx.assert_metrics(&[
+        r#"tgin_source_errors_total{source="lp",reason="unauthorized"} 3"#,
+        r#"tgin_source_state{source="lp",state="running"} 1"#,
+    ]);
+    assert_eq!(fx.source.last_error(), None);
+    stop(ingest, handle).await;
+
+    // A server that keeps refusing: `backoff` with the reason, never failed.
+    let tg = Telegram::start_with(
+        api_error(401, &format!("Unauthorized: bot{TOKEN}"), None),
+        vec![],
+    )
+    .await;
+    let opts = LongPollOptions {
+        backoff: (FOREVER, FOREVER, FOREVER),
+        ..local()
+    };
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), opts);
+    let (ingest, handle) = fx.spawn();
+    fx.wait_metric(r#"tgin_source_state{source="lp",state="backoff"} 1"#)
+        .await;
+    let reason = fx.source.last_error().expect("the reason it backs off");
+    assert!(
+        reason.contains("getMe failed: Bot API error 401"),
+        "{reason}"
+    );
+    assert!(!reason.contains(TOKEN), "{reason}");
+    assert!(!handle.is_finished());
+    stop(ingest, handle).await;
+
+    let tg = Telegram::start_with(api_error(403, "Forbidden", None), vec![]).await;
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), local());
+    let exit = timeout(PATIENCE, fx.source.run(CancellationToken::new()))
+        .await
+        .expect("getMe 403 did not end the run");
+    assert!(matches!(exit, Exit::Fatal(_)), "{exit:?}");
+}
+
+/// On a `cloud` upstream a 401 or 404 still means Telegram rejected the
+/// token: the source stops for good.
+#[tokio::test]
+async fn cloud_upstream_401_still_fatal() {
+    let cloud = LongPollOptions {
+        local_upstream: false,
+        ..options()
+    };
+    let tg = Telegram::start_with(api_error(401, "Unauthorized", None), vec![]).await;
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), cloud.clone());
+    let exit = timeout(PATIENCE, fx.source.run(CancellationToken::new()))
+        .await
+        .expect("getMe 401 did not end the run");
+    assert!(matches!(exit, Exit::Fatal(_)), "{exit:?}");
+    assert_eq!(tg.count("getMe").await, 1);
+    fx.assert_metrics(&[r#"tgin_source_state{source="lp",state="failed"} 1"#]);
+
+    let tg = Telegram::start(vec![api_error(404, "Not Found", None)]).await;
+    let fx = Fixture::new(&tg, Recorder::new(|_| Admit::Admitted), cloud);
+    let exit = timeout(PATIENCE, fx.source.run(CancellationToken::new()))
+        .await
+        .expect("getUpdates 404 did not end the run");
+    assert!(matches!(exit, Exit::Fatal(_)), "{exit:?}");
+    assert_eq!(tg.count("getUpdates").await, 1);
+    fx.assert_metrics(&[r#"tgin_source_state{source="lp",state="failed"} 1"#]);
+}
+
 #[tokio::test]
 async fn get_me_learns_username() {
     let mut tg = Telegram::start(vec![]).await;

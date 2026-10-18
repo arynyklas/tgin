@@ -61,9 +61,13 @@ pub struct ReloadReport {
     pub sources_added: Vec<String>,
     /// Bots that are gone: the caller stops them.
     pub sources_removed: Vec<String>,
-    /// Bots whose token, `api_url` or ingress changed: the caller restarts
-    /// them.
+    /// Bots whose token, upstream (by name, kind, URL or local mode) or
+    /// ingress changed: the caller restarts them.
     pub sources_restarted: Vec<String>,
+    /// Bots now on another upstream (another name or URL); also in
+    /// `sources_restarted`. Unless the old server logged the bot out
+    /// first, Telegram may split its updates between the two servers.
+    pub upstream_changed: Vec<String>,
     /// Changed settings that take effect only after a restart:
     /// `server.listen`, `server.max_connections`,
     /// `server.header_read_timeout`, `server.tls` (turned on or off),
@@ -297,8 +301,15 @@ impl Plan {
                         removed_sources.push(bot.name.clone());
                     }
                     Some(new) => {
-                        if new.token.expose() != bot.token.expose()
-                            || new.api_url != bot.api_url
+                        let (old_upstream, new_upstream) = (&bot.upstream, &new.upstream);
+                        let moved = !new_upstream.same_server(old_upstream);
+                        if moved {
+                            report.upstream_changed.push(new.name.clone());
+                        }
+                        if moved
+                            || new.token.expose() != bot.token.expose()
+                            || new_upstream.kind != old_upstream.kind
+                            || new_upstream.local_mode != old_upstream.local_mode
                             || new.ingress != bot.ingress
                         {
                             report.sources_restarted.push(new.name.clone());
@@ -315,6 +326,7 @@ impl Plan {
             &mut report.sources_added,
             &mut report.sources_removed,
             &mut report.sources_restarted,
+            &mut report.upstream_changed,
             &mut report.restart_required,
         ] {
             list.sort();
@@ -462,7 +474,7 @@ pub(crate) fn compile(
 
 /// Clears the runtime endpoint of every push consumer of `state` that no
 /// longer accepts one, that the bot whose `setWebhook` set it no longer
-/// feeds (R37), or whose bot's token changed since: a token holder never
+/// feeds, or whose bot's token changed since: a token holder never
 /// redirects another bot's updates, not even across reloads, and rotating a
 /// leaked token evicts what its holder set. Draining instances keep theirs
 /// to deliver what they hold, unless their bot's token changed (see

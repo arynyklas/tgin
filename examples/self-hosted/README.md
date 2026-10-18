@@ -1,0 +1,140 @@
+# tgin with a self-hosted Bot API server
+
+tgin in front of your own [telegram-bot-api](https://github.com/tdlib/telegram-bot-api)
+server instead of `api.telegram.org`, with one polling bot behind tgin:
+
+```
+           upstream network                bots network
+Telegram ── telegram-bot-api ◄── tgin ◄──────────────── bot
+              (no published port)  long poll   gateway http://tgin:8080/c/bot
+```
+
+- `telegram-bot-api` is built from `docker/telegram-bot-api` (flags, volumes
+  and security notes in its README). It runs in local mode, shares the
+  `upstream` network with tgin only, and publishes no port.
+- tgin long-polls the server and queues the updates for the `bot` consumer.
+  The server is the upstream `tba` in `config/tgin.yaml`: `kind: local`,
+  `local_mode: true`, and `files.dir`, the server's `--files-dir` as
+  mounted in tgin. Its gateway is the bot's Bot API: the bot's calls reach
+  the server through tgin, and the bot's files come from tgin's disk.
+- The bot (`examples/simple/bot1.py`) is on the `bots` network with tgin, so
+  it cannot reach the server around tgin. It answers every message.
+- The server keeps its state (the bots' TDLib databases, the update queue)
+  in the `server-state` volume, private to its user (10001), and the files
+  in `server-files`, which is mounted read-only into tgin at the same path.
+  tgin keeps its own uid (65532) and joins the server's group (`group_add`),
+  which may read the files: TDLib creates them 0640 in directories 0750.
+- tgin's config is `config/tgin.yaml`, mounted as the directory
+  `/etc/tgin`: a single-file mount would keep the old file after an edit
+  saved by rename, so tgin would never see the change.
+
+## Run it
+
+You need an api_id and api_hash from <https://my.telegram.org> and a bot
+token. Put them in a `.env` file next to `compose.yaml` (it is git-ignored):
+
+```sh
+BOT_TOKEN=123456789:...
+TELEGRAM_API_ID=...
+TELEGRAM_API_HASH=...
+TGIN_ADMIN_TOKEN=...   # any long random string
+```
+
+A bot that has used `api.telegram.org` must log out of it first: while it
+is logged in on two servers, neither is sure to get all of its updates.
+Once logged out, it cannot log back in to `api.telegram.org` for 10
+minutes, and its pending updates there are dropped. Call `logOut` there
+once, directly (tgin's gateway refuses it from downstreams):
+
+```sh
+curl "https://api.telegram.org/bot$BOT_TOKEN/logOut"
+```
+
+If tgin already runs the bot against `api.telegram.org`,
+`tgin admin bot logout <bot> --yes` does this for you after the bot's
+pending updates are delivered ([DOCS.md → Moving a bot between
+servers](../../DOCS.md#moving-a-bot-between-servers)).
+
+Then, from this directory:
+
+```sh
+docker compose up -d --build
+docker compose logs -f
+```
+
+The first build of the server compiles TDLib and takes a while.
+
+## Try it without Telegram
+
+`compose.fake.yaml` swaps the server for tgin's fake Bot API server
+(`tests/e2e/fake-telegram`) under the same name, and gives tgin and the bot
+the fake token `123456:self_hosted_example_fake_token`. It runs as its own
+Compose project, `tgin-self-hosted-fake`, so it never touches a real
+deployment of this example, its image or its volumes. `fake.env` only
+satisfies the variables `compose.yaml` requires; a token in your shell's
+environment is not used. Nothing reaches Telegram.
+
+```sh
+docker compose --env-file fake.env -f compose.yaml -f compose.fake.yaml up -d --build --wait
+docker compose --env-file fake.env -f compose.yaml -f compose.fake.yaml port telegram-bot-api 8081
+# 127.0.0.1:PORT, the fake's control API (the fake only; the real server is never published)
+
+# A user's message to the bot, queued on the fake as Telegram would:
+curl -s -X POST "http://127.0.0.1:PORT/fake/updates/123456:self_hosted_example_fake_token" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":{"message_id":1,"date":1767225600,"chat":{"id":42,"type":"private","first_name":"Ann"},"from":{"id":42,"is_bot":false,"first_name":"Ann"},"text":"hi"}}'
+
+# tgin polled it, the bot got it from tgin and answered through tgin's gateway:
+curl -s "http://127.0.0.1:PORT/fake/calls?method=sendMessage"
+
+docker compose --env-file fake.env -f compose.yaml -f compose.fake.yaml down -v --rmi local
+```
+
+The last call lists one `sendMessage` to chat 42 with the text "hello
+through a self-hosted Bot API server".
+
+The fake runs in local mode (`--local-mode`) on the same files volume, so
+tgin serves the bot's files here as it would the real server's: a
+`getFile` through tgin answers a path relative to the bot's directory, such
+as `documents/file_1.bin`, and `/file/bot<token>/documents/file_1.bin` on
+tgin streams the file from the volume. The fake writes as root there, as
+the volumes are made for the real server's paths (see `compose.fake.yaml`).
+
+## Deployment rules
+
+- **Never expose the server.** It has no authentication beyond the bot token
+  in the URL and no TLS. Anyone who reaches it with a token controls that
+  bot; anyone who reaches it with any valid token makes it log in as that
+  bot with your api_id. Keep it on a network only tgin can reach, publish
+  no port, and do not put bots on that network.
+- **Never expose its statistics port.** Leave `--http-stat-port` off; when
+  on, the page is unauthenticated, lists bots by token prefix and changes
+  the log verbosity on request.
+- **One server per token set.** A bot is logged in on exactly one server,
+  which owns its update queue: two servers for one token each get part of
+  its updates. Many bots may share one server; split them across servers
+  with `--filter` if you must.
+- **Never one server per tgin replica.** Replicas of tgin share the one
+  server their bots live on; a server per replica logs each bot in several
+  times.
+- **Local mode trusts its callers.** A `file:` path in a request makes the
+  server upload any file it can read, other bots' databases included, and
+  webhooks may target private addresses. Only tgin reaches the server here,
+  and tgin refuses a `file:` reference from the bot (`allow_local_files` is
+  off by default); limit the server's egress all the same.
+- **Keep the `server-state` volume.** It holds the bots' Telegram sessions
+  and their pending updates; losing it logs every bot out of this server.
+- **Keep the api_id, api_hash and tokens out of images and version
+  control.** Pass them through the environment, as here. `docker inspect`
+  and `docker compose config` show them, so limit who can reach the Docker
+  API.
+
+## Files
+
+The server stores each bot's files in
+`/var/lib/telegram-bot-api/files/<token>/` (the token with its `:`), and
+tgin has that volume read-only at the same path, which `files.dir` names.
+tgin serves the bot its own directory on `/file/bot<token>/…`, and turns
+the absolute paths `getFile` answers in local mode into paths under that
+directory, so a bot downloads through tgin as it would from
+`api.telegram.org`, without the cloud's 20 MB limit.

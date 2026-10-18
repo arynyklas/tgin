@@ -1,13 +1,17 @@
 //! Hot reload: one task serializes every trigger (SIGHUP, `POST /v1/reload`
 //! and the config watcher), re-reads the config file, applies it to the
 //! engine and starts, stops and restarts the sources the change touches.
+//! The same task moves bots off their Bot API server
+//! (`POST /v1/bots/{name}/logout|close`), so a reload never restarts a bot
+//! halfway through its move.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tgin_core::config::{self, Config};
+use tgin_botapi::{ApiError, BotClient, WebhookInfo};
+use tgin_core::config::{self, Bot, Config, Ingress};
 use tgin_core::metrics::ReloadOutcome;
 use tgin_core::reload::ReloadReport;
 use tgin_runtime::config::{ConfigError, ConfigWatcher, Env, watch_config};
@@ -16,19 +20,29 @@ use tgin_runtime::lifecycle::{Lifecycle, Phase};
 use tgin_runtime::obs::LogHandle;
 use tgin_runtime::secret::Redactor;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::admin::{BotMove, MAX_MOVE_TIMEOUT, Moved};
 use crate::app::{self, Shared};
 use crate::cli;
 use crate::data_server::DataRoutes;
-use crate::sources::Kind;
+use crate::sources::{self, Kind, Stop};
 
-/// Reload requests that may wait while one runs; a SIGHUP finding the queue
-/// full is covered by a request already waiting.
+/// Reload requests that may wait while a reload or a move runs, and moves
+/// likewise, each in a queue of its own: moves never fill the reload
+/// queue, so a SIGHUP finding it full is covered by a reload already
+/// waiting, which reads the file when it runs.
 const QUEUE: usize = 8;
 /// How often the watcher re-reads the config file, for file systems that
 /// deliver no change events.
 const WATCH_POLL: Duration = Duration::from_secs(2);
+/// How often a move looks whether tgin still holds updates of the bot.
+const MOVE_CHECK: Duration = Duration::from_millis(50);
+/// The most of a move's timeout kept for its calls being sent to end
+/// (step 4), whatever tgin still delivers (step 3); a quarter of the
+/// timeout when that is less.
+const IN_FLIGHT_RESERVE: Duration = Duration::from_secs(5);
 
 /// What asked for a reload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +58,41 @@ pub(crate) struct Request {
     reply: Option<oneshot::Sender<Result<ReloadReport, ReloadError>>>,
 }
 
+/// One bot to move off its Bot API server, with where the result goes;
+/// see [`Reloader::move_bot`].
+pub(crate) struct Move {
+    bot: String,
+    how: BotMove,
+    timeout: Option<Duration>,
+    /// When the move was asked for: its timeout runs from here.
+    requested: Instant,
+    reply: oneshot::Sender<Result<Moved, MoveError>>,
+}
+
+/// A move's requester waiting for its result. Dropped before it came (its
+/// HTTP client went away), it closes the reply, so that the queued move
+/// is dropped unless it has stopped the bot's ingest by then.
+struct Awaited<'a> {
+    bot: &'a str,
+    result: oneshot::Receiver<Result<Moved, MoveError>>,
+    done: bool,
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.result.close();
+            tracing::debug!(bot = %self.bot, "bot move abandoned by its requester");
+        }
+    }
+}
+
+/// What [`Reloader::run`] takes its jobs from.
+pub(crate) struct Requests {
+    reloads: mpsc::Receiver<Request>,
+    moves: mpsc::Receiver<Move>,
+}
+
 /// Why a reload changed nothing.
 #[derive(Debug)]
 pub(crate) enum ReloadError {
@@ -53,18 +102,57 @@ pub(crate) enum ReloadError {
     Rejected(Vec<ConfigError>),
 }
 
-/// Where reload requests go.
+/// Why a bot was not moved.
+#[derive(Debug)]
+pub(crate) enum MoveError {
+    /// tgin is shutting down.
+    Draining,
+    /// No bot of the running config has the name.
+    UnknownBot,
+    /// The bot is parked already.
+    Parked,
+    /// The Bot API server still held updates of the bot when the move's
+    /// time for its drain ran out, a reserve before the deadline (or the
+    /// move waited in the queue past its deadline); the bot runs on
+    /// unchanged.
+    Undrained,
+    /// This many calls of the bot were still being sent to its server at
+    /// the deadline; nothing was called on the server, and the bot runs on.
+    Busy(usize),
+    /// The Bot API server refused or failed the call (token masked); the
+    /// bot runs on.
+    Upstream(ApiError),
+    /// As [`MoveError::Upstream`] for a `close` refused after
+    /// `deleteWebhook`, and the webhook tgin does not register could not
+    /// be set again: it must be set again for the bot to get updates.
+    Unrestored(ApiError),
+}
+
+/// Where reload and move requests go.
 #[derive(Clone)]
 pub(crate) struct ReloadQueue {
     tx: mpsc::Sender<Request>,
+    moves: mpsc::Sender<Move>,
     lifecycle: Arc<Lifecycle>,
 }
 
 impl ReloadQueue {
-    /// A queue and the receiver [`Reloader::run`] takes requests from.
-    pub(crate) fn new(lifecycle: Arc<Lifecycle>) -> (Self, mpsc::Receiver<Request>) {
-        let (tx, rx) = mpsc::channel(QUEUE);
-        (Self { tx, lifecycle }, rx)
+    /// A queue and the receivers [`Reloader::run`] takes requests from.
+    pub(crate) fn new(lifecycle: Arc<Lifecycle>) -> (Self, Requests) {
+        let (tx, reloads) = mpsc::channel(QUEUE);
+        let (moves, moved) = mpsc::channel(QUEUE);
+        let requests = Requests {
+            reloads,
+            moves: moved,
+        };
+        (
+            Self {
+                tx,
+                moves,
+                lifecycle,
+            },
+            requests,
+        )
     }
 
     /// SIGHUP: queues a reload, unless tgin is shutting down.
@@ -102,6 +190,39 @@ impl ReloadQueue {
         // Dropped unanswered when the shutdown stopped the reloads.
         result.await.unwrap_or(Err(ReloadError::Draining))
     }
+
+    /// `POST /v1/bots/{bot}/logout|close`: moves the bot (see
+    /// [`Reloader::move_bot`]) and returns the result, after the moves
+    /// already waiting and before any reload that has not begun: a move
+    /// acts on the config in force when it was asked for (operators move
+    /// a bot before they change its upstream).
+    pub(crate) async fn move_bot(
+        &self,
+        bot: String,
+        how: BotMove,
+        timeout: Option<Duration>,
+    ) -> Result<Moved, MoveError> {
+        let (reply, result) = oneshot::channel();
+        let request = Move {
+            bot: bot.clone(),
+            how,
+            timeout,
+            requested: Instant::now(),
+            reply,
+        };
+        if self.moves.send(request).await.is_err() {
+            return Err(MoveError::Draining);
+        }
+        tracing::debug!(bot = %bot, method = how.method(), "bot move queued");
+        let mut awaited = Awaited {
+            bot: &bot,
+            result,
+            done: false,
+        };
+        let result = (&mut awaited.result).await;
+        awaited.done = true;
+        result.unwrap_or(Err(MoveError::Draining))
+    }
 }
 
 /// The config file and what reloading it touches.
@@ -135,21 +256,35 @@ struct Watch {
 }
 
 impl Reloader {
-    /// Runs the reloads asked through `requests`, and those the config
-    /// watcher asks for while the config enables it, one at a time, until
-    /// `stop` is cancelled.
-    pub(crate) async fn run(
-        mut self,
-        mut requests: mpsc::Receiver<Request>,
-        stop: CancellationToken,
-    ) {
+    /// Runs the moves and reloads asked through `requests`, and the
+    /// reloads the config watcher asks for while the config enables it, one
+    /// at a time, until `stop` is cancelled. Waiting moves run first, so a
+    /// reload never runs before a move asked for earlier: the move would
+    /// otherwise read the reloaded config, and could log a bot out of the
+    /// upstream it was just moved to. A reload thus waits for the queued
+    /// moves, each bounded by its timeout; a SIGHUP is not dropped meanwhile,
+    /// the moves having a queue of their own.
+    pub(crate) async fn run(mut self, requests: Requests, stop: CancellationToken) {
+        let Requests {
+            mut reloads,
+            mut moves,
+        } = requests;
         let mut watch = None;
         self.settle(&mut watch).await;
         loop {
             let request = tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                request = requests.recv() => match request {
+                job = moves.recv() => match job {
+                    Some(mut job) => {
+                        if let Some(result) = self.move_bot(&mut job).await {
+                            let _ = job.reply.send(result);
+                        }
+                        continue;
+                    }
+                    None => return,
+                },
+                request = reloads.recv() => match request {
                     Some(request) => request,
                     None => return,
                 },
@@ -333,20 +468,40 @@ impl Reloader {
     }
 
     /// Stops the removed sources, restarts the changed ones, starts the new
-    /// ones, and serves the new routes.
+    /// ones, and serves the new routes. A parked bot stays parked, with a
+    /// warning, unless the reload changed its upstream: it then starts on
+    /// the new one, which is said at info. Losing its ingress keeps it
+    /// parked too, so that ingress coming back on the same upstream does
+    /// not start it. Any other bot moved to another upstream gets a warning:
+    /// the old server may still have it logged in.
     async fn restart_sources(&self, cfg: &Config, report: &ReloadReport) {
-        let shared = &self.shared;
-        let sources = &shared.sources;
+        let sources = &self.shared.sources;
         for name in &report.sources_removed {
-            sources.stop(name, true);
+            sources.stop(name, Stop::BotGone);
         }
         let mut starting = Vec::new();
         for name in &report.sources_restarted {
             let bot = cfg.bots.iter().find(|bot| &bot.name == name);
-            // A bot whose ingress went away is gone as a source.
-            let gone = bot.is_none_or(|bot| bot.ingress.is_none());
-            sources.stop(name, gone);
-            if let Some(bot) = bot.filter(|_| !gone) {
+            let why = match bot {
+                None => Stop::BotGone,
+                Some(bot) if bot.ingress.is_none() => Stop::SourceGone,
+                Some(_) => Stop::Restart,
+            };
+            let moved = report.upstream_changed.contains(name);
+            if moved {
+                if sources.unpark(name) {
+                    tracing::info!(bot = %name, "the parked bot starts on its new upstream; it was logged out of the old one");
+                } else {
+                    tracing::warn!(
+                        bot = %name,
+                        "the bot now talks to another Bot API server; while the old one still has it logged in, the bot's updates may be split between the two: move bots with `tgin admin bot logout` (or `close`) before changing their upstream"
+                    );
+                }
+            } else if why == Stop::Restart && sources.is_parked(name) {
+                continue;
+            }
+            sources.stop(name, why);
+            if let Some(bot) = bot.filter(|_| why == Stop::Restart) {
                 starting.push(bot);
             }
         }
@@ -357,8 +512,19 @@ impl Reloader {
                 .filter_map(|name| cfg.bots.iter().find(|bot| &bot.name == name))
                 .filter(|bot| bot.ingress.is_some()),
         );
+        self.start_sources(cfg, starting).await;
+        for name in sources.parked() {
+            tracing::warn!(bot = %name, "the bot stays parked: it was logged out of its Bot API server, and this reload left its upstream unchanged; a reload that changes its upstream starts it there");
+        }
+    }
+
+    /// Starts the sources of `bots`, which have ingress, and serves the
+    /// routes of `cfg`.
+    async fn start_sources(&self, cfg: &Config, bots: Vec<&Bot>) {
+        let shared = &self.shared;
+        let sources = &shared.sources;
         let mut prepared = Vec::new();
-        for bot in starting {
+        for bot in bots {
             match sources.prepare(bot) {
                 Ok(bot) => prepared.push(bot),
                 Err(err) => {
@@ -371,8 +537,7 @@ impl Reloader {
         // to a registered webhook only after `setWebhook`, which comes after
         // the username is known.
         if let (Some(routes), Some(server)) = (&self.routes, &cfg.server) {
-            let ingest = shared.lifecycle.ingest_token();
-            routes.rebuild(cfg, server, &shared.engine, &ingest);
+            routes.rebuild(cfg, server, &shared.engine, &|bot| sources.ingest_of(bot));
         }
         sources.identify(&prepared).await;
         let (long_polls, webhooks): (Vec<_>, Vec<_>) = prepared
@@ -382,6 +547,184 @@ impl Reloader {
         for bot in long_polls {
             sources.start_long_poll(bot);
         }
+    }
+
+    /// Moves the bot of `job` off its Bot API server, `how` says with which
+    /// call, in these steps; its timeout (`reload.drain_timeout` when
+    /// `None`, at most [`MAX_MOVE_TIMEOUT`] either way), counted from the
+    /// request, bounds steps 1 to 4 together; steps 1 and 3 end
+    /// [`IN_FLIGHT_RESERVE`] (or a quarter of the timeout, if less) before
+    /// it, so step 4 always has that much left:
+    /// 1. the server runs dry of the bot's updates, its ingest running on
+    ///    ([`crate::sources::Sources::drain_upstream`]); not done in time,
+    ///    the move fails ([`MoveError::Undrained`]) and changes nothing, as
+    ///    when the move waited in the queue past its deadline;
+    /// 2. the bot's ingest stops, and it is parked;
+    /// 3. tgin delivers what it holds of the bot, until its time is up;
+    /// 4. the gateway refuses the bot's calls that would go to a server
+    ///    ([`tgin_botapi::gateway::Gateway::set_parked`]), those still
+    ///    waiting on a rate limit or a 429 included, and the move waits for
+    ///    the calls being sent to end; any left at the deadline, the move
+    ///    fails ([`MoveError::Busy`]), the bot is unparked and starts again,
+    ///    and nothing is called on the server;
+    /// 5. the server is called: `logOut`, or `deleteWebhook` then `close`.
+    ///    When that fails, the bot is unparked and starts again.
+    ///
+    /// `None`, having changed nothing, when the requester went away before
+    /// the server ran dry (step 1): no one would learn the outcome. Once it
+    /// has, the move goes on, as calling off a finished drain would leave
+    /// the bot's long poll held. During the shutdown nothing is called on
+    /// the server.
+    async fn move_bot(&self, job: &mut Move) -> Option<Result<Moved, MoveError>> {
+        let Move {
+            bot: name,
+            how,
+            timeout,
+            requested,
+            reply,
+        } = job;
+        let (name, how) = (name.as_str(), *how);
+        let abandoned = || {
+            tracing::warn!(bot = %name, "the requester of the bot's move went away before the Bot API server ran dry of its updates; the move was dropped and changed nothing");
+        };
+        if reply.is_closed() {
+            abandoned();
+            return None;
+        }
+        let shared = &self.shared;
+        if shared.lifecycle.phase() >= Phase::Draining {
+            return Some(Err(MoveError::Draining));
+        }
+        let cfg = shared.config.load_full();
+        let Some(bot) = cfg.bots.iter().find(|bot| bot.name == name) else {
+            return Some(Err(MoveError::UnknownBot));
+        };
+        let sources = &shared.sources;
+        if sources.is_parked(name) {
+            return Some(Err(MoveError::Parked));
+        }
+        let Some(id) = shared.engine.source_id(name) else {
+            return Some(Err(MoveError::UnknownBot));
+        };
+        let client = match sources.client(bot) {
+            Ok(client) => client,
+            Err(err) => return Some(Err(MoveError::Upstream(err))),
+        };
+        // The API and the CLI refuse more; `reload.drain_timeout` has no bound.
+        let timeout = timeout
+            .unwrap_or(cfg.reload.drain_timeout)
+            .min(MAX_MOVE_TIMEOUT);
+        let deadline = *requested + timeout;
+        if Instant::now() >= deadline {
+            tracing::warn!(bot = %name, ?timeout, "the move waited in the queue past its deadline; the bot was not moved");
+            return Some(Err(MoveError::Undrained));
+        }
+        let ingest = shared.lifecycle.ingest_token();
+        // Steps 1 and 3 end early enough to leave step 4 a budget: a bot
+        // whose updates tgin still delivers has calls of its own on their
+        // way.
+        let reserve = IN_FLIGHT_RESERVE.min(timeout / 4);
+        let delivering_until = deadline.checked_sub(reserve).unwrap_or(deadline);
+
+        let mut failure = None;
+        let drain = tokio::time::timeout_at(
+            delivering_until,
+            sources.drain_upstream(bot, &client, &mut failure),
+        );
+        let drained = tokio::select! {
+            drained = ingest.run_until_cancelled(drain) => drained,
+            () = reply.closed() => {
+                abandoned();
+                return None;
+            }
+        };
+        match drained {
+            None => return Some(Err(MoveError::Draining)),
+            Some(Err(_)) => {
+                match failure.or_else(|| sources.long_poll_error(name)) {
+                    Some(error) => {
+                        tracing::warn!(bot = %name, ?timeout, ?reserve, %error, "the Bot API server could not be asked whether it still held updates of the bot before the move's time for its drain ran out, a reserve before its deadline; the bot was not moved")
+                    }
+                    None => {
+                        tracing::warn!(bot = %name, ?timeout, ?reserve, "the Bot API server still held updates of the bot when the move's time for its drain ran out, a reserve before its deadline; the bot was not moved")
+                    }
+                }
+                return Some(Err(MoveError::Undrained));
+            }
+            Some(Ok(())) => {}
+        }
+        sources.park(name);
+        let engine = &shared.engine;
+        let delivered = tokio::time::timeout_at(delivering_until, async {
+            while engine.pending_from(id) > 0 {
+                tokio::time::sleep(MOVE_CHECK).await;
+            }
+        });
+        if ingest.run_until_cancelled(delivered).await.is_none() {
+            return Some(Err(MoveError::Draining));
+        }
+
+        // From now on no call of the bot leaves for the server, whose next
+        // call would log the bot in again once it is logged out; those on
+        // their way end first.
+        let gateway = &shared.gateway;
+        gateway.set_parked(name, true);
+        let sent = calls_sent(deadline, || gateway.sending(name));
+        match ingest.run_until_cancelled(sent).await {
+            None => {
+                gateway.set_parked(name, false);
+                return Some(Err(MoveError::Draining));
+            }
+            Some(Err(sending)) => {
+                tracing::warn!(bot = %name, ?timeout, sending, "calls of the bot were still being sent to its Bot API server at the deadline; the bot was not moved and starts again");
+                self.resume(&cfg, bot).await;
+                return Some(Err(MoveError::Busy(sending)));
+            }
+            Some(Ok(())) => {}
+        }
+
+        // What tgin still holds of the bot as the server is called.
+        let left = engine.pending_from(id);
+        let called = match how {
+            BotMove::LogOut => client.log_out().await.map_err(|err| (err, None)),
+            BotMove::Close => close(bot, &client).await,
+        };
+        Some(match called {
+            Ok(result) => {
+                tracing::info!(bot = %name, method = how.method(), upstream = %bot.upstream.name, left, "the bot was logged out of its Bot API server and stays parked; a reload that changes its upstream starts it there");
+                Ok(Moved {
+                    bot: name.to_owned(),
+                    left,
+                    upstream: bot.upstream.name.to_string(),
+                    result,
+                })
+            }
+            Err((err, deleted)) => {
+                tracing::warn!(bot = %name, method = how.method(), error = %err, "the Bot API server did not log the bot out; it starts again");
+                self.resume(&cfg, bot).await;
+                match deleted {
+                    None => Err(MoveError::Upstream(err)),
+                    Some(before) => match sources::restore_webhook(bot, &client, &before).await {
+                        Ok(()) => {
+                            tracing::info!(bot = %name, "the bot's webhook, deleted before close, was set again");
+                            Err(MoveError::Upstream(err))
+                        }
+                        Err(error) => {
+                            tracing::error!(bot = %name, %error, "the bot's webhook was deleted before close and could not be set again; set it again, or the bot gets no update");
+                            Err(MoveError::Unrestored(err))
+                        }
+                    },
+                }
+            }
+        })
+    }
+
+    /// Ends the parking of `bot`, whose move failed, and starts its source
+    /// again if it has ingress.
+    async fn resume(&self, cfg: &Config, bot: &Bot) {
+        self.shared.sources.unpark(&bot.name);
+        let restart = bot.ingress.is_some().then_some(bot);
+        self.start_sources(cfg, restart.into_iter().collect()).await;
     }
 
     /// Reloads the data plane's certificate when the bytes of its
@@ -419,6 +762,29 @@ impl Reloader {
     }
 }
 
+/// `close`'s calls for `bot` on `client`: `deleteWebhook`, then `close`.
+/// A webhook bot that tgin does not register (`register: false`) has its
+/// webhook, set by its operator, read first: should `close` fail once the
+/// webhook is deleted, the error comes with it, to be set again (tgin
+/// registers the other bots' webhooks itself as they start again).
+async fn close(
+    bot: &Bot,
+    client: &BotClient,
+) -> Result<Option<String>, (ApiError, Option<WebhookInfo>)> {
+    let set_by_operator = matches!(&bot.ingress, Some(Ingress::Webhook(hook)) if !hook.register);
+    let before = if set_by_operator {
+        Some(client.webhook_info().await.map_err(|err| (err, None))?)
+    } else {
+        None
+    };
+    client
+        .delete_webhook(false)
+        .await
+        .map_err(|err| (err, None))?;
+    let deleted = before.filter(|info| !info.url.is_empty());
+    client.close().await.map_err(|err| (err, deleted))
+}
+
 /// The next change the watcher reports: `true`, or `false` once it has
 /// stopped; never without a watch.
 async fn next_change(watch: &mut Option<Watch>) -> bool {
@@ -436,6 +802,23 @@ pub(crate) async fn read_tls(files: &TlsFiles) -> std::io::Result<TlsBytes> {
     ))
 }
 
+/// Waits, until `deadline`, for `sending` (a bot's calls being sent) to
+/// come to 0; the count still being sent at the deadline when it has not.
+/// Looked at once more as the deadline comes: the last call may have ended
+/// between two looks.
+async fn calls_sent(deadline: Instant, sending: impl Fn() -> usize) -> Result<(), usize> {
+    let waited = tokio::time::timeout_at(deadline, async {
+        while sending() > 0 {
+            tokio::time::sleep(MOVE_CHECK).await;
+        }
+    })
+    .await;
+    match (waited, sending()) {
+        (Ok(()), _) | (Err(_), 0) => Ok(()),
+        (Err(_), left) => Err(left),
+    }
+}
+
 /// `err` on one line: `path (line L, column C): message (hint: …)`.
 fn one_line(err: &ConfigError) -> String {
     let mut line = match &err.at {
@@ -449,4 +832,62 @@ fn one_line(err: &ConfigError) -> String {
         line.push(')');
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Waker};
+
+    use super::*;
+
+    /// Moves filling their queue, one more waiting to get in, leave room
+    /// for a SIGHUP's reload.
+    #[test]
+    fn sighup_queued_while_moves_fill_their_queue() {
+        let (queue, mut requests) = ReloadQueue::new(Arc::new(Lifecycle::new()));
+        let mut cx = Context::from_waker(Waker::noop());
+        type Moving<'a> = Pin<Box<dyn Future<Output = Result<Moved, MoveError>> + 'a>>;
+        let mut moving: Vec<Moving<'_>> = (0..=QUEUE)
+            .map(|n| {
+                let moved = queue.move_bot(format!("bot{n}"), BotMove::LogOut, None);
+                Box::pin(moved) as Moving<'_>
+            })
+            .collect();
+        for future in &mut moving {
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+
+        queue.signal();
+        let reload = requests.reloads.try_recv().expect("the SIGHUP's reload");
+        assert_eq!(reload.trigger, Trigger::Signal);
+        assert!(reload.reply.is_none());
+        // The first `QUEUE` moves are queued; the last waits to get in.
+        for n in 0..QUEUE {
+            let queued = requests.moves.try_recv().expect("a queued move");
+            assert_eq!(queued.bot, format!("bot{n}"));
+        }
+        assert!(requests.moves.try_recv().is_err());
+    }
+
+    /// A call that ends between the wait's last look and its deadline does
+    /// not fail it; one still being sent then does, counted.
+    #[tokio::test(start_paused = true)]
+    async fn calls_sent_looks_again_at_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(1020);
+        // Looks at 0, 50 ms, …, 1000 ms see it; the next, at 1050 ms, would
+        // come after the deadline.
+        let ends = start + Duration::from_millis(1010);
+        let sending = || usize::from(Instant::now() < ends);
+        assert_eq!(calls_sent(deadline, sending).await, Ok(()));
+        assert_eq!(Instant::now(), deadline);
+
+        let start = Instant::now();
+        let stuck = || 2;
+        assert_eq!(
+            calls_sent(start + Duration::from_millis(100), stuck).await,
+            Err(2)
+        );
+    }
 }

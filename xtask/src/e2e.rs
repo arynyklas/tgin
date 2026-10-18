@@ -1,7 +1,8 @@
 //! `cargo xtask e2e [--keep]`: the end-to-end suite. Real bot frameworks
 //! (aiogram, python-telegram-bot, grammY, Telegraf) run against tgin and the
 //! fake Telegram in `tests/e2e/compose.yaml`; every scenario is checked
-//! through the fake's call journal.
+//! through the fake's call journal. The self-hosted scenario has a fake of
+//! its own in local mode (`fake-local`) and its own journal.
 //!
 //! The runner builds the images, starts the stack with
 //! `docker compose up -d --wait`, and runs the scenarios in order. Each check
@@ -112,6 +113,33 @@ fn framework(name: &str) -> &'static Framework {
         .iter()
         .find(|f| f.name == name)
         .unwrap_or(&FRAMEWORKS[0])
+}
+
+/// The self-hosted scenario's polling bot (python-telegram-bot): the compose
+/// service, the tgin bot and the consumer, on tgin's `fake-local` upstream.
+const LOCAL_POLL: &str = "local-poll";
+/// Its token, as in `compose.yaml`. Realistic in shape: the local fake names
+/// the bot's files directory after it.
+const LOCAL_POLL_TOKEN: &str = "8100000001:AAHe2eFakeLocalPollBotTokenx7Kq9Zr2";
+/// The self-hosted scenario's webhook bot (grammY), as [`LOCAL_POLL`].
+const LOCAL_HOOK: &str = "local-hook";
+const LOCAL_HOOK_TOKEN: &str = "8100000002:AAHe2eFakeLocalHookBotTokenm4Tp8Wd5";
+/// The URL tgin registers at the local fake for [`LOCAL_HOOK`]: its data
+/// plane over plain http, at the bot's default webhook path.
+const LOCAL_HOOK_URL: &str = "http://tgin:8080/webhook/local-hook";
+/// The local fake's files directory, mounted read-only in tgin at the same
+/// path.
+const LOCAL_FILES_DIR: &str = "/srv/tba";
+/// A local file reference the gateway must refuse.
+const LOCAL_FILE_REFERENCE: &str = "file:///etc/passwd";
+/// tgin's answer to a local file reference (`local_files.rs`).
+const LOCAL_FILE_REFUSED: &str = "Bad Request: local file uploads are disabled by tgin";
+/// tgin's answer to a downstream `logOut` or `close` (`intercept.rs`).
+const LOG_OUT_DISABLED: &str = "Bad Request: logOut and close are disabled by tgin; operators move bots with tgin admin bot logout|close";
+
+/// Whether `token` is a bot of the local fake.
+fn is_local(token: &str) -> bool {
+    token == LOCAL_POLL_TOKEN || token == LOCAL_HOOK_TOKEN
 }
 
 pub(crate) fn run(keep: bool) -> ExitCode {
@@ -295,6 +323,8 @@ struct Stack {
     http: Client,
     /// The fake's control API and Bot API.
     fake: String,
+    /// The local-mode fake's control API and Bot API.
+    fake_local: String,
     /// tgin's data plane (the gateway).
     gateway: String,
     /// tgin's admin plane (public metrics).
@@ -311,6 +341,7 @@ impl Stack {
         Ok(Self {
             http,
             fake: published("fake", 8081)?,
+            fake_local: published("fake-local", 8081)?,
             gateway: published("tgin", 8080)?,
             admin: published("tgin", 9090)?,
         })
@@ -342,6 +373,11 @@ struct Call {
     #[serde(default)]
     files: Vec<FilePart>,
     status: Option<u16>,
+    /// The update a webhook delivery carried.
+    update_id: Option<i64>,
+    /// A parameter named a local file (`file:…`).
+    #[serde(default)]
+    local_file: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -512,7 +548,19 @@ impl Suite {
         }
         scenario!("7 shaping: 5 messages to one chat", self.shaping());
         scenario!(
-            "final: exact counts and no downstream setWebhook/close/logOut",
+            "8 self-hosted: files from disk (python-telegram-bot)",
+            self.local_files()
+        );
+        scenario!(
+            "8 self-hosted: webhook over http (grammY)",
+            self.local_webhook()
+        );
+        scenario!(
+            "8 self-hosted: file: references refused",
+            self.local_refused()
+        );
+        scenario!(
+            "final: exact counts, close/logOut refused, no downstream setWebhook/close/logOut",
             self.finally()
         );
         println!("e2e: scenarios took {:.1} s", total.elapsed().as_secs_f64());
@@ -962,12 +1010,312 @@ impl Suite {
         })
     }
 
-    /// Every exact count still holds, and no downstream ever reached
-    /// setWebhook, close or logOut on Telegram (tgin calls none of them):
-    /// the runner itself calls close and logOut on a consumer-scoped base
-    /// and on the proxy-only base first. Each bot's only getMe and
-    /// deleteWebhook are tgin's own, made once at start: the frameworks'
-    /// startup calls, restarts included, stay local.
+    /// Scenario 8, files: a document stored at the local fake (written under
+    /// /srv/tba/<token>/, its getFile answering the absolute path) reaches
+    /// the polling bot. tgin's getFile answers the path relative to the
+    /// bot's directory, so the bot downloads from tgin's file route (PTB
+    /// with `%3A` for the token's colon) and sends the bytes back with
+    /// sendDocument. tgin serves the file from the shared volume: it never
+    /// times a file request against the server
+    /// (`tgin_gateway_upstream_seconds`, which every proxied request
+    /// observes), and the local fake's file route (404 in local mode) sees
+    /// no request. The runner's own getFile and downloads, on the
+    /// consumer-scoped and the proxy-only base, give the relative path and
+    /// the exact bytes.
+    async fn local_files(&mut self) -> Result<(), String> {
+        let (bot, token) = (LOCAL_POLL, LOCAL_POLL_TOKEN);
+        let chat = self.chat();
+        let filename = "e2e-local.bin";
+        let data = document_bytes();
+        let checksum = fnv1a64(&data);
+        let stored = self.store_file(token, chat, filename, &data).await?;
+        // The fake's paths hold the token: checked, never printed. On
+        // Linux the bot's directory keeps the token's ':'.
+        let relative = [token.to_owned(), token.replace(':', "~")]
+            .iter()
+            .find_map(|dir| {
+                stored
+                    .file_path
+                    .strip_prefix(&format!("{LOCAL_FILES_DIR}/{dir}/"))
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                format!("the local fake's getFile path is not under the bot's directory in {LOCAL_FILES_DIR}")
+            })?;
+        let mark = self.mark(token).await?;
+        let mut update = self.message(chat);
+        update["message"]["document"] = json!({
+            "file_id": stored.file_id,
+            "file_unique_id": stored.file_unique_id,
+            "file_name": filename,
+            "file_size": data.len(),
+        });
+        self.inject(token, update).await?;
+
+        let echo_name = format!("echo-{filename}");
+        let size = data.len();
+        let sent = {
+            let echo_name = echo_name.clone();
+            move |call: &Call| {
+                call.ok()
+                    && call.arg("chat_id") == Some(chat.to_string().as_str())
+                    && call.files.iter().any(|part| part.filename == echo_name)
+            }
+        };
+        let uploads = self
+            .exactly(
+                format!("sendDocument of {echo_name}"),
+                token,
+                "sendDocument",
+                sent,
+                1..=1,
+            )
+            .await?;
+        let part = uploads[0].files.iter().find(|p| p.filename == echo_name);
+        ensure(
+            part.is_some_and(|p| p.size == size && p.fnv1a64 == checksum),
+            || format!("sendDocument carried {part:?}, not {size} bytes with fnv1a64 {checksum}"),
+        )?;
+        let file_id = stored.file_id.as_str();
+        let get_files = self.calls(token, "getFile", "").await?;
+        ensure(
+            get_files
+                .iter()
+                .any(|c| c.seq > mark && c.ok() && c.arg("file_id") == Some(file_id)),
+            || format!("no getFile for {file_id}: {get_files:?}"),
+        )?;
+        let logs = compose(&["logs", "--no-color", bot]).quiet()?;
+        ensure(
+            logs.contains("encodes the token's colon as %3A: True"),
+            || "PTB's download path did not carry %3A".to_owned(),
+        )?;
+
+        let gateway = self.stack.gateway.clone();
+        for (base, scope) in [
+            (format!("{gateway}/c/{bot}"), "consumer-scoped"),
+            (gateway, "proxy-only"),
+        ] {
+            let info = self
+                .post_json(
+                    &format!("{base}/bot{token}/getFile"),
+                    &json!({"file_id": file_id}),
+                )
+                .await?;
+            ensure(
+                info["result"]["file_path"].as_str() == Some(relative.as_str()),
+                || {
+                    format!(
+                        "getFile on the {scope} base did not answer the path relative to the bot's directory"
+                    )
+                },
+            )?;
+            let fetched = self
+                .get_bytes(&format!("{base}/file/bot{token}/{relative}"))
+                .await?;
+            ensure(fnv1a64(&fetched) == checksum && fetched == data, || {
+                format!(
+                    "the file route on the {scope} base served {} bytes (fnv1a64 {}), not the {size} stored",
+                    fetched.len(),
+                    fnv1a64(&fetched)
+                )
+            })?;
+        }
+        // One snapshot for both series: the 3 downloads counted, and not
+        // one of them timed against the server.
+        let (from_disk, upstream) =
+            eventually(&format!("tgin counts {bot}'s 3 file downloads"), || async {
+                let text = self.metrics().await?;
+                let ok = metric(
+                    &text,
+                    "tgin_gateway_requests_total",
+                    &[("bot", bot), ("method", "file"), ("outcome", "ok")],
+                );
+                let upstream = metric(
+                    &text,
+                    "tgin_gateway_upstream_seconds_count",
+                    &[("bot", bot), ("method", "file")],
+                );
+                Ok((ok >= 3.0).then_some((ok, upstream)))
+            })
+            .await?;
+        ensure(upstream == 0.0, || {
+            format!(
+                "tgin timed {upstream} of {bot}'s {from_disk} file downloads against the Bot API server instead of serving them from disk"
+            )
+        })?;
+        // File paths hold the token: counted, never printed.
+        let proxied = self.calls(token, "", "file").await?.len();
+        ensure(proxied == 0, || {
+            format!(
+                "{proxied} downloads reached the local fake's file route instead of tgin's disk"
+            )
+        })
+    }
+
+    /// Scenario 8, webhook: tgin registered its own data plane at the local
+    /// fake over plain http (`http://tgin:8080/webhook/local-hook`, with a
+    /// secret), and grammY's setWebhook stayed in tgin as the consumer's
+    /// runtime endpoint. An update injected at the local fake is POSTed to
+    /// tgin over http (the fake journals the delivery answered 200), pushed
+    /// to grammY, and its webhook reply (JSON) is executed against the local
+    /// fake.
+    async fn local_webhook(&mut self) -> Result<(), String> {
+        let (hook, token) = (LOCAL_HOOK, LOCAL_HOOK_TOKEN);
+        let registered = eventually("tgin's setWebhook at the local fake", || async {
+            Ok(self
+                .calls(token, "setWebhook", "")
+                .await?
+                .into_iter()
+                .find(Call::ok))
+        })
+        .await?;
+        ensure(registered.arg("url") == Some(LOCAL_HOOK_URL), || {
+            format!(
+                "tgin registered the webhook URL {:?}, not {LOCAL_HOOK_URL}",
+                registered.arg("url")
+            )
+        })?;
+        ensure(
+            registered
+                .arg("secret_token")
+                .is_some_and(|s| !s.is_empty()),
+            || "tgin registered its webhook without a secret_token".to_owned(),
+        )?;
+        let info_url = format!("{}/c/{hook}/bot{token}/getWebhookInfo", self.stack.gateway);
+        let expected = format!("http://{hook}:8081/hook");
+        eventually(
+            &format!("{hook}'s getWebhookInfo url {expected:?}"),
+            || async {
+                let info = self.get_json(&info_url).await?;
+                Ok((info["result"]["url"].as_str() == Some(expected.as_str())).then_some(()))
+            },
+        )
+        .await?;
+
+        let chat = self.chat();
+        let text = "hook local";
+        let update_id = self.inject(token, self.text_update(chat, text)).await?;
+        let echo = self.echo(token, "sendMessage", chat, text, 1..=1).await?;
+        ensure(echo[0].arg("method") == Some("sendMessage"), || {
+            format!(
+                "grammY's sendMessage did not come from a webhook reply: {:?}",
+                echo[0]
+            )
+        })?;
+        let delivered = eventually(
+            &format!("the local fake's delivery of update {update_id} answered 200"),
+            || async {
+                let deliveries: Vec<Call> = self
+                    .calls(token, "", "webhook")
+                    .await?
+                    .into_iter()
+                    .filter(|c| c.update_id == Some(update_id) && c.status.is_some())
+                    .collect();
+                Ok((!deliveries.is_empty()).then_some(deliveries))
+            },
+        )
+        .await?;
+        let statuses: Vec<Option<u16>> = delivered.iter().map(|c| c.status).collect();
+        ensure(statuses == [Some(200)], || {
+            format!(
+                "the local fake's deliveries of update {update_id} were answered {statuses:?}, not once 200"
+            )
+        })?;
+        eventually(
+            &format!("a delivery counted on {hook}'s runtime endpoint"),
+            || async {
+                let delivered = self
+                    .metric(
+                        "tgin_delivery_attempts_total",
+                        &[
+                            ("consumer", hook),
+                            ("endpoint", "runtime"),
+                            ("outcome", "delivered"),
+                        ],
+                    )
+                    .await?;
+                Ok((delivered >= 1.0).then_some(()))
+            },
+        )
+        .await?;
+        eventually(&format!("{hook} counts the reply executed"), || async {
+            Ok((self.replies(hook, "executed").await? >= 1.0).then_some(()))
+        })
+        .await
+    }
+
+    /// Scenario 8, `file:` references: the runner's sendDocument naming a
+    /// local file, as JSON on the consumer-scoped base and as a multipart
+    /// text field on the proxy-only base, gets tgin's own 400; the local
+    /// fake (which would accept it) journals no call naming a local file
+    /// and no sendDocument to the chat.
+    async fn local_refused(&mut self) -> Result<(), String> {
+        let (bot, token) = (LOCAL_POLL, LOCAL_POLL_TOKEN);
+        let chat = self.chat();
+        let gateway = self.stack.gateway.clone();
+        let json_body = self
+            .stack
+            .http
+            .post(format!("{gateway}/c/{bot}/bot{token}/sendDocument"))
+            .json(&json!({"chat_id": chat, "document": LOCAL_FILE_REFERENCE}));
+        self.refused(
+            "a JSON sendDocument naming a local file (consumer-scoped base)",
+            json_body,
+            LOCAL_FILE_REFUSED,
+        )
+        .await?;
+        let form = multipart::Form::new()
+            .text("chat_id", chat.to_string())
+            .text("document", LOCAL_FILE_REFERENCE);
+        let multipart_body = self
+            .stack
+            .http
+            .post(format!("{gateway}/bot{token}/sendDocument"))
+            .multipart(form);
+        self.refused(
+            "a multipart sendDocument naming a local file (proxy-only base)",
+            multipart_body,
+            LOCAL_FILE_REFUSED,
+        )
+        .await?;
+        let named = self
+            .local_calls("", "", "")
+            .await?
+            .into_iter()
+            .filter(|c| c.local_file)
+            .count();
+        ensure(named == 0, || {
+            format!("{named} calls named a local file at the local fake")
+        })?;
+        let to_chat = move |c: &Call| c.arg("chat_id") == Some(chat.to_string().as_str());
+        let reached = self
+            .calls(token, "sendDocument", "")
+            .await?
+            .into_iter()
+            .filter(to_chat)
+            .count();
+        ensure(reached == 0, || {
+            format!("{reached} sendDocument calls to {chat} reached the local fake")
+        })?;
+        self.expect_exact(
+            format!("sendDocument to {chat} at the local fake"),
+            token,
+            "sendDocument",
+            to_chat,
+            0..=0,
+        );
+        Ok(())
+    }
+
+    /// Every exact count still holds. The runner sends close and logOut for
+    /// a bot of each fake on a consumer-scoped base and on the proxy-only
+    /// base, and tgin answers each itself with its 400. No downstream ever
+    /// reached setWebhook, close or logOut on either fake: tgin calls none
+    /// of them, except its own setWebhook for the local webhook bot, the
+    /// local fake's only one. Each bot's only getMe and deleteWebhook are
+    /// tgin's own, made once at start (a webhook bot gets no deleteWebhook):
+    /// the frameworks' startup calls, restarts included, stay local. The
+    /// local fake never saw a local file reference.
     async fn finally(&mut self) -> Result<(), String> {
         for exact in &self.exact {
             let n = self
@@ -983,24 +1331,25 @@ impl Suite {
                 )
             })?;
         }
+        let gateway = self.stack.gateway.clone();
         let f = &FRAMEWORKS[0];
-        let bases = [
-            format!("{}/c/{}", self.stack.gateway, f.poll()),
-            self.stack.gateway.clone(),
-        ];
-        for base in &bases {
-            for method in ["close", "logOut"] {
-                let url = format!("{base}/bot{}/{method}", f.poll_token);
-                let response = self
-                    .stack
-                    .http
-                    .post(&url)
-                    .send()
-                    .await
-                    .map_err(|err| format!("{method} through tgin: {err}"))?;
-                ensure(response.status().is_success(), || {
-                    format!("{method} through tgin answered {}", response.status())
-                })?;
+        for (bot, token) in [
+            (f.poll(), f.poll_token),
+            (LOCAL_POLL.to_owned(), LOCAL_POLL_TOKEN),
+        ] {
+            for (base, scope) in [
+                (format!("{gateway}/c/{bot}"), "consumer-scoped"),
+                (gateway.clone(), "proxy-only"),
+            ] {
+                for method in ["close", "logOut"] {
+                    let request = self.stack.http.post(format!("{base}/bot{token}/{method}"));
+                    self.refused(
+                        &format!("{method} for {bot} on the {scope} base"),
+                        request,
+                        LOG_OUT_DISABLED,
+                    )
+                    .await?;
+                }
             }
         }
         for method in ["setWebhook", "close", "logOut"] {
@@ -1009,6 +1358,18 @@ impl Suite {
                 format!("{method} reached Telegram: {calls:?}")
             })?;
         }
+        for method in ["close", "logOut"] {
+            let calls = self.local_calls("", method, "").await?;
+            ensure(calls.is_empty(), || {
+                format!("{method} reached the local fake: {calls:?}")
+            })?;
+        }
+        let set = self.local_calls("", "setWebhook", "").await?.len();
+        let own = self.calls(LOCAL_HOOK_TOKEN, "setWebhook", "").await?;
+        ensure(
+            set == 1 && own.len() == 1 && own[0].arg("url") == Some(LOCAL_HOOK_URL),
+            || format!("the local fake saw {set} setWebhook calls, not only tgin's own"),
+        )?;
         for f in &FRAMEWORKS {
             for (bot, token) in [(f.poll(), f.poll_token), (f.hook(), f.hook_token)] {
                 for method in ["getMe", "deleteWebhook"] {
@@ -1019,7 +1380,28 @@ impl Suite {
                 }
             }
         }
-        Ok(())
+        for (bot, token, deletes) in [
+            (LOCAL_POLL, LOCAL_POLL_TOKEN, 1),
+            (LOCAL_HOOK, LOCAL_HOOK_TOKEN, 0),
+        ] {
+            for (method, expected) in [("getMe", 1), ("deleteWebhook", deletes)] {
+                let n = self.calls(token, method, "").await?.len();
+                ensure(n == expected, || {
+                    format!(
+                        "{bot}: {n} {method} calls reached the local fake, not tgin's own {expected}"
+                    )
+                })?;
+            }
+        }
+        let named = self
+            .local_calls("", "", "")
+            .await?
+            .into_iter()
+            .filter(|c| c.local_file)
+            .count();
+        ensure(named == 0, || {
+            format!("{named} calls named a local file at the local fake")
+        })
     }
 
     // --- helpers ---------------------------------------------------------
@@ -1048,14 +1430,28 @@ impl Suite {
         update
     }
 
-    async fn inject(&self, token: &str, update: Value) -> Result<(), String> {
-        let url = format!("{}/fake/updates/{token}", self.stack.fake);
-        self.post_json(&url, &update).await.map(drop)
+    /// The fake that serves `token`'s bot: the local one for the
+    /// self-hosted scenario's bots.
+    fn fake_of(&self, token: &str) -> &str {
+        if is_local(token) {
+            &self.stack.fake_local
+        } else {
+            &self.stack.fake
+        }
     }
 
-    /// Stores a file at the fake (its own sendDocument with the bot's token)
-    /// and reads its `file_path` with the fake's getFile; both happen before
-    /// the scenario's journal mark.
+    /// Queues `update` at the bot's fake; returns its `update_id`.
+    async fn inject(&self, token: &str, update: Value) -> Result<i64, String> {
+        let url = format!("{}/fake/updates/{token}", self.fake_of(token));
+        let answer = self.post_json(&url, &update).await?;
+        answer["update_id"]
+            .as_i64()
+            .ok_or_else(|| format!("the fake assigned no update_id: {answer}"))
+    }
+
+    /// Stores a file at the bot's fake (its own sendDocument with the bot's
+    /// token) and reads its `file_path` with the fake's getFile; both happen
+    /// before the scenario's journal mark.
     async fn store_file(
         &self,
         token: &str,
@@ -1063,7 +1459,8 @@ impl Suite {
         filename: &str,
         data: &[u8],
     ) -> Result<StoredFile, String> {
-        let url = format!("{}/bot{token}/sendDocument", self.stack.fake);
+        let fake = self.fake_of(token);
+        let url = format!("{fake}/bot{token}/sendDocument");
         let part = multipart::Part::bytes(data.to_vec()).file_name(filename.to_owned());
         let form = multipart::Form::new()
             .text("chat_id", chat.to_string())
@@ -1075,11 +1472,11 @@ impl Suite {
             .multipart(form)
             .send()
             .await
-            .map_err(|err| format!("storing {filename}: {err}"))?;
+            .map_err(|err| format!("storing {filename}: {}", err.without_url()))?;
         let body: Value = response
             .json()
             .await
-            .map_err(|err| format!("storing {filename}: {err}"))?;
+            .map_err(|err| format!("storing {filename}: {}", err.without_url()))?;
         let document = &body["result"]["document"];
         let (Some(file_id), Some(file_unique_id)) = (
             document["file_id"].as_str(),
@@ -1089,7 +1486,7 @@ impl Suite {
         };
         let info = self
             .post_json(
-                &format!("{}/bot{token}/getFile", self.stack.fake),
+                &format!("{fake}/bot{token}/getFile"),
                 &json!({"file_id": file_id}),
             )
             .await?;
@@ -1103,11 +1500,33 @@ impl Suite {
         })
     }
 
-    /// The journal entries of `token` (all bots when empty), filtered by
-    /// `method` and `kind` when not empty.
+    /// The journal entries of `token` (all bots when empty) at its fake (the
+    /// cloud one when empty), filtered by `method` and `kind` when not
+    /// empty.
     async fn calls(&self, token: &str, method: &str, kind: &str) -> Result<Vec<Call>, String> {
+        self.journal(self.fake_of(token), token, method, kind).await
+    }
+
+    /// As [`Self::calls`], at the local fake.
+    async fn local_calls(
+        &self,
+        token: &str,
+        method: &str,
+        kind: &str,
+    ) -> Result<Vec<Call>, String> {
+        self.journal(&self.stack.fake_local, token, method, kind)
+            .await
+    }
+
+    async fn journal(
+        &self,
+        fake: &str,
+        token: &str,
+        method: &str,
+        kind: &str,
+    ) -> Result<Vec<Call>, String> {
         let url = Url::parse_with_params(
-            &format!("{}/fake/calls", self.stack.fake),
+            &format!("{fake}/fake/calls"),
             [("token", token), ("method", method), ("kind", kind)],
         )
         .map_err(|err| format!("journal URL: {err}"))?;
@@ -1117,11 +1536,11 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("reading the journal: {err}"))?;
+            .map_err(|err| format!("reading the journal: {}", err.without_url()))?;
         response
             .json()
             .await
-            .map_err(|err| format!("reading the journal: {err}"))
+            .map_err(|err| format!("reading the journal: {}", err.without_url()))
     }
 
     /// The highest journal sequence number of `token` so far.
@@ -1230,11 +1649,11 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("reading tgin's metrics: {err}"))?;
+            .map_err(|err| format!("reading tgin's metrics: {}", err.without_url()))?;
         response
             .text()
             .await
-            .map_err(|err| format!("reading tgin's metrics: {err}"))
+            .map_err(|err| format!("reading tgin's metrics: {}", err.without_url()))
     }
 
     async fn metric(&self, name: &str, labels: &[(&str, &str)]) -> Result<f64, String> {
@@ -1258,7 +1677,7 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("GET {}: {err}", redact(url)))?;
+            .map_err(|err| format!("GET {}: {}", redact(url), err.without_url()))?;
         let status = response.status();
         ensure(status.is_success(), || {
             format!("GET {} answered {status}", redact(url))
@@ -1266,7 +1685,7 @@ impl Suite {
         let body = response
             .bytes()
             .await
-            .map_err(|err| format!("GET {}: {err}", redact(url)))?;
+            .map_err(|err| format!("GET {}: {}", redact(url), err.without_url()))?;
         Ok(body.to_vec())
     }
 
@@ -1277,11 +1696,11 @@ impl Suite {
             .get(url)
             .send()
             .await
-            .map_err(|err| format!("GET {}: {err}", redact(url)))?;
+            .map_err(|err| format!("GET {}: {}", redact(url), err.without_url()))?;
         response
             .json()
             .await
-            .map_err(|err| format!("GET {}: {err}", redact(url)))
+            .map_err(|err| format!("GET {}: {}", redact(url), err.without_url()))
     }
 
     async fn post_json(&self, url: &str, body: &Value) -> Result<Value, String> {
@@ -1292,42 +1711,77 @@ impl Suite {
             .json(body)
             .send()
             .await
-            .map_err(|err| format!("POST {}: {err}", redact(url)))?;
+            .map_err(|err| format!("POST {}: {}", redact(url), err.without_url()))?;
         let status = response.status();
         let answer: Value = response
             .json()
             .await
-            .map_err(|err| format!("POST {}: {err}", redact(url)))?;
+            .map_err(|err| format!("POST {}: {}", redact(url), err.without_url()))?;
         ensure(status.is_success(), || {
             format!("POST {} answered {status}: {answer}", redact(url))
         })?;
         Ok(answer)
     }
 
+    /// Sends `request` and checks that tgin answered it itself with its
+    /// Telegram-shaped 400 and exactly `description`; `what` names the
+    /// request in errors (its URL holds the token).
+    async fn refused(
+        &self,
+        what: &str,
+        request: reqwest::RequestBuilder,
+        description: &str,
+    ) -> Result<(), String> {
+        let response = request
+            .send()
+            .await
+            .map_err(|err| format!("{what}: {}", err.without_url()))?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|err| format!("{what}: {}", err.without_url()))?;
+        let expected = json!({"ok": false, "error_code": 400, "description": description});
+        ensure(
+            status == reqwest::StatusCode::BAD_REQUEST && body == expected,
+            || format!("{what} answered {status} {body}, not 400 {expected}"),
+        )
+    }
+
     async fn print_journal_tail(&self) {
-        match self.calls("", "", "").await {
-            Ok(calls) => {
-                eprintln!("\n--- the fake's journal (last 80 of {}) ---", calls.len());
-                for call in calls.iter().rev().take(80).rev() {
-                    let files: Vec<_> = call
-                        .files
-                        .iter()
-                        .map(|p| (&p.name, &p.filename, p.size))
-                        .collect();
-                    eprintln!(
-                        "#{} t={} {} {:?} status={:?} ct={:?} te={:?} args={:?} files={files:?}",
-                        call.seq,
-                        call.time_ms,
-                        call.kind,
-                        call.method,
-                        call.status,
-                        call.content_type,
-                        call.transfer_encoding,
-                        call.args,
-                    );
+        for (name, fake) in [
+            ("the fake's", &self.stack.fake),
+            ("the local fake's", &self.stack.fake_local),
+        ] {
+            match self.journal(fake, "", "", "").await {
+                Ok(calls) => {
+                    eprintln!("\n--- {name} journal (last 80 of {}) ---", calls.len());
+                    for call in calls.iter().rev().take(80).rev() {
+                        let files: Vec<_> = call
+                            .files
+                            .iter()
+                            .map(|p| (&p.name, &p.filename, p.size))
+                            .collect();
+                        // tgin's derived webhook secret stays out of the output.
+                        let mut args = call.args.clone();
+                        if let Some(secret) = args.get_mut("secret_token") {
+                            "<redacted>".clone_into(secret);
+                        }
+                        eprintln!(
+                            "#{} t={} {} {:?} status={:?} ct={:?} te={:?} args={:?} files={files:?}",
+                            call.seq,
+                            call.time_ms,
+                            call.kind,
+                            call.method,
+                            call.status,
+                            call.content_type,
+                            call.transfer_encoding,
+                            args,
+                        );
+                    }
                 }
+                Err(err) => eprintln!("cannot read {name} journal: {err}"),
             }
-            Err(err) => eprintln!("cannot read the fake's journal: {err}"),
         }
     }
 }
@@ -1346,11 +1800,34 @@ mod tests {
     #[test]
     fn tokens_match_compose() {
         let compose = std::fs::read_to_string(compose_file()).expect("compose.yaml reads");
-        for f in &FRAMEWORKS {
-            for (service, token) in [(f.poll(), f.poll_token), (f.hook(), f.hook_token)] {
-                let anchor = format!("&{service}-token \"{token}\"");
-                assert!(compose.contains(&anchor), "compose.yaml lacks `{anchor}`");
-            }
+        let local = [
+            (LOCAL_POLL, LOCAL_POLL_TOKEN),
+            (LOCAL_HOOK, LOCAL_HOOK_TOKEN),
+        ];
+        let all = FRAMEWORKS
+            .iter()
+            .flat_map(|f| [(f.poll(), f.poll_token), (f.hook(), f.hook_token)])
+            .chain(local.map(|(service, token)| (service.to_owned(), token)));
+        for (service, token) in all {
+            let anchor = format!("&{service}-token \"{token}\"");
+            assert!(compose.contains(&anchor), "compose.yaml lacks `{anchor}`");
+        }
+    }
+
+    /// The local fake's bots have tokens of Telegram's shape:
+    /// `<digits>:<35 characters>`.
+    #[test]
+    fn local_tokens_are_realistic() {
+        for token in [LOCAL_POLL_TOKEN, LOCAL_HOOK_TOKEN] {
+            let (id, secret) = token.split_once(':').expect("a token has a ':'");
+            assert!(!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+            assert_eq!(secret.len(), 35);
+            assert!(
+                secret
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            );
+            assert!(is_local(token));
         }
     }
 

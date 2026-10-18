@@ -57,11 +57,19 @@
       "additionalProperties": false,
       "description": "One Telegram bot.",
       "properties": {
+        "allow_local_files": {
+          "default": false,
+          "description": "Let `file:` references (files on the server's own disk) reach a\n`local` upstream. Off, the gateway and webhook replies refuse them\nfor every `local` upstream, `local_mode` or not (the server may run\n`--local` all the same), so a client cannot read the server's files\nthrough tgin. Cloud upstreams never read local files.",
+          "type": "boolean"
+        },
         "api_url": {
           "default": "https://api.telegram.org",
-          "description": "Bot API base URL. Supports `${env:…}` and `${file:…}`.",
+          "description": "Bot API base URL: shorthand for an unnamed `cloud` upstream, which\n`/v1/config` and metrics call `api_url`. Not with `upstream`.\nSupports `${env:…}` and `${file:…}`.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "gateway": {
           "$ref": "#/$defs/Gateway",
@@ -124,6 +132,14 @@
         "token": {
           "$ref": "#/$defs/Secret",
           "description": "The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot\nAPI gateway serves only tokens shaped `<digits>:<secret>`."
+        },
+        "upstream": {
+          "description": "The `upstreams` entry this bot talks to. Not with `api_url`.",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -289,6 +305,37 @@
       "required": [
         "url"
       ],
+      "type": "object"
+    },
+    "Files": {
+      "additionalProperties": false,
+      "description": "Where a local server's files are: `dir` (with `server_dir`) or `url`.\nThe server keeps each bot's files in a directory named after its token\n(`:` replaced by `~` where its filesystem refuses `:`); tgin serves a\nbot only its own.",
+      "properties": {
+        "dir": {
+          "description": "The server's files directory, its `--files-dir` (without it, the bot\ndirectories hold the server's databases too), as mounted in tgin;\nread-only is enough. A relative path is relative to the config\nfile's directory. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_dir": {
+          "description": "The same directory as the server sees it, an absolute path; only\nwith `dir`, which it defaults to. Supports `${env:…}` and\n`${file:…}`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "An HTTP origin serving the server's files directory, its\n`--files-dir`, `http` or `https`. Supports `${env:…}` and\n`${file:…}`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "Gateway": {
@@ -1143,6 +1190,67 @@
       ],
       "type": "object"
     },
+    "Upstream": {
+      "additionalProperties": false,
+      "description": "A Bot API server: Telegram's (`cloud`) or a self-hosted\n`telegram-bot-api` (`local`).",
+      "properties": {
+        "files": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Files"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How tgin serves the bots' files on `/file/bot<token>/…`. Only with\n`kind: local`; omitted, it serves none."
+        },
+        "kind": {
+          "$ref": "#/$defs/UpstreamKind",
+          "description": "`cloud` or `local`: which webhook, file and timeout rules apply."
+        },
+        "local_mode": {
+          "default": false,
+          "description": "The server runs with `--local`: it accepts `file:` uploads from its\nown disk, answers `getFile` with absolute paths, and posts webhooks\nover `http` to any port. Only with `kind: local`.",
+          "type": "boolean"
+        },
+        "response_timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Longest wait for the server's response once a request was sent;\nabove 0, at most 1h. Omitted, `1m` for `cloud` and `10m` for\n`local`."
+        },
+        "url": {
+          "description": "The server's base URL, `http` or `https`; plain `http` to a host\nthat is not loopback warns. Supports `${env:…}` and `${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "url"
+      ],
+      "type": "object"
+    },
+    "UpstreamKind": {
+      "oneOf": [
+        {
+          "const": "cloud",
+          "description": "Telegram's Bot API, or a server with its rules.",
+          "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "A self-hosted `telegram-bot-api` server.",
+          "type": "string"
+        }
+      ]
+    },
     "Webhook": {
       "additionalProperties": false,
       "description": "Telegram posts updates to the data plane.",
@@ -1181,12 +1289,12 @@
         "ip_allowlist": {
           "$ref": "#/$defs/IpAllowlist",
           "default": "none",
-          "description": "Who may post updates: `none` (anyone), `telegram` (Telegram's\npublished networks) or a list of networks."
+          "description": "Who may post updates: `none` (anyone), `telegram` (Telegram's\npublished networks; not for a `local` upstream) or a list of\nnetworks."
         },
         "max_connections": {
-          "description": "Telegram's `max_connections`, 1 to 100.",
+          "description": "Telegram's `max_connections`: 1 to 100, or to 100000 for an\nupstream in local mode, where a value above 100 must not exceed\n`server.max_connections`.",
           "format": "uint32",
-          "maximum": 100,
+          "maximum": 100000,
           "minimum": 1,
           "type": [
             "integer",
@@ -1202,7 +1310,7 @@
           ]
         },
         "public_url": {
-          "description": "The public HTTPS base URL Telegram reaches tgin at; `setWebhook`\nregisters it followed by `path`. Supports `${env:…}` and `${file:…}`.",
+          "description": "The public base URL the Bot API server reaches tgin at; `setWebhook`\nregisters it followed by `path`. `https` on port 443, 80, 88 or\n8443, except for an upstream in local mode, which takes `http` and\nany port. Supports `${env:…}` and `${file:…}`.",
           "minLength": 1,
           "type": [
             "string",
@@ -1330,6 +1438,16 @@
         }
       ],
       "description": "The data plane: webhook ingress and pull consumers. Omitted, tgin\nserves neither."
+    },
+    "upstreams": {
+      "additionalProperties": false,
+      "description": "Bot API servers, by name, that bots reference with `upstream`. A\nbot with `api_url`, or with neither field, talks to an unnamed\n`cloud` upstream instead.",
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]{0,62}$": {
+          "$ref": "#/$defs/Upstream"
+        }
+      },
+      "type": "object"
     },
     "version": {
       "const": 1,

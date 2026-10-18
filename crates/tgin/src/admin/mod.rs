@@ -12,6 +12,7 @@
 //! | `POST /v1/consumers/{name}/pause`, `/drain` | token | 204 |
 //! | `POST /v1/consumers/{name}/resume` | token | 204: unpaused, and an admin drain ended |
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
+//! | `POST /v1/bots/{name}/logout`, `/close` | token | 200 [`Moved`] |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
 //! `admin.token` (loopback listeners only) the API needs none. After a
@@ -20,12 +21,85 @@
 //! answer `{"error":"…"}`: 401 `unauthorized`, 404 `unknown consumer`, 503
 //! `draining` for a reload during the shutdown, 409 `draining` for a resume
 //! during it.
+//!
+//! `POST /v1/bots/{name}/logout|close[?timeout=<duration>]` moves a bot off
+//! its Bot API server, serialized with the reloads. Within the timeout
+//! (`30s`, `2m`…; `reload.drain_timeout` without one; at most `1h` either way),
+//! counted from the request, the server runs dry of the bot's updates, the
+//! bot's ingest stops, tgin delivers what it holds of the bot, and the
+//! gateway stops sending the bot's calls to the server and waits for those
+//! being sent; then the server is called (`logOut`, or `deleteWebhook` and
+//! `close`) and the bot is parked: reloads do not start it again until one
+//! changes its upstream. A move whose requester goes away before the server
+//! has run dry of the bot's updates is dropped, having changed nothing;
+//! after that it goes on. Failures: 400 `invalid
+//! timeout`, 404 `unknown bot`, 409 `draining` during the shutdown, 409
+//! `parked`, 504 `upstream not drained` when the server still held updates
+//! `min(5 s, timeout/4)` before the deadline, or could not say (the bot
+//! runs on unchanged; the warning logged names the server's error), 504
+//! `calls in flight` when
+//! calls of the bot were still being sent to the server at the deadline,
+//! their count and the way out in `description` (nothing was called on the
+//! server; the bot runs on), 502 `upstream
+//! refused` with the server's masked text in `description` when it refused
+//! the call (the bot runs on).
+//!
+//! API v1 grows additively within a major version: answers may gain
+//! fields, enum values (state and phase words) and error codes, and the
+//! client ignores what it does not know.
 
 mod api;
 pub mod client;
 
 pub(crate) use api::{loop_detected, router};
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+/// The longest `timeout` of a bot move: the move holds up every reload
+/// while it runs.
+pub const MAX_MOVE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// How `POST /v1/bots/{name}/…` moves a bot off its Bot API server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotMove {
+    /// `logout`: the server's `logOut`.
+    LogOut,
+    /// `close`: the server's `deleteWebhook`, then `close`.
+    Close,
+}
+
+impl BotMove {
+    /// The endpoint's last path segment.
+    pub fn segment(self) -> &'static str {
+        match self {
+            Self::LogOut => "logout",
+            Self::Close => "close",
+        }
+    }
+
+    /// The Bot API method that logs the bot out.
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::LogOut => "logOut",
+            Self::Close => "close",
+        }
+    }
+}
+
+/// `POST /v1/bots/{name}/logout|close`: a bot moved off its server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    pub bot: String,
+    /// The bot's updates tgin still held (queued or leased) when the
+    /// server was called.
+    pub left: usize,
+    /// The name of the upstream the bot was logged out of (`api_url` for
+    /// the shorthand).
+    pub upstream: String,
+    /// The server's description of its answer, if any, secrets masked.
+    pub result: Option<String>,
+}
 
 /// `GET /v1/status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +130,14 @@ pub struct SourceStatus {
     /// Why the source backs off or failed, secrets masked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The name of the bot's upstream (`api_url` for the shorthand); empty
+    /// from a server older than this client.
+    #[serde(default)]
+    pub upstream: String,
+    /// Whether the bot was moved off its Bot API server; shown only while
+    /// it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
 }
 
 /// One consumer of the running config.

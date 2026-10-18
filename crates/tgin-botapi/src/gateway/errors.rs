@@ -52,6 +52,16 @@ pub fn too_many_requests(retry_after_secs: u64) -> Response {
     response
 }
 
+/// `503 Service Unavailable` with `description` and a `Retry-After` header
+/// of `retry_after_secs`.
+pub fn service_unavailable(description: &str, retry_after_secs: u64) -> Response {
+    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, description);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    response
+}
+
 /// `{"ok":false,"error_code":…,"description":…`, unclosed.
 fn error_head(status: StatusCode, description: &str) -> Vec<u8> {
     let mut body = Vec::with_capacity(64 + description.len());

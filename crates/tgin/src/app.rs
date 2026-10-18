@@ -25,7 +25,6 @@ use tgin_runtime::lifecycle::{Lifecycle, ShutdownTiming, SignalKind, Signals};
 use tgin_runtime::obs::{Health, LogHandle, MetricsRegistry, Readiness};
 use tgin_runtime::secret::{Redactor, Secret};
 use tgin_runtime::supervisor::{Exit, Supervisor};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -33,7 +32,7 @@ use crate::admin;
 use crate::cli::{LoadError, VERSION, commit};
 use crate::data_server::DataRoutes;
 use crate::exit::Outcome;
-use crate::reload::{self, ReloadQueue, Reloader, Request};
+use crate::reload::{self, ReloadQueue, Reloader, Requests};
 use crate::sources::{Kind, Sources, source_task};
 
 /// How long the listeners and the supervised tasks get to finish once the
@@ -204,9 +203,9 @@ struct Handles {
     /// The engine and its metrics once built.
     engine: Arc<OnceLock<(Arc<Engine>, CoreMetrics)>>,
     reloads: ReloadQueue,
-    /// The queue's receiving end until the reload task takes it; requests
-    /// made while tgin starts wait there.
-    requests: Arc<Mutex<Option<mpsc::Receiver<Request>>>>,
+    /// The queues' receiving ends until the reload task takes them;
+    /// requests made while tgin starts wait there.
+    requests: Arc<Mutex<Option<Requests>>>,
     /// Stops the reload task: no reload once the shutdown has begun.
     stop_reloads: CancellationToken,
 }
@@ -354,7 +353,12 @@ impl App {
         let (routes, data_addrs, tls) = match &cfg.server {
             Some(server) => {
                 let routes = Arc::new(DataRoutes::new(
-                    &cfg, server, &engine, &ingest, gateway, via,
+                    &cfg,
+                    server,
+                    &engine,
+                    &|bot| sources.ingest_of(bot),
+                    gateway,
+                    via,
                 ));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
@@ -459,8 +463,10 @@ impl App {
         let (Some(routes), Some(server)) = (&self.routes, &cfg.server) else {
             return false;
         };
-        let ingest = self.handles.lifecycle.ingest_token();
-        routes.rebuild(cfg, server, &self.shared.engine, &ingest);
+        let sources = &self.shared.sources;
+        routes.rebuild(cfg, server, &self.shared.engine, &|bot| {
+            sources.ingest_of(bot)
+        });
         true
     }
 
@@ -681,13 +687,17 @@ impl Connections {
     }
 }
 
-/// Every secret value of `cfg`, for log redaction: bot tokens, webhook
-/// secrets (automatic ones derived), the admin token, pull `auth_token`s
-/// and push endpoint `secret_token`s.
+/// Every secret value of `cfg`, for log redaction: bot tokens, their '~'
+/// forms (a self-hosted server's directory name for the bot) and their
+/// `%3A` and `%3a` forms (as a `files.url` origin's paths carry them),
+/// webhook secrets (automatic ones derived), the admin token, pull
+/// `auth_token`s and push endpoint `secret_token`s.
 pub fn secrets(cfg: &Config) -> Vec<String> {
     let mut secrets = Vec::new();
     for bot in &cfg.bots {
-        secrets.push(bot.token.expose().clone());
+        let token = bot.token.expose();
+        secrets.extend(config::Upstream::token_dirs(token));
+        secrets.extend(["%3A", "%3a"].map(|colon| token.replace(':', colon)));
         if let Some(Ingress::Webhook(hook)) = &bot.ingress
             && let Some(secret) = webhook_secret(bot, hook)
         {
@@ -730,7 +740,8 @@ pub(crate) fn gateway_bots(cfg: &Config, engine: &Engine) -> Vec<GatewayBot> {
                 name: Arc::from(bot.name.as_str()),
                 source,
                 token: bot.token.clone(),
-                api_url: bot.api_url.expose().clone(),
+                upstream: Arc::clone(&bot.upstream),
+                allow_local_files: bot.allow_local_files,
                 gateway: bot.gateway.clone(),
             })
         })

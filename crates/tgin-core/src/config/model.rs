@@ -12,6 +12,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -51,6 +52,13 @@ pub struct RawConfig {
     pub admin: Admin,
     #[serde(default)]
     pub reload: Reload,
+    /// Bot API servers, by name, that bots reference with `upstream`. A
+    /// bot with `api_url`, or with neither field, talks to an unnamed
+    /// `cloud` upstream instead.
+    // A located key would hide the name from error paths, so an upstream's
+    // errors point at its value instead.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub upstreams: IndexMap<Name, At<Upstream>>,
     /// The Telegram bots updates come from.
     #[serde(default)]
     pub bots: Vec<Bot>,
@@ -172,9 +180,22 @@ pub struct Bot {
     /// The bot token: only ASCII letters, digits, `:`, `_` and `-`. The Bot
     /// API gateway serves only tokens shaped `<digits>:<secret>`.
     pub token: SecretText,
-    /// Bot API base URL. Supports `${env:…}` and `${file:…}`.
-    #[serde(default = "defaults::api_url")]
-    pub api_url: Template,
+    /// Bot API base URL: shorthand for an unnamed `cloud` upstream, which
+    /// `/v1/config` and metrics call `api_url`. Not with `upstream`.
+    /// Supports `${env:…}` and `${file:…}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = defaults::API_URL))]
+    pub api_url: Option<Template>,
+    /// The `upstreams` entry this bot talks to. Not with `api_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<At<Name>>,
+    /// Let `file:` references (files on the server's own disk) reach a
+    /// `local` upstream. Off, the gateway and webhook replies refuse them
+    /// for every `local` upstream, `local_mode` or not (the server may run
+    /// `--local` all the same), so a client cannot read the server's files
+    /// through tgin. Cloud upstreams never read local files.
+    #[serde(default)]
+    pub allow_local_files: bool,
     /// How updates arrive; at most one. Omitted, the bot receives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<At<Ingress>>,
@@ -185,6 +206,66 @@ pub struct Bot {
     /// Rules in order; the first match wins.
     #[serde(default)]
     pub routes: Vec<At<Route>>,
+}
+
+/// A Bot API server: Telegram's (`cloud`) or a self-hosted
+/// `telegram-bot-api` (`local`).
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct Upstream {
+    /// `cloud` or `local`: which webhook, file and timeout rules apply.
+    pub kind: At<UpstreamKind>,
+    /// The server's base URL, `http` or `https`; plain `http` to a host
+    /// that is not loopback warns. Supports `${env:…}` and `${file:…}`.
+    pub url: Template,
+    /// The server runs with `--local`: it accepts `file:` uploads from its
+    /// own disk, answers `getFile` with absolute paths, and posts webhooks
+    /// over `http` to any port. Only with `kind: local`.
+    #[serde(default = "defaults::local_mode")]
+    pub local_mode: At<bool>,
+    /// How tgin serves the bots' files on `/file/bot<token>/…`. Only with
+    /// `kind: local`; omitted, it serves none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<At<Files>>,
+    /// Longest wait for the server's response once a request was sent;
+    /// above 0, at most 1h. Omitted, `1m` for `cloud` and `10m` for
+    /// `local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_timeout: Option<At<HumanDuration>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamKind {
+    /// Telegram's Bot API, or a server with its rules.
+    Cloud,
+    /// A self-hosted `telegram-bot-api` server.
+    Local,
+}
+
+/// Where a local server's files are: `dir` (with `server_dir`) or `url`.
+/// The server keeps each bot's files in a directory named after its token
+/// (`:` replaced by `~` where its filesystem refuses `:`); tgin serves a
+/// bot only its own.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct Files {
+    /// The server's files directory, its `--files-dir` (without it, the bot
+    /// directories hold the server's databases too), as mounted in tgin;
+    /// read-only is enough. A relative path is relative to the config
+    /// file's directory. Supports `${env:…}` and `${file:…}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<Template>,
+    /// The same directory as the server sees it, an absolute path; only
+    /// with `dir`, which it defaults to. Supports `${env:…}` and
+    /// `${file:…}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_dir: Option<Template>,
+    /// An HTTP origin serving the server's files directory, its
+    /// `--files-dir`, `http` or `https`. Supports `${env:…}` and
+    /// `${file:…}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<Template>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -231,8 +312,10 @@ pub struct Webhook {
     /// Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Template>,
-    /// The public HTTPS base URL Telegram reaches tgin at; `setWebhook`
-    /// registers it followed by `path`. Supports `${env:…}` and `${file:…}`.
+    /// The public base URL the Bot API server reaches tgin at; `setWebhook`
+    /// registers it followed by `path`. `https` on port 443, 80, 88 or
+    /// 8443, except for an upstream in local mode, which takes `http` and
+    /// any port. Supports `${env:…}` and `${file:…}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_url: Option<Template>,
     /// Call `setWebhook` at start; needs `public_url`.
@@ -245,9 +328,11 @@ pub struct Webhook {
     /// except `chat_member`, `message_reaction` and `message_reaction_count`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_updates: Option<Vec<String>>,
-    /// Telegram's `max_connections`, 1 to 100.
+    /// Telegram's `max_connections`: 1 to 100, or to 100000 for an
+    /// upstream in local mode, where a value above 100 must not exceed
+    /// `server.max_connections`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 100))]
+    #[schemars(range(min = 1, max = 100_000))]
     pub max_connections: Option<At<u32>>,
     /// Telegram's `drop_pending_updates` for `setWebhook`.
     pub drop_pending_updates: bool,
@@ -260,8 +345,9 @@ pub struct Webhook {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub certificate_file: Option<Template>,
     /// Who may post updates: `none` (anyone), `telegram` (Telegram's
-    /// published networks) or a list of networks.
-    pub ip_allowlist: IpAllowlist,
+    /// published networks; not for a `local` upstream) or a list of
+    /// networks.
+    pub ip_allowlist: At<IpAllowlist>,
 }
 
 /// The Bot API gateway: how tgin forwards the bot's requests from
@@ -783,6 +869,19 @@ impl From<Duration> for HumanDuration {
     }
 }
 
+/// Parses the text as a config file's quoted duration: month and year units
+/// are accepted, so check [`HumanDuration::calendar_unit`].
+impl FromStr for HumanDuration {
+    type Err = humantime::DurationError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        humantime::parse_duration(text).map(|value| Self {
+            value,
+            text: text.to_owned(),
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for HumanDuration {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct DurationVisitor;
@@ -795,13 +894,8 @@ impl<'de> Deserialize<'de> for HumanDuration {
             }
 
             fn visit_str<E: de::Error>(self, text: &str) -> Result<HumanDuration, E> {
-                match humantime::parse_duration(text) {
-                    Ok(value) => Ok(HumanDuration {
-                        value,
-                        text: text.to_owned(),
-                    }),
-                    Err(err) => Err(E::custom(format_args!("invalid duration `{text}`: {err}"))),
-                }
+                text.parse()
+                    .map_err(|err| E::custom(format_args!("invalid duration `{text}`: {err}")))
             }
 
             /// An unquoted `0`; any other number needs a unit.

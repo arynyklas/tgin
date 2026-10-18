@@ -23,6 +23,7 @@ form_urlencoded.workspace = true
 futures-util.workspace = true
 multer.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -34,6 +35,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json", "multipart"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [lints]

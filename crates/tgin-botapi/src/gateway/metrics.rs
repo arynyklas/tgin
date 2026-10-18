@@ -5,14 +5,18 @@
 //! handles: those of its rate limiter and retries resolved up front, those
 //! of each method resolved on the method's first request and kept by method
 //! index, so a request never hashes labels after that and an unused method
-//! exports no series. Labels name the bot and the method, never a token or
-//! a path.
+//! exports no series. [`UpstreamMetrics`] holds a bot's `tgin_bot_info`
+//! series and its `tgin_upstream_up` handle, for as long as the bot keeps
+//! its upstream. Labels name the bot, the method and the upstream, never a
+//! token, a URL or a path.
 
 use std::sync::{Arc, OnceLock};
 
+use parking_lot::Mutex;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use tgin_core::label_enum;
@@ -126,6 +130,12 @@ struct BotLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct InfoLabels {
+    bot: Arc<str>,
+    upstream: Arc<str>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReplyLabels {
     consumer: Arc<str>,
     outcome: &'static str,
@@ -133,9 +143,10 @@ struct ReplyLabels {
 
 type HistogramCtor = fn() -> Histogram;
 
-/// Time to response headers: 1 ms to about 33 s, as delivery latency.
+/// Time to response headers: 1 ms to about 524 s, so that a local server's
+/// answer minutes after a large upload still lands in a bucket.
 fn upstream_histogram() -> Histogram {
-    Histogram::new(exponential_buckets(0.001, 2.0, 16))
+    Histogram::new(exponential_buckets(0.001, 2.0, 20))
 }
 
 /// The gateway metric families. Cloning shares the families.
@@ -147,6 +158,8 @@ pub struct GatewayMetrics {
     retries: Family<BotLabels, Counter>,
     unauthorized: Counter,
     webhook_replies: Family<ReplyLabels, Counter>,
+    bot_info: Family<InfoLabels, Gauge>,
+    upstream_up: Family<BotLabels, Gauge>,
 }
 
 impl GatewayMetrics {
@@ -160,6 +173,8 @@ impl GatewayMetrics {
             retries: Family::default(),
             unauthorized: Counter::default(),
             webhook_replies: Family::default(),
+            bot_info: Family::default(),
+            upstream_up: Family::default(),
         };
         reg.register(
             "gateway_requests",
@@ -168,7 +183,7 @@ impl GatewayMetrics {
         );
         reg.register(
             "gateway_upstream_seconds",
-            "Time from sending a gateway request to Telegram's response headers",
+            "Time from sending a gateway request to the Bot API server's response headers",
             m.upstream.clone(),
         );
         reg.register(
@@ -190,6 +205,16 @@ impl GatewayMetrics {
             "webhook_replies",
             "Webhook replies of push consumers by outcome",
             m.webhook_replies.clone(),
+        );
+        reg.register(
+            "bot_info",
+            "1 for each bot, naming its upstream (`api_url` for the shorthand)",
+            m.bot_info.clone(),
+        );
+        reg.register(
+            "upstream_up",
+            "1 after any HTTP answer from the bot's upstream, 0 after a connect failure, a timeout or a lost connection; absent before the first",
+            m.upstream_up.clone(),
         );
         m
     }
@@ -276,6 +301,34 @@ impl GatewayMetrics {
             });
         }
     }
+
+    /// The bot `bot`'s series for its upstream `upstream` (the upstream's
+    /// name): `tgin_bot_info` set to 1 now, `tgin_upstream_up` on its
+    /// first outcome.
+    pub fn upstream(&self, bot: &str, upstream: &str) -> UpstreamMetrics {
+        let bot: Arc<str> = Arc::from(bot);
+        let info = InfoLabels {
+            bot: Arc::clone(&bot),
+            upstream: Arc::from(upstream),
+        };
+        self.bot_info.get_or_create(&info).set(1);
+        UpstreamMetrics {
+            info,
+            up: UpstreamUp(Arc::new(UpState {
+                family: self.upstream_up.clone(),
+                labels: BotLabels { bot },
+                gauge: OnceLock::new(),
+                retired: Mutex::new(false),
+            })),
+        }
+    }
+
+    /// Removes the series of `upstream`; its `tgin_upstream_up` handle no
+    /// longer exports anything.
+    pub fn remove_upstream(&self, upstream: &UpstreamMetrics) {
+        self.bot_info.remove(&upstream.info);
+        upstream.up.retire();
+    }
 }
 
 /// One bot's handles. Cloning shares them.
@@ -348,7 +401,7 @@ impl MethodMetrics {
         self.outcomes[outcome as usize].inc();
     }
 
-    /// Telegram's response headers arrived `seconds` after sending.
+    /// The server's response headers arrived `seconds` after sending.
     pub fn upstream_seconds(&self, seconds: f64) {
         self.upstream.observe(seconds);
     }
@@ -364,6 +417,76 @@ impl ReplyMetrics {
     }
 }
 
+/// A bot's series for its current upstream, from
+/// [`GatewayMetrics::upstream`] to [`GatewayMetrics::remove_upstream`].
+/// Cloning shares them.
+#[derive(Clone, Debug)]
+pub struct UpstreamMetrics {
+    info: InfoLabels,
+    up: UpstreamUp,
+}
+
+impl UpstreamMetrics {
+    /// The bot's `tgin_upstream_up` handle.
+    pub fn up(&self) -> &UpstreamUp {
+        &self.up
+    }
+}
+
+/// One bot's `tgin_upstream_up` on one upstream. Its series is created by
+/// the first outcome, so it is absent until then, and never again once
+/// retired: a retired handle that a task still holds exports nothing.
+/// Cloning shares it.
+#[derive(Clone, Debug)]
+pub struct UpstreamUp(Arc<UpState>);
+
+#[derive(Debug)]
+struct UpState {
+    family: Family<BotLabels, Gauge>,
+    labels: BotLabels,
+    /// Resolved by the first outcome, under `retired`.
+    gauge: OnceLock<Gauge>,
+    /// Whether the series was removed; creating it is checked against
+    /// this, so a late outcome never brings a removed series back.
+    retired: Mutex<bool>,
+}
+
+impl UpstreamUp {
+    /// The upstream sent an HTTP answer, whatever its status.
+    pub fn answered(&self) {
+        self.set(1);
+    }
+
+    /// The upstream could not be reached, did not answer in time, or lost
+    /// the connection.
+    pub fn unreachable(&self) {
+        self.set(0);
+    }
+
+    fn set(&self, value: i64) {
+        let state = &self.0;
+        if let Some(gauge) = state.gauge.get() {
+            gauge.set(value);
+            return;
+        }
+        let retired = state.retired.lock();
+        if *retired {
+            return;
+        }
+        state
+            .gauge
+            .get_or_init(|| state.family.get_or_create_owned(&state.labels))
+            .set(value);
+    }
+
+    fn retire(&self) {
+        let state = &self.0;
+        let mut retired = state.retired.lock();
+        *retired = true;
+        state.family.remove(&state.labels);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use prometheus_client::encoding::text::encode;
@@ -374,6 +497,29 @@ mod tests {
         let mut out = String::new();
         encode(&mut out, reg).expect("encode");
         out
+    }
+
+    /// A bot's `tgin_upstream_up` handle exports nothing once its series
+    /// were removed, even when its first outcome comes only then (a task
+    /// of the bot's old upstream still running); the bot's new handle
+    /// starts absent.
+    #[test]
+    fn retired_upstream_up_never_exports() {
+        let mut reg = Registry::with_prefix("tgin");
+        let metrics = GatewayMetrics::register(&mut reg);
+        let old = metrics.upstream("shop", "api_url");
+        let late = old.up().clone();
+        metrics.remove_upstream(&old);
+        let new = metrics.upstream("shop", "tba");
+        late.unreachable();
+        let out = exported(&reg);
+        assert!(!out.contains("tgin_upstream_up{"), "{out}");
+        assert!(!out.contains(r#"upstream="api_url""#), "{out}");
+        let info = r#"tgin_bot_info{bot="shop",upstream="tba"} 1"#;
+        assert!(out.contains(info), "{out}");
+        new.up().answered();
+        late.unreachable();
+        assert!(exported(&reg).contains("tgin_upstream_up{bot=\"shop\"} 1\n"));
     }
 
     /// Every family is registered at once; a bot exports its limiter and
@@ -437,5 +583,35 @@ mod tests {
         metrics.remove_replies("hooks");
         let out = exported(&reg);
         assert!(!out.contains(r#"consumer="hooks""#), "{out}");
+    }
+
+    /// `tgin_gateway_upstream_seconds` reaches from 1 ms to about 524 s in
+    /// 20 doubling buckets: an answer minutes after a large upload to a
+    /// local server lands in a bucket of its own, not only in `+Inf`.
+    #[test]
+    fn buckets_cover_ten_minutes() {
+        let mut reg = Registry::with_prefix("tgin");
+        let metrics = GatewayMetrics::register(&mut reg);
+        let bot = metrics.bot("shop");
+        let send = bot.method(MethodLabel::of("sendDocument"));
+        send.upstream_seconds(0.000_5);
+        send.upstream_seconds(400.0);
+        let out = exported(&reg);
+        let buckets: Vec<(f64, u64)> = out
+            .lines()
+            .filter(|l| l.starts_with("tgin_gateway_upstream_seconds_bucket{"))
+            .filter_map(|l| {
+                let le = l.split("le=\"").nth(1)?.split('"').next()?;
+                let count = l.rsplit(' ').next()?.parse().ok()?;
+                Some((le.parse().ok()?, count))
+            })
+            .filter(|(le, _): &(f64, u64)| le.is_finite())
+            .collect();
+        assert_eq!(buckets.len(), 20, "{out}");
+        assert_eq!(buckets[0], (0.001, 1), "{out}");
+        let (top, top_count) = buckets[19];
+        assert!((top - 524.288).abs() < 1e-9, "top bucket {top}");
+        assert_eq!(top_count, 2, "400 s counted below the top bucket");
+        assert_eq!(buckets[18], (262.144, 1), "{out}");
     }
 }

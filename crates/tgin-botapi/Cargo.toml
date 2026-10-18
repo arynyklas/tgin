@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Telegram Bot API client and update facts extraction for tgin."
-license.workspace = true
+license = "MIT AND BSL-1.0"
 repository.workspace = true
 publish.workspace = true
 
@@ -22,8 +22,8 @@ bytes.workspace = true
 form_urlencoded.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
+httpdate.workspace = true
 ipnet.workspace = true
-multer.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
 prometheus-client.workspace = true
@@ -34,8 +34,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 tgin-core.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "time"] }
-tokio-util.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "sync", "time"] }
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 
 [dev-dependencies]

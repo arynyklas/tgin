@@ -149,4 +149,49 @@ impl Params {
                 .and_then(by_name)
         })
     }
+
+    /// Whether any `InputFile` names a local file (`file:…`): a top-level
+    /// `InputFile` parameter, or a string value at any depth of a JSON
+    /// document carried by a parameter (`media`, `stickers`, `results`).
+    pub fn names_local_file(&self) -> bool {
+        self.args.iter().any(|(name, value)| {
+            (INPUT_FILES.contains(&name.as_str()) && is_local_file(value))
+                || matches!(value.trim_start().as_bytes().first(), Some(b'[' | b'{'))
+                    && serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|json| json_names_local_file(&json))
+        })
+    }
+}
+
+/// The Bot API's top-level `InputFile` parameters.
+const INPUT_FILES: &[&str] = &[
+    "animation",
+    "audio",
+    "certificate",
+    "document",
+    "photo",
+    "png_sticker",
+    "sticker",
+    "thumbnail",
+    "thumb",
+    "tgs_sticker",
+    "video",
+    "video_note",
+    "voice",
+    "webm_sticker",
+    "cover",
+    "live_photo",
+];
+
+fn is_local_file(value: &str) -> bool {
+    value.starts_with("file:")
+}
+
+fn json_names_local_file(json: &serde_json::Value) -> bool {
+    match json {
+        serde_json::Value::String(value) => is_local_file(value),
+        serde_json::Value::Array(items) => items.iter().any(json_names_local_file),
+        serde_json::Value::Object(fields) => fields.values().any(json_names_local_file),
+        _ => false,
+    }
 }

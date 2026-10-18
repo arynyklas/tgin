@@ -8,7 +8,8 @@
 //! | `getMe` | the cached identity; proxied once to fill it | same |
 //! | `setWebhook`, `deleteWebhook` | answered, nothing changes | applied to a push consumer with `accept_set_webhook` |
 //! | `getWebhookInfo` | synthesized | the runtime endpoint and the consumer's pending count |
-//! | `logOut`, `close` | answered, a warning logged | same |
+//! | `logOut`, `close` | 400, a warning logged | same |
+//! | `getFile` (local mode with `files`) | proxied, the bot's own absolute `file_path` made relative | same |
 //!
 //! The method is matched by its label, which the case-insensitive method
 //! table gives, so `GETME` is `getMe` as on Telegram. The descriptions are
@@ -29,6 +30,7 @@ use tgin_core::engine::{Consumer, Engine, Mode, TokenChanged, WebhookChange};
 use tgin_runtime::secret::Secret;
 
 use super::metrics::{MethodLabel, Outcome};
+use super::proxy::NO_ANSWER;
 use super::{Bot, Bounded, errors, params, read_bounded};
 use crate::pull;
 
@@ -44,6 +46,9 @@ const MAX_SECRET_TOKEN_LEN: usize = 256;
 /// forwarded call would take its updates.
 const PROXY_ONLY_GET_UPDATES: &str =
     "Conflict: tgin serves getUpdates per consumer at /c/<consumer>/bot<token>/getUpdates";
+/// `logOut` or `close` from a downstream: forwarded, it would log the bot
+/// out from under tgin's source and every other downstream.
+const LOG_OUT_DISABLED: &str = "Bad Request: logOut and close are disabled by tgin; operators move bots with tgin admin bot logout|close";
 // telegram-bot-api `Client.cpp` (master e3e9dd8): `do_set_webhook` and
 // `on_webhook_verified`.
 const WEBHOOK_WAS_SET: &str = "Webhook was set";
@@ -54,7 +59,7 @@ const INVALID_WEBHOOK_URL: &str = "Bad Request: invalid webhook URL specified";
 const SECRET_TOKEN_TOO_LONG: &str = "Bad Request: secret token is too long";
 const SECRET_TOKEN_ILLEGAL: &str = "Bad Request: secret token contains illegal characters";
 /// tdlib's `HttpReader` for a body over its limit.
-const TOO_LARGE: &str = "Request Entity Too Large";
+pub(super) const TOO_LARGE: &str = "Request Entity Too Large";
 
 /// What becomes of a gateway method request.
 pub(super) enum Routed {
@@ -65,6 +70,9 @@ pub(super) enum Routed {
     /// To Telegram, and its answer fills the bot's identity cache
     /// ([`learn_identity`]).
     ProxyAndLearn(Request),
+    /// To the Bot API server uncompressed, and its local-mode `getFile`
+    /// answer rewritten (`files::rewrite_response`).
+    ProxyAndRewrite(Request),
 }
 
 /// One request to a bot the gateway serves.
@@ -95,8 +103,14 @@ impl Call<'_> {
             "getWebhookInfo" => self.webhook_info(),
             "logOut" | "close" => {
                 self.count(Outcome::Local);
-                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), "a downstream asked to log the bot out of Telegram; answered locally, not forwarded");
-                errors::ok_true(None)
+                tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), "a downstream asked to log the bot out of its Bot API server; refused, not forwarded (operators move bots with tgin admin bot logout|close)");
+                errors::error(StatusCode::BAD_REQUEST, LOG_OUT_DISABLED)
+            }
+            "getFile" if self.bot.rewrite.is_on() => {
+                let mut req = req;
+                // The answer is read for the rewrite: never compressed.
+                req.headers_mut().remove(header::ACCEPT_ENCODING);
+                return Routed::ProxyAndRewrite(req);
             }
             _ => return Routed::Proxy(req),
         };
@@ -244,7 +258,7 @@ impl Call<'_> {
             Some(WebhookChange::Deleted) => WEBHOOK_WAS_DELETED,
             Some(WebhookChange::AlreadyDeleted) => WEBHOOK_IS_ALREADY_DELETED,
             None => {
-                tracing::info!(bot = %self.bot.name, consumer = self.consumer, method = self.label.as_str(), "answered locally and not forwarded to Telegram; nothing changed");
+                tracing::info!(bot = %self.bot.name, consumer = self.consumer, method = self.label.as_str(), "answered locally and not forwarded to the Bot API server; nothing changed");
                 if url.is_empty() {
                     WEBHOOK_WAS_DELETED
                 } else {
@@ -328,17 +342,14 @@ pub(super) async fn learn_identity(bot: &Bot, response: Response) -> Response {
             match crate::client::identity(&body) {
                 Ok(identity) => bot.identity.store(Some(Arc::new(identity))),
                 Err(_) => {
-                    tracing::debug!(bot = %bot.name, "Telegram's getMe answer is no identity; not cached");
+                    tracing::debug!(bot = %bot.name, "the Bot API server's getMe answer is no identity; not cached");
                 }
             }
             Response::from_parts(parts, Body::from(body))
         }
         Ok(Bounded::Over(partial)) => Response::from_parts(parts, partial.into_body()),
-        // The proxy counted and logged the failed body.
-        Err(_) => errors::error(
-            StatusCode::BAD_GATEWAY,
-            "Bad Gateway: Telegram is unreachable",
-        ),
+        // The proxy counted and logged the failed body; the call went out.
+        Err(_) => errors::error(StatusCode::BAD_GATEWAY, NO_ANSWER),
     }
 }
 

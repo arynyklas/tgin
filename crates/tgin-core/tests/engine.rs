@@ -1014,6 +1014,56 @@ async fn reload_reports_restart_required() {
     assert_eq!(report.sources_restarted, ["a"]);
 }
 
+/// Moving a bot to another upstream restarts its source and lists it in
+/// `upstream_changed` (the app warns of the update split, or says that a
+/// parked bot starts there); editing another bot's upstream, or one no bot
+/// uses, leaves it alone.
+#[tokio::test(start_paused = true)]
+async fn upstream_change_reported() {
+    const MOVES: &str = r#"version: 1
+server: {}
+upstreams:
+  local: { kind: local, url: "http://127.0.0.1:8081" }
+  other: { kind: local, url: "http://127.0.0.1:8082" }
+  spare: { kind: local, url: "http://127.0.0.1:8090" }
+bots:
+  - name: mover
+    token: "1:mover"
+    routes: [{ to: [p] }]
+  - name: stayer
+    token: "2:stayer"
+    upstream: other
+    routes: [{ to: [q] }]
+consumers:
+  p: { pull: {} }
+  q: { pull: {} }
+"#;
+    let h = Harness::new(MOVES);
+
+    let moved = MOVES.replace(
+        "token: \"1:mover\"\n",
+        "token: \"1:mover\"\n    upstream: local\n",
+    );
+    let report = h.engine.apply(&load(&moved)).expect("apply");
+    assert_eq!(report.sources_restarted, ["mover"]);
+    assert_eq!(report.upstream_changed, ["mover"]);
+    assert!(report.restart_required.is_empty(), "{report:?}");
+
+    let edited = moved.replace("8082", "8083");
+    let report = h.engine.apply(&load(&edited)).expect("apply");
+    assert_eq!(report.sources_restarted, ["stayer"]);
+    assert_eq!(report.upstream_changed, ["stayer"]);
+
+    let same = h.engine.apply(&load(&edited)).expect("apply");
+    assert!(same.sources_restarted.is_empty(), "{same:?}");
+    assert!(same.upstream_changed.is_empty(), "{same:?}");
+
+    let spare = edited.replace("8090", "8091");
+    let report = h.engine.apply(&load(&spare)).expect("apply");
+    assert!(report.sources_restarted.is_empty(), "{report:?}");
+    assert!(report.upstream_changed.is_empty(), "{report:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn reload_generation_increments() {
     let h = Harness::new(BASE);
@@ -1531,7 +1581,7 @@ consumers:
     assert_eq!(h.stats("shared").available, 1, "x's leftover stays");
 }
 
-/// A runtime endpoint belongs to the bot whose `setWebhook` set it (R37):
+/// A runtime endpoint belongs to the bot whose `setWebhook` set it:
 /// a reload that keeps the consumer and its bot keeps it; one that moves
 /// the consumer to another bot, leaves it with none, or turns
 /// `accept_set_webhook` off clears it.

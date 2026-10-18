@@ -9,9 +9,10 @@ use tgin_runtime::config::{ConfigError, Located};
 use url::Url;
 
 use super::model::{
-    At, Consumer, Gateway, HumanDuration, Ingress, Name, Push, RateMode, RawConfig, Split,
-    SplitStrategy, Target,
+    At, Bot, Consumer, Files, Gateway, HumanDuration, Ingress, IpAllowlist, Name, Push, RateMode,
+    RawConfig, Split, SplitStrategy, Target, Upstream, UpstreamKind,
 };
+use super::resolve::{self, TELEGRAM_MAX_CONNECTIONS, WebhookRules};
 
 /// Paths that tgin itself serves or will serve: a configured path must not
 /// be one of them or lie below one. The Bot API gateway's paths are reserved
@@ -28,6 +29,8 @@ const MIN_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The longest gateway `max_delay` and `retry_429.max_wait`: a client
 /// waits that long for its request.
 const MAX_GATEWAY_WAIT: Duration = Duration::from_secs(60);
+/// The longest upstream `response_timeout`.
+const MAX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Errors and warnings found so far.
 #[derive(Debug, Default)]
@@ -138,6 +141,7 @@ pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) {
     duration(diag, "reload.drain_timeout", &raw.reload.drain_timeout);
 
     consumers(raw, diag);
+    upstreams(raw, diag);
     bots(raw, diag);
 }
 
@@ -248,6 +252,104 @@ fn push(diag: &mut Diagnostics, path: &str, location: Location, push: &Push) {
     );
 }
 
+/// The `upstreams` entry `bot` names, if it names one that exists.
+fn upstream_of<'a>(raw: &'a RawConfig, bot: &Bot) -> Option<&'a Upstream> {
+    let name = bot.upstream.as_ref()?;
+    raw.upstreams
+        .get(name.value.as_str())
+        .map(|upstream| &upstream.value)
+}
+
+/// The webhook rules of `bot`'s upstream as written: Telegram's for the
+/// `api_url` shorthand, and for an unknown name, which is reported.
+pub(super) fn webhook_rules(raw: &RawConfig, bot: &Bot) -> WebhookRules {
+    upstream_of(raw, bot).map_or(WebhookRules::new(UpstreamKind::Cloud, false), |upstream| {
+        WebhookRules::new(upstream.kind.value, upstream.local_mode.value)
+    })
+}
+
+fn upstreams(raw: &RawConfig, diag: &mut Diagnostics) {
+    for (name, upstream) in &raw.upstreams {
+        let path = format!("upstreams.{}", name.as_str());
+        if name.as_str() == resolve::Upstream::SHORTHAND {
+            diag.errors.push(
+                ConfigError::new("the upstream name `api_url` is reserved")
+                    .at(located(&path, upstream.location))
+                    .hint("a bot's `api_url` is shorthand for an unnamed upstream of that name; choose another name"),
+            );
+        } else {
+            check_name(diag, &path, name.as_str(), upstream.location);
+        }
+        let location = upstream.location;
+        let upstream = &upstream.value;
+        if upstream.kind.value == UpstreamKind::Cloud {
+            if upstream.local_mode.value {
+                diag.errors.push(
+                    ConfigError::new("`local_mode` needs `kind: local`")
+                        .at(located(
+                            format!("{path}.local_mode"),
+                            known(upstream.local_mode.location, location),
+                        ))
+                        .hint("only a self-hosted `telegram-bot-api` runs with `--local`"),
+                );
+            }
+            if let Some(files) = &upstream.files {
+                diag.errors.push(
+                    ConfigError::new("`files` needs `kind: local`")
+                        .at(located(format!("{path}.files"), files.location))
+                        .hint("a cloud upstream serves its files itself; tgin forwards file downloads to it"),
+                );
+            }
+        }
+        if let Some(files) = &upstream.files {
+            self::files(diag, &format!("{path}.files"), files);
+        }
+        if let Some(timeout) = &upstream.response_timeout {
+            let path = format!("{path}.response_timeout");
+            duration(diag, &path, timeout);
+            positive(
+                diag,
+                &path,
+                timeout,
+                "0 would fail every request; omitted, it is 1m for cloud and 10m for local",
+            );
+            at_most(
+                diag,
+                &path,
+                timeout,
+                MAX_RESPONSE_TIMEOUT,
+                "it bounds the wait for the Bot API server's response once a request was sent",
+            );
+        }
+    }
+}
+
+/// An upstream's `files`: `dir` (with an optional `server_dir`) or `url`.
+fn files(diag: &mut Diagnostics, path: &str, files: &At<Files>) {
+    let value = &files.value;
+    let shape = match (&value.dir, &value.url) {
+        (Some(_), Some(_)) => false,
+        (None, None) => value.server_dir.is_some(),
+        _ => true,
+    };
+    if !shape {
+        diag.errors.push(
+            ConfigError::new("`files` takes either `dir` or `url`")
+                .at(located(path, files.location))
+                .hint("`dir` is the server's directory mounted in tgin; `url` an HTTP origin serving it"),
+        );
+    }
+    if let Some(server_dir) = &value.server_dir
+        && value.dir.is_none()
+    {
+        diag.error(
+            format!("{path}.server_dir"),
+            server_dir.0.location,
+            "`server_dir` needs `dir`: it names the same directory as the server sees it",
+        );
+    }
+}
+
 fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
     let mut names: HashMap<&str, usize> = HashMap::new();
     // The bot that first targets each consumer that serves one bot.
@@ -266,8 +368,12 @@ fn bots(raw: &RawConfig, diag: &mut Diagnostics) {
             names.insert(name, i);
         }
 
+        if let Some(upstream) = &bot.upstream {
+            self::bot_upstream(raw, diag, &path, bot, upstream);
+        }
+
         if let Some(ingress) = &bot.ingress {
-            self::ingress(raw, diag, &path, ingress);
+            self::ingress(raw, diag, &path, bot, ingress);
         }
         self::gateway(
             diag,
@@ -421,7 +527,36 @@ fn valid_method_pattern(method: &str) -> bool {
     !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphabetic())
 }
 
-fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ingress>) {
+/// A bot's `upstream`: one of `upstreams`, and not with `api_url`.
+fn bot_upstream(raw: &RawConfig, diag: &mut Diagnostics, path: &str, bot: &Bot, name: &At<Name>) {
+    let path = format!("{path}.upstream");
+    if bot.api_url.is_some() {
+        diag.errors.push(
+            ConfigError::new("`upstream` and `api_url` are mutually exclusive")
+                .at(located(&path, name.location))
+                .hint("`api_url` is shorthand for an unnamed cloud upstream; keep one of the two"),
+        );
+    }
+    if !raw.upstreams.contains_key(name.value.as_str()) {
+        let names: Vec<String> = raw
+            .upstreams
+            .keys()
+            .map(|name| format!("`{}`", name.as_str()))
+            .collect();
+        let hint = if names.is_empty() {
+            "no `upstreams` are defined".to_owned()
+        } else {
+            format!("the upstreams are {}", names.join(", "))
+        };
+        diag.errors.push(
+            ConfigError::new(format!("unknown upstream `{}`", name.value.as_str()))
+                .at(located(path, name.location))
+                .hint(hint),
+        );
+    }
+}
+
+fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, bot: &Bot, ingress: &At<Ingress>) {
     match &ingress.value {
         Ingress::LongPoll(poll) => {
             let path = format!("{path}.ingress.long_poll");
@@ -439,7 +574,13 @@ fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ing
                     .hint("Telegram takes whole seconds, and 0 would poll in a tight loop; use 1s or more (30s is usual)"),
                 );
             }
-            in_range(diag, format!("{path}.limit"), &poll.limit, ingress.location);
+            in_range(
+                diag,
+                format!("{path}.limit"),
+                &poll.limit,
+                100,
+                ingress.location,
+            );
         }
         Ingress::Webhook(hook) => {
             let path = format!("{path}.ingress.webhook");
@@ -454,7 +595,7 @@ fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ing
                 diag.error(
                     format!("{path}.register"),
                     hook.register.location,
-                    "`register: true` needs `public_url`, the https URL Telegram posts to",
+                    "`register: true` needs `public_url`, the URL the Bot API server posts updates to",
                 );
             }
             if let Some(certificate) = &hook.certificate_file
@@ -466,12 +607,46 @@ fn ingress(raw: &RawConfig, diag: &mut Diagnostics, path: &str, ingress: &At<Ing
                     "`certificate_file` is uploaded by setWebhook, so it needs `register: true`",
                 );
             }
+            let upstream = upstream_of(raw, bot);
+            let rules = webhook_rules(raw, bot);
             if let Some(max) = &hook.max_connections {
                 in_range(
                     diag,
                     format!("{path}.max_connections"),
                     max,
+                    rules.max_connections,
                     ingress.location,
+                );
+                // Above Telegram's 100 (local mode only), the server could
+                // hold more connections than the data plane accepts.
+                if let Some(server) = &raw.server
+                    && (TELEGRAM_MAX_CONNECTIONS + 1..=rules.max_connections).contains(&max.value)
+                    && usize::try_from(max.value).is_ok_and(|n| n > server.max_connections.value)
+                {
+                    let limit = server.max_connections.value;
+                    diag.errors.push(
+                        ConfigError::new(format!(
+                            "`max_connections: {}` is above `server.max_connections` ({limit}); the data plane closes connections beyond that, so the Bot API server's could take every one",
+                            max.value
+                        ))
+                        .at(located(
+                            format!("{path}.max_connections"),
+                            known(max.location, ingress.location),
+                        ))
+                        .hint(format!("lower it to {limit} or less, or raise `server.max_connections`")),
+                    );
+                }
+            }
+            if hook.ip_allowlist.value == IpAllowlist::Telegram
+                && upstream.is_some_and(|upstream| upstream.kind.value == UpstreamKind::Local)
+            {
+                diag.errors.push(
+                    ConfigError::new("`ip_allowlist: telegram` names Telegram's networks, but a `local` upstream posts updates from its own address")
+                        .at(located(
+                            format!("{path}.ip_allowlist"),
+                            known(hook.ip_allowlist.location, ingress.location),
+                        ))
+                        .hint("list the Bot API server's networks as CIDRs instead, such as `[10.0.0.0/8]`"),
                 );
             }
         }
@@ -670,13 +845,13 @@ fn capacity_bytes(diag: &mut Diagnostics, path: String, value: &At<super::model:
     }
 }
 
-/// Telegram's 1 to 100.
-fn in_range(diag: &mut Diagnostics, path: String, value: &At<u32>, fallback: Location) {
-    if !(1..=100).contains(&value.value) {
+/// 1 to `max`, such as Telegram's 1 to 100.
+fn in_range(diag: &mut Diagnostics, path: String, value: &At<u32>, max: u32, fallback: Location) {
+    if !(1..=max).contains(&value.value) {
         diag.error(
             path,
             known(value.location, fallback),
-            format!("{} is out of range; use 1 to 100", value.value),
+            format!("{} is out of range; use 1 to {max}", value.value),
         );
     }
 }

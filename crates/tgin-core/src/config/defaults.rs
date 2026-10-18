@@ -11,7 +11,12 @@ use super::model::{
 };
 
 /// The Telegram Bot API.
-const API_URL: &str = "https://api.telegram.org";
+pub(super) const API_URL: &str = "https://api.telegram.org";
+/// A `cloud` upstream's `response_timeout`.
+pub(super) const CLOUD_RESPONSE_TIMEOUT: Duration = secs(60);
+/// A `local` upstream's `response_timeout`: a local server takes uploads of
+/// up to 2 GB and may answer long after the body was sent.
+pub(super) const LOCAL_RESPONSE_TIMEOUT: Duration = secs(600);
 /// The data-plane listener.
 const SERVER_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
 /// The admin listener.
@@ -27,6 +32,10 @@ const fn secs(n: u64) -> Duration {
 
 pub(super) fn api_url() -> Template {
     Template(At::new(API_URL.to_owned()))
+}
+
+pub(super) fn local_mode() -> At<bool> {
+    At::new(false)
 }
 
 pub(super) fn balance() -> Balance {
@@ -139,7 +148,7 @@ impl Default for Webhook {
             drop_pending_updates: false,
             ip_address: None,
             certificate_file: None,
-            ip_allowlist: IpAllowlist::None,
+            ip_allowlist: At::new(IpAllowlist::None),
         }
     }
 }

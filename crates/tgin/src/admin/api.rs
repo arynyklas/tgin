@@ -3,12 +3,15 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use tgin_botapi::ApiError;
+use tgin_core::config::model::HumanDuration;
 use tgin_core::config::{self, Ingress};
 use tgin_core::engine::{BreakerStatus, Mode};
 use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
@@ -19,10 +22,12 @@ use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
 use tgin_runtime::supervisor::TaskState;
 
-use super::{ConsumerStatus, EndpointStatus, SourceStatus, Status, TaskStatus};
+use super::{
+    BotMove, ConsumerStatus, EndpointStatus, MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
+};
 use crate::app::Shared;
 use crate::cli::VERSION;
-use crate::reload::ReloadError;
+use crate::reload::{MoveError, ReloadError};
 use crate::sources::{Kind, source_task};
 
 /// The admin plane's routes over `shared`.
@@ -35,6 +40,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/consumers/{name}/resume", post(resume))
         .route("/v1/consumers/{name}/drain", post(drain))
         .route("/v1/consumers/{name}/purge", post(purge))
+        .route("/v1/bots/{name}/logout", post(log_out))
+        .route("/v1/bots/{name}/close", post(close))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             require_token,
@@ -51,7 +58,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
 /// rotated token applies at once). Without a token, a request is
 /// authorized only while every admin listener is on loopback: a reload may
 /// drop the token while a non-loopback listener stays bound until a
-/// restart, and then nothing is authorized (R40).
+/// restart, and then nothing is authorized.
 fn authorized(shared: &Shared, headers: &HeaderMap) -> bool {
     match &shared.config.load().admin.token {
         Some(token) => bearer_matches(headers, token),
@@ -184,6 +191,8 @@ fn status_of(shared: &Shared) -> Status {
                             ("backoff", error.map(|e| redactor.redact(&e).into_owned()))
                         }
                         Some(state) => state,
+                        // A parked bot's long poll has ended and gone.
+                        None if shared.sources.is_parked(&bot.name) => ("stopped", None),
                         None => ("starting", None),
                     };
                     (state, Some("long_poll"))
@@ -210,6 +219,8 @@ fn status_of(shared: &Shared) -> Status {
                 updates_total: metrics.map_or(0, |m| m.updates_total()),
                 errors_total: metrics.map_or(0, |m| m.errors_total()),
                 error,
+                upstream: bot.upstream.name.to_string(),
+                parked: shared.sources.is_parked(&bot.name),
             }
         })
         .collect();
@@ -349,4 +360,90 @@ async fn purge(State(shared): State<Arc<Shared>>, Path(name): Path<String>) -> R
         Some(purged) => axum::Json(json!({ "purged": purged })).into_response(),
         None => unknown_consumer(),
     }
+}
+
+async fn log_out(
+    State(shared): State<Arc<Shared>>,
+    Path(name): Path<String>,
+    uri: Uri,
+) -> Response {
+    move_bot(&shared, name, BotMove::LogOut, &uri).await
+}
+
+async fn close(State(shared): State<Arc<Shared>>, Path(name): Path<String>, uri: Uri) -> Response {
+    move_bot(&shared, name, BotMove::Close, &uri).await
+}
+
+/// The query of `POST /v1/bots/{name}/logout|close`.
+#[derive(Deserialize)]
+struct MoveQuery {
+    /// A duration such as `30s`; no month or year units.
+    timeout: Option<String>,
+}
+
+/// Moves the bot `name` off its Bot API server (`how`), serialized with
+/// the reloads. The server's text, in the answer or an error, may echo
+/// the token: it passes through the current redactor.
+async fn move_bot(shared: &Shared, name: String, how: BotMove, uri: &Uri) -> Response {
+    if shared.lifecycle.phase() >= Phase::Draining {
+        return error(StatusCode::CONFLICT, "draining");
+    }
+    let timeout = match Query::<MoveQuery>::try_from_uri(uri).map(|q| q.0.timeout) {
+        Ok(None) => None,
+        Ok(Some(text)) => match text.parse::<HumanDuration>() {
+            Ok(timeout)
+                if timeout.calendar_unit().is_none() && timeout.get() <= MAX_MOVE_TIMEOUT =>
+            {
+                Some(timeout.get())
+            }
+            _ => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
+        },
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid timeout"),
+    };
+    let redactor = || shared.redactor.load();
+    match shared.reloads.move_bot(name, how, timeout).await {
+        Ok(mut moved) => {
+            moved.result = moved.result.map(|r| redactor().redact(&r).into_owned());
+            axum::Json(moved).into_response()
+        }
+        Err(MoveError::Draining) => error(StatusCode::CONFLICT, "draining"),
+        Err(MoveError::UnknownBot) => error(StatusCode::NOT_FOUND, "unknown bot"),
+        Err(MoveError::Parked) => error(StatusCode::CONFLICT, "parked"),
+        Err(MoveError::Undrained) => error(StatusCode::GATEWAY_TIMEOUT, "upstream not drained"),
+        Err(MoveError::Busy(sending)) => {
+            let calls = if sending == 1 {
+                "1 call of the bot was".to_owned()
+            } else {
+                format!("{sending} calls of the bot were")
+            };
+            let body = json!({
+                "error": "calls in flight",
+                "description": format!(
+                    "{calls} still being sent to its Bot API server, a large upload perhaps; retry later, or with a longer --timeout (up to 1h)"
+                ),
+            });
+            (StatusCode::GATEWAY_TIMEOUT, axum::Json(body)).into_response()
+        }
+        Err(MoveError::Upstream(err)) => refused(shared, &err, ""),
+        Err(MoveError::Unrestored(err)) => refused(
+            shared,
+            &err,
+            "; the bot's webhook was deleted and could not be set again: set it again",
+        ),
+    }
+}
+
+/// 502 `upstream refused`: the Bot API server refused a move's call with
+/// `err`, whose text (with `more` appended) may echo a secret, so it
+/// passes through the current redactor.
+fn refused(shared: &Shared, err: &ApiError, more: &str) -> Response {
+    let text = match err {
+        ApiError::Http { description, .. } => format!("{description}{more}"),
+        other => format!("{other}{more}"),
+    };
+    let body = json!({
+        "error": "upstream refused",
+        "description": shared.redactor.load().redact(&text),
+    });
+    (StatusCode::BAD_GATEWAY, axum::Json(body)).into_response()
 }

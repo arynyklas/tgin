@@ -30,6 +30,8 @@ tgin receives your Telegram bots' updates — by long polling the Bot API or as 
 
 tgin began as a fork of [chesnokpeter/tgin](https://github.com/chesnokpeter/tgin) by Peter Chesnokov, whose idea it is: an NGINX-like router that sits in front of Telegram bots and distributes their updates across bot instances. This project rewrote the engine for delivery guarantees (bounded queues with backpressure, leases, retries) and for performance; [Performance](#performance) shows the numbers.
 
+The parser that checks requests to a self-hosted Bot API server for local file references is a port of [TDLib](https://github.com/tdlib/td)'s `HttpReader`, by Aliaksei Levin and Arseny Smirnov, under the Boost Software License 1.0 ([LICENSES/BSL-1.0.txt](LICENSES/BSL-1.0.txt)).
+
 ## Contents
 
 - [Origin](#origin)
@@ -53,11 +55,12 @@ graph LR
 
 - **Many bots, one process.** Each bot has its own token, ingress (long poll or webhook) and rules.
 - **Rules.** Route by update type, chat, chat type, user, command, text or callback data; send an update to one consumer, to several, or to one of a group (round robin, sticky by chat, or weighted).
-- **A Bot API gateway.** A bot framework points its Bot API base URL at tgin (`http://tgin:8080/c/<consumer>`): its `getUpdates` polls the consumer, and its other calls go through tgin, which forwards them to Telegram (streaming uploads and downloads, holding the bot's sends to Telegram's flood limits, retrying a short `429` once) and answers `getMe`, the webhook methods, `logOut` and `close` itself, so a downstream cannot disturb tgin or the bot's other downstreams through them. aiogram, python-telegram-bot, grammY and Telegraf are tested end to end.
+- **A Bot API gateway.** A bot framework points its Bot API base URL at tgin (`http://tgin:8080/c/<consumer>`): its `getUpdates` polls the consumer, and its other calls go through tgin, which forwards them to the bot's Bot API server (streaming uploads and downloads, holding the bot's sends to Telegram's flood limits, retrying a short `429` once) and answers `getMe`, the webhook methods, `logOut` and `close` itself, so a downstream cannot disturb tgin or the bot's other downstreams through them. aiogram, python-telegram-bot, grammY and Telegraf are tested end to end.
+- **Self-hosted Bot API servers.** A bot can talk to your own `telegram-bot-api` instead of `api.telegram.org`: tgin serves its files from the server's disk, refuses requests that would make a local-mode server read its own files, takes its webhooks over plain HTTP, and moves bots between servers with `tgin admin bot logout|close`.
 - **Pull consumers** speak Telegram's `getUpdates`. Updates are leased and acknowledged by `offset`; one lost by a crashed bot instance goes to another after its lease times out.
 - **Push consumers** post each update to HTTP endpoints with retries, backoff, per-endpoint circuit breakers and optional per-chat ordering. An endpoint can answer with a Bot API call (a webhook reply), which tgin makes, and a webhook bot can register its URL with `setWebhook` on tgin.
 - **Bounded queues** per consumer, with backpressure to the source or dropping the oldest updates, your choice per consumer.
-- **Hot reload** of the config file on change, `SIGHUP` or the admin API; only bots whose token, URL or ingress changed restart.
+- **Hot reload** of the config file on change, `SIGHUP` or the admin API; only bots whose token, Bot API server or ingress changed restart.
 - **Operations.** An admin plane with `/livez`, `/readyz`, Prometheus `/metrics` and the admin API (`tgin admin` on the command line), JSON logs with secrets masked, and a graceful drain on shutdown.
 
 Delivery is at least once while the process lives: queues are in memory, so a crash loses what they hold ([DOCS.md → Delivery semantics](DOCS.md#delivery-semantics)).
@@ -124,12 +127,13 @@ Releases carry archives for Linux (glibc and static musl), macOS and Windows on 
 
 ## Documentation
 
-- [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, the Bot API gateway, hot reload, admin API, metrics, security, shutdown and deployment.
+- [DOCS.md](DOCS.md) — concepts, configuration, delivery semantics, the Bot API gateway, self-hosted Bot API servers, hot reload, admin API, metrics, security, shutdown and deployment.
 - [docs/config-reference.md](docs/config-reference.md) — every config key, generated from the config model.
 - [PERF.md](PERF.md) — benchmark methodology, results and the harness's limits.
 - [CHANGELOG.md](CHANGELOG.md) — changes per release, including breaking ones.
 - [SECURITY.md](SECURITY.md) — supported versions, private vulnerability reporting, release verification.
 - [examples/simple](examples/simple) — a Compose stack: one bot, two polling instances and one webhook service, all on the gateway.
+- [examples/self-hosted](examples/self-hosted) — a Compose stack: tgin in front of a self-hosted Bot API server in local mode.
 
 ## Performance
 

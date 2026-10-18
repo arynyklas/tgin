@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tgin_core::config::{
-    self, Balance, Config, ConsumerKind, Gateway, Ingress, IpAllowlist, LogFormat, LogLevel, Pull,
-    Push, Rate, RateLimit, RateMode, WebhookReply, WebhookSecret,
+    self, Balance, Config, ConsumerKind, Files, Gateway, Ingress, IpAllowlist, LogFormat, LogLevel,
+    Pull, Push, Rate, RateLimit, RateMode, Upstream, UpstreamKind, WebhookReply, WebhookRules,
+    WebhookSecret,
 };
 use tgin_core::consumer::push::LEASE_TIMEOUT;
 use tgin_core::ids::ConsumerId;
@@ -166,7 +167,10 @@ fn example_full_config_loads() {
     };
     assert_eq!(shop.name, "shop");
     assert_eq!(shop.token.expose(), "123456:shop-token-value");
-    assert_eq!(shop.api_url.expose().as_str(), "https://api.telegram.org/");
+    assert_eq!(
+        shop.upstream.url.expose().as_str(),
+        "https://api.telegram.org/"
+    );
     let Some(Ingress::LongPoll(poll)) = &shop.ingress else {
         panic!("{:?}", shop.ingress);
     };
@@ -236,7 +240,7 @@ fn defaults_applied() {
 
     let poller = &cfg.bots[0];
     assert_eq!(
-        poller.api_url.expose().as_str(),
+        poller.upstream.url.expose().as_str(),
         "https://api.telegram.org/"
     );
     let Some(Ingress::LongPoll(poll)) = &poller.ingress else {
@@ -761,9 +765,9 @@ version: 1
 server: {}
 bots:
   - { name: Shop, token: t }
-  - { name: -dash, token: t }
-  - { name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, token: t }
-  - { name: ok-1, token: t }
+  - { name: -dash, token: t2 }
+  - { name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, token: t3 }
+  - { name: ok-1, token: t4 }
 consumers:
   Bad_Name: { pull: {} }
 "#;
@@ -851,7 +855,7 @@ bots:
     token: t
     routes: [{ to: [q, q] }]
   - name: second
-    token: t
+    token: t2
     routes: [{ to: [{ all: [q] }] }]
 consumers:
   q: { pull: {} }
@@ -1037,7 +1041,7 @@ bots:
     token: t
     ingress: { webhook: {} }
   - name: b
-    token: t
+    token: t2
     ingress: { webhook: { path: /hook } }
 consumers:
   q: { pull: { aliases: [/webhook/a, /hook] } }
@@ -1165,7 +1169,7 @@ bots:
     token: t
     ingress: { long_poll: { limit: 0 } }
   - name: b
-    token: t
+    token: t2
     ingress: { webhook: { max_connections: 101 } }
 consumers:
   q: { pull: { capacity: 0, capacity_bytes: 0 } }
@@ -1298,10 +1302,10 @@ bots:
     routes:
       - to: [p, { all: [p, { split: { strategy: round_robin, among: [p] } }] }]
   - name: b
-    token: t
+    token: t2
     ingress: { webhook: { secret_token: auto, ip_allowlist: [10.1.0.0/16, 192.0.2.7] } }
   - name: c
-    token: t
+    token: t3
     ingress: { webhook: { secret_token: my-secret, ip_allowlist: none } }
 consumers:
   p: { push: { endpoints: [{ url: "http://p/" }] } }
@@ -1584,7 +1588,7 @@ consumers:
     assert_eq!(tls.key_file.expose(), Path::new("/tls/tls.key"));
     let bot = &cfg.bots[0];
     assert_eq!(bot.token.expose(), "1:bot-token");
-    assert_eq!(bot.api_url.expose().as_str(), "http://bot-api:8081/");
+    assert_eq!(bot.upstream.url.expose().as_str(), "http://bot-api:8081/");
     let Some(Ingress::Webhook(hook)) = &bot.ingress else {
         panic!("{:?}", bot.ingress);
     };
@@ -1938,7 +1942,10 @@ consumers:
         .unwrap_or_else(|errors| panic!("{}", render(&errors)));
     let p = push(&cfg, "p");
     assert_eq!(p.endpoints[0].url.expose().query(), Some("token=env-qu3ry"));
-    assert_eq!(cfg.bots[0].api_url.expose().password(), Some("pa55word"));
+    assert_eq!(
+        cfg.bots[0].upstream.url.expose().password(),
+        Some("pa55word")
+    );
 
     for rendering in renderings(yaml, &env) {
         for leaked in [
@@ -2437,4 +2444,662 @@ fn rule_paths_survive_url_encoding() {
         .map(|a| a.expose().clone())
         .collect();
     assert_eq!(aliases, ["/hook%20x", "/a|b", "/a;b=c", "/~u/x.y"]);
+}
+
+/// The repository's configs, each with every `${env:…}` it uses set (a
+/// `*_URL` to the cloud, anything else to a distinct token-shaped value),
+/// and the upstream URL all its `api_url` shorthand bots have.
+fn repo_configs() -> Vec<(PathBuf, String, MapEnv, &'static str)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cloud = "https://api.telegram.org/";
+    let files = [
+        ("crates/tgin-core/tests/fixtures/full.yaml", cloud),
+        ("crates/tgin-core/tests/fixtures/design.yaml", cloud),
+        ("crates/tgin-core/tests/fixtures/minimal.yaml", cloud),
+        ("tgin.yaml", cloud),
+        ("examples/simple/config/tgin.yaml", cloud),
+        ("tests/e2e/tgin.yaml", "http://fake:8081/"),
+        (
+            "tests/performance/cfgs/v1/longpoll-1.yaml",
+            "http://10.5.0.3:8090/",
+        ),
+        (
+            "tests/performance/cfgs/v1/longpoll-3.yaml",
+            "http://10.5.0.3:8090/",
+        ),
+        (
+            "tests/performance/cfgs/v1/webhook-1.yaml",
+            "http://10.5.0.3:8090/",
+        ),
+        (
+            "tests/performance/cfgs/v1/webhook-3.yaml",
+            "http://10.5.0.3:8090/",
+        ),
+    ];
+    files
+        .into_iter()
+        .map(|(file, url)| {
+            let path = root.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut env = MapEnv::default();
+            env.files.insert(
+                PathBuf::from("/run/secrets/tgin-admin-token"),
+                "admin-api-token\n".into(),
+            );
+            for (i, reference) in text.split("${env:").skip(1).enumerate() {
+                let name = reference.split('}').next().unwrap_or_default();
+                let value = if name.ends_with("_URL") {
+                    "https://api.telegram.org".to_owned()
+                } else {
+                    format!("value-{i}")
+                };
+                env.vars.insert(name.to_owned(), value);
+            }
+            // A relative origin, so that an absolute `${file:…}` path
+            // resolves as written on every platform.
+            (PathBuf::from(file), text, env, url)
+        })
+        .collect()
+}
+
+/// `api_url`, written or left out, is an unnamed cloud upstream named
+/// `api_url`, with the URL every existing config already resolved to. Bots
+/// on a named upstream are checked by the upstream tests; every listed
+/// config keeps at least one shorthand bot, so the check is never vacuous.
+#[test]
+fn api_url_shorthand_unchanged() {
+    for (path, text, env, url) in repo_configs() {
+        let cfg = config::load(&text, &path, &env)
+            .unwrap_or_else(|errors| panic!("{}: {}", path.display(), render(&errors)));
+        let mut shorthand = 0;
+        for bot in &cfg.bots {
+            let upstream = &bot.upstream;
+            if &*upstream.name != "api_url" {
+                continue;
+            }
+            shorthand += 1;
+            assert_eq!(upstream.kind, UpstreamKind::Cloud, "{}", path.display());
+            assert_eq!(upstream.url.expose().as_str(), url, "{}", path.display());
+            assert!(!upstream.local_mode, "{}", path.display());
+            assert_eq!(upstream.files, None, "{}", path.display());
+            assert_eq!(upstream.response_timeout, secs(60), "{}", path.display());
+            assert!(!bot.allow_local_files, "{}", path.display());
+        }
+        assert!(
+            shorthand > 0,
+            "{}: no api_url shorthand bot",
+            path.display()
+        );
+    }
+
+    // A bot with neither `api_url` nor `upstream` gets the cloud default;
+    // `/v1/config` shows it as `api_url`, defaults filled in.
+    let cfg = loads(
+        "version: 1\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"https://bot-api.example/x\"\n  - name: b\n    token: \"2:t\"\n",
+    );
+    assert_eq!(
+        cfg.bots[0].upstream.url.expose().as_str(),
+        "https://bot-api.example/x"
+    );
+    assert_eq!(
+        cfg.bots[1].upstream.url.expose().as_str(),
+        "https://api.telegram.org/"
+    );
+    let json = config::redacted_json(&cfg);
+    assert_eq!(json["bots"][0]["api_url"], "https://bot-api.example/…");
+    assert_eq!(json["bots"][1]["api_url"], "https://api.telegram.org");
+    assert_eq!(json["bots"][1]["allow_local_files"], false);
+    assert!(json["bots"][1].get("upstream").is_none(), "{json}");
+    assert!(json.get("upstreams").is_none(), "{json}");
+}
+
+#[test]
+fn upstream_and_api_url_exclusive() {
+    let yaml = r#"version: 1
+upstreams:
+  local: { kind: local, url: "http://127.0.0.1:8081" }
+bots:
+  - name: a
+    token: "1:t"
+    api_url: https://api.telegram.org
+    upstream: local
+"#;
+    let err = single_error(yaml);
+    assert_at(&err, "bots[0].upstream", pos(yaml, "local\n"));
+    assert_message(&err, "`upstream` and `api_url`");
+
+    let cfg = loads(&yaml.replace("    api_url: https://api.telegram.org\n", ""));
+    let upstream = &cfg.bots[0].upstream;
+    assert_eq!(&*upstream.name, "local");
+    assert_eq!(upstream.kind, UpstreamKind::Local);
+    assert_eq!(upstream.url.expose().as_str(), "http://127.0.0.1:8081/");
+    assert!(std::sync::Arc::ptr_eq(upstream, &cfg.upstreams[0]));
+}
+
+#[test]
+fn unknown_upstream_reference_located() {
+    let yaml = r#"version: 1
+upstreams:
+  local: { kind: local, url: "http://127.0.0.1:8081" }
+bots:
+  - name: a
+    token: "1:t"
+    upstream: lcoal
+  - name: b
+    token: "2:t"
+    upstream: api_url
+"#;
+    let errors = errors(yaml);
+    assert_eq!(errors.len(), 2, "{}", render(&errors));
+    assert_at(&errors[0], "bots[0].upstream", pos(yaml, "lcoal"));
+    assert_message(&errors[0], "unknown upstream `lcoal`");
+    assert_at(&errors[1], "bots[1].upstream", pos(yaml, "api_url\n"));
+    assert_message(&errors[1], "unknown upstream `api_url`");
+    assert!(
+        errors[1]
+            .hint
+            .as_deref()
+            .is_some_and(|h| h.contains("`local`")),
+        "{}",
+        errors[1]
+    );
+
+    // `api_url` names the shorthand; no upstream may take it.
+    let yaml =
+        "version: 1\nupstreams:\n  api_url: { kind: cloud, url: \"https://api.telegram.org\" }\n";
+    let err = single_error(yaml);
+    assert_at(&err, "upstreams.api_url", pos(yaml, "{ kind"));
+    assert_message(&err, "reserved");
+    let yaml =
+        "version: 1\nupstreams:\n  Bad_Name: { kind: cloud, url: \"https://api.telegram.org\" }\n";
+    let err = single_error(yaml);
+    assert_message(&err, "invalid name `Bad_Name`");
+}
+
+#[test]
+fn files_rules() {
+    let upstream = |body: &str| {
+        format!(
+            "version: 1\nupstreams:\n  u:\n{body}bots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n"
+        )
+    };
+
+    let yaml = upstream(
+        "    kind: cloud\n    url: \"https://api.telegram.org\"\n    files: { dir: /srv/tba }\n",
+    );
+    let err = single_error(&yaml);
+    assert_at(&err, "upstreams.u.files", pos(&yaml, "{ dir"));
+    assert_message(&err, "`files`");
+
+    let yaml =
+        upstream("    kind: cloud\n    url: \"https://api.telegram.org\"\n    local_mode: true\n");
+    let err = single_error(&yaml);
+    assert_at(&err, "upstreams.u.local_mode", pos(&yaml, "true"));
+    assert_message(&err, "`local_mode`");
+
+    let yaml = upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { server_dir: /var/lib/tba }\n",
+    );
+    let err = single_error(&yaml);
+    assert_at(&err, "upstreams.u.files.server_dir", pos(&yaml, "/var"));
+    assert_message(&err, "`server_dir` needs `dir`");
+
+    let yaml = upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { dir: /srv/tba, url: \"http://files:8080\" }\n",
+    );
+    let err = single_error(&yaml);
+    assert_at(&err, "upstreams.u.files", pos(&yaml, "{ dir"));
+    assert_message(&err, "either `dir` or `url`");
+    let yaml = upstream("    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: {}\n");
+    let err = single_error(&yaml);
+    assert_message(&err, "either `dir` or `url`");
+
+    let yaml = upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { dir: /srv/tba, server_dir: var/lib/tba }\n",
+    );
+    let err = single_error(&yaml);
+    assert_at(&err, "upstreams.u.files.server_dir", pos(&yaml, "var/lib"));
+    assert_message(&err, "absolute");
+    // The server's `--files-dir` only: without it, its bot directories
+    // hold TDLib's databases too, which are never to be served.
+    let hint = err.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("as the Bot API server sees it") && hint.contains("--files-dir"),
+        "{err}"
+    );
+    assert!(!hint.contains("`--dir`"), "{err}");
+
+    // `server_dir` defaults to `dir`, made absolute.
+    let cfg = loads(&upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    local_mode: true\n    files: { dir: /srv/tba }\n",
+    ));
+    let upstream_of = |cfg: &Config| cfg.bots[0].upstream.clone();
+    assert!(upstream_of(&cfg).local_mode);
+    let srv = std::path::absolute("/srv/tba").unwrap();
+    assert_eq!(dirs(&cfg), (srv.clone(), srv.clone()));
+    let cfg = loads(&upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { dir: /srv/tba, server_dir: /var/lib/telegram-bot-api }\n",
+    ));
+    assert_eq!(
+        dirs(&cfg),
+        (srv, PathBuf::from("/var/lib/telegram-bot-api"))
+    );
+    let cfg = loads(&upstream(
+        "    kind: local\n    url: \"http://127.0.0.1:8081\"\n    files: { url: \"http://127.0.0.1:8080/files\" }\n",
+    ));
+    let Some(Files::Url(url)) = &upstream_of(&cfg).files else {
+        panic!("{:?}", upstream_of(&cfg).files);
+    };
+    assert_eq!(url.expose().as_str(), "http://127.0.0.1:8080/files");
+
+    // The server names a bot's directory after its token, keeping the
+    // `:`, or with `~` for `:` where its filesystem refuses `:`.
+    assert_eq!(
+        Upstream::token_dirs("123456:AA-bb_CC"),
+        ["123456:AA-bb_CC", "123456~AA-bb_CC"]
+    );
+}
+
+/// The resolved `files.dir` and `files.server_dir` of bot 0's upstream.
+fn dirs(cfg: &Config) -> (PathBuf, PathBuf) {
+    match &cfg.bots[0].upstream.files {
+        Some(Files::Dir { dir, server_dir }) => (dir.expose().clone(), server_dir.expose().clone()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A relative `files.dir` is relative to the config file's directory, and
+/// to the working directory below that: it and the `server_dir` it
+/// defaults to are absolute. `Debug` shows both as written.
+#[test]
+fn files_dir_absolute_and_masked() {
+    let yaml = "version: 1\nupstreams:\n  u: { kind: local, url: \"http://127.0.0.1:8081\", files: { dir: tba } }\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n";
+    for (origin, relative) in [("tgin.yaml", "tba"), ("conf/tgin.yaml", "conf/tba")] {
+        let cfg = config::load(yaml, Path::new(origin), &env(&[]))
+            .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+        let (dir, server_dir) = dirs(&cfg);
+        assert!(dir.is_absolute(), "{origin}: {}", dir.display());
+        assert_eq!(dir, std::path::absolute(relative).unwrap(), "{origin}");
+        assert_eq!(server_dir, dir, "{origin}");
+    }
+
+    let yaml = "version: 1\nupstreams:\n  u: { kind: local, url: \"http://127.0.0.1:8081\", files: { dir: \"${env:FILES_DIR}\", server_dir: \"/var/${env:SEG}\" } }\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n";
+    let env = env(&[("FILES_DIR", "/srv/s3cret-env"), ("SEG", "s3cret-seg")]);
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert_eq!(
+        dirs(&cfg),
+        (
+            std::path::absolute("/srv/s3cret-env").unwrap(),
+            PathBuf::from("/var/s3cret-seg")
+        )
+    );
+    for rendering in renderings(yaml, &env) {
+        for leaked in ["s3cret-env", "s3cret-seg"] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
+    }
+    let debug = format!("{cfg:?}");
+    assert!(debug.contains("${env:FILES_DIR}"), "{debug}");
+    assert!(debug.contains("/var/${env:SEG}"), "{debug}");
+}
+
+/// A token repeated across bots splits its updates between them: refused,
+/// at the second bot, without quoting the token.
+#[test]
+fn duplicate_tokens_rejected() {
+    let yaml = "version: 1\nbots:\n  - name: a\n    token: \"1:dup-s3cret\"\n  - name: b\n    token: '1:dup-s3cret'\n";
+    let err = single_error(yaml);
+    assert_at(&err, "bots[1].token", pos(yaml, "'1:dup"));
+    assert_message(&err, "bots[0]");
+    assert!(!err.to_string().contains("dup-s3cret"), "{err}");
+
+    let yaml = "version: 1\nbots:\n  - name: a\n    token: \"${env:A}\"\n  - name: b\n    token: \"${env:B}\"\n  - name: c\n    token: \"${env:C}\"\n";
+    let env = env(&[
+        ("A", "1:dup-s3cret"),
+        ("B", "1:dup-s3cret"),
+        ("C", "2:other"),
+    ]);
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", render(&errors));
+    assert_at(&errors[0], "bots[1].token", pos(yaml, "\"${env:B}"));
+    assert!(
+        !errors[0].to_string().contains("dup-s3cret"),
+        "{}",
+        errors[0]
+    );
+}
+
+/// Webhook `public_url`, port and `max_connections` limits follow the
+/// bot's upstream: only a local server in local mode posts over plain http,
+/// to any port, with up to 100 000 connections.
+#[test]
+fn webhook_rules_follow_the_upstream_kind() {
+    let yaml = |upstreams: &str, bot: &str, hook: &str| {
+        format!(
+            "version: 1\nserver: {{ max_connections: 100000 }}\n{upstreams}bots:\n  - name: a\n    token: \"1:t\"\n{bot}    ingress: {{ webhook: {hook} }}\n"
+        )
+    };
+    let cloud_like = [
+        ("", ""),
+        (
+            "upstreams:\n  c: { kind: cloud, url: \"https://api.telegram.org\" }\n",
+            "    upstream: c\n",
+        ),
+        (
+            "upstreams:\n  l: { kind: local, url: \"http://127.0.0.1:8081\" }\n",
+            "    upstream: l\n",
+        ),
+    ];
+    for (upstreams, bot) in cloud_like {
+        let text = yaml(upstreams, bot, "{ public_url: \"http://tgin.example\" }");
+        let err = single_error(&text);
+        assert_at(
+            &err,
+            "bots[0].ingress.webhook.public_url",
+            pos(&text, "\"http://tgin"),
+        );
+        assert_message(&err, "must be https");
+
+        let text = yaml(
+            upstreams,
+            bot,
+            "{ public_url: \"https://tgin.example:8080\" }",
+        );
+        let err = single_error(&text);
+        assert_at(
+            &err,
+            "bots[0].ingress.webhook.public_url",
+            pos(&text, "\"https://tgin"),
+        );
+        assert_message(&err, "port 8080");
+
+        let text = yaml(upstreams, bot, "{ max_connections: 101 }");
+        let err = single_error(&text);
+        assert_at(
+            &err,
+            "bots[0].ingress.webhook.max_connections",
+            pos(&text, "101"),
+        );
+        assert_message(&err, "use 1 to 100");
+
+        for ok in [
+            "{ public_url: \"https://tgin.example\", max_connections: 100 }",
+            "{ public_url: \"https://tgin.example:8443/x\" }",
+            "{ public_url: \"https://tgin.example:88\" }",
+            "{ public_url: \"https://tgin.example:80\" }",
+        ] {
+            loads(&yaml(upstreams, bot, ok));
+        }
+        let cfg = loads(&yaml(upstreams, bot, "{}"));
+        assert_eq!(
+            cfg.bots[0].upstream.webhook_rules(),
+            WebhookRules {
+                http_allowed: false,
+                any_port: false,
+                max_connections: 100,
+            }
+        );
+    }
+
+    let local =
+        "upstreams:\n  l: { kind: local, url: \"http://127.0.0.1:8081\", local_mode: true }\n";
+    let cfg = loads(&yaml(
+        local,
+        "    upstream: l\n",
+        "{ public_url: \"http://tgin:8080\", register: true, max_connections: 100000 }",
+    ));
+    assert_eq!(
+        cfg.bots[0].upstream.webhook_rules(),
+        WebhookRules {
+            http_allowed: true,
+            any_port: true,
+            max_connections: 100_000,
+        }
+    );
+    let Some(Ingress::Webhook(hook)) = &cfg.bots[0].ingress else {
+        panic!("{:?}", cfg.bots[0].ingress);
+    };
+    assert_eq!(
+        hook.public_url.as_ref().unwrap().expose().as_str(),
+        "http://tgin:8080/"
+    );
+    assert_eq!(hook.max_connections, Some(100_000));
+    let text = yaml(local, "    upstream: l\n", "{ max_connections: 100001 }");
+    let err = single_error(&text);
+    assert_at(
+        &err,
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "100001"),
+    );
+    assert_message(&err, "use 1 to 100000");
+
+    // Telegram's networks never post for a local server.
+    for local in [
+        local,
+        "upstreams:\n  l: { kind: local, url: \"http://127.0.0.1:8081\" }\n",
+    ] {
+        let text = yaml(local, "    upstream: l\n", "{ ip_allowlist: telegram }");
+        let err = single_error(&text);
+        assert_at(
+            &err,
+            "bots[0].ingress.webhook.ip_allowlist",
+            pos(&text, "telegram }"),
+        );
+        assert!(
+            err.hint.as_deref().is_some_and(|h| h.contains("CIDR")),
+            "{err}"
+        );
+    }
+    loads(&yaml("", "", "{ ip_allowlist: telegram }"));
+}
+
+/// A local-mode webhook's `max_connections` above 100 must also fit the
+/// data plane's own `server.max_connections`, which closes connections
+/// beyond it; values in Telegram's 1 to 100 are never checked against it,
+/// so no v1 config changes.
+#[test]
+fn local_webhook_max_connections_fit_the_data_plane() {
+    const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+    let yaml = |upstream: &str, server: &str, max: u32| {
+        format!(
+            "version: 1\nserver: {server}\nupstreams:\n  l: {upstream}\nbots:\n  - name: a\n    token: \"{TOKEN}\"\n    upstream: l\n    ingress: {{ webhook: {{ max_connections: {max} }} }}\n"
+        )
+    };
+    let local = "{ kind: local, url: \"http://127.0.0.1:8081\", local_mode: true }";
+    let text = yaml(local, "{}", 10_001);
+    let err = single_error(&text);
+    assert_at(
+        &err,
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "10001"),
+    );
+    assert_message(&err, "above `server.max_connections` (10000)");
+    let hint = err.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("server.max_connections"), "{err}");
+    assert!(!format!("{err}").contains(TOKEN) && !hint.contains(TOKEN));
+
+    let text = yaml(local, "{ max_connections: 500 }", 501);
+    assert_at(
+        &single_error(&text),
+        "bots[0].ingress.webhook.max_connections",
+        pos(&text, "501"),
+    );
+    for (upstream, server, max) in [
+        (local, "{ max_connections: 20000 }", 20_000),
+        (local, "{}", 10_000),
+        // Within Telegram's range: never compared.
+        (local, "{ max_connections: 50 }", 100),
+        (
+            "{ kind: cloud, url: \"https://api.telegram.org\" }",
+            "{ max_connections: 50 }",
+            100,
+        ),
+    ] {
+        loads(&yaml(upstream, server, max));
+    }
+}
+
+/// A plain-http upstream off loopback warns once, naming the upstream and
+/// never the URL.
+#[test]
+fn http_upstream_warning() {
+    let yaml = |url: &str| {
+        format!(
+            "version: 1\nupstreams:\n  local: {{ kind: local, url: \"{url}\" }}\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: local\n  - name: b\n    token: \"2:t\"\n    upstream: local\n"
+        )
+    };
+    let text = yaml("http://telegram-bot-api:8081");
+    let cfg = loads(&text);
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_at(warning, "upstreams.local.url", pos(&text, "\"http://"));
+    assert_message(warning, "`local`");
+    assert!(
+        !warning.to_string().contains("telegram-bot-api"),
+        "{warning}"
+    );
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("Bot API server"), "{warning}");
+    assert!(!hint.contains("kind: local"), "{warning}");
+
+    for quiet in [
+        "http://127.0.0.1:8081",
+        "http://[::1]:8081",
+        "http://localhost:8081",
+        "https://telegram-bot-api:8443",
+    ] {
+        let cfg = loads(&yaml(quiet));
+        assert!(
+            cfg.warnings.is_empty(),
+            "{quiet}: {}",
+            render(&cfg.warnings)
+        );
+    }
+
+    // The shorthand is an upstream too, a cloud one: a self-hosted server
+    // behind it would not have tgin refuse `file:` references.
+    let text = "version: 1\nbots:\n  - name: a\n    token: \"1:t\"\n    api_url: \"http://bot-api:8081\"\n";
+    let cfg = loads(text);
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_at(warning, "bots[0].api_url", pos(text, "\"http://"));
+    assert_message(warning, "`api_url`");
+    assert!(!warning.to_string().contains("bot-api"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("upstreams: { <name>: { kind: local") && hint.contains("`file:`"),
+        "{warning}"
+    );
+}
+
+/// A `files.url` origin is asked for each bot's directory, named after its
+/// token: plain http to a host that is not loopback warns as an upstream
+/// URL does, naming the upstream and never the URL.
+#[test]
+fn http_files_url_warning() {
+    let yaml = |files_url: &str| {
+        format!(
+            "version: 1\nupstreams:\n  local: {{ kind: local, url: \"http://127.0.0.1:8081\", files: {{ url: \"{files_url}\" }} }}\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: local\n"
+        )
+    };
+    let text = yaml("http://files.internal/tba");
+    let cfg = loads(&text);
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_at(
+        warning,
+        "upstreams.local.files.url",
+        pos(&text, "\"http://files"),
+    );
+    assert_message(warning, "`local`");
+    assert!(!warning.to_string().contains("files.internal"), "{warning}");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("file server") && !hint.contains("Bot API server"),
+        "{warning}"
+    );
+    for quiet in ["http://127.0.0.1:8090/tba", "https://files.internal/tba"] {
+        let cfg = loads(&yaml(quiet));
+        assert!(
+            cfg.warnings.is_empty(),
+            "{quiet}: {}",
+            render(&cfg.warnings)
+        );
+    }
+}
+
+#[test]
+fn response_timeout_defaults_and_bounds() {
+    let yaml = |kind: &str, timeout: &str| {
+        format!(
+            "version: 1\nupstreams:\n  u: {{ kind: {kind}, url: \"https://127.0.0.1:8081\"{timeout} }}\nbots:\n  - name: a\n    token: \"1:t\"\n    upstream: u\n"
+        )
+    };
+    let timeout = |text: &str| loads(text).bots[0].upstream.response_timeout;
+    assert_eq!(timeout(&yaml("cloud", "")), secs(60));
+    assert_eq!(timeout(&yaml("local", "")), secs(600));
+    assert_eq!(timeout(&yaml("local", ", response_timeout: 2m")), secs(120));
+    assert_eq!(
+        timeout(&yaml("cloud", ", response_timeout: 1h")),
+        secs(3600)
+    );
+
+    let text = yaml("local", ", response_timeout: 0s");
+    let err = single_error(&text);
+    assert_at(&err, "upstreams.u.response_timeout", pos(&text, "0s"));
+    assert_message(&err, "longer than 0");
+    let text = yaml("local", ", response_timeout: 61m");
+    let err = single_error(&text);
+    assert_at(&err, "upstreams.u.response_timeout", pos(&text, "61m"));
+    assert_message(&err, "maximum of 1h");
+}
+
+/// Upstream URLs show as their origin only, like every other URL field;
+/// one without a resolved counterpart renders as `[redacted]`.
+#[test]
+fn redacted_json_masks_upstream_urls() {
+    let yaml = r#"version: 1
+upstreams:
+  local:
+    kind: local
+    url: "http://user:pa55word@bot-api.internal:8081/x?k=qu3ry"
+    files: { url: "https://files.internal/s3cret-path?k=f1le-qu3ry" }
+bots:
+  - name: a
+    token: "1:t"
+    upstream: local
+"#;
+    let env = env(&[]);
+    let cfg = config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    for rendering in renderings(yaml, &env) {
+        for leaked in ["pa55word", "qu3ry", "s3cret-path", "f1le-qu3ry"] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
+    }
+    let json = config::redacted_json(&cfg);
+    let local = &json["upstreams"]["local"];
+    assert_eq!(local["url"], "http://bot-api.internal:8081/…");
+    assert_eq!(local["files"]["url"], "https://files.internal/…");
+    assert_eq!(json["bots"][0]["upstream"], "local");
+    assert!(json["bots"][0].get("api_url").is_none(), "{json}");
+
+    let mut cfg = cfg;
+    cfg.upstreams.clear();
+    cfg.bots.clear();
+    let json = config::redacted_json(&cfg);
+    let local = &json["upstreams"]["local"];
+    assert_eq!(local["url"], "[redacted]");
+    assert_eq!(local["files"]["url"], "[redacted]");
+    let text = json.to_string();
+    for leaked in ["bot-api.internal", "files.internal"] {
+        assert!(!text.contains(leaked), "{leaked} in {text}");
+    }
 }

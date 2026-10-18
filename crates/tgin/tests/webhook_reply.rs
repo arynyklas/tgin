@@ -512,7 +512,7 @@ fn assert_no_token_logged() {
     assert!(!LOGS.text().contains(TOKEN), "the bot token was logged");
 }
 
-/// Review Focus 5: the reply goes to Telegram exactly as the endpoint sent
+/// The reply goes to Telegram exactly as the endpoint sent
 /// it, once per delivery, while the update is still leased. Under
 /// `ordering: per_chat` the chat's next update is posted only after the
 /// reply call has completed.
@@ -998,6 +998,101 @@ async fn reply_call_bounded_by_30s() {
     tgin.stop().await;
 }
 
+/// Below 30 s, the upstream's `response_timeout` bounds a reply's call
+/// instead (here a local upstream's 5 s): it ends at exactly 5 s, counts
+/// `failed` and `unreachable`, and the warning says the Bot API server did
+/// not answer and the call may have been executed.
+#[tokio::test(start_paused = true)]
+async fn reply_call_bounded_by_response_timeout() {
+    let frozen = freeze();
+    let telegram = Telegram::default();
+    let (arrived, release) = telegram.hold_next();
+    let api = telegram.serve().await;
+    let down = MockServer::start().await;
+    let reply = r#"{"method":"sendMessage","chat_id":5,"text":"slow"}"#;
+    answer_update(&down, 1, 200, "application/json", reply).await;
+    let yaml = config(&api, &down.uri(), &Extra::default())
+        .replace("name: hooked", "name: slowtba")
+        .replace(&format!("    api_url: \"{api}\"\n"), "    upstream: tba\n")
+        .replace(
+            "bots:\n",
+            &format!(
+                "upstreams:\n  tba: {{ kind: local, url: \"{api}\", response_timeout: 5s }}\nbots:\n"
+            ),
+        );
+    let tgin = start(&yaml).await;
+    let failed = r#"tgin_webhook_replies_total{consumer="hooks",outcome="failed"} 1"#;
+
+    tgin.admit(1, 5).await;
+    within("the reply reaches the server", arrived)
+        .await
+        .expect("held");
+    tokio::time::advance(Duration::from_millis(4_999)).await;
+    let _ = real_time(QUIET).await;
+    assert!(!tgin.has_metric(failed), "the reply call ended before 5 s");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    until("the reply call times out", || tgin.has_metric(failed)).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="slowtba",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    let logs = LOGS.text();
+    assert!(
+        logs.lines().any(|l| l.contains("WARN")
+            && l.contains("bot=slowtba")
+            && l.contains(
+                "webhook reply failed: the Bot API server did not answer; the call may have been executed"
+            )),
+        "no warning that the call may have been executed"
+    );
+    assert_no_token_logged();
+    drop(release);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
+/// A bot on the `api_url` shorthand keeps v1's 30 s reply bound, however
+/// short its `upstream_idle_timeout` (here 5 s): that timeout bounds the
+/// gateway's header wait on the shorthand, never a reply.
+#[tokio::test(start_paused = true)]
+async fn shorthand_reply_keeps_30s_bound() {
+    let frozen = freeze();
+    let telegram = Telegram::default();
+    let (arrived, release) = telegram.hold_next();
+    let api = telegram.serve().await;
+    let down = MockServer::start().await;
+    let reply = r#"{"method":"sendMessage","chat_id":5,"text":"slow"}"#;
+    answer_update(&down, 1, 200, "application/json", reply).await;
+    let extra = Extra {
+        bot: "    gateway: { upstream_idle_timeout: 5s }\n",
+        ..Extra::default()
+    };
+    let yaml = config(&api, &down.uri(), &extra).replace("name: hooked", "name: v1idle");
+    let tgin = start(&yaml).await;
+    let failed = r#"tgin_webhook_replies_total{consumer="hooks",outcome="failed"} 1"#;
+
+    tgin.admit(1, 5).await;
+    within("the reply reaches the server", arrived)
+        .await
+        .expect("held");
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let _ = real_time(QUIET).await;
+    assert!(
+        !tgin.has_metric(failed),
+        "the reply call ended at the idle timeout"
+    );
+    tokio::time::advance(Duration::from_millis(24_999)).await;
+    let _ = real_time(QUIET).await;
+    assert!(!tgin.has_metric(failed), "the reply call ended before 30 s");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    until("the reply call times out", || tgin.has_metric(failed)).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="v1idle",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    drop(release);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
 /// A multipart reply's `chat_id` is not read for the limits, as for a
 /// streamed gateway request: only the global quota applies, so it goes
 /// while its chat's quota is used up. A JSON reply to that chat is refused.
@@ -1094,5 +1189,209 @@ async fn failed_reply_logged_with_redacted_description() {
     assert!(line.contains(&"y".repeat(100)), "{line}");
     assert!(!line.contains(&"y".repeat(210)), "not capped: {line}");
     assert_no_token_logged();
+    tgin.stop().await;
+}
+
+/// To a bot whose upstream is in local mode, a reply carrying a local file
+/// reference is refused (`refused`, a warn line without the value): a JSON
+/// one, an urlencoded one with the reference in JSON in a value, and a
+/// multipart one with it in a text field after a file part. A clean reply
+/// after them is executed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_with_local_file_refused() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let json = "application/json";
+    let local = "file:///srv/secret/passwd";
+    let boundary = "local-file-boundary";
+    let upload_type = format!("multipart/form-data; boundary={boundary}");
+    let down = MockServer::start().await;
+    answer_update(
+        &down,
+        1,
+        200,
+        json,
+        format!(r#"{{"method":"sendDocument","chat_id":5,"document":"{local}"}}"#),
+    )
+    .await;
+    answer_update(
+        &down,
+        2,
+        200,
+        "application/x-www-form-urlencoded",
+        "method=sendMediaGroup&chat_id=5&media=%5B%7B%22type%22%3A%22photo%22%2C%22media%22%3A%22file%3A%2F%2F%2Fsrv%2Fsecret%2Fpasswd%22%7D%5D",
+    )
+    .await;
+    let upload = multipart(
+        boundary,
+        &[
+            ("method", None, b"sendDocument"),
+            ("chat_id", None, b"5"),
+            ("document", Some("a.bin"), b"\x00bytes"),
+            ("thumbnail", None, local.as_bytes()),
+        ],
+    );
+    answer_update(&down, 3, 200, &upload_type, upload).await;
+    let control = r#"{"method":"sendMessage","chat_id":5,"text":"see file:///srv"}"#;
+    answer_update(&down, 4, 200, json, control).await;
+    let yaml = config(&api, &down.uri(), &Extra::default())
+        .replace(&format!("    api_url: \"{api}\"\n"), "    upstream: tba\n")
+        .replace(
+            "bots:\n",
+            &format!(
+                "upstreams:\n  tba: {{ kind: local, url: \"{api}\", local_mode: true }}\nbots:\n"
+            ),
+        );
+    let tgin = start(&yaml).await;
+    let before = telegram.paths();
+    for id in 1..=4 {
+        tgin.admit(id, 5).await;
+    }
+
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 1"#)
+        .await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 3"#);
+    let mut after = telegram.paths();
+    assert_eq!(after.drain(..before.len()).collect::<Vec<_>>(), before);
+    assert_eq!(after, [format!("/bot{TOKEN}/sendMessage")]);
+    assert_eq!(
+        &telegram.calls_to("sendMessage")[0].body[..],
+        control.as_bytes()
+    );
+    let logs = LOGS.text();
+    let refusals: Vec<&str> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("bot=hooked")
+                && line.contains("webhook reply refused: it carries a local file reference")
+        })
+        .collect();
+    assert_eq!(refusals.len(), 3, "{logs}");
+    assert!(
+        refusals.iter().all(|line| line.contains("WARN")),
+        "{refusals:?}"
+    );
+    assert!(!logs.contains("secret/passwd"), "a path reached the logs");
+    assert_no_token_logged();
+    tgin.stop().await;
+}
+
+/// A multipart reply whose scan reads past the deepest JSON level it
+/// follows (a failed delimiter match releases many bytes at once) is
+/// refused like any other, and the push consumer's dispatcher, which runs
+/// the scan, goes on: the next update's reply is executed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_scan_survives_the_deepest_json_level() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let boundary = r"\\u0022[\\\\u0022Z";
+    let mut upload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"method\"\r\n\r\nsendMediaGroup\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n5\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"media\"\r\n\r\n"
+    );
+    upload.push_str(r#"["[\"["#);
+    upload.push_str("\r\n--");
+    upload.push_str(&boundary[..boundary.len() - 1]);
+    upload.push_str("Y\r\n--");
+    upload.push_str(boundary);
+    upload.push_str("--\r\n");
+    let upload_type = format!("multipart/form-data; boundary=\"{boundary}\"");
+    let down = MockServer::start().await;
+    answer_update(&down, 1, 200, &upload_type, upload).await;
+    let control = r#"{"method":"sendMessage","chat_id":6,"text":"after"}"#;
+    answer_update(&down, 2, 200, "application/json", control).await;
+    let yaml = config(&api, &down.uri(), &Extra::default())
+        .replace("name: hooked", "name: deep")
+        .replace(&format!("    api_url: \"{api}\"\n"), "    upstream: tba\n")
+        .replace(
+            "bots:\n",
+            &format!(
+                "upstreams:\n  tba: {{ kind: local, url: \"{api}\", local_mode: true }}\nbots:\n"
+            ),
+        );
+    let tgin = start(&yaml).await;
+    tgin.admit(1, 5).await;
+    tgin.admit(2, 6).await;
+
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 1"#)
+        .await;
+    tgin.wait_held("hooks", 0).await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#);
+    assert!(telegram.calls_to("sendMediaGroup").is_empty());
+    assert_eq!(
+        &telegram.calls_to("sendMessage")[0].body[..],
+        control.as_bytes()
+    );
+    tgin.assert_metric(
+        r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="0",outcome="delivered"} 2"#,
+    );
+    tgin.stop().await;
+}
+
+/// The reply's `method` is read as the Bot API server reads it: a part
+/// whose `filename` sits inside another parameter's quoted value is a text
+/// field there, so the reply is executed; a percent-encoded field name is
+/// decoded; the parameters of a part typed urlencoded count too. A part
+/// with a real `filename` is a file, never the method.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_reply_method_read_as_the_server_reads_it() {
+    let telegram = Telegram::default();
+    let api = telegram.serve().await;
+    let boundary = "server-grammar";
+    let upload_type = format!("multipart/form-data; boundary={boundary}");
+    let body = |parts: &[(&str, &str)]| {
+        let mut body = String::new();
+        for (headers, value) in parts {
+            body.push_str(&format!("--{boundary}\r\n{headers}\r\n\r\n{value}\r\n"));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body
+    };
+    let quoted = body(&[
+        (
+            r#"Content-Disposition: form-data; name=method; x="; filename=a""#,
+            "sendMessage",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "5"),
+    ]);
+    let encoded = body(&[
+        (
+            r#"Content-Disposition: form-data; name="meth%6Fd""#,
+            "sendDice",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "6"),
+    ]);
+    let form_part = body(&[(
+        "Content-Disposition: form-data; name=\"p\"\r\nContent-Type: application/x-www-form-urlencoded",
+        "chat_id=7&method=sendContact",
+    )]);
+    let file = body(&[
+        (
+            r#"Content-Disposition: form-data; name="method"; filename="m""#,
+            "sendPoll",
+        ),
+        (r#"Content-Disposition: form-data; name="chat_id""#, "8"),
+    ]);
+    let down = MockServer::start().await;
+    answer_update(&down, 1, 200, &upload_type, quoted.clone()).await;
+    answer_update(&down, 2, 200, &upload_type, encoded).await;
+    answer_update(&down, 3, 200, &upload_type, form_part).await;
+    answer_update(&down, 4, 200, &upload_type, file).await;
+    let tgin = start(&config(&api, &down.uri(), &Extra::default())).await;
+    for id in 1..=4 {
+        tgin.admit(id, id + 4).await;
+    }
+
+    tgin.wait_held("hooks", 0).await;
+    tgin.wait_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="executed"} 3"#)
+        .await;
+    tgin.assert_metric(r#"tgin_webhook_replies_total{consumer="hooks",outcome="refused"} 1"#);
+    let [sent] = &telegram.calls_to("sendMessage")[..] else {
+        panic!("one sendMessage");
+    };
+    assert_eq!(&sent.body[..], quoted.as_bytes(), "byte-identical");
+    assert_eq!(telegram.calls_to("sendDice").len(), 1);
+    assert_eq!(telegram.calls_to("sendContact").len(), 1);
+    assert!(telegram.calls_to("sendPoll").is_empty());
     tgin.stop().await;
 }

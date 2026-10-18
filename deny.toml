@@ -19,7 +19,10 @@ yanked = "deny"
 allow = [
     # tgin itself (LICENSE), tokio, axum, hyper, tower, tracing and ~40 more
     "MIT",
-    # sync_wrapper; aws-lc-sys (AND expression); ryu picks it over BSL-1.0
+    # tgin and tgin-botapi (MIT AND BSL-1.0): the port of td's HttpReader in
+    # crates/tgin-botapi/src/gateway/local_files/http_reader.rs
+    "BSL-1.0",
+    # sync_wrapper; aws-lc-sys (AND expression); ryu (Apache-2.0 OR BSL-1.0)
     "Apache-2.0",
     # subtle, matchit (MIT AND BSD-3-Clause), aws-lc-sys, encoding_rs (via serde-saphyr)
     "BSD-3-Clause",

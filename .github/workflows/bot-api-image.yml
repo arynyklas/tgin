@@ -1,0 +1,105 @@
+name: Bot API image
+
+# Builds docker/telegram-bot-api natively on amd64 and arm64, with an SBOM
+# and provenance, and smoke-tests the result. Build-only: nothing is pushed
+# before 1.0. Runs when the image or this workflow changes, and weekly, so a
+# build that stops working (the upstream fetch, the Alpine packages) shows up
+# without a change here.
+on:
+  push:
+    # Dependabot branches are covered by their pull_request run.
+    branches-ignore: ["dependabot/**"]
+    paths:
+      - "docker/telegram-bot-api/**"
+      - ".github/workflows/bot-api-image.yml"
+  pull_request:
+    paths:
+      - "docker/telegram-bot-api/**"
+      - ".github/workflows/bot-api-image.yml"
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bot-api-image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # TDLib is a large C++ build; a cold cache takes most of this.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The SBOM and the provenance make the result an image index with
+      # attestation manifests, which the docker exporter cannot load. So this
+      # step exports only to a directory, which receives `sbom.spdx.json` and
+      # `provenance.json` next to the root filesystem. The weekly run skips
+      # the cache, so it really fetches and builds again; it still refreshes
+      # the cache for later runs.
+      - name: Build (attested)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/telegram-bot-api
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          sbom: true
+          provenance: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          outputs: type=local,dest=${{ runner.temp }}/bot-api-image
+          cache-from: type=gha,scope=bot-api-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=bot-api-image-${{ matrix.arch }}
+      # The same build without attestations, loaded into Docker for the smoke
+      # test. Every step is cached by the build above (the builder's own cache,
+      # and the GHA scope), so nothing is rebuilt.
+      - name: Load for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker/telegram-bot-api
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          sbom: false
+          provenance: false
+          load: true
+          tags: tgin-telegram-bot-api:ci
+          cache-from: type=gha,scope=bot-api-image-${{ matrix.arch }}
+      - name: Smoke test
+        run: |
+          docker run --rm tgin-telegram-bot-api:ci --help
+          docker run --rm tgin-telegram-bot-api:ci --version
+          uid="$(docker run --rm --entrypoint id tgin-telegram-bot-api:ci -u)"
+          echo "uid: $uid"
+          test "$uid" = 10001
+      # Both are in-toto statements: an SPDX document that lists packages,
+      # and SLSA provenance.
+      - name: Check the attestations
+        working-directory: ${{ runner.temp }}/bot-api-image
+        run: |
+          jq -e '.predicateType == "https://spdx.dev/Document" and (.predicate.packages | length > 0)' sbom.spdx.json
+          jq -e '.predicateType | startswith("https://slsa.dev/provenance/")' provenance.json
+          install -D -m 0644 sbom.spdx.json "$RUNNER_TEMP/attestations/sbom.spdx.json"
+          install -D -m 0644 provenance.json "$RUNNER_TEMP/attestations/provenance.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bot-api-image-attestations-${{ matrix.arch }}
+          path: ${{ runner.temp }}/attestations/*
+          if-no-files-found: error
+          retention-days: 7

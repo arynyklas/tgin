@@ -9,8 +9,10 @@
 
 pub mod chat_key;
 pub mod errors;
+mod files;
 mod intercept;
 pub mod limit;
+mod local_files;
 pub mod methods;
 pub mod metrics;
 pub mod params;
@@ -21,7 +23,7 @@ mod reply;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -42,9 +44,12 @@ use tgin_runtime::http::{ClientOptions, Via, client};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio::time::Instant;
 
+use self::files::{FileTarget, Rewrite};
 use self::limit::BotLimiter;
-pub use self::metrics::GatewayMetrics;
-use self::metrics::{BotMetrics, MethodLabel, Outcome, ReplyMetrics};
+use self::metrics::{
+    BotMetrics, MethodLabel, MethodMetrics, Outcome, ReplyMetrics, UpstreamMetrics,
+};
+pub use self::metrics::{GatewayMetrics, UpstreamUp};
 use self::path::GatewayPath;
 use self::proxy::Upstream;
 use crate::client::Identity;
@@ -57,7 +62,9 @@ pub struct GatewayBot {
     pub name: Arc<str>,
     pub source: SourceId,
     pub token: Secret<String>,
-    pub api_url: Url,
+    pub upstream: Arc<config::Upstream>,
+    /// `file:` references may reach an upstream in local mode.
+    pub allow_local_files: bool,
     pub gateway: config::Gateway,
 }
 
@@ -71,21 +78,81 @@ pub struct Gateway {
     table: ArcSwap<Table>,
     /// `tgin_webhook_replies_total` handles by push consumer.
     replies: Mutex<HashMap<Arc<str>, ReplyMetrics>>,
-    /// The requests forwarded to Telegram, for the shutdown's drain.
+    /// The requests forwarded to Telegram, and the files served from disk,
+    /// for the shutdown's drain.
     upstreams: Arc<Upstreams>,
 }
 
-/// The gateway's requests forwarded to Telegram: how many are in flight,
-/// and when one last started or ended (`None` before the first).
+/// What a parked bot's calls that would go to a Bot API server or a file
+/// origin answer, with `Retry-After` [`PARKED_RETRY_AFTER`]: the server it
+/// left launches a bot again on its next call, and the bot's updates would
+/// be split between two servers.
+const PARKED: &str =
+    "Service Unavailable: the bot is being moved to another Bot API server by tgin";
+/// Seconds.
+const PARKED_RETRY_AFTER: u64 = 5;
+
+/// One bot's way to its servers: whether it is parked
+/// ([`Gateway::set_parked`]), and how many of its calls are being sent.
+/// Shared by the entries that replace one another while the bot stays
+/// configured, so a reload never lifts parking or loses a call in flight.
+#[derive(Default)]
+struct Gate {
+    parked: AtomicBool,
+    sending: AtomicUsize,
+}
+
+impl Gate {
+    fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// A call about to go to a server, counted while it is being sent;
+    /// `None` while the bot is parked. Counted before the flag is read, and
+    /// a move sets the flag before it reads the count, so either the call
+    /// sees the bot parked or the move sees the call.
+    fn enter(&self) -> Option<Sending<'_>> {
+        self.sending.fetch_add(1, Ordering::SeqCst);
+        if self.parked.load(Ordering::SeqCst) {
+            self.sending.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Sending(self))
+    }
+}
+
+/// A call being sent to a server, counted in its bot's [`Gate`] until it
+/// is dropped: once the server's answer has begun, or the call failed.
+pub(super) struct Sending<'a>(&'a Gate);
+
+impl Drop for Sending<'_> {
+    fn drop(&mut self) {
+        self.0.sending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The answer to a call of the parked bot `bot` that would have gone to a
+/// server, counted `rejected`: refused by tgin, as its other refusals are,
+/// before any server.
+fn refuse_parked(bot: &Bot, handles: &MethodMetrics, label: MethodLabel) -> Response {
+    handles.count(Outcome::Rejected);
+    tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway request refused: the bot is parked, moved off its Bot API server");
+    errors::service_unavailable(PARKED, PARKED_RETRY_AFTER)
+}
+
+/// The gateway's requests forwarded to Telegram, and its files served from
+/// disk: how many are in flight, and when one last started or ended
+/// (`None` before the first).
 #[derive(Default)]
 struct Upstreams {
     in_flight: AtomicUsize,
     last: Mutex<Option<Instant>>,
 }
 
-/// One request forwarded to Telegram, counted in [`Upstreams`] until it is
-/// dropped: with its response body, which may stream long after the
-/// headers, or with the request when no body is relayed.
+/// One request forwarded to Telegram, or one file served from disk,
+/// counted in [`Upstreams`] until it is dropped: with its response body,
+/// which may stream long after the headers, or with the request when no
+/// body is relayed.
 pub(super) struct Forwarding(Arc<Upstreams>);
 
 impl Forwarding {
@@ -101,6 +168,39 @@ impl Drop for Forwarding {
         // Stamped first: whoever sees nothing in flight sees this end.
         *self.0.last.lock() = Some(Instant::now());
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A body tgin serves itself, a file from disk, kept in flight for the
+/// shutdown's drain until it ends or is dropped, as a relayed body is: a
+/// bot that downloads an update's file before answering it is served the
+/// same whatever its upstream.
+struct Held {
+    body: Body,
+    forwarding: Option<Forwarding>,
+}
+
+impl HttpBody for Held {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.forwarding = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -134,24 +234,46 @@ struct Bot {
     name: Arc<str>,
     source: SourceId,
     token: Secret<String>,
-    api_url: Url,
+    upstream: Arc<config::Upstream>,
     gateway: config::Gateway,
-    /// `{api_url}/bot{token}/`, the `api_url` path kept.
+    /// `{url}/bot{token}/`, the upstream URL's path kept.
     method_base: Url,
-    /// `{api_url}/file/bot{token}/`.
-    file_base: Url,
+    /// Where `/file/bot{token}/…` goes.
+    files: FileTarget,
+    /// Which local-mode `getFile` paths become relative.
+    rewrite: Rewrite,
+    /// Whether requests carrying a local file reference are refused
+    /// (`local_files`).
+    refuses_local_files: bool,
+    /// The proxy's longest wait for the response headers once the request
+    /// body has been sent (webhook replies use the resolved upstream's
+    /// value, see `reply`). A bot on the `api_url` shorthand gets its own
+    /// `upstream_idle_timeout`: that is all a v1 config can reach, it cannot
+    /// set `response_timeout`, and before upstreams existed the idle bound
+    /// ran from the upload's end, so such a bot keeps exactly the wait it
+    /// had. A bot on an `upstreams` entry gets that entry's
+    /// `response_timeout`, configured or defaulted, as it is. Computed here,
+    /// so the resolved upstream (and `/v1/config`) stays as configured.
+    response_timeout: Duration,
     /// The gateway profile: no total timeout, the connect timeout above;
-    /// the proxy bounds idleness with `gateway.upstream_idle_timeout`.
+    /// the proxy bounds idleness with `gateway.upstream_idle_timeout` and
+    /// the wait for an answer with `response_timeout`.
     client: reqwest::Client,
     /// This process's `Via` (see [`Gateway::new`]).
     via: HeaderValue,
     metrics: BotMetrics,
+    /// `tgin_bot_info` and `tgin_upstream_up` for `upstream`: kept while
+    /// the bot's upstream stays the same, replaced when it changes.
+    upstream_metrics: UpstreamMetrics,
     /// Shared with the entries that replace this one while the token and
     /// the rate limits stay the same, so a reload never resets a quota.
     limiter: Arc<BotLimiter>,
     /// Shared with the entries that replace this one while the token stays
     /// the same, so an identity learned meanwhile is never lost.
     identity: Arc<ArcSwapOption<Identity>>,
+    /// Whether the bot is parked, and its calls being sent: shared with
+    /// every entry that replaces this one.
+    gate: Arc<Gate>,
 }
 
 impl Bot {
@@ -159,37 +281,59 @@ impl Bot {
         bot: GatewayBot,
         via: HeaderValue,
         metrics: BotMetrics,
+        upstream_metrics: UpstreamMetrics,
         identity: Arc<ArcSwapOption<Identity>>,
         limiter: Arc<BotLimiter>,
-    ) -> Option<Bot> {
+        gate: Arc<Gate>,
+    ) -> Result<Bot, UpstreamMetrics> {
         let token = bot.token.expose();
-        let method_base = base(&bot.api_url, &[&format!("bot{token}")])?;
-        let file_base = base(&bot.api_url, &["file", &format!("bot{token}")])?;
+        let url = bot.upstream.url.expose();
+        let (Some(method_base), Some(files)) = (
+            base(url, &[&format!("bot{token}")]),
+            FileTarget::new(&bot.upstream, token),
+        ) else {
+            return Err(upstream_metrics);
+        };
+        let rewrite = Rewrite::new(&bot.upstream);
+        let refuses_local_files =
+            local_files::refuses_local_files(&bot.upstream, bot.allow_local_files);
+        let response_timeout = if *bot.upstream.name == *config::Upstream::SHORTHAND {
+            bot.gateway.upstream_idle_timeout
+        } else {
+            bot.upstream.response_timeout
+        };
         let client = client(&ClientOptions {
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: None,
             ..ClientOptions::default()
         });
-        Some(Bot {
+        Ok(Bot {
             name: bot.name,
             source: bot.source,
             token: bot.token,
-            api_url: bot.api_url,
+            upstream: bot.upstream,
             gateway: bot.gateway,
             method_base,
-            file_base,
+            files,
+            rewrite,
+            refuses_local_files,
+            response_timeout,
             client,
             via,
             metrics,
+            upstream_metrics,
             limiter,
             identity,
+            gate,
         })
     }
 
     /// Whether `bot` describes this entry unchanged.
     fn same(&self, bot: &GatewayBot) -> bool {
         self.token.expose() == bot.token.expose()
-            && self.api_url == bot.api_url
+            && self.upstream == bot.upstream
+            && self.refuses_local_files
+                == local_files::refuses_local_files(&bot.upstream, bot.allow_local_files)
             && self.gateway == bot.gateway
             && self.source == bot.source
     }
@@ -230,11 +374,35 @@ impl Gateway {
         }
     }
 
-    /// Replaces the bot table. An entry whose token, `api_url` and gateway
+    /// Parks the bot `bot`, or ends its parking. While it is parked, every
+    /// call of it the gateway would send to its Bot API server or file
+    /// origin, webhook replies included, is refused, also one that waited
+    /// out a rate limit or a 429 since it came in; what needs no server
+    /// (the intercepts, pull `getUpdates`, files served from disk) goes on.
+    /// Reloads that rebuild the bot's entry leave it parked.
+    pub fn set_parked(&self, bot: &str, parked: bool) {
+        if let Some(entry) = self.table.load().named(bot) {
+            entry.gate.parked.store(parked, Ordering::SeqCst);
+        }
+    }
+
+    /// How many calls of the bot `bot` are being sent to its servers now:
+    /// once it is parked, no new one starts, and a move waits for these.
+    pub fn sending(&self, bot: &str) -> usize {
+        self.table
+            .load()
+            .named(bot)
+            .map_or(0, |entry| entry.gate.sending.load(Ordering::SeqCst))
+    }
+
+    /// Replaces the bot table. An entry whose token, upstream and gateway
     /// config are unchanged keeps its state (client, identity, limiter); a
     /// bot whose token stays keeps its identity, and its limiter too while
-    /// its rate limits stay. A removed bot's metric series go, and so do
-    /// the webhook-reply series of consumers the engine no longer has.
+    /// its rate limits stay. A bot moved to another server (its upstream's
+    /// name or URL changed) gets a new `tgin_bot_info` label pair and its
+    /// `tgin_upstream_up` starts absent again; other upstream edits keep
+    /// both. A removed bot's metric series go, and so do the
+    /// webhook-reply series of consumers the engine no longer has.
     pub fn set_bots(&self, bots: Vec<GatewayBot>, trusted_proxies: Vec<IpNet>) {
         let old = self.table.load_full();
         let mut entries = Vec::with_capacity(bots.len());
@@ -256,6 +424,7 @@ impl Gateway {
                 .filter(same_token)
                 .filter(|previous| previous.gateway.rate_limit == bot.gateway.rate_limit)
                 .map(|previous| Arc::clone(&previous.limiter));
+            let gate = previous.map_or_else(Arc::default, |previous| Arc::clone(&previous.gate));
             let name = Arc::clone(&bot.name);
             let limiter = match kept_limiter {
                 Some(limiter) => limiter,
@@ -267,16 +436,42 @@ impl Gateway {
                     }
                 },
             };
-            match Bot::new(bot, self.via.clone(), metrics, identity, limiter) {
-                Some(entry) => entries.push(Arc::new(entry)),
-                None => {
-                    tracing::error!(bot = %name, "the bot's api_url cannot be a base URL; the gateway does not serve it")
+            // Kept while the bot stays on the same server: its running
+            // source holds this handle until a reload that moves it, and
+            // only such a reload restarts the source for its upstream.
+            let upstream_metrics = match previous {
+                Some(previous) if previous.upstream.same_server(&bot.upstream) => {
+                    previous.upstream_metrics.clone()
+                }
+                _ => {
+                    // The old series go first: the new ones may carry the
+                    // same labels (the upstream's URL changed, not its name).
+                    if let Some(previous) = previous {
+                        self.metrics.remove_upstream(&previous.upstream_metrics);
+                    }
+                    self.metrics.upstream(&bot.name, &bot.upstream.name)
+                }
+            };
+            match Bot::new(
+                bot,
+                self.via.clone(),
+                metrics,
+                upstream_metrics,
+                identity,
+                limiter,
+                gate,
+            ) {
+                Ok(entry) => entries.push(Arc::new(entry)),
+                Err(upstream_metrics) => {
+                    self.metrics.remove_upstream(&upstream_metrics);
+                    tracing::error!(bot = %name, "the bot's upstream URL cannot be a base URL; the gateway does not serve it");
                 }
             }
         }
         for gone in &old.bots {
             if !entries.iter().any(|entry| entry.name == gone.name) {
                 self.metrics.remove_bot(&gone.metrics);
+                self.metrics.remove_upstream(&gone.upstream_metrics);
             }
         }
         self.table.store(Arc::new(Table {
@@ -284,6 +479,14 @@ impl Gateway {
             trusted_proxies,
         }));
         self.retain_reply_metrics();
+    }
+
+    /// The `tgin_upstream_up` handle of the bot `bot` on its current
+    /// upstream, for the bot's own Bot API calls (long polls, `getMe`,
+    /// `setWebhook` and the like).
+    pub fn upstream_up(&self, bot: &str) -> Option<UpstreamUp> {
+        let table = self.table.load();
+        Some(table.named(bot)?.upstream_metrics.up().clone())
     }
 
     /// Records the identity `getMe` returned for the bot `bot`.
@@ -308,34 +511,26 @@ impl Gateway {
     /// `401 Unauthorized`; a consumer the bot does not route to `404`; a
     /// method other than GET or POST `405`. `getUpdates`, `getMe`, the
     /// webhook methods, `logOut` and `close` are answered here (see
-    /// `intercept`). Everything else streams to Telegram.
+    /// `intercept`); a local-mode `getFile` answer has the bot's own file
+    /// path made relative. Every other method streams to the Bot API
+    /// server. The file route goes where the bot's upstream keeps files
+    /// (see `files`). A parked bot's calls that would go to a server get
+    /// 503 ([`Gateway::set_parked`]).
     pub async fn handle(&self, req: Request) -> Response {
         let uri = req.uri().clone();
         let Some(target) = path::parse(uri.path()) else {
             return errors::error(StatusCode::NOT_FOUND, "Not Found");
         };
         let table = self.table.load_full();
-        let (consumer, token, upstream, label) = match &target {
+        let (consumer, token, label) = match &target {
             GatewayPath::Method {
                 consumer,
                 token,
                 method,
-            } => (
-                *consumer,
-                token,
-                Upstream::Method(method),
-                MethodLabel::of(method),
-            ),
+            } => (*consumer, token, MethodLabel::of(method)),
             GatewayPath::File {
-                consumer,
-                token,
-                file_path,
-            } => (
-                *consumer,
-                token,
-                Upstream::File(file_path),
-                MethodLabel::File,
-            ),
+                consumer, token, ..
+            } => (*consumer, token, MethodLabel::File),
         };
         let Some(bot) = table.find(token) else {
             self.metrics.unauthorized();
@@ -353,36 +548,94 @@ impl Gateway {
             handles.count(Outcome::Rejected);
             return errors::error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
         }
-        if let Upstream::Method(_) = upstream {
-            let call = intercept::Call {
-                engine: &self.engine,
-                bot,
-                consumer,
-                label,
-                trusted_proxies: &table.trusted_proxies,
-            };
-            return match call.route(req).await {
-                intercept::Routed::Answered(response) => response,
-                intercept::Routed::Proxy(req) => {
-                    let forwarding = Forwarding::new(&self.upstreams);
-                    proxy::forward(bot, upstream, label, req, forwarding).await
-                }
-                intercept::Routed::ProxyAndLearn(req) => {
-                    let forwarding = Forwarding::new(&self.upstreams);
-                    let response = proxy::forward(bot, upstream, label, req, forwarding).await;
-                    intercept::learn_identity(bot, response).await
-                }
-            };
-        }
+        let file_path = match &target {
+            GatewayPath::Method { method, .. } => {
+                let upstream = Upstream::Method(method);
+                let call = intercept::Call {
+                    engine: &self.engine,
+                    bot,
+                    consumer,
+                    label,
+                    trusted_proxies: &table.trusted_proxies,
+                };
+                return match call.route(req).await {
+                    intercept::Routed::Answered(response) => response,
+                    _ if bot.gate.is_parked() => refuse_parked(bot, handles, label),
+                    intercept::Routed::Proxy(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        proxy::forward(bot, upstream, label, req, forwarding).await
+                    }
+                    intercept::Routed::ProxyAndLearn(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        let response = proxy::forward(bot, upstream, label, req, forwarding).await;
+                        intercept::learn_identity(bot, response).await
+                    }
+                    intercept::Routed::ProxyAndRewrite(req) => {
+                        let forwarding = Forwarding::new(&self.upstreams);
+                        let response = proxy::forward(bot, upstream, label, req, forwarding).await;
+                        files::rewrite_response(bot, response).await
+                    }
+                };
+            }
+            GatewayPath::File { file_path, .. } => *file_path,
+        };
+        let root = match &bot.files {
+            FileTarget::Proxy(_) | FileTarget::Origin(_) if bot.gate.is_parked() => {
+                return refuse_parked(bot, handles, label);
+            }
+            FileTarget::Proxy(base) => {
+                let forwarding = Forwarding::new(&self.upstreams);
+                let upstream = Upstream::File {
+                    base,
+                    path: file_path,
+                    server: true,
+                };
+                return proxy::forward(bot, upstream, label, req, forwarding).await;
+            }
+            FileTarget::Origin(base) => {
+                // Never the raw bytes: the checked segments, encoded again.
+                let Some(path) = files::origin_path(file_path) else {
+                    handles.count(Outcome::Rejected);
+                    tracing::debug!(bot = %bot.name, method = label.as_str(), "gateway file request refused: the path is not a plain relative path");
+                    return errors::error(StatusCode::NOT_FOUND, files::NOT_FOUND);
+                };
+                let forwarding = Forwarding::new(&self.upstreams);
+                // The origin is not the Bot API server: its outcomes leave
+                // `tgin_upstream_up` alone.
+                let upstream = Upstream::File {
+                    base,
+                    path: &path,
+                    server: false,
+                };
+                return proxy::forward(bot, upstream, label, req, forwarding).await;
+            }
+            FileTarget::NotServed => {
+                handles.count(Outcome::Rejected);
+                return errors::error(StatusCode::NOT_FOUND, files::NOT_SERVED);
+            }
+            FileTarget::Disk { root } => root,
+        };
         let forwarding = Forwarding::new(&self.upstreams);
-        proxy::forward(bot, upstream, label, req, forwarding).await
+        let response = match files::bot_dir(root, bot.token.expose()).await {
+            Some(dir) => files::serve(&dir, file_path, req.headers()).await,
+            None => errors::error(StatusCode::NOT_FOUND, files::FILE_NOT_FOUND),
+        };
+        let status = response.status();
+        handles.count(proxy::outcome(status));
+        tracing::debug!(bot = %bot.name, method = label.as_str(), status = status.as_u16(), "gateway file served from disk");
+        response.map(|body| {
+            Body::new(Held {
+                body,
+                forwarding: Some(forwarding),
+            })
+        })
     }
 
-    /// When the gateway last forwarded a request to Telegram: `now` while
-    /// one is in flight, else when the last one started or ended, `None`
-    /// before the first. Requests the gateway answers itself (`getUpdates`
-    /// and the other intercepts) do not count, so pollers never hold the
-    /// shutdown's drain open.
+    /// When the gateway last forwarded a request to Telegram or served a
+    /// file from disk: `now` while one is in flight, else when the last one
+    /// started or ended, `None` before the first. Requests the gateway
+    /// answers itself (`getUpdates` and the other intercepts) do not count,
+    /// so pollers never hold the shutdown's drain open.
     pub fn upstream_busy_at(&self, now: Instant) -> Option<Instant> {
         if self.upstreams.in_flight.load(Ordering::SeqCst) > 0 {
             return Some(now);
@@ -544,7 +797,8 @@ mod tests {
             name: Arc::from(bot.name.as_str()),
             source: SourceId(0),
             token: Secret::new(token.to_owned()),
-            api_url: bot.api_url.expose().clone(),
+            upstream: Arc::clone(&bot.upstream),
+            allow_local_files: bot.allow_local_files,
             gateway: bot.gateway.clone(),
         }
     }
@@ -598,6 +852,7 @@ mod tests {
         gateway.set_identity("a", &identity);
         gateway.set_identity("nobody", &identity);
         let first = Arc::clone(&gateway.table.load().bots[0]);
+        gateway.set_parked("a", true);
 
         gateway.set_bots(vec![gateway_bot(&cfg, "1:a")], Vec::new());
         assert!(Arc::ptr_eq(&first, &gateway.table.load().bots[0]), "kept");
@@ -609,6 +864,10 @@ mod tests {
             "rebuilt"
         );
         assert_eq!(gateway.identity("a").as_deref(), Some(&identity));
+        let parked = || gateway.table.load().named("a").expect("a").gate.is_parked();
+        assert!(parked(), "a rebuilt entry stays parked");
+        gateway.set_parked("a", false);
+        assert!(!parked());
 
         gateway.set_bots(vec![gateway_bot(&slower, "1:b")], Vec::new());
         assert!(

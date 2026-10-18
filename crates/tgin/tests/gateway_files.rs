@@ -1,0 +1,2121 @@
+//! The gateway's file modes for self-hosted Bot API servers end to end:
+//! files served from the server's directory mounted in tgin, proxied to an
+//! operator's file origin, or not served at all, and local mode's absolute
+//! `getFile` paths rewritten to the bot's own relative ones. The app runs in
+//! process on loopback sockets the OS picks; wiremock plays the server and
+//! the file origin. The cloud file route is `gateway.rs`'s
+//! `file_route_streams_with_range`.
+
+use std::io;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tgin::app::{App, Boot, secrets};
+use tgin::exit::Outcome;
+use tgin_runtime::config::MapEnv;
+use tgin_runtime::lifecycle::{SignalKind, Signals};
+use tgin_runtime::obs::MetricsRegistry;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Bounds every wait, so a stall fails the test instead of hanging it.
+const PATIENCE: Duration = Duration::from_secs(10);
+const TOKEN: &str = "123456789:AAAAexampleSecretTokenValue_-xyz";
+const OTHER_TOKEN: &str = "987654321:BBBBanotherSecretTokenValue_-xyz";
+const THIRD_TOKEN: &str = "555555555:CCCCthirdSecretTokenValue_-xyz-abc";
+const FOURTH_TOKEN: &str = "444444444:DDDDfourthSecretTokenValue_-xyz-abc";
+const CONTENT: &[u8] = b"0123456789";
+
+/// Everything every test logs, unredacted: the test subscriber has no
+/// redactor, so a token or a token directory that reaches a log line shows
+/// up here.
+static LOGS: LazyLock<Logs> = LazyLock::new(|| {
+    let logs = Logs::default();
+    tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        // wiremock logs an unmatched request whole, URL and all; those
+        // lines are not tgin's.
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace,wiremock=off"))
+        .try_init()
+        .expect("the only global subscriber");
+    logs
+});
+
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
+    }
+}
+
+impl io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("logs").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A fresh scratch directory under the target directory.
+fn scratch(prefix: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{prefix}-{:016x}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+/// `token` with ':' replaced by '~'.
+fn tilde(token: &str) -> String {
+    token.replace(':', "~")
+}
+
+/// Creates the bot directory of `token` under `root` as telegram-bot-api
+/// does: the token as it is, or its '~' form where the filesystem refuses
+/// ':' (Windows). Returns the directory.
+fn bot_dir(root: &Path, token: &str) -> PathBuf {
+    let colon = root.join(token);
+    match std::fs::create_dir(&colon) {
+        Ok(()) => colon,
+        Err(_) => {
+            let tilde = root.join(tilde(token));
+            std::fs::create_dir(&tilde).expect("the '~' bot directory");
+            tilde
+        }
+    }
+}
+
+/// Writes `content` to `dir/rel`, creating its parents.
+fn put(dir: &Path, rel: &str, content: &[u8]) {
+    let file = dir.join(rel);
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
+    std::fs::write(&file, content).expect("the file");
+}
+
+/// The app, running on signals the test sends.
+struct Tgin {
+    addr: SocketAddr,
+    signals: mpsc::Sender<SignalKind>,
+    run: JoinHandle<Outcome>,
+    metrics: Arc<MetricsRegistry>,
+    http: reqwest::Client,
+}
+
+async fn start(yaml: &str) -> Tgin {
+    LazyLock::force(&LOGS);
+    let file = scratch("gateway-files").join("tgin.yaml");
+    std::fs::write(&file, yaml).expect("the config file");
+    let boot = Boot::load(&file, Arc::new(MapEnv::default()))
+        .unwrap_or_else(|err| panic!("invalid test config: {err:?}"));
+    let app = App::start(boot).await.expect("tgin starts");
+    let addr = app.data_addrs()[0];
+    let metrics = app.metrics();
+    let (signals, rx) = mpsc::channel(4);
+    let run = tokio::spawn(app.run(Signals::from_channel(rx)));
+    Tgin {
+        addr,
+        signals,
+        run,
+        metrics,
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+    }
+}
+
+impl Tgin {
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// GETs `path` with `headers`.
+    async fn get(&self, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+        let mut request = self.http.get(self.url(path));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        timeout(PATIENCE, request.send())
+            .await
+            .expect("an answer in time")
+            .expect("a response")
+    }
+
+    /// `/file/bot<token>/<rel>`, the token's ':' percent-encoded as
+    /// clients send it.
+    async fn file(&self, token: &str, rel: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+        let encoded = token.replace(':', "%3A");
+        self.get(&format!("/file/bot{encoded}/{rel}"), headers)
+            .await
+    }
+
+    /// Sends `body` of type `content_type` (none when empty) to `path`
+    /// with `method`.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        content_type: &str,
+        body: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        let mut request = self.http.request(method, self.url(path)).body(body);
+        if !content_type.is_empty() {
+            request = request.header("content-type", content_type);
+        }
+        timeout(PATIENCE, request.send())
+            .await
+            .expect("an answer in time")
+            .expect("a response")
+    }
+
+    #[track_caller]
+    fn assert_metric(&self, line: &str) {
+        let out = self.metrics.encode();
+        assert!(out.lines().any(|l| l == line), "missing {line:?} in\n{out}");
+    }
+
+    async fn stop(self) {
+        self.signals
+            .send(SignalKind::Terminate)
+            .await
+            .expect("the app listens");
+        let outcome = timeout(PATIENCE, self.run)
+            .await
+            .expect("the app exits in time")
+            .expect("the app does not panic");
+        assert_eq!(outcome, Outcome::Clean);
+    }
+}
+
+async fn description(response: reqwest::Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let body = response.bytes().await.expect("body");
+    let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| panic!("JSON: {body:?}"));
+    (
+        status,
+        value["description"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+/// Asserts that no log line holds a token, in either directory form.
+#[track_caller]
+fn assert_logs_clean(tokens: &[&str]) {
+    let logs = LOGS.text();
+    for token in tokens {
+        assert!(!logs.contains(token), "a token reached the logs");
+        assert!(
+            !logs.contains(&tilde(token)),
+            "a '~' token directory reached the logs"
+        );
+        let secret = token.split_once(':').expect("a token").1;
+        assert!(!logs.contains(secret), "a token's secret reached the logs");
+    }
+}
+
+/// Bots `gw` (`TOKEN`) and `other` (`OTHER_TOKEN`) on the local upstream
+/// `tba` at `api`, its files mounted at `dir`.
+fn disk_config(api: &str, dir: &Path) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true, files: {{ dir: '{dir}' }} }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    routes: [{{ to: [workers] }}]
+  - name: other
+    token: "{OTHER_TOKEN}"
+    upstream: tba
+    routes: [{{ to: [others] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+  others: {{ pull: {{}} }}
+"#,
+        dir = dir.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_file_served_with_range_and_conditionals() {
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    // `gw` in whichever form the filesystem takes, `other` in the '~' form
+    // on every platform: tgin finds either.
+    put(&bot_dir(&root, TOKEN), "documents/file_1.pdf", CONTENT);
+    let other = root.join(tilde(OTHER_TOKEN));
+    put(&other, "photos/file_2.jpg", b"other");
+    let tgin = start(&disk_config(&server.uri(), &root)).await;
+
+    let full = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(full.status(), 200);
+    let headers = full.headers().clone();
+    assert_eq!(headers["content-type"], "application/octet-stream");
+    assert_eq!(headers["content-length"], "10");
+    assert_eq!(headers["accept-ranges"], "bytes");
+    let etag = headers["etag"].to_str().expect("ASCII").to_owned();
+    assert!(etag.starts_with("W/\""), "{etag}");
+    let last_modified = headers["last-modified"].to_str().expect("ASCII").to_owned();
+    assert!(last_modified.ends_with(" GMT"), "{last_modified}");
+    assert_eq!(&full.bytes().await.expect("body")[..], CONTENT);
+
+    let other_file = tgin.file(OTHER_TOKEN, "photos/file_2.jpg", &[]).await;
+    assert_eq!(other_file.status(), 200);
+    assert_eq!(&other_file.bytes().await.expect("body")[..], b"other");
+
+    for (range, content_range, body) in [
+        ("bytes=2-5", "bytes 2-5/10", &CONTENT[2..6]),
+        ("bytes=7-", "bytes 7-9/10", &CONTENT[7..]),
+        ("bytes=-3", "bytes 7-9/10", &CONTENT[7..]),
+        ("bytes=8-100", "bytes 8-9/10", &CONTENT[8..]),
+    ] {
+        let partial = tgin
+            .file(TOKEN, "documents/file_1.pdf", &[("range", range)])
+            .await;
+        assert_eq!(partial.status(), 206, "{range}");
+        let headers = partial.headers().clone();
+        assert_eq!(headers["content-range"], content_range, "{range}");
+        assert_eq!(headers["content-length"], body.len().to_string().as_str());
+        assert_eq!(headers["content-type"], "application/octet-stream");
+        assert_eq!(&partial.bytes().await.expect("body")[..], body, "{range}");
+    }
+
+    for range in ["bytes=10-", "bytes=20-30", "bytes=-0"] {
+        let unsatisfiable = tgin
+            .file(TOKEN, "documents/file_1.pdf", &[("range", range)])
+            .await;
+        assert_eq!(unsatisfiable.status(), 416, "{range}");
+        assert_eq!(unsatisfiable.headers()["content-range"], "bytes */10");
+    }
+
+    // Several ranges, or one that does not parse, get the whole file.
+    for range in ["bytes=0-1,4-5", "lines=1-2", "bytes=5-2"] {
+        let whole = tgin
+            .file(TOKEN, "documents/file_1.pdf", &[("range", range)])
+            .await;
+        assert_eq!(whole.status(), 200, "{range}");
+        assert_eq!(&whole.bytes().await.expect("body")[..], CONTENT);
+    }
+
+    // A matching `If-Range` keeps the range; a stale one sends everything.
+    let kept = tgin
+        .file(
+            TOKEN,
+            "documents/file_1.pdf",
+            &[("range", "bytes=0-1"), ("if-range", &last_modified)],
+        )
+        .await;
+    assert_eq!(kept.status(), 206);
+    let stale = tgin
+        .file(
+            TOKEN,
+            "documents/file_1.pdf",
+            &[("range", "bytes=0-1"), ("if-range", "\"stale\"")],
+        )
+        .await;
+    assert_eq!(stale.status(), 200);
+
+    for conditional in [
+        ("if-none-match", etag.as_str()),
+        ("if-none-match", "\"a\", W/\"b\", *"),
+        ("if-modified-since", last_modified.as_str()),
+        ("if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT"),
+    ] {
+        let not_modified = tgin
+            .file(TOKEN, "documents/file_1.pdf", &[conditional])
+            .await;
+        assert_eq!(not_modified.status(), 304, "{conditional:?}");
+        assert_eq!(not_modified.headers()["etag"], etag.as_str());
+        assert!(not_modified.bytes().await.expect("body").is_empty());
+    }
+    for conditional in [
+        ("if-none-match", "\"something-else\""),
+        ("if-modified-since", "Thu, 01 Jan 1970 00:00:00 GMT"),
+    ] {
+        let modified = tgin
+            .file(TOKEN, "documents/file_1.pdf", &[conditional])
+            .await;
+        assert_eq!(modified.status(), 200, "{conditional:?}");
+    }
+    // `If-None-Match` wins over `If-Modified-Since`.
+    let modified = tgin
+        .file(
+            TOKEN,
+            "documents/file_1.pdf",
+            &[
+                ("if-none-match", "\"something-else\""),
+                ("if-modified-since", &last_modified),
+            ],
+        )
+        .await;
+    assert_eq!(modified.status(), 200);
+
+    let missing = tgin.file(TOKEN, "documents/nope.pdf", &[]).await;
+    assert_eq!(
+        description(missing).await,
+        (404, "Not Found: file not found".to_owned())
+    );
+    // A type directory is no file, and a single segment is never served.
+    let directory = tgin.file(TOKEN, "documents", &[]).await;
+    assert_eq!(description(directory).await, (404, "Not Found".to_owned()));
+
+    // Nothing went to the Bot API server, and the route is method `file`.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty()
+    );
+    tgin.assert_metric(r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="ok"} 17"#);
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="rejected"} 5"#,
+    );
+    assert_logs_clean(&[TOKEN, OTHER_TOKEN]);
+    tgin.stop().await;
+}
+
+/// On a filesystem that takes ':', both forms may exist; the colon form is
+/// telegram-bot-api's own, so it comes first.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn colon_directory_preferred_over_tilde() {
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    put(&root.join(TOKEN), "documents/file_1.pdf", b"colon");
+    put(&root.join(tilde(TOKEN)), "documents/file_1.pdf", b"tilde");
+    let tgin = start(&disk_config(&server.uri(), &root)).await;
+
+    let response = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(&response.bytes().await.expect("body")[..], b"colon");
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_confined_to_the_calling_bots_directory() {
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    let mine = bot_dir(&root, TOKEN);
+    put(&mine, "documents/mine.txt", b"mine");
+    // The other bot in both forms, so neither is reachable.
+    let theirs = bot_dir(&root, OTHER_TOKEN);
+    put(&theirs, "documents/secret.txt", b"secret");
+    let theirs_tilde = root.join(tilde(OTHER_TOKEN));
+    put(&theirs_tilde, "documents/secret.txt", b"secret");
+    put(&root, "outside.txt", b"outside");
+    let tgin = start(&disk_config(&server.uri(), &root)).await;
+
+    let own = tgin.file(TOKEN, "documents/mine.txt", &[]).await;
+    assert_eq!(own.status(), 200);
+    assert_eq!(&own.bytes().await.expect("body")[..], b"mine");
+    let through_theirs = tgin.file(OTHER_TOKEN, "documents/secret.txt", &[]).await;
+    assert_eq!(through_theirs.status(), 200);
+
+    // Another bot's file through this bot's token is simply not there.
+    let missing = tgin.file(TOKEN, "documents/secret.txt", &[]).await;
+    assert_eq!(
+        description(missing).await,
+        (404, "Not Found: file not found".to_owned())
+    );
+
+    let theirs_name = theirs
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    let theirs_encoded = theirs_name.replace(':', "%3A");
+    let tilde_name = tilde(OTHER_TOKEN);
+    let mut escapes = vec![
+        format!("%2e%2e/{theirs_encoded}/documents/secret.txt"),
+        format!("%2E%2E/{tilde_name}/documents/secret.txt"),
+        format!("documents/%2e%2e/%2e%2e/{tilde_name}/documents/secret.txt"),
+        format!("..%2F{tilde_name}%2Fdocuments%2Fsecret.txt"),
+        format!("documents%2F..%2F..%2F{tilde_name}%2Fdocuments%2Fsecret.txt"),
+        format!("%2e%2e%2f{theirs_encoded}%2fdocuments%2fsecret.txt"),
+        "%2e%2e/outside.txt".to_owned(),
+        "..%2Foutside.txt".to_owned(),
+        "%2Foutside.txt".to_owned(),
+        "documents%5C..%5C..%5Coutside.txt".to_owned(),
+        "documents/mine.txt%00".to_owned(),
+    ];
+    let absolute = root.join("outside.txt");
+    let absolute = absolute.to_string_lossy();
+    escapes.push(absolute.replace('\\', "%5C").replace(':', "%3A"));
+    for escape in &escapes {
+        let encoded = TOKEN.replace(':', "%3A");
+        let response = tgin.get(&format!("/file/bot{encoded}/{escape}"), &[]).await;
+        let (status, text) = description(response).await;
+        assert_eq!(status, 404, "{escape}");
+        assert!(text.starts_with("Not Found"), "{escape}: {text}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        // A directory and a file link out of the bot's directory, and one
+        // that stays inside it; the files below a type directory, the only
+        // paths served.
+        symlink(&theirs_tilde, mine.join("theirs")).expect("a directory link");
+        symlink(root.join("outside.txt"), mine.join("documents/outside.txt")).expect("a file link");
+        symlink(
+            mine.join("documents/mine.txt"),
+            mine.join("documents/inside.txt"),
+        )
+        .expect("a link inside");
+        for rel in ["theirs/documents/secret.txt", "documents/outside.txt"] {
+            let response = tgin.file(TOKEN, rel, &[]).await;
+            assert_eq!(
+                description(response).await,
+                (404, "Not Found".to_owned()),
+                "{rel}"
+            );
+        }
+        let inside = tgin.file(TOKEN, "documents/inside.txt", &[]).await;
+        assert_eq!(inside.status(), 200);
+        assert_eq!(&inside.bytes().await.expect("body")[..], b"mine");
+    }
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty()
+    );
+    assert_logs_clean(&[TOKEN, OTHER_TOKEN]);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_files_proxied() {
+    let server = MockServer::start().await;
+    let origin = MockServer::start().await;
+    let encoded = TOKEN.replace(':', "%3A");
+    Mock::given(method("GET"))
+        .and(path(format!("/files/{encoded}/documents/file_1.pdf")))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .set_body_raw("2345", "application/pdf")
+                .insert_header("content-range", "bytes 2-5/10")
+                .insert_header("accept-ranges", "bytes")
+                .insert_header("etag", "\"o1\"")
+                .insert_header("set-cookie", "origin=1"),
+        )
+        .mount(&origin)
+        .await;
+    // Paths are forwarded as their decoded segments, encoded again: a
+    // double-encoded dot run stays one literal segment, an encoded
+    // unreserved character arrives plain.
+    for (rel, body) in [
+        ("documents/%252e%252e%252fx", "literal"),
+        ("documents/file_1.pdf", "plain"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{encoded}/{rel}")))
+            .and(query_param("probe", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/plain"))
+            .with_priority(1)
+            .mount(&origin)
+            .await;
+    }
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true, files: {{ url: "{files}/files" }} }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    routes: [{{ to: [workers] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+        files = origin.uri(),
+    );
+    let tgin = start(&yaml).await;
+
+    let response = tgin
+        .file(
+            TOKEN,
+            "documents/file_1.pdf",
+            &[("range", "bytes=2-5"), ("cookie", "c=1")],
+        )
+        .await;
+    assert_eq!(response.status(), 206);
+    let headers = response.headers().clone();
+    assert_eq!(headers["content-range"], "bytes 2-5/10");
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(headers["etag"], "\"o1\"");
+    assert_eq!(headers["content-length"], "4");
+    assert!(headers.get("set-cookie").is_none());
+    assert_eq!(&response.bytes().await.expect("body")[..], b"2345");
+
+    let requests = origin.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers["range"], "bytes=2-5");
+    assert!(requests[0].headers.get("cookie").is_none());
+    assert!(requests[0].headers.get("via").is_some());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty()
+    );
+    tgin.assert_metric(r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="ok"} 1"#);
+
+    // Traversal, encoded or not, never reaches the origin.
+    for escape in ["..%2F/", "..%2F..%2Fx", "%2e%2e%2fx", "a%5C..%5Cx", "a%00b"] {
+        let response = tgin.file(TOKEN, escape, &[]).await;
+        assert_eq!(
+            description(response).await,
+            (404, "Not Found".to_owned()),
+            "{escape}"
+        );
+    }
+    assert_eq!(
+        origin.received_requests().await.expect("recording").len(),
+        1
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="rejected"} 5"#,
+    );
+
+    for (rel, expected_path, body) in [
+        (
+            "documents/%252e%252e%252fx",
+            format!("/files/{encoded}/documents/%252e%252e%252fx"),
+            "literal",
+        ),
+        (
+            "documents/file%5F1.pdf",
+            format!("/files/{encoded}/documents/file_1.pdf"),
+            "plain",
+        ),
+    ] {
+        let response = tgin.file(TOKEN, &format!("{rel}?probe=1"), &[]).await;
+        assert_eq!(response.status(), 200, "{rel}");
+        assert_eq!(&response.bytes().await.expect("body")[..], body.as_bytes());
+        let requests = origin.received_requests().await.expect("recording");
+        let last = requests.last().expect("a request");
+        assert_eq!(last.url.path(), expected_path, "{rel}");
+    }
+    assert_logs_clean(&[TOKEN]);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_files_config_answers_not_served() {
+    let server = MockServer::start().await;
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    routes: [{{ to: [workers] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+    );
+    let tgin = start(&yaml).await;
+
+    let response = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(
+        description(response).await,
+        (
+            404,
+            "Not Found: files are not served for this upstream".to_owned()
+        )
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty()
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="rejected"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+/// A `getFile` answer with `file_path`.
+fn get_file_answer(file_path: &str) -> Value {
+    json!({
+        "ok": true,
+        "result": {
+            "file_id": "AgAD",
+            "file_unique_id": "AQAD",
+            "file_size": 10,
+            "file_path": file_path,
+        }
+    })
+}
+
+/// Mounts, on `server`, `token`'s `getFile` for `file_id` answering
+/// `body`.
+async fn mount_get_file(server: &MockServer, token: &str, file_id: &str, body: &Value) {
+    Mock::given(path(format!("/bot{token}/getFile")))
+        .and(query_param("file_id", file_id))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_file_rewritten_only_in_local_mode_and_only_own_prefix() {
+    let server = MockServer::start().await;
+    let dir = scratch("files");
+    // `local` (TOKEN) is in local mode with the server's directory at
+    // /srv/tba; `plain` (OTHER_TOKEN) has the same directory but no local
+    // mode; `origin` (THIRD_TOKEN) is in local mode with a file origin;
+    // `cloud` (FOURTH_TOKEN) is on the cloud.
+    let tilde_token = tilde(TOKEN);
+    let cases: Vec<(&str, &str, String, Value)> = vec![
+        // (token, file_id, file_path answered, file_path expected)
+        (
+            TOKEN,
+            "colon",
+            format!("/srv/tba/{TOKEN}/documents/file_1.pdf"),
+            json!("documents/file_1.pdf"),
+        ),
+        (
+            TOKEN,
+            "tilde",
+            format!("/srv/tba/{tilde_token}/photos/file_2.jpg"),
+            json!("photos/file_2.jpg"),
+        ),
+        (
+            THIRD_TOKEN,
+            "origin-windows",
+            format!("C:\\tba\\{THIRD_TOKEN}\\videos\\file_0.mp4"),
+            json!("videos/file_0.mp4"),
+        ),
+        (
+            TOKEN,
+            "escaped",
+            format!("/srv/tba/{TOKEN}/music/\"q\" é.mp3"),
+            json!("music/\"q\" é.mp3"),
+        ),
+        // Another bot's directory, a relative path, another root, and the
+        // bot's directory alone: verbatim.
+        (
+            TOKEN,
+            "theirs",
+            format!("/srv/tba/{OTHER_TOKEN}/documents/file_3.pdf"),
+            json!(format!("/srv/tba/{OTHER_TOKEN}/documents/file_3.pdf")),
+        ),
+        (
+            TOKEN,
+            "relative",
+            "documents/file_4.pdf".to_owned(),
+            json!("documents/file_4.pdf"),
+        ),
+        (
+            TOKEN,
+            "elsewhere",
+            format!("/var/tba/{TOKEN}/documents/file_5.pdf"),
+            json!(format!("/var/tba/{TOKEN}/documents/file_5.pdf")),
+        ),
+        (
+            TOKEN,
+            "dir-only",
+            format!("/srv/tba/{TOKEN}/"),
+            json!(format!("/srv/tba/{TOKEN}/")),
+        ),
+        (
+            TOKEN,
+            "prefix-of-root",
+            format!("/srv/tba2/{TOKEN}/documents/f"),
+            json!(format!("/srv/tba2/{TOKEN}/documents/f")),
+        ),
+        // Not in local mode: verbatim.
+        (
+            OTHER_TOKEN,
+            "plain",
+            format!("/srv/tba/{OTHER_TOKEN}/documents/file_6.pdf"),
+            json!(format!("/srv/tba/{OTHER_TOKEN}/documents/file_6.pdf")),
+        ),
+        // A file origin: the bot's own directory, wherever the server's is.
+        (
+            THIRD_TOKEN,
+            "origin",
+            format!("/var/lib/telegram-bot-api/{THIRD_TOKEN}/videos/file_7.mp4"),
+            json!("videos/file_7.mp4"),
+        ),
+        (
+            THIRD_TOKEN,
+            "origin-theirs",
+            format!("/var/lib/telegram-bot-api/{TOKEN}/videos/file_8.mp4"),
+            json!(format!(
+                "/var/lib/telegram-bot-api/{TOKEN}/videos/file_8.mp4"
+            )),
+        ),
+        (
+            THIRD_TOKEN,
+            "origin-relative",
+            "videos/file_9.mp4".to_owned(),
+            json!("videos/file_9.mp4"),
+        ),
+        // The cloud: verbatim.
+        (
+            FOURTH_TOKEN,
+            "cloud",
+            format!("/srv/tba/{FOURTH_TOKEN}/documents/file_10.pdf"),
+            json!(format!("/srv/tba/{FOURTH_TOKEN}/documents/file_10.pdf")),
+        ),
+    ];
+    for (token, file_id, file_path, _) in &cases {
+        mount_get_file(&server, token, file_id, &get_file_answer(file_path)).await;
+    }
+    // A failed getFile, another method with a file path, and an answer
+    // over 64 KiB pass verbatim.
+    let failed = json!({ "ok": false, "error_code": 400, "description": format!("Bad Request: /srv/tba/{TOKEN}/x") });
+    Mock::given(path(format!("/bot{TOKEN}/getFile")))
+        .and(query_param("file_id", "failed"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(&failed))
+        .mount(&server)
+        .await;
+    let other_method = get_file_answer(&format!("/srv/tba/{TOKEN}/documents/file_1.pdf"));
+    Mock::given(path(format!("/bot{TOKEN}/getStickerSet")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&other_method))
+        .mount(&server)
+        .await;
+    let mut large = get_file_answer(&format!("/srv/tba/{TOKEN}/documents/large.pdf"));
+    large["result"]["padding"] = json!("x".repeat(70 * 1024));
+    mount_get_file(&server, TOKEN, "large", &large).await;
+
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  local: {{ kind: local, url: "{api}", local_mode: true, files: {{ dir: '{dir}', server_dir: /srv/tba }} }}
+  plain: {{ kind: local, url: "{api}", files: {{ dir: '{dir}', server_dir: /srv/tba }} }}
+  origin: {{ kind: local, url: "{api}", local_mode: true, files: {{ url: "{api}/files" }} }}
+bots:
+  - name: local
+    token: "{TOKEN}"
+    upstream: local
+    routes: [{{ to: [a] }}]
+  - name: plain
+    token: "{OTHER_TOKEN}"
+    upstream: plain
+    routes: [{{ to: [b] }}]
+  - name: origin
+    token: "{THIRD_TOKEN}"
+    upstream: origin
+    routes: [{{ to: [c] }}]
+  - name: cloud
+    token: "{FOURTH_TOKEN}"
+    api_url: "{api}"
+    routes: [{{ to: [d] }}]
+consumers:
+  a: {{ pull: {{}} }}
+  b: {{ pull: {{}} }}
+  c: {{ pull: {{}} }}
+  d: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+        dir = dir.display(),
+    );
+    let tgin = start(&yaml).await;
+
+    for (token, file_id, _, expected) in &cases {
+        let response = tgin
+            .get(
+                &format!("/bot{token}/getFile?file_id={file_id}"),
+                &[("accept-encoding", "gzip")],
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{file_id}");
+        let length: usize = response.headers()["content-length"]
+            .to_str()
+            .expect("ASCII")
+            .parse()
+            .expect("a length");
+        let body = response.bytes().await.expect("body");
+        assert_eq!(body.len(), length, "{file_id}");
+        let value: Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(value["result"]["file_path"], *expected, "{file_id}");
+        assert_eq!(value["result"]["file_id"], "AgAD", "{file_id}");
+        assert_eq!(value["result"]["file_size"], 10, "{file_id}");
+        assert_eq!(value["ok"], true, "{file_id}");
+    }
+
+    // A rewrite changes `file_path` alone: the rest stays byte for byte.
+    let response = tgin
+        .get(&format!("/bot{TOKEN}/getFile?file_id=colon"), &[])
+        .await;
+    let body = response.bytes().await.expect("body");
+    let answered = serde_json::to_vec(&get_file_answer(&format!(
+        "/srv/tba/{TOKEN}/documents/file_1.pdf"
+    )))
+    .expect("JSON");
+    let answered = String::from_utf8(answered).expect("UTF-8");
+    let expected = answered.replace(&format!("/srv/tba/{TOKEN}/"), "");
+    assert_eq!(std::str::from_utf8(&body).expect("UTF-8"), expected);
+
+    let response = tgin
+        .get(&format!("/bot{TOKEN}/getFile?file_id=failed"), &[])
+        .await;
+    assert_eq!(response.status(), 400);
+    let value: Value =
+        serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
+    assert_eq!(value, failed);
+
+    let response = tgin
+        .get(
+            &format!("/bot{TOKEN}/getStickerSet"),
+            &[("accept-encoding", "gzip")],
+        )
+        .await;
+    let value: Value =
+        serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
+    assert_eq!(value, other_method);
+
+    let response = tgin
+        .get(&format!("/bot{TOKEN}/getFile?file_id=large"), &[])
+        .await;
+    assert_eq!(response.status(), 200);
+    let value: Value =
+        serde_json::from_slice(&response.bytes().await.expect("body")).expect("JSON");
+    assert_eq!(value, large);
+
+    // A rewritten getFile goes upstream uncompressed (its answer is read);
+    // a verbatim one, and any other method, keeps the client's header.
+    let requests = server.received_requests().await.expect("recording");
+    let encoding_of = |path: String| {
+        let found: Vec<Option<String>> = requests
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .map(|request| {
+                request
+                    .headers
+                    .get("accept-encoding")
+                    .map(|value| value.to_str().expect("ASCII").to_owned())
+            })
+            .collect();
+        assert!(!found.is_empty(), "no request at {path}");
+        found
+    };
+    for token in [TOKEN, THIRD_TOKEN] {
+        for encoding in encoding_of(format!("/bot{token}/getFile")) {
+            assert_eq!(encoding, None);
+        }
+    }
+    for token in [OTHER_TOKEN, FOURTH_TOKEN] {
+        for encoding in encoding_of(format!("/bot{token}/getFile")) {
+            assert_eq!(encoding.as_deref(), Some("gzip"));
+        }
+    }
+    assert_eq!(
+        encoding_of(format!("/bot{TOKEN}/getStickerSet")),
+        [Some("gzip".to_owned())]
+    );
+
+    tgin.stop().await;
+}
+
+/// Each token's '~' form, the directory name telegram-bot-api may use,
+/// and its `%3A` forms, as a `files.url` origin's paths carry it, are
+/// secrets the logs mask, as the token itself is.
+#[test]
+fn token_directory_forms_are_secrets() {
+    let yaml = format!(
+        "version: 1\nserver: {{}}\nupstreams:\n  tba: {{ kind: local, url: \"http://127.0.0.1:8081\" }}\nbots:\n  - name: a\n    token: \"{TOKEN}\"\n    upstream: tba\n    routes: [{{ to: [w] }}]\n  - name: b\n    token: \"{OTHER_TOKEN}\"\n    routes: [{{ to: [v] }}]\nconsumers:\n  w: {{ pull: {{}} }}\n  v: {{ pull: {{}} }}\n"
+    );
+    let cfg = tgin_core::config::load(&yaml, Path::new("tgin.yaml"), &MapEnv::default())
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let secrets = secrets(&cfg);
+    let redactor = tgin_runtime::secret::Redactor::new(secrets.clone());
+    for token in [TOKEN, OTHER_TOKEN] {
+        assert!(secrets.iter().any(|s| s == token));
+        assert!(secrets.iter().any(|s| *s == tilde(token)));
+        let secret = token.split_once(':').expect("a token").1;
+        for encoded in ["%3A", "%3a"] {
+            let form = token.replace(':', encoded);
+            assert!(secrets.contains(&form), "{encoded}");
+            let line = format!("GET http://files.internal/tba/{form}/documents/file_1.pdf");
+            let masked = redactor.redact(&line);
+            assert!(!masked.contains(secret), "{masked}");
+        }
+    }
+}
+
+/// The answer to a local file reference tgin refuses.
+const LOCAL_REFUSED: &str = "Bad Request: local file uploads are disabled by tgin";
+/// A local file reference; the logs never show its path.
+const LOCAL_FILE: &str = "file:///srv/secret/passwd";
+const SECRET_PATH: &str = "secret/passwd";
+const JSON: &str = "application/json";
+const FORM: &str = "application/x-www-form-urlencoded";
+const BOUNDARY: &str = "local-files-boundary";
+const MULTIPART: &str = "multipart/form-data; boundary=local-files-boundary";
+
+/// Bots on `api`: `gw` (`TOKEN`) and `allowed` (`OTHER_TOKEN`, with
+/// `allow_local_files`) on a local upstream in local mode, `plain`
+/// (`THIRD_TOKEN`) on a local upstream without it (refused all the same),
+/// `cloud` (`FOURTH_TOKEN`) on the cloud. Only `gw` keeps the default rate
+/// limits.
+fn local_files_config(api: &str) -> String {
+    format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true }}
+  plain: {{ kind: local, url: "{api}" }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    routes: [{{ to: [a] }}]
+  - name: allowed
+    token: "{OTHER_TOKEN}"
+    upstream: tba
+    allow_local_files: true
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [b] }}]
+  - name: plain
+    token: "{THIRD_TOKEN}"
+    upstream: plain
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [c] }}]
+  - name: cloud
+    token: "{FOURTH_TOKEN}"
+    api_url: "{api}"
+    gateway: {{ rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [d] }}]
+consumers:
+  a: {{ pull: {{}} }}
+  b: {{ pull: {{}} }}
+  c: {{ pull: {{}} }}
+  d: {{ pull: {{}} }}
+"#
+    )
+}
+
+/// A server that answers every call with `{"ok":true,"result":true}`.
+async fn answering_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(r#"{"ok":true,"result":true}"#, JSON))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Every byte but ASCII letters and digits percent-encoded.
+fn encoded(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// A multipart body of `parts` (header lines, value) with [`BOUNDARY`].
+fn multipart(parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (headers, value) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n{headers}\r\n\r\n").as_bytes());
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// The headers of the text field `name`.
+fn text_field(name: &str) -> String {
+    format!("Content-Disposition: form-data; name=\"{name}\"")
+}
+
+/// The headers of the file part `name`.
+fn file_part(name: &str) -> String {
+    format!(
+        "Content-Disposition: form-data; name=\"{name}\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream"
+    )
+}
+
+/// Requests carrying [`LOCAL_FILE`] in every position a server in local
+/// mode reads it from: (method, content type, body).
+fn local_references() -> Vec<(&'static str, &'static str, Vec<u8>)> {
+    let media = format!(r#"[{{"type":"photo","media":"{LOCAL_FILE}"}}]"#);
+    let json = |body: String| body.into_bytes();
+    vec![
+        (
+            "sendDocument",
+            JSON,
+            json(format!(r#"{{"chat_id":1,"document":"{LOCAL_FILE}"}}"#)),
+        ),
+        // JSON escapes decode to the same reference.
+        (
+            "sendDocument",
+            JSON,
+            json(r#"{"chat_id":1,"document":"file:\/\/\/srv\/secret\/passwd"}"#.to_owned()),
+        ),
+        (
+            "sendDocument",
+            JSON,
+            json(r#"{"chat_id":1,"document":"\u0066ile:///srv/secret/passwd"}"#.to_owned()),
+        ),
+        (
+            "sendDocument",
+            JSON,
+            json(format!(
+                r#"{{"chat_id":1,"document":"BQACAgIAAx0","thumbnail":"{LOCAL_FILE}"}}"#
+            )),
+        ),
+        (
+            "sendMediaGroup",
+            JSON,
+            json(format!(r#"{{"chat_id":1,"media":{media}}}"#)),
+        ),
+        // JSON carried in a string parameter.
+        (
+            "sendMediaGroup",
+            JSON,
+            json(format!(
+                r#"{{"chat_id":1,"media":{}}}"#,
+                serde_json::to_string(&media).expect("JSON")
+            )),
+        ),
+        (
+            "sendMediaGroup",
+            FORM,
+            json(format!("chat_id=1&media={}", encoded(&media))),
+        ),
+        (
+            "sendDocument",
+            FORM,
+            json(format!("chat_id=1&document={}", encoded(LOCAL_FILE))),
+        ),
+        (
+            "sendMediaGroup",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (&text_field("media"), media.as_bytes()),
+            ]),
+        ),
+        // A text field after a file part.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (&file_part("document"), b"\x89PNG\r\n--not-the-boundary"),
+                (&text_field("thumbnail"), LOCAL_FILE.as_bytes()),
+            ]),
+        ),
+        // A part the server reads as urlencoded parameters.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (
+                    &format!(
+                        "{}\r\nContent-Type: application/x-www-form-urlencoded",
+                        text_field("params")
+                    ),
+                    format!("document={}", encoded(LOCAL_FILE)).as_bytes(),
+                ),
+            ]),
+        ),
+        // The server sees `filename` inside a quoted parameter, so no file
+        // name: a text field.
+        (
+            "sendDocument",
+            MULTIPART,
+            multipart(&[
+                (&text_field("chat_id"), b"1"),
+                (
+                    "Content-Disposition: form-data; name=thumbnail; x=\"; filename=a\"",
+                    LOCAL_FILE.as_bytes(),
+                ),
+            ]),
+        ),
+    ]
+}
+
+/// Query strings carrying [`LOCAL_FILE`]: (HTTP method, path and query,
+/// content type, body).
+fn query_references() -> Vec<(reqwest::Method, String, &'static str, Vec<u8>)> {
+    vec![
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?chat_id=1&document={}", encoded(LOCAL_FILE)),
+            "",
+            Vec::new(),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?document={LOCAL_FILE}"),
+            JSON,
+            br#"{"chat_id":1}"#.to_vec(),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("sendDocument?thumbnail={LOCAL_FILE}"),
+            MULTIPART,
+            multipart(&[(&text_field("chat_id"), b"1")]),
+        ),
+        (
+            reqwest::Method::GET,
+            "sendPhoto?chat_id=1&photo=%66ile:///srv/secret/passwd".to_owned(),
+            "",
+            Vec::new(),
+        ),
+    ]
+}
+
+/// Asserts that the last request `server` received went to `token`'s
+/// `method` with `body`, byte for byte.
+async fn assert_forwarded(server: &MockServer, token: &str, method: &str, body: &[u8]) {
+    let requests = server.received_requests().await.expect("recording");
+    let last = requests.last().expect("a request");
+    assert_eq!(last.url.path(), format!("/bot{token}/{method}"));
+    assert_eq!(last.body, body, "{method}");
+}
+
+/// Sends `head` (a request head, its empty line included) and then `body`
+/// on a connection of its own to tgin, writing nothing more, and reads
+/// tgin's answer within [`PATIENCE`]: its status and its description.
+async fn raw_exchange(tgin: &Tgin, head: &str, body: &[u8]) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(tgin.addr)
+        .await
+        .expect("connect");
+    stream.write_all(head.as_bytes()).await.expect("the head");
+    stream.write_all(body).await.expect("the body");
+    let read = async {
+        let mut answer = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(end) = answer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&answer[..end]).expect("ASCII");
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().expect("a length"))
+                    })
+                    .expect("a Content-Length");
+                if answer.len() >= end + 4 + length {
+                    let status = head[9..12].parse().expect("a status");
+                    let value: Value = serde_json::from_slice(&answer[end + 4..end + 4 + length])
+                        .expect("a JSON answer");
+                    let description = value["description"].as_str().unwrap_or_default();
+                    return (status, description.to_owned());
+                }
+            }
+            let n = stream.read(&mut buf).await.expect("the answer");
+            assert!(n > 0, "closed: {}", String::from_utf8_lossy(&answer));
+            answer.extend_from_slice(&buf[..n]);
+        }
+    };
+    timeout(PATIENCE, read).await.expect("an answer in time")
+}
+
+/// A JSON body over 1 MiB.
+fn large_json() -> Vec<u8> {
+    format!(r#"{{"chat_id":4,"text":"{}"}}"#, "x".repeat(1 << 20)).into_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_file_refused_in_every_position() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+
+    for (method, content_type, body) in local_references() {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{TOKEN}/{method}"),
+                content_type,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{method} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    // Announced over 1 MiB, answered at once and no byte of it read: the
+    // body is never written, as a client still writing it may never read
+    // the answer (a broken pipe, or a reset for the bytes tgin left unread).
+    let head = format!(
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: {JSON}\r\nContent-Length: {}\r\n\r\n",
+        (1 << 20) + 1
+    );
+    assert_eq!(
+        raw_exchange(&tgin, &head, b"").await,
+        (413, "Request Entity Too Large".to_owned())
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
+
+    // "file:" anywhere but at a value's start, and a file part's bytes, are
+    // no references.
+    let text = br#"{"chat_id":2,"text":"see file:///srv/secret/passwd"}"#;
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendMessage"),
+            JSON,
+            &text[..],
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, TOKEN, "sendMessage", text).await;
+    let upload = multipart(&[
+        (&text_field("chat_id"), b"3"),
+        (&file_part("document"), LOCAL_FILE.as_bytes()),
+    ]);
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendDocument"),
+            MULTIPART,
+            upload.clone(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, TOKEN, "sendDocument", &upload).await;
+
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 8"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMediaGroup",outcome="rejected"} 4"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    assert_logs_clean(&[TOKEN]);
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_file_in_query_string_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(method, &format!("/bot{TOKEN}/{path}"), content_type, body)
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{path}"
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
+
+    let response = tgin
+        .get(&format!("/bot{TOKEN}/getChat?chat_id=1&title=file"), &[])
+        .await;
+    assert_eq!(response.status(), 200);
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.query(), Some("chat_id=1&title=file"));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 3"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendPhoto",outcome="rejected"} 1"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    tgin.stop().await;
+}
+
+/// Sends every reference of [`local_references`] and
+/// [`query_references`] for `token` and asserts each reached the server
+/// as it was sent.
+async fn assert_references_pass(tgin: &Tgin, server: &MockServer, token: &str) {
+    for (method, content_type, body) in local_references() {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{token}/{method}"),
+                content_type,
+                body.clone(),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{method}");
+        assert_forwarded(server, token, method, &body).await;
+    }
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(method, &format!("/bot{token}/{path}"), content_type, body)
+            .await;
+        assert_eq!(response.status(), 200, "{path}");
+        let requests = server.received_requests().await.expect("recording");
+        let last = requests.last().expect("a request");
+        let query = path.split_once('?').expect("a query").1;
+        assert_eq!(last.url.query(), Some(query));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowed_bot_passes_file_references() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_pass(&tgin, &server, OTHER_TOKEN).await;
+    tgin.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_upstreams_unaffected() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    assert_references_pass(&tgin, &server, FOURTH_TOKEN).await;
+    // No 1 MiB bound either.
+    let large = large_json();
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{FOURTH_TOKEN}/sendMessage"),
+            JSON,
+            large.clone(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_forwarded(&server, FOURTH_TOKEN, "sendMessage", &large).await;
+    tgin.stop().await;
+}
+
+/// A `local` upstream configured without `local_mode` may still run with
+/// `--local`: its bots' references are refused all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_upstream_without_local_mode_refused() {
+    let server = answering_server().await;
+    let tgin = start(&local_files_config(&server.uri())).await;
+    for (method, content_type, body) in local_references() {
+        let response = tgin
+            .send(
+                reqwest::Method::POST,
+                &format!("/bot{THIRD_TOKEN}/{method}"),
+                content_type,
+                body,
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{method}"
+        );
+    }
+    for (method, path, content_type, body) in query_references() {
+        let response = tgin
+            .send(
+                method,
+                &format!("/bot{THIRD_TOKEN}/{path}"),
+                content_type,
+                body,
+            )
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{path}"
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused call reached the server"
+    );
+    tgin.stop().await;
+}
+
+/// A file origin is not the Bot API server: its outage leaves the bot's
+/// `tgin_upstream_up` as it was. The cloud file route is the server
+/// itself, and feeds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_origin_outcomes_leave_upstream_up_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})))
+        .mount(&server)
+        .await;
+    let cloud = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&cloud)
+        .await;
+    // Bound but not listening, and held for the whole test: the origin is
+    // down, and no other socket can take the port meanwhile.
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = closed.local_addr().unwrap().port();
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", files: {{ url: "http://127.0.0.1:{port}/files" }} }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    gateway: {{ upstream_idle_timeout: 30s }}
+    routes: [{{ to: [workers] }}]
+  - name: other
+    token: "{OTHER_TOKEN}"
+    api_url: "{cloud}"
+    routes: [{{ to: [others] }}]
+consumers:
+  workers: {{ pull: {{}} }}
+  others: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+        cloud = cloud.uri(),
+    );
+    let tgin = start(&yaml).await;
+    let series = |bot: &str| {
+        let prefix = format!("tgin_upstream_up{{bot=\"{bot}\"}}");
+        tgin.metrics
+            .encode()
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .map(str::to_owned)
+    };
+
+    // An origin outage before any server outcome: still absent.
+    let down = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(
+        description(down).await,
+        (
+            502,
+            "Bad Gateway: the file server is unreachable".to_owned()
+        )
+    );
+    assert_eq!(series("gw"), None);
+
+    let call = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/getChat"),
+            "",
+            "",
+        )
+        .await;
+    assert_eq!(call.status(), 200);
+    assert_eq!(
+        series("gw").as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+    let down = tgin.file(TOKEN, "documents/file_1.pdf", &[]).await;
+    assert_eq!(down.status(), 502);
+    assert_eq!(
+        series("gw").as_deref(),
+        Some(r#"tgin_upstream_up{bot="gw"} 1"#)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="file",outcome="unreachable"} 2"#,
+    );
+
+    // The cloud file route: its answer, a 404 too, feeds the series.
+    assert_eq!(series("other"), None);
+    let missing = tgin.file(OTHER_TOKEN, "documents/none.pdf", &[]).await;
+    assert_eq!(missing.status(), 404);
+    assert_eq!(
+        series("other").as_deref(),
+        Some(r#"tgin_upstream_up{bot="other"} 1"#)
+    );
+    tgin.stop().await;
+}
+
+/// An empty multipart body carries no parameters: it goes upstream as it
+/// is, its end known at once, so the wait for the answer is bounded by
+/// `response_timeout`, not by `upstream_idle_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_multipart_body_waits_for_the_answer() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"ok":true,"result":true}"#, JSON)
+                .set_delay(Duration::from_millis(2500)),
+        )
+        .mount(&server)
+        .await;
+    let yaml = format!(
+        r#"version: 1
+runtime: {{ lame_duck: 0s, shutdown_grace: 2s }}
+server: {{ listen: ["127.0.0.1:0"] }}
+admin: {{ listen: ["127.0.0.1:0"] }}
+upstreams:
+  tba: {{ kind: local, url: "{api}", local_mode: true, response_timeout: 8s }}
+bots:
+  - name: gw
+    token: "{TOKEN}"
+    upstream: tba
+    gateway: {{ upstream_idle_timeout: 1s, rate_limit: {{ mode: off }} }}
+    routes: [{{ to: [a] }}]
+consumers:
+  a: {{ pull: {{}} }}
+"#,
+        api = server.uri(),
+    );
+    let tgin = start(&yaml).await;
+    let response = tgin
+        .send(
+            reqwest::Method::POST,
+            &format!("/bot{TOKEN}/sendDocument?chat_id=1"),
+            MULTIPART,
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].body.is_empty());
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="ok"} 1"#,
+    );
+    tgin.stop().await;
+}
+
+/// JSON and urlencoded bodies over 64 KiB stream through the scan: a clean
+/// one reaches the server byte for byte; one whose reference comes late,
+/// or that turns out longer than 1 MiB while it streams (no length
+/// announced), gets 400 or 413, and the server sees its connection end
+/// short of the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_bodies_scanned_while_they_stream() {
+    let (api, seen) = recorder().await;
+    let tgin = start(&local_files_config(&api)).await;
+    let path = format!("/bot{TOKEN}/sendDocument");
+    let padding = "x".repeat(200 * 1024);
+    let clean_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"BQAC"}}"#);
+    let clean_form = format!("chat_id=1&caption={padding}&document=BQAC");
+    for (n, (content_type, body)) in [(JSON, &clean_json), (FORM, &clean_form)]
+        .into_iter()
+        .enumerate()
+    {
+        let response = tgin
+            .send(reqwest::Method::POST, &path, content_type, body.clone())
+            .await;
+        assert_eq!(response.status(), 200, "{content_type}");
+        let record = recorded(&seen, n + 1).await.remove(n);
+        assert_eq!(record.path.as_deref(), Some(path.as_str()));
+        assert!(record.complete, "{content_type}");
+        assert!(
+            record.body == body.as_bytes(),
+            "{content_type}: not byte for byte"
+        );
+    }
+
+    let late_json = format!(r#"{{"chat_id":1,"caption":"{padding}","document":"{LOCAL_FILE}"}}"#);
+    let late_form = format!(
+        "chat_id=1&caption={padding}&media={}",
+        encoded(&format!(r#"[{{"media":"{LOCAL_FILE}"}}]"#))
+    );
+    let mut refused = Vec::new();
+    for (content_type, body) in [(JSON, late_json), (FORM, late_form)] {
+        let len = body.len();
+        let response = tgin
+            .send(reqwest::Method::POST, &path, content_type, body)
+            .await;
+        assert_eq!(
+            description(response).await,
+            (400, LOCAL_REFUSED.to_owned()),
+            "{content_type}"
+        );
+        refused.push(len);
+    }
+    // Exactly 1 MiB of JSON text in 64 KiB chunks, all scanned clean, then
+    // one more byte, and nothing after it: tgin refuses at that byte, having
+    // read everything sent, so its answer cannot be lost to a client still
+    // writing or to a reset for unread data.
+    let mut body = Vec::new();
+    let mut text = br#"{"chat_id":1,"caption":""#.to_vec();
+    text.resize(1 << 20, b'y');
+    for chunk in text.chunks(64 * 1024) {
+        body.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        body.extend_from_slice(chunk);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"1\r\ny\r\n");
+    let head = format!(
+        "POST /bot{TOKEN}/sendMessage HTTP/1.1\r\nHost: tgin\r\nContent-Type: {JSON}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    assert_eq!(
+        raw_exchange(&tgin, &head, &body).await,
+        (413, "Request Entity Too Large".to_owned())
+    );
+    refused.push(text.len() + 1);
+
+    // Each refused upload breaks the connection it went on, which the
+    // server records as ended short: with the part of the request it got,
+    // or with nothing at all when the request head never left tgin. tgin
+    // may have more connections open, which end between requests too.
+    // The wait is the check that every refused upload's connection ended.
+    let records = recorded(&seen, 2 + refused.len()).await;
+    let later = &records[2..];
+    assert!(
+        later.iter().all(|record| !record.complete),
+        "a refused upload reached the server whole: {}",
+        summary(&records)
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="rejected"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendDocument",outcome="rejected"} 2"#,
+    );
+    assert!(
+        !LOGS.text().contains(SECRET_PATH),
+        "a path reached the logs"
+    );
+    tgin.stop().await;
+}
+
+/// `records` without their bodies, for a failure message.
+fn summary(records: &[Recorded]) -> String {
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "{} {} B{}",
+                record.path.as_deref().unwrap_or("-"),
+                record.body.len(),
+                if record.complete { "" } else { " (short)" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What [`recorder`] saw of one connection's last request: the path, the
+/// body bytes it got (`received` of them in whole chunks, for a chunked
+/// body), and whether the body was complete (its whole `Content-Length`,
+/// or a chunked body's last chunk and trailer section).
+#[derive(Clone, Debug)]
+struct Recorded {
+    path: Option<String>,
+    received: usize,
+    body: Vec<u8>,
+    complete: bool,
+}
+
+/// A Bot API server over raw TCP that tolerates bodies cut short: each
+/// request read whole is recorded and answered `{"ok":true,"result":true}`
+/// (connections kept alive); a connection that ends mid-request is recorded
+/// incomplete, and one that ends between requests is recorded with no path.
+async fn recorder() -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let seen: Arc<Mutex<Vec<Recorded>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                loop {
+                    let mut record = Recorded {
+                        path: None,
+                        received: 0,
+                        body: Vec::new(),
+                        complete: false,
+                    };
+                    let mut line = String::new();
+                    let (mut length, mut chunked) = (0usize, false);
+                    loop {
+                        line.clear();
+                        match read.read_line(&mut line).await {
+                            Ok(0) | Err(_) => {
+                                log.lock().expect("log").push(record);
+                                return;
+                            }
+                            Ok(_) => {}
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if record.path.is_none() {
+                            record.path = line.split(' ').nth(1).map(str::to_owned);
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().expect("a length");
+                        }
+                        chunked |=
+                            lower.starts_with("transfer-encoding:") && lower.contains("chunked");
+                    }
+                    let mut buf = vec![0u8; 64 * 1024];
+                    if chunked {
+                        loop {
+                            line.clear();
+                            if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            let size = usize::from_str_radix(
+                                line.trim().split(';').next().unwrap_or(""),
+                                16,
+                            )
+                            .expect("a chunk size");
+                            if size == 0 {
+                                // The trailer section, up to its empty line.
+                                loop {
+                                    line.clear();
+                                    if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                        break;
+                                    }
+                                    if line == "\r\n" {
+                                        record.complete = true;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            let mut left = size + 2;
+                            while left > 0 {
+                                let want = left.min(buf.len());
+                                match read.read(&mut buf[..want]).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        record.body.extend_from_slice(&buf[..n]);
+                                        left -= n;
+                                    }
+                                }
+                            }
+                            if left > 0 {
+                                break;
+                            }
+                            record.body.truncate(record.body.len() - 2);
+                            record.received += size;
+                        }
+                    } else {
+                        while record.received < length {
+                            let want = (length - record.received).min(buf.len());
+                            match read.read(&mut buf[..want]).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    record.body.extend_from_slice(&buf[..n]);
+                                    record.received += n;
+                                }
+                            }
+                        }
+                        record.complete = record.received == length;
+                    }
+                    let complete = record.complete;
+                    log.lock().expect("log").push(record);
+                    if !complete {
+                        return;
+                    }
+                    let body = br#"{"ok":true,"result":true}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if write.write_all(head.as_bytes()).await.is_err()
+                        || write.write_all(body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Waits until `seen` holds `n` records, for at most [`PATIENCE`].
+async fn recorded(seen: &Mutex<Vec<Recorded>>, n: usize) -> Vec<Recorded> {
+    let started = std::time::Instant::now();
+    loop {
+        let records = seen.lock().expect("log").clone();
+        if records.len() >= n {
+            return records;
+        }
+        assert!(
+            started.elapsed() < PATIENCE,
+            "{n} records never came: {records:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A chunked multipart body without its closing delimiter, ended by a
+/// trailers frame, is refused: the server never gets the last chunk, which
+/// would make the request whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trailers_never_end_a_refused_body_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (api, seen) = recorder().await;
+    let tgin = start(&local_files_config(&api)).await;
+    let part = format!(
+        "--{BOUNDARY}\r\n{}\r\n\r\nno closing delimiter",
+        text_field("caption")
+    );
+    let mut stream = tokio::net::TcpStream::connect(tgin.addr)
+        .await
+        .expect("connect");
+    let request = format!(
+        "POST /bot{TOKEN}/sendDocument?chat_id=1 HTTP/1.1\r\nHost: tgin\r\nContent-Type: {MULTIPART}\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{part}\r\n0\r\nX-T: 1\r\n\r\n",
+        part.len()
+    );
+    stream.write_all(request.as_bytes()).await.expect("request");
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !answer.ends_with(b"}") {
+        let n = timeout(PATIENCE, stream.read(&mut buf))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        assert!(n > 0, "closed: {}", String::from_utf8_lossy(&answer));
+        answer.extend_from_slice(&buf[..n]);
+    }
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    assert!(
+        answer.contains("Bad Request: can't parse the request parameters"),
+        "{answer}"
+    );
+    let records = recorded(&seen, 1).await;
+    assert!(records.iter().all(|record| !record.complete), "{records:?}");
+    tgin.stop().await;
+}
+
+/// `fut`, bounded by [`PATIENCE`] of real time, whatever tokio's clock does.
+async fn within<F: Future>(what: &str, fut: F) -> F::Output {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(PATIENCE);
+        let _ = tx.send(());
+    });
+    tokio::select! {
+        out = fut => out,
+        _ = rx => panic!("{what} did not happen within {PATIENCE:?}"),
+    }
+}
+
+/// A download served from disk is a call in flight for the shutdown's
+/// drain, as one from the cloud or a file origin is: a client that reads
+/// its first bytes, then pauses for 4 s, past the drain's quiet second and
+/// the data plane's close grace, still gets the whole file. On tokio's
+/// frozen clock (as `gateway.rs::freeze`): only the test moves time.
+#[tokio::test(start_paused = true)]
+async fn drain_finishes_a_slow_disk_download() {
+    // Far more than the socket buffers on both ends hold.
+    const SIZE: usize = 32 << 20;
+    let (hold, held) = std::sync::mpsc::channel::<()>();
+    drop(tokio::task::spawn_blocking(move || {
+        let _ = held.recv();
+    }));
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    put(
+        &bot_dir(&root, TOKEN),
+        "documents/large.bin",
+        &vec![b'f'; SIZE],
+    );
+    let yaml =
+        disk_config(&server.uri(), &root).replace("shutdown_grace: 2s", "shutdown_grace: 10s");
+    let tgin = start(&yaml).await;
+    tgin.signals
+        .send(SignalKind::Terminate)
+        .await
+        .expect("the app listens");
+    within("the drain's start", async {
+        while !LOGS
+            .text()
+            .lines()
+            .any(|l| l.contains("shutdown started; draining") && l.contains("grace=10s"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let mut response = within(
+        "the download's head",
+        tgin.http
+            .get(tgin.url(&format!(
+                "/file/bot{}/documents/large.bin",
+                TOKEN.replace(':', "%3A")
+            )))
+            .send(),
+    )
+    .await
+    .expect("a response");
+    assert_eq!(response.status(), 200);
+    let mut read = within("a first chunk", response.chunk())
+        .await
+        .expect("the body")
+        .expect("bytes")
+        .len();
+    for _ in 0..40 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    while let Some(chunk) = within("the rest", response.chunk())
+        .await
+        .expect("the body goes on")
+    {
+        read += chunk.len();
+    }
+    assert_eq!(read, SIZE);
+    drop(hold);
+    tokio::time::resume();
+    let outcome = timeout(PATIENCE, tgin.run)
+        .await
+        .expect("the app exits in time")
+        .expect("the app does not panic");
+    assert_eq!(outcome, Outcome::Clean);
+}
+
+/// Only a bot's files are served: paths of at least two segments, a type
+/// directory and a file (`documents/x`). The top level of the bot's
+/// directory holds the server's TDLib database (`td.binlog`, `db.sqlite`)
+/// when `--files-dir` is not set apart; it is refused with 404 from disk,
+/// and never asked of a file origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_paths_below_a_type_directory_served() {
+    let server = MockServer::start().await;
+    let root = scratch("files");
+    let mine = bot_dir(&root, TOKEN);
+    put(&mine, "td.binlog", b"session");
+    put(&mine, "db.sqlite", b"database");
+    put(&mine, "documents/x", b"file");
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("from origin", "text/plain"))
+        .mount(&origin)
+        .await;
+    let yaml = disk_config(&server.uri(), &root)
+        .replace(
+            "consumers:\n",
+            &format!(
+                "  - name: remote\n    token: \"{THIRD_TOKEN}\"\n    upstream: origin\n    routes: [{{ to: [remotes] }}]\nconsumers:\n  remotes: {{ pull: {{}} }}\n"
+            ),
+        )
+        .replace(
+            "bots:\n",
+            &format!(
+                "  origin: {{ kind: local, url: \"{api}\", files: {{ url: \"{files}/files\" }} }}\nbots:\n",
+                api = server.uri(),
+                files = origin.uri(),
+            ),
+        );
+    let tgin = start(&yaml).await;
+
+    for top in ["td.binlog", "db.sqlite", "documents"] {
+        let refused = tgin.file(TOKEN, top, &[]).await;
+        assert_eq!(
+            description(refused).await,
+            (404, "Not Found".to_owned()),
+            "{top}"
+        );
+    }
+    let served = tgin.file(TOKEN, "documents/x", &[]).await;
+    assert_eq!(served.status(), 200);
+    assert_eq!(&served.bytes().await.expect("body")[..], b"file");
+
+    for top in ["td.binlog", "db.sqlite"] {
+        let refused = tgin.file(THIRD_TOKEN, top, &[]).await;
+        assert_eq!(
+            description(refused).await,
+            (404, "Not Found".to_owned()),
+            "{top}"
+        );
+    }
+    assert!(
+        origin
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a top-level path reached the origin"
+    );
+    let proxied = tgin.file(THIRD_TOKEN, "documents/x", &[]).await;
+    assert_eq!(proxied.status(), 200);
+    assert_eq!(
+        origin.received_requests().await.expect("recording").len(),
+        1
+    );
+    assert_logs_clean(&[TOKEN, THIRD_TOKEN]);
+    tgin.stop().await;
+}

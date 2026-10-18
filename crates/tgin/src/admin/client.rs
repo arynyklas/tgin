@@ -7,10 +7,11 @@ use std::time::Duration;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
+use tgin_core::config::model::HumanDuration;
 use tgin_runtime::http::{self, ClientOptions, describe_error};
 use url::Url;
 
-use super::{ConsumerStatus, Status};
+use super::{BotMove, ConsumerStatus, MAX_MOVE_TIMEOUT, Moved, Status};
 use crate::exit;
 
 /// The admin API `tgin admin` talks to without `--url`: the default of
@@ -42,6 +43,14 @@ pub enum Action {
     Drain(String),
     Purge(String),
     Health,
+    /// `bot logout|close`: moves the bot `name` off its Bot API server,
+    /// within `timeout`; without `yes`, only says what would happen.
+    Bot {
+        name: String,
+        how: BotMove,
+        timeout: Option<HumanDuration>,
+        yes: bool,
+    },
 }
 
 /// Parses `--url`: an `http` or `https` URL.
@@ -57,8 +66,57 @@ pub fn parse_url(text: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// Parses `bot logout|close --timeout`: a duration such as `30s`, at most
+/// 1 h, without month or year units.
+///
+/// # Errors
+///
+/// Not such a duration.
+pub fn parse_timeout(text: &str) -> Result<HumanDuration, String> {
+    let timeout: HumanDuration = text
+        .parse()
+        .map_err(|err| format!("not a duration such as `30s`: {err}"))?;
+    if let Some(unit) = timeout.calendar_unit() {
+        return Err(format!("`{unit}` is a month or year unit"));
+    }
+    if timeout.get() > MAX_MOVE_TIMEOUT {
+        return Err("a move's timeout is at most 1h".to_owned());
+    }
+    Ok(timeout)
+}
+
+/// What `bot logout|close` without `--yes` prints: the steps it would take.
+fn move_plan(name: &str, how: BotMove, timeout: Option<&HumanDuration>) -> String {
+    let call = match how {
+        BotMove::LogOut => "call logOut on its Bot API server",
+        BotMove::Close => "call deleteWebhook, then close, on its Bot API server",
+    };
+    let within = timeout.map_or("reload.drain_timeout", HumanDuration::as_str);
+    format!(
+        "tgin admin bot {segment} would, for the bot {name}:\n\
+         1. wait until its Bot API server holds no update for it (its ingest runs on)\n\
+         2. stop its ingest and park it: reloads do not start it again until one changes its upstream\n\
+         3. wait until tgin has delivered the updates it holds of it\n\
+         4. stop sending its calls to any server, and wait for those being sent\n\
+         5. {call}\n\
+         Steps 1 to 4 get {within} (at most 1h), counted from the request; if step 1 does not finish in time, nothing changes.\n\
+         Run it again with --yes to do it.",
+        segment = how.segment(),
+    )
+}
+
 /// Runs `command` and returns the process exit code.
 pub fn run(command: &Command) -> u8 {
+    if let Action::Bot {
+        name,
+        how,
+        timeout,
+        yes: false,
+    } = &command.action
+    {
+        eprintln!("{}", move_plan(name, *how, timeout.as_ref()));
+        return exit::USAGE;
+    }
     // `health` reads an unauthenticated probe: a token file it cannot read
     // (a secret the healthcheck's user may not see) must not fail it.
     let token_file = command
@@ -103,25 +161,32 @@ struct Answer {
     body: String,
 }
 
-/// The admin client's options: `timeout` for connecting and for the whole
-/// request, and no proxy ever (R34): the bearer token would reach the
-/// proxy in cleartext, and the health check would depend on it.
-fn client_options(timeout: Duration) -> ClientOptions {
+/// The admin client's options: `timeout` for connecting, and for the whole
+/// request unless `None`, and no proxy ever: the bearer token would
+/// reach the proxy in cleartext, and the health check would depend on it.
+fn client_options(connect: Duration, total: Option<Duration>) -> ClientOptions {
     ClientOptions {
-        connect_timeout: timeout,
-        request_timeout: Some(timeout),
+        connect_timeout: connect,
+        request_timeout: total,
         no_proxy: true,
         ..ClientOptions::default()
     }
 }
 
 async fn execute(command: &Command, token: Option<&str>) -> u8 {
-    let timeout = if command.action == Action::Health {
-        HEALTH_TIMEOUT
-    } else {
-        REQUEST_TIMEOUT
+    let (connect, total) = match &command.action {
+        Action::Health => (HEALTH_TIMEOUT, Some(HEALTH_TIMEOUT)),
+        // tgin bounds a move itself: the timeout (the config's when none is
+        // given), then its calls to the Bot API server.
+        Action::Bot { timeout, .. } => (
+            REQUEST_TIMEOUT,
+            timeout
+                .as_ref()
+                .map(|t| t.get().saturating_add(REQUEST_TIMEOUT)),
+        ),
+        _ => (REQUEST_TIMEOUT, Some(REQUEST_TIMEOUT)),
     };
-    let client = http::client(&client_options(timeout));
+    let client = http::client(&client_options(connect, total));
     let (method, segments): (Method, Vec<&str>) = match &command.action {
         Action::Status | Action::Consumers => (Method::GET, vec!["v1", "status"]),
         Action::Reload => (Method::POST, vec!["v1", "reload"]),
@@ -130,18 +195,31 @@ async fn execute(command: &Command, token: Option<&str>) -> u8 {
         Action::Drain(name) => (Method::POST, vec!["v1", "consumers", name, "drain"]),
         Action::Purge(name) => (Method::POST, vec!["v1", "consumers", name, "purge"]),
         Action::Health => (Method::GET, vec!["readyz"]),
+        Action::Bot { name, how, .. } => (Method::POST, vec!["v1", "bots", name, how.segment()]),
     };
-    let mut request = client.request(method, endpoint(&command.url, &segments));
+    let mut url = endpoint(&command.url, &segments);
+    if let Action::Bot {
+        timeout: Some(timeout),
+        ..
+    } = &command.action
+    {
+        url.query_pairs_mut()
+            .append_pair("timeout", timeout.as_str());
+    }
+    let mut request = client.request(method, url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
-    let sent = tokio::time::timeout(timeout, async {
+    let send = async {
         let response = request.send().await?;
         let status = response.status();
         let body = response.text().await?;
         Ok::<_, reqwest::Error>(Answer { status, body })
-    })
-    .await;
+    };
+    let sent = match total {
+        Some(total) => tokio::time::timeout(total, send).await.map_err(|_| total),
+        None => Ok(send.await),
+    };
     let origin = command.url.origin().ascii_serialization();
     let answer = match sent {
         Ok(Ok(answer)) => answer,
@@ -152,10 +230,10 @@ async fn execute(command: &Command, token: Option<&str>) -> u8 {
             );
             return exit::FAILURE;
         }
-        Err(_elapsed) => {
+        Err(total) => {
             eprintln!(
                 "tgin: the admin API at {origin} did not answer within {}s",
-                timeout.as_secs()
+                total.as_secs()
             );
             return exit::FAILURE;
         }
@@ -220,14 +298,18 @@ fn health(command: &Command, answer: &Answer) -> u8 {
     }
 }
 
-/// The server's account of a failure: its `error`, its list of config
-/// errors, or the body as sent.
+/// The server's account of a failure: its `error` (with its
+/// `description`, when it sent one), its list of config errors, or the
+/// body as sent.
 fn failure(body: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return body.trim().to_owned();
     };
     if let Some(error) = value["error"].as_str() {
-        return error.to_owned();
+        return match value["description"].as_str() {
+            Some(description) => format!("{error}: {description}"),
+            None => error.to_owned(),
+        };
     }
     if let Some(errors) = value["errors"].as_array() {
         let mut text = format!(
@@ -276,6 +358,9 @@ struct ReloadSummary {
     sources_added: Vec<String>,
     sources_removed: Vec<String>,
     sources_restarted: Vec<String>,
+    /// Absent from a server older than this client.
+    #[serde(default)]
+    upstream_changed: Vec<String>,
     restart_required: Vec<String>,
 }
 
@@ -307,6 +392,7 @@ fn render(action: &Action, body: &str) -> Result<String, serde_json::Error> {
                 ("sources added", &report.sources_added),
                 ("sources removed", &report.sources_removed),
                 ("sources restarted", &report.sources_restarted),
+                ("upstream changed", &report.upstream_changed),
             ] {
                 if !names.is_empty() {
                     let _ = writeln!(text, "  {label}: {}", names.join(", "));
@@ -333,6 +419,28 @@ fn render(action: &Action, body: &str) -> Result<String, serde_json::Error> {
             format!("purged {} updates from {name}\n", purged.purged)
         }
         Action::Health => body.to_owned(),
+        Action::Bot { how, .. } => {
+            let moved: Moved = serde_json::from_str(body)?;
+            let done = match how {
+                BotMove::LogOut => "logged out of",
+                BotMove::Close => "closed on",
+            };
+            let mut text = format!(
+                "{} {done} its Bot API server ({}); parked until a reload changes its upstream\n",
+                moved.bot, moved.upstream
+            );
+            if let Some(result) = &moved.result {
+                let _ = writeln!(text, "  the server said: {result}");
+            }
+            if moved.left > 0 {
+                let _ = writeln!(
+                    text,
+                    "  {} of its updates were still queued in tgin; they are still delivered",
+                    moved.left
+                );
+            }
+            text
+        }
     })
 }
 
@@ -341,10 +449,21 @@ fn sources_table(status: &Status) -> String {
         .sources
         .iter()
         .map(|source| {
+            let state = if source.parked {
+                format!("{}, parked", source.state)
+            } else {
+                source.state.clone()
+            };
+            let upstream = if source.upstream.is_empty() {
+                "-".to_owned()
+            } else {
+                source.upstream.clone()
+            };
             vec![
                 source.name.clone(),
                 source.ingress.clone().unwrap_or_else(|| "-".to_owned()),
-                source.state.clone(),
+                upstream,
+                state,
                 source.updates_total.to_string(),
                 source.errors_total.to_string(),
                 source.error.clone().unwrap_or_default(),
@@ -355,6 +474,7 @@ fn sources_table(status: &Status) -> String {
         &[
             "SOURCE",
             "INGRESS",
+            "UPSTREAM",
             "STATE",
             "UPDATES",
             "ERRORS",
@@ -445,7 +565,7 @@ mod tests {
         }
         let options = ClientOptions {
             proxy: Some(reqwest::Proxy::all(proxy.uri()).expect("a proxy URL")),
-            ..client_options(HEALTH_TIMEOUT)
+            ..client_options(HEALTH_TIMEOUT, Some(HEALTH_TIMEOUT))
         };
         let response = http::client(&options)
             .get(format!("{}/readyz", admin.uri()))
@@ -492,6 +612,46 @@ mod tests {
     }
 
     #[test]
+    fn move_plan_lists_the_steps_in_order() {
+        let timeout: HumanDuration = "5s".parse().unwrap();
+        let plan = move_plan("shop", BotMove::Close, Some(&timeout));
+        let steps = [
+            "1. wait until its Bot API server holds no update",
+            "2. stop its ingest and park it",
+            "3. wait until tgin has delivered",
+            "4. stop sending its calls to any server",
+            "5. call deleteWebhook, then close",
+            "Steps 1 to 4 get 5s (at most 1h), counted from the request",
+        ];
+        let mut at = 0;
+        for step in steps {
+            let found = plan[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step}: {plan}"));
+            at += found + step.len();
+        }
+        let plan = move_plan("shop", BotMove::LogOut, None);
+        assert!(
+            plan.contains("5. call logOut on its Bot API server"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("get reload.drain_timeout (at most 1h)"),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn move_timeouts_are_at_most_an_hour() {
+        for ok in ["30s", "1h", "60m", "0s"] {
+            assert!(parse_timeout(ok).is_ok(), "{ok}");
+        }
+        for bad in ["61m", "1h 1s", "2h", "1M", "soon"] {
+            assert!(parse_timeout(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn failure_lists_config_errors() {
         let body = r#"{"errors":[{"path":"bots[0].token","line":3,"column":12,"message":"bad","hint":"fix it"},{"path":null,"line":null,"column":null,"message":"other","hint":null}]}"#;
         assert_eq!(
@@ -499,7 +659,68 @@ mod tests {
             "the config was rejected (2 errors); the running config is unchanged\nerror: bots[0].token (line 3, column 12): bad\n  hint: fix it\nerror: other"
         );
         assert_eq!(failure(r#"{"error":"unauthorized"}"#), "unauthorized");
+        assert_eq!(
+            failure(r#"{"error":"upstream refused","description":"Bad Request: no"}"#),
+            "upstream refused: Bad Request: no"
+        );
+        assert_eq!(
+            failure(
+                r#"{"error":"calls in flight","description":"2 calls of the bot were still being sent"}"#
+            ),
+            "calls in flight: 2 calls of the bot were still being sent"
+        );
         assert_eq!(failure("plain text\n"), "plain text");
+    }
+
+    /// Admin answers grow additively: fields and enum values this client
+    /// does not know are ignored, not errors, and fields older servers do
+    /// not send are optional.
+    #[test]
+    fn admin_client_ignores_unknown_fields() {
+        let status = r#"{
+            "version": "9.9.9", "generation": 3, "phase": "rebalancing", "shard": "b",
+            "sources": [
+                {"name": "a", "kind": "channel", "ingress": "mtproto", "state": "warming",
+                 "updates_total": 1, "errors_total": 0, "upstream": "tba", "parked": true,
+                 "lag": {"seconds": 2}},
+                {"name": "b", "kind": "bot", "ingress": null, "state": "running",
+                 "updates_total": 0, "errors_total": 0}
+            ],
+            "consumers": [
+                {"name": "w", "mode": "stream", "depth": 0, "leased": 0, "in_flight": 0,
+                 "paused": false, "endpoints": [{"url_redacted": "https://x", "breaker": "tripped",
+                 "weight": 2}], "priority": 1}
+            ],
+            "tasks": [{"name": "t", "state": "sleeping", "since": 5}]
+        }"#;
+        let text = render(&Action::Status, status).expect("decoded");
+        assert!(text.contains("UPSTREAM"), "{text}");
+        let row = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} row in\n{text}"))
+        };
+        assert!(
+            row("a ").contains("tba") && row("a ").contains("warming, parked"),
+            "{text}"
+        );
+        assert!(!row("b ").contains("parked"), "{text}");
+        assert!(render(&Action::Consumers, status).is_ok());
+
+        let reload = r#"{"generation": 2, "added": [], "removed": [], "changed": [],
+            "sources_added": [], "sources_removed": [], "sources_restarted": [],
+            "restart_required": [], "warnings": ["x"], "mode": "dry"}"#;
+        assert!(render(&Action::Reload, reload).is_ok());
+        let moved = r#"{"bot": "a", "left": 0, "upstream": "tba", "result": null, "how": "new"}"#;
+        let bot = Action::Bot {
+            name: "a".to_owned(),
+            how: BotMove::LogOut,
+            timeout: None,
+            yes: true,
+        };
+        assert!(render(&bot, moved).is_ok());
+        let purged = r#"{"purged": 3, "left": 0}"#;
+        assert!(render(&Action::Purge("w".to_owned()), purged).is_ok());
     }
 
     #[test]

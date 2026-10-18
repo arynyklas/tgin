@@ -1,0 +1,53 @@
+# Runs the example without Telegram: swaps the Bot API server for tgin's fake
+# Bot API server (tests/e2e/fake-telegram), keeping its name, network and
+# port, and gives tgin and the bot a fake token:
+#
+#   docker compose --env-file fake.env -f compose.yaml -f compose.fake.yaml up -d --build --wait
+#
+# compose.yaml requires its variables before this file applies; fake.env
+# satisfies it with fake values. The values below are literal, so a token in
+# your shell's environment never reaches this stack.
+# README.md shows how to inject an update and see the bot answer it.
+
+# A project of its own, so that the fake run never recreates a real
+# deployment of this example, overwrites its server image or deletes its
+# volumes (`down -v`).
+name: tgin-self-hosted-fake
+
+x-fake-token: &fake-token "123456:self_hosted_example_fake_token"
+
+services:
+  telegram-bot-api:
+    build: !override
+      context: ../..
+      dockerfile: tests/e2e/fake-telegram/Dockerfile
+    # The fake imitates `telegram-bot-api --local` with the server's files
+    # directory: uploads land under <files-dir>/<token>/ in the files
+    # volume, which tgin reads, and getFile answers absolute paths there. It
+    # takes no API credentials.
+    command: !override ["--local-mode", "--files-dir", "/var/lib/telegram-bot-api/files"]
+    environment: !reset {}
+    # The volumes are created at the real server's paths, which the fake's
+    # image does not have, so they belong to root: the fake runs as root to
+    # write there, still with every capability dropped (compose.yaml). Its
+    # files are world-readable, so tgin reads them under its own uid.
+    user: "0:0"
+    healthcheck: !override
+      test: ["CMD", "/usr/local/bin/fake-telegram", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    # The fake only: its control API (POST /fake/updates/{token},
+    # GET /fake/calls) on an ephemeral port of the host's loopback; ask
+    # `docker compose port telegram-bot-api 8081`. Never publish the real
+    # server.
+    ports: ["127.0.0.1::8081"]
+
+  tgin:
+    environment:
+      BOT_TOKEN: *fake-token
+      TGIN_ADMIN_TOKEN: fake-admin-token
+
+  bot:
+    environment:
+      TOKEN: *fake-token

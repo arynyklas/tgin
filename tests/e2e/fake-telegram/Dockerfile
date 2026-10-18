@@ -20,7 +20,8 @@ COPY tests/e2e/fake-telegram ./tests/e2e/fake-telegram
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/tgin/target \
     cargo build --release --locked -p tgin-fake-telegram && \
-    install -D -m 0755 target/release/fake-telegram /out/fake-telegram
+    install -D -m 0755 target/release/fake-telegram /out/fake-telegram && \
+    mkdir -p /out/srv/tba
 
 # gcr.io/distroless/static-debian13:latest (multi-arch index digest)
 FROM gcr.io/distroless/static-debian13@sha256:58133991db06659feaabe0f4e97a35cebf15ef4ea08f8a4c6d2ee5f75e4aa6a0
@@ -31,6 +32,9 @@ LABEL org.opencontainers.image.title="tgin-fake-telegram" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /out/fake-telegram /usr/local/bin/fake-telegram
+# The local-mode files directory, writable by the fake's user: a fresh named
+# volume mounted here inherits this ownership.
+COPY --from=builder --chown=65532:65532 /out/srv/tba /srv/tba
 
 USER 65532:65532
 ENV FAKE_TELEGRAM_LISTEN=0.0.0.0:8081

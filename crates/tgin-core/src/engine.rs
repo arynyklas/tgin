@@ -953,6 +953,18 @@ impl Engine {
         current + retired
     }
 
+    /// The updates of the bot `source` not yet acked, delivered or
+    /// dead-lettered, queued or leased, over every consumer, including
+    /// retired ones still draining.
+    pub fn pending_from(&self, source: SourceId) -> usize {
+        let of = |c: &Consumer| c.queue().count_where(|e| e.source == source);
+        let current: usize = self.shared.state.load().consumers.iter().map(of).sum();
+        let retired: usize = (self.shared.retired.lock().iter())
+            .map(|s| of(&s.consumer))
+            .sum();
+        current + retired
+    }
+
     /// Stops leasing to the consumer `name`; it still admits. `false` if
     /// there is no such consumer.
     pub fn pause(&self, name: &str) -> bool {
