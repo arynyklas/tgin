@@ -1121,6 +1121,108 @@ async fn restart_does_not_count_as_failed() {
     tgin.stop().await;
 }
 
+/// A `local` upstream named `tba` at `server`, in local mode if `local_mode`.
+fn local_upstream(server: &MockServer, local_mode: bool) -> String {
+    format!(
+        "upstreams:\n  tba: {{ kind: local, url: \"{}\", local_mode: {local_mode} }}\n",
+        server.uri()
+    )
+}
+
+/// A webhook bot on a local-mode server registers over plain `http`, on a
+/// port the cloud would refuse, with its `max_connections` (up to 100 000
+/// there) on every attempt: the first answer is a 429, and the
+/// supervised `register:<bot>` retry registers it after `retry_after`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_connections_forwarded() {
+    let server = MockServer::start().await;
+    Mock::given(path(format!("/bot{TOKEN}/getMe")))
+        .respond_with(me("tgin_bot"))
+        .mount(&server)
+        .await;
+    let (seen, mut registrations) = mpsc::unbounded_channel();
+    let set_webhook = format!("/bot{TOKEN}/setWebhook");
+    Mock::given(path(set_webhook.as_str()))
+        .respond_with(Record {
+            seen: seen.clone(),
+            response: ResponseTemplate::new(429).set_body_json(json!({
+                "ok": false, "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })),
+        })
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(path(set_webhook.as_str()))
+        .respond_with(Record {
+            seen,
+            response: ok(json!(true)),
+        })
+        .mount(&server)
+        .await;
+    let tgin = start(
+        "max_connections_forwarded",
+        &config(&format!(
+            "{}bots:\n  - name: hooked\n    token: \"{TOKEN}\"\n    upstream: tba\n    ingress: {{ webhook: {{ path: /hook, secret_token: {HOOK_SECRET}, public_url: \"http://tgin.internal:8080\", register: true, max_connections: 100000 }} }}\n    routes: [{{ to: [workers] }}]\nconsumers:\n  workers: {{ pull: {{}} }}\n",
+            local_upstream(&server, true)
+        )),
+    )
+    .await;
+
+    for attempt in 1..=2 {
+        let request = next(&mut registrations).await;
+        let body: Value = serde_json::from_slice(&request.body).expect("a JSON setWebhook");
+        assert_eq!(body["url"], "http://tgin.internal:8080/hook", "{attempt}");
+        assert_eq!(body["max_connections"], 100_000, "{attempt}");
+    }
+    let status = tgin
+        .wait_status("register:hooked stopped", |s| {
+            task_state(s, "register:hooked").as_deref() == Some("stopped")
+        })
+        .await;
+    assert_eq!(status.sources[0].state, "running");
+    assert_eq!(tgin.readiness().await, 200);
+    tgin.stop().await;
+}
+
+/// A long poll whose local Bot API server answers 401 (its api_id or
+/// api_hash rejected) backs off with the reason in the status, its task
+/// still running: it never counts as failed, so tgin keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_upstream_rejection_backs_off() {
+    let server = MockServer::start().await;
+    let rejected = ResponseTemplate::new(401).set_body_json(json!({
+        "ok": false, "error_code": 401, "description": "Unauthorized: invalid api-id/api-hash"
+    }));
+    mount_bot(&server, TOKEN, rejected, Duration::from_secs(3600)).await;
+    let tgin = start(
+        "local_upstream_rejection_backs_off",
+        &config(&format!(
+            "{}bots:\n  - name: poller\n    token: \"{TOKEN}\"\n    upstream: tba\n    ingress: {{ long_poll: {{ timeout: 1s, delete_webhook_on_start: false }} }}\n    routes: [{{ to: [workers] }}]\nconsumers:\n  workers: {{ pull: {{}} }}\n",
+            local_upstream(&server, false)
+        )),
+    )
+    .await;
+
+    let status = tgin
+        .wait_status("poller backs off", |s| s.sources[0].state == "backoff")
+        .await;
+    let error = status.sources[0].error.clone().expect("the reason");
+    assert!(error.contains("401"), "{error}");
+    assert!(error.contains("invalid api-id/api-hash"), "{error}");
+    assert!(!error.contains(TOKEN), "{error}");
+    assert_eq!(
+        task_state(&status, "source:poller").as_deref(),
+        Some("running")
+    );
+    assert_eq!(status.phase, "running");
+    assert_eq!(tgin.readiness().await, 200);
+    assert!(!tgin.run.is_finished(), "tgin shut down");
+    tgin.stop().await;
+}
+
 /// R40: once a reload drops `admin.token` while a non-loopback admin
 /// listener stays bound (`admin.listen` changes need a restart), every
 /// protected endpoint refuses every request; the probes stay open.

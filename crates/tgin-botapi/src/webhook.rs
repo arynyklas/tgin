@@ -1,11 +1,13 @@
-//! Webhook ingress: Telegram POSTs each update to a route on the shared HTTP
-//! plane, and the update is offered to a [`Sink`] before the response.
+//! Webhook ingress: the Bot API server POSTs each update to a route on the
+//! shared HTTP plane, and the update is offered to a [`Sink`] before the
+//! response.
 
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, HttpBody};
@@ -19,6 +21,7 @@ use ipnet::IpNet;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::{SourceErrorReason, SourceMetrics};
 use tgin_core::sink::{Admit, Sink};
+use tgin_runtime::backoff::{Backoff, honor_retry_after};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio_util::sync::CancellationToken;
 
@@ -29,14 +32,20 @@ use crate::facts::extract;
 /// bounds what one request can make the server buffer.
 pub const DEFAULT_WEBHOOK_BODY_LIMIT: usize = 1024 * 1024;
 
-/// `Retry-After` (seconds) on a 503: Telegram redelivers the update later,
-/// after a shutdown by then to the replacement instance.
+/// `Retry-After` (seconds) on a 503: the Bot API server redelivers the
+/// update later, after a shutdown by then to the replacement instance.
 const RETRY_AFTER_SECS: &str = "5";
 
 const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 const FORWARDED_FOR: &str = "x-forwarded-for";
+/// The backoff between `setWebhook` attempts: `(initial, max)`.
+const REGISTER_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(300));
+/// The longest server-requested `retry_after` a registration waits.
+const REGISTER_RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
 
-/// The networks Telegram sends webhooks from.
+/// The networks Telegram's cloud sends webhooks from; a self-hosted Bot API
+/// server sends from wherever it runs (config validation keeps this preset
+/// to `cloud` upstreams).
 const TELEGRAM_NETS: [IpNet; 2] = [
     IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(149, 154, 160, 0)), 20),
     IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(91, 108, 4, 0)), 22),
@@ -121,9 +130,9 @@ struct Ingress<S> {
 ///    400 for a body the client fails to send;
 /// 6. 400 for a body that is not a JSON object with an integer `update_id`;
 /// 7. 503 with `Retry-After: 5` when the sink pushes back, or when `ingest`
-///    was cancelled by the time an update is admitted, so Telegram delivers
-///    the update again later (the admitted copy may still be delivered too:
-///    at least once);
+///    was cancelled by the time an update is admitted, so the Bot API
+///    server delivers the update again later (the admitted copy may still
+///    be delivered too: at least once);
 /// 8. otherwise 200 with an empty body, also when no rule matches.
 ///
 /// Checks 1 to 4 run on the request head alone: the body is read only for
@@ -172,11 +181,66 @@ pub fn webhook_router<S: Sink>(
         .with_state(ingress)
 }
 
-/// Sends `setWebhook`. The app calls it at start when a registration is
-/// configured; `req.secret_token` must be the router's `secret` (for an
-/// automatic secret, derive it with [`crate::webhook_secret`]).
+/// Sends `setWebhook` once. The app calls it at start when a registration
+/// is configured, then [`retry_registration`] if it failed;
+/// `req.secret_token` must be the router's `secret` (for an automatic
+/// secret, derive it with [`crate::webhook_secret`]).
 pub async fn register(client: &BotClient, req: &SetWebhook) -> Result<(), ApiError> {
     client.set_webhook(req).await
+}
+
+/// Makes `attempt`, a `setWebhook` call, until one succeeds or `stop` is
+/// cancelled. `failed` is the error of an attempt made just before, waited
+/// out first; without it the first attempt is made at once. Between
+/// attempts it waits the backoff, 1 s doubling to 5 min with full jitter,
+/// or the server's `retry_after` (up to 1 h) when that is longer. `name` is
+/// the bot's, for logs.
+///
+/// Returns whether the webhook was registered: `false` as soon as `stop` is
+/// cancelled, mid-wait or mid-attempt, or after a client setup error, which
+/// no retry can fix.
+pub async fn retry_registration<F, Fut>(
+    name: &str,
+    stop: &CancellationToken,
+    mut failed: Option<ApiError>,
+    mut attempt: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), ApiError>>,
+{
+    let (initial, max) = REGISTER_BACKOFF;
+    let mut backoff = Backoff::new(initial, max, Duration::ZERO);
+    loop {
+        if let Some(err) = failed.take() {
+            let retry_after = match &err {
+                ApiError::Config(_) => {
+                    tracing::error!(source = %name, error = %err, "setWebhook cannot be sent; the Bot API server may not deliver updates");
+                    return false;
+                }
+                ApiError::Http { retry_after, .. } => *retry_after,
+                ApiError::Network(_) | ApiError::Decode(_) => None,
+            };
+            let delay = honor_retry_after(
+                backoff.next_delay(&mut rand::rng()),
+                retry_after,
+                REGISTER_RETRY_AFTER_CAP,
+            );
+            tracing::warn!(source = %name, error = %err, ?delay, "setWebhook failed; the Bot API server may not deliver updates until a retry succeeds");
+            if stop
+                .run_until_cancelled(tokio::time::sleep(delay))
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        match stop.run_until_cancelled(attempt()).await {
+            None => return false,
+            Some(Ok(())) => return true,
+            Some(Err(err)) => failed = Some(err),
+        }
+    }
 }
 
 async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -> Response {
@@ -235,8 +299,8 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
             // `cancel()` (the token's internal lock orders them), which
             // happens before the coordinator's `pending()` check, so every
             // update acknowledged here is visible to the drain. Otherwise
-            // Telegram retries; the queued copy may still be delivered, so
-            // the update may arrive twice.
+            // the Bot API server retries; the queued copy may still be
+            // delivered, so the update may arrive twice.
             if ingress.ingest.is_cancelled() {
                 return retry_later();
             }
@@ -249,13 +313,13 @@ async fn handle<S: Sink>(State(ingress): State<Arc<Ingress<S>>>, req: Request) -
             StatusCode::OK.into_response()
         }
         Admit::Backpressure => {
-            tracing::debug!(source = %ingress.name, update_id, "sink is full; asking Telegram to retry");
+            tracing::debug!(source = %ingress.name, update_id, "sink is full; asking the Bot API server to retry");
             retry_later()
         }
     }
 }
 
-/// 503 with `Retry-After`: Telegram delivers the update again later.
+/// 503 with `Retry-After`: the Bot API server delivers the update again later.
 fn retry_later() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

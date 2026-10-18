@@ -27,6 +27,8 @@ const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_LIMIT: u32 = 100;
 /// The longest server-requested `retry_after` honoured.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
+/// The longest wait after a 401 or 404 from a self-hosted Bot API server.
+const REJECTED_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A webhook that is active again this soon after a successful
 /// `deleteWebhook` was set again by another process (a bot framework calling
 /// `setWebhook`, say); deleting it again would only fight that process.
@@ -50,6 +52,11 @@ pub struct LongPollOptions {
     pub delete_webhook_on_start: bool,
     /// The error backoff: `(initial, max, floor)`.
     pub backoff: (Duration, Duration, Duration),
+    /// The upstream is a self-hosted Bot API server (a `local` upstream).
+    /// Its 401 and 404 can come from the server itself (its api_id or
+    /// api_hash rejected), so the source waits them out with the error
+    /// backoff, capped at 5 min instead, rather than stopping.
+    pub local_upstream: bool,
     /// The wait after a 409 that polling again cannot fix.
     pub conflict_backoff: Duration,
     /// The wait before offering again an update the sink refused with
@@ -69,6 +76,7 @@ impl Default for LongPollOptions {
                 Duration::from_secs(30),
                 Duration::from_millis(50),
             ),
+            local_upstream: false,
             conflict_backoff: Duration::from_secs(5),
             admit_retry: Duration::from_millis(250),
         }
@@ -100,27 +108,48 @@ enum Step {
 struct Poll {
     /// The first update not yet confirmed: the last admitted id + 1.
     offset: i64,
-    backoff: Backoff,
+    backoff: Backoffs,
     /// When `deleteWebhook` last succeeded.
     webhook_deleted: Option<Instant>,
     /// Whether the source is in [`SourceStateLabel::Running`].
     running: bool,
 }
 
-impl Poll {
-    fn error_delay(&mut self, err: &ApiError) -> Duration {
-        error_delay(&mut self.backoff, err)
-    }
+/// The source's error backoffs: one for every error a retry may fix, and
+/// one, capped at [`REJECTED_BACKOFF_MAX`], for a self-hosted server's 401
+/// or 404.
+struct Backoffs {
+    errors: Backoff,
+    rejected: Backoff,
 }
 
-/// The backoff's next delay, or the server's `retry_after` if longer.
-fn error_delay(backoff: &mut Backoff, err: &ApiError) -> Duration {
-    let retry_after = match err {
-        ApiError::Http { retry_after, .. } => *retry_after,
-        _ => None,
-    };
-    let computed = backoff.next_delay(&mut rand::rng());
-    honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+impl Backoffs {
+    fn new((initial, max, floor): (Duration, Duration, Duration)) -> Self {
+        Self {
+            errors: Backoff::new(initial, max, floor),
+            rejected: Backoff::new(initial, REJECTED_BACKOFF_MAX, floor),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.errors.reset();
+        self.rejected.reset();
+    }
+
+    /// The next delay after `err`, or the server's `retry_after` if longer.
+    fn delay(&mut self, err: &ApiError) -> Duration {
+        let (backoff, retry_after) = match err {
+            ApiError::Http {
+                status: 401 | 404,
+                retry_after,
+                ..
+            } => (&mut self.rejected, *retry_after),
+            ApiError::Http { retry_after, .. } => (&mut self.errors, *retry_after),
+            _ => (&mut self.errors, None),
+        };
+        let computed = backoff.next_delay(&mut rand::rng());
+        honor_retry_after(computed, retry_after, RETRY_AFTER_CAP)
+    }
 }
 
 impl<S: Sink> LongPollSource<S> {
@@ -158,11 +187,13 @@ impl<S: Sink> LongPollSource<S> {
 
     /// Calls `getMe`, then polls until `ingest` is cancelled.
     ///
-    /// Returns [`Exit::Done`] on cancellation and [`Exit::Fatal`] when
-    /// Telegram rejects the token (401, 403 or 404). Every other failure,
-    /// of `getMe` too, is waited out here, on a sleep that cancelling
-    /// `ingest` ends at once. Updates not yet admitted at cancellation are
-    /// not confirmed, so Telegram delivers them again to the next poller.
+    /// Returns [`Exit::Done`] on cancellation and [`Exit::Fatal`] when the
+    /// Bot API server rejects the token (401, 403 or 404; on a self-hosted
+    /// server only 403, see [`LongPollOptions::local_upstream`]). Every
+    /// other failure, of `getMe` too, is waited out here, on a sleep that
+    /// cancelling `ingest` ends at once. Updates not yet admitted at
+    /// cancellation are not confirmed, so the server delivers them again to
+    /// the next poller.
     pub async fn run(&self, ingest: CancellationToken) -> Exit {
         self.metrics.set_state(SourceStateLabel::Starting);
         let exit = self.poll(&ingest).await;
@@ -184,7 +215,7 @@ impl<S: Sink> LongPollSource<S> {
     async fn identify(
         &self,
         ingest: &CancellationToken,
-        backoff: &mut Backoff,
+        backoff: &mut Backoffs,
     ) -> Result<Identity, Exit> {
         loop {
             let err = match ingest.run_until_cancelled(self.client.get_me()).await {
@@ -194,11 +225,11 @@ impl<S: Sink> LongPollSource<S> {
             };
             self.count(&err);
             let message = format!("getMe failed: {err}");
-            if is_fatal(&err) {
-                tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
+            if is_fatal(&err, self.opts.local_upstream) {
+                tracing::error!(source = %self.name, error = %err, "the Bot API server rejected the bot token; the source stops");
                 return Err(Exit::Fatal(message));
             }
-            let delay = error_delay(backoff, &err);
+            let delay = backoff.delay(&err);
             tracing::warn!(source = %self.name, error = %err, ?delay, "getMe failed; trying again");
             *self.last_error.lock() = Some(message);
             self.metrics.set_state(SourceStateLabel::Backoff);
@@ -213,8 +244,7 @@ impl<S: Sink> LongPollSource<S> {
     }
 
     async fn poll(&self, ingest: &CancellationToken) -> Exit {
-        let (initial, max, floor) = self.opts.backoff;
-        let mut backoff = Backoff::new(initial, max, floor);
+        let mut backoff = Backoffs::new(self.opts.backoff);
         let identity = match self.identify(ingest, &mut backoff).await {
             Ok(identity) => identity,
             Err(exit) => return exit,
@@ -374,7 +404,7 @@ impl<S: Sink> LongPollSource<S> {
                     Some(Err(err)) => {
                         self.count(&err);
                         tracing::warn!(source = %self.name, error = %err, "deleteWebhook failed");
-                        Step::Wait(state.error_delay(&err))
+                        Step::Wait(state.backoff.delay(&err))
                     }
                 }
             }
@@ -392,12 +422,12 @@ impl<S: Sink> LongPollSource<S> {
                 tracing::warn!(source = %self.name, error = %err, "another process is polling this bot token; run one tgin per token");
                 Step::Wait(self.opts.conflict_backoff)
             }
-            _ if is_fatal(&err) => {
-                tracing::error!(source = %self.name, error = %err, "Telegram rejected the bot token; the source stops");
+            _ if is_fatal(&err, self.opts.local_upstream) => {
+                tracing::error!(source = %self.name, error = %err, "the Bot API server rejected the bot token; the source stops");
                 Step::Exit(Exit::Fatal(format!("getUpdates failed: {err}")))
             }
             _ => {
-                let delay = state.error_delay(&err);
+                let delay = state.backoff.delay(&err);
                 tracing::warn!(source = %self.name, error = %err, ?delay, "getUpdates failed; backing off");
                 Step::Wait(delay)
             }
@@ -411,16 +441,18 @@ impl<S: Sink> LongPollSource<S> {
     }
 }
 
-/// Errors no retry can fix: Telegram rejected the token (401, 403, 404) or
-/// the client is misconfigured.
-pub fn is_fatal(err: &ApiError) -> bool {
-    matches!(
-        err,
+/// Errors no retry can fix: the Bot API server rejected the token (401, 403,
+/// 404) or the client is misconfigured. On a self-hosted server
+/// (`local_upstream`) a 401 or 404 may come from the server itself (its
+/// api_id or api_hash rejected) and is retried, so only a 403 is fatal.
+pub fn is_fatal(err: &ApiError, local_upstream: bool) -> bool {
+    match err {
         ApiError::Http {
-            status: 401 | 403 | 404,
-            ..
-        } | ApiError::Config(_)
-    )
+            status: 401 | 404, ..
+        } => !local_upstream,
+        ApiError::Http { status: 403, .. } | ApiError::Config(_) => true,
+        _ => false,
+    }
 }
 
 /// The metric reason of `err`; a client setup error is not a source error.
@@ -437,4 +469,53 @@ fn reason(err: &ApiError) -> Option<SourceErrorReason> {
         ApiError::Http { .. } => SourceErrorReason::Http,
         ApiError::Config(_) => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(status: u16) -> ApiError {
+        ApiError::Http {
+            status,
+            description: String::new(),
+            retry_after: None,
+        }
+    }
+
+    /// A self-hosted server's 401 and 404 back off up to 5 min, on a
+    /// backoff of their own; other errors keep the configured cap.
+    #[test]
+    fn rejections_back_off_up_to_5_min() {
+        let defaults = LongPollOptions::default().backoff;
+        let mut backoffs = Backoffs::new(defaults);
+        for _ in 0..64 {
+            for status in [401, 404] {
+                assert!(backoffs.delay(&http(status)) <= REJECTED_BACKOFF_MAX);
+            }
+            assert!(backoffs.delay(&http(502)) <= defaults.1);
+        }
+        assert_eq!(backoffs.rejected.max(), Duration::from_secs(300));
+        assert_eq!(backoffs.rejected.attempt(), 128);
+        assert_eq!(backoffs.errors.attempt(), 64);
+        backoffs.reset();
+        assert_eq!(
+            (backoffs.errors.attempt(), backoffs.rejected.attempt()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn rejections_fatal_on_cloud_only() {
+        for status in [401, 404] {
+            assert!(is_fatal(&http(status), false), "{status}");
+            assert!(!is_fatal(&http(status), true), "{status}");
+        }
+        for local in [false, true] {
+            assert!(is_fatal(&http(403), local));
+            assert!(is_fatal(&ApiError::Config("x"), local));
+            assert!(!is_fatal(&http(429), local));
+            assert!(!is_fatal(&http(500), local));
+        }
+    }
 }

@@ -192,6 +192,9 @@ fn router(
         let opts = WebhookOptions {
             path: hook.path.expose().clone(),
             secret: app::webhook_secret(bot, hook),
+            // Deliveries come from the bot's Bot API server: Telegram's
+            // networks for a cloud upstream, wherever a self-hosted one
+            // runs otherwise (validation keeps `telegram` to cloud bots).
             ip_allowlist: match &hook.ip_allowlist {
                 config::IpAllowlist::None => IpAllowlist::None,
                 config::IpAllowlist::Telegram => IpAllowlist::Telegram,
