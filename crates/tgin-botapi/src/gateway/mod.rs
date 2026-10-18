@@ -150,8 +150,9 @@ struct Bot {
     /// Whether requests carrying a local file reference are refused
     /// (`local_files`).
     refuses_local_files: bool,
-    /// The longest wait for the response headers once the request body has
-    /// been sent. A bot on the `api_url` shorthand gets its own
+    /// The proxy's longest wait for the response headers once the request
+    /// body has been sent (webhook replies use the resolved upstream's
+    /// value, see `reply`). A bot on the `api_url` shorthand gets its own
     /// `upstream_idle_timeout`: that is all a v1 config can reach, it cannot
     /// set `response_timeout`, and before upstreams existed the idle bound
     /// ran from the upload's end, so such a bot keeps exactly the wait it

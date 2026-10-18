@@ -1050,6 +1050,49 @@ async fn reply_call_bounded_by_response_timeout() {
     tgin.stop().await;
 }
 
+/// A bot on the `api_url` shorthand keeps v1's 30 s reply bound, however
+/// short its `upstream_idle_timeout` (here 5 s): that timeout bounds the
+/// gateway's header wait on the shorthand, never a reply.
+#[tokio::test(start_paused = true)]
+async fn shorthand_reply_keeps_30s_bound() {
+    let frozen = freeze();
+    let telegram = Telegram::default();
+    let (arrived, release) = telegram.hold_next();
+    let api = telegram.serve().await;
+    let down = MockServer::start().await;
+    let reply = r#"{"method":"sendMessage","chat_id":5,"text":"slow"}"#;
+    answer_update(&down, 1, 200, "application/json", reply).await;
+    let extra = Extra {
+        bot: "    gateway: { upstream_idle_timeout: 5s }\n",
+        ..Extra::default()
+    };
+    let yaml = config(&api, &down.uri(), &extra).replace("name: hooked", "name: v1idle");
+    let tgin = start(&yaml).await;
+    let failed = r#"tgin_webhook_replies_total{consumer="hooks",outcome="failed"} 1"#;
+
+    tgin.admit(1, 5).await;
+    within("the reply reaches the server", arrived)
+        .await
+        .expect("held");
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let _ = real_time(QUIET).await;
+    assert!(
+        !tgin.has_metric(failed),
+        "the reply call ended at the idle timeout"
+    );
+    tokio::time::advance(Duration::from_millis(24_999)).await;
+    let _ = real_time(QUIET).await;
+    assert!(!tgin.has_metric(failed), "the reply call ended before 30 s");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    until("the reply call times out", || tgin.has_metric(failed)).await;
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="v1idle",method="sendMessage",outcome="unreachable"} 1"#,
+    );
+    drop(release);
+    frozen.thaw();
+    tgin.stop().await;
+}
+
 /// A multipart reply's `chat_id` is not read for the limits, as for a
 /// streamed gateway request: only the global quota applies, so it goes
 /// while its chat's quota is used up. A JSON reply to that chat is refused.

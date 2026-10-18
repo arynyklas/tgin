@@ -572,7 +572,9 @@ impl Call<'_> {
             Err(err) => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %err, "gateway response aborted");
                 self.count(Outcome::UpstreamError);
-                return errors::error(StatusCode::BAD_GATEWAY, NO_ANSWER);
+                // The 429 status already says flood control refused the
+                // call: it was not executed, so the client may send it again.
+                return errors::error(StatusCode::BAD_GATEWAY, UNREACHABLE);
             }
         };
         let max_wait = self.bot.gateway.retry_429_max_wait;

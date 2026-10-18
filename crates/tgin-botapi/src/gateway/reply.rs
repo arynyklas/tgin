@@ -34,9 +34,10 @@ use super::proxy::{deadline, outcome, url};
 use super::{Bot, Bounded, Gateway, read_bounded};
 
 /// The longest bound on a reply's call, from connecting to the end of the
-/// response; the bot's response wait (`Bot::response_timeout`), when
-/// shorter, bounds it instead. The body is in memory, so no upload can be
-/// slow.
+/// response; the resolved upstream's `response_timeout`, when shorter,
+/// bounds it instead. Not `Bot::response_timeout`: a reply's v1 bound was
+/// always 30 s, and the `api_url` shorthand resolves to 60 s, which keeps
+/// it. The body is in memory, so no upload can be slow.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest method name executed; Bot API names are far shorter.
 const MAX_METHOD_LEN: usize = 64;
@@ -196,7 +197,7 @@ impl Call<'_> {
         let sent = bot
             .client
             .post(url(&bot.method_base, method, None))
-            .timeout(bot.response_timeout.min(REPLY_TIMEOUT))
+            .timeout(bot.upstream.response_timeout.min(REPLY_TIMEOUT))
             .header(CONTENT_TYPE, reply.content_type.clone())
             .header(VIA, bot.via.clone())
             .body(reply.body.clone())

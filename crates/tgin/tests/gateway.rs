@@ -1260,36 +1260,32 @@ async fn per_chat_shaping_delays_fourth_message() {
     tgin.stop().await;
 }
 
-/// Steps the frozen clock in 10 ms ticks for `span`, collecting what
-/// reaches Telegram, each stamped against `t0`.
-async fn arrivals_over(
+/// What reaches Telegram, stamped against `t0`. The frozen clock moves only
+/// after the requests that are due have been seen: `due[n]` requests are
+/// awaited at `t0 + n` seconds. Before each next second the clock stops 1 ms
+/// short of it, and [`quiet`] shows that nothing goes early. After the last
+/// second, half a second more stays quiet.
+async fn arrivals_by_second(
     arrivals: &mut mpsc::UnboundedReceiver<Arrival>,
     t0: tokio::time::Instant,
-    span: Duration,
+    due: &[usize],
 ) -> Vec<(Duration, Bytes)> {
     let mut seen = Vec::new();
-    let tick = Duration::from_millis(10);
-    let mut passed = Duration::ZERO;
-    while passed <= span {
-        // Real time for requests already released to cross loopback.
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            let _ = tx.send(());
-        });
-        let mut rx = rx;
-        loop {
-            tokio::select! {
-                arrival = arrivals.recv() => {
-                    let arrival = arrival.expect("open");
-                    seen.push((arrival.at - t0, arrival.body));
-                }
-                _ = &mut rx => break,
-            }
+    for (second, &count) in due.iter().enumerate() {
+        if second > 0 {
+            tokio::time::advance(Duration::from_millis(999)).await;
+            quiet("a request before its second", arrivals).await;
+            tokio::time::advance(Duration::from_millis(1)).await;
         }
-        tokio::time::advance(tick).await;
-        passed += tick;
+        for _ in 0..count {
+            let arrival = within("a request due now", arrivals.recv())
+                .await
+                .expect("open");
+            seen.push((arrival.at - t0, arrival.body));
+        }
     }
+    tokio::time::advance(Duration::from_millis(500)).await;
+    quiet("a request after the last", arrivals).await;
     seen
 }
 
@@ -1309,7 +1305,10 @@ async fn five_at_once_to_one_chat_arrive_at_the_chat_rate() {
             tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
         })
         .collect();
-    let seen = arrivals_over(&mut arrivals, t0, Duration::from_millis(2_500)).await;
+    // The clock stays at t0 until the whole burst is booked.
+    let delayed = r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="delayed"} 2"#;
+    until("the burst booked", || tgin.has_metric(delayed)).await;
+    let seen = arrivals_by_second(&mut arrivals, t0, &[3, 1, 1]).await;
     let at: Vec<Duration> = seen.iter().map(|(at, _)| *at).collect();
     let s = Duration::from_secs;
     assert_eq!(at, [s(0), s(0), s(0), s(1), s(2)]);
@@ -1338,6 +1337,9 @@ async fn five_at_once_beside_a_429_retry_arrive_at_the_chat_rate() {
         .await
         .expect("open");
     assert_eq!(first.at, t0);
+    // Its 429 is back at tgin at t0, so the retry is due at exactly 1 s.
+    let answered = r#"tgin_gateway_upstream_seconds_count{bot="gw",method="sendMessage"} 1"#;
+    until("the 429 at tgin", || tgin.has_metric(answered)).await;
     let sends: Vec<_> = (1..=5)
         .map(|i| {
             let (http, addr) = (tgin.http.clone(), tgin.addr);
@@ -1345,7 +1347,9 @@ async fn five_at_once_beside_a_429_retry_arrive_at_the_chat_rate() {
             tokio::spawn(async move { call(&http, addr, "sendMessage", &body).await.status() })
         })
         .collect();
-    let seen = arrivals_over(&mut arrivals, t0, Duration::from_millis(2_500)).await;
+    let delayed = r#"tgin_gateway_ratelimited_total{bot="gw",scope="chat",action="delayed"} 2"#;
+    until("the burst booked", || tgin.has_metric(delayed)).await;
+    let seen = arrivals_by_second(&mut arrivals, t0, &[3, 2, 1]).await;
     let of = |needle: &[u8]| -> Vec<Duration> {
         seen.iter()
             .filter(|(_, body)| body.windows(needle.len()).any(|w| w == needle))
@@ -2123,9 +2127,9 @@ async fn reading_server() -> (SocketAddr, mpsc::UnboundedReceiver<usize>) {
 }
 
 /// A Bot API server that reads each request whole (its head, then
-/// `Content-Length` bytes), counts it, and closes the connection without
-/// an answer.
-async fn closing_server() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+/// `Content-Length` bytes), counts it, writes `reply` (nothing, or the
+/// start of a response) and closes the connection.
+async fn closing_server(reply: &'static [u8]) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("address");
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2152,7 +2156,7 @@ async fn closing_server() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
                         .map_or(0, |v| v.trim().parse().expect("length"));
                     if buf.len() >= end + 4 + length {
                         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // Dropped unanswered.
+                        let _ = stream.write_all(reply).await;
                         return;
                     }
                 }
@@ -2428,7 +2432,7 @@ async fn connect_failure_says_unreachable() {
 /// call and a streamed upload alike, and neither goes upstream again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_lost_after_upload_may_have_been_executed() {
-    let (api, requests) = closing_server().await;
+    let (api, requests) = closing_server(b"").await;
     let tgin = start(&local_config(&format!("http://{api}"), "dropped", "10s")).await;
     let (content_type, upload) = multipart("7");
     let calls = [
@@ -2470,5 +2474,82 @@ async fn connection_lost_after_upload_may_have_been_executed() {
             && l.contains("the call may have been executed")),
         "the lost answer is logged with the bot's name"
     );
+    tgin.stop().await;
+}
+
+/// A 429 whose body breaks off: the status already says flood control
+/// refused the call, so it was not executed. The client is told the server
+/// is unreachable (it may send again), never "may have been executed"; the
+/// outcome is `upstream_error` (an HTTP answer came), and the buffered call
+/// is not sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_429_body_was_not_executed() {
+    let (api, requests) = closing_server(
+        b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"ok\":false,\"error_code\":429",
+    )
+    .await;
+    let tgin = start(&limited_config(&format!("http://{api}"), "{}")).await;
+    let response = timeout(
+        PATIENCE,
+        call(
+            &tgin.http,
+            tgin.addr,
+            "sendMessage",
+            &json!({ "chat_id": 7, "text": "hi" }),
+        ),
+    )
+    .await
+    .expect("answered in time");
+    let (status, body) = json_of(response).await;
+    assert_eq!(status, 502);
+    assert_eq!(body, telegram_error(502, UNREACHABLE));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="upstream_error"} 1"#,
+    );
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="gw",method="sendMessage",outcome="unreachable"} 0"#,
+    );
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "not sent again"
+    );
+    tgin.assert_metric(r#"tgin_gateway_retries_total{bot="gw"} 0"#);
+    tgin.stop().await;
+}
+
+/// An explicit upstream's `response_timeout` is honoured as configured,
+/// even below `upstream_idle_timeout` (no max of the two): with 2 s against
+/// an idle bound of 30 s, the "may have been executed" 502 comes exactly
+/// 2 s after the upload ended.
+#[tokio::test(start_paused = true)]
+async fn response_timeout_below_idle_is_honoured() {
+    let frozen = freeze();
+    let (api, mut arrivals) = waiting_server().await;
+    let config = local_config(&format!("http://{api}"), "brief", "2s")
+        .replace("upstream_idle_timeout: 1s", "upstream_idle_timeout: 30s");
+    let tgin = start(&config).await;
+    let (content_type, upload) = multipart("7");
+    let response = spawn_call(
+        tgin.http
+            .post(tgin.url(&format!("/bot{TOKEN}/sendDocument?mode=never")))
+            .header("content-type", content_type)
+            .body(upload.clone()),
+    );
+    let arrival = within("the upload", arrivals.recv()).await.expect("open");
+    assert_eq!(&arrival.body[..], upload.as_bytes(), "the whole upload");
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    unanswered("an upload before its response_timeout", &response).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let (status, body) = within("the 502", response).await.expect("sent");
+    assert_eq!(status, 502);
+    assert_eq!(body, telegram_error(502, NO_ANSWER));
+    assert_eq!(arrival.at.elapsed(), Duration::from_secs(2));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="brief",method="sendDocument",outcome="unreachable"} 1"#,
+    );
+    quiet("a call sent again", &mut arrivals).await;
+    frozen.thaw();
     tgin.stop().await;
 }
