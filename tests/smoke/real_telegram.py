@@ -27,9 +27,11 @@ both file routes.
 Self-hosted (`--self-hosted URL --files-dir DIR`): the bot talks to the
 operator's telegram-bot-api server, run with `--local`, through an upstream
 `kind: local, local_mode: true` whose files tgin serves from DIR, the server's
-`--files-dir` (its `--dir` when that is unset) as this machine sees it
-(`--server-dir` names it as the server sees it, when the server runs in a
-container). The server's api_id and api_hash stay with the server; the
+`--files-dir` as this machine sees it (`--server-dir` names it as the server
+sees it, when the server runs in a container). Run the server with an explicit
+`--files-dir`: without one its files live under `--dir`, whose bot directories
+also hold TDLib's database, and tgin does not serve those. The server's api_id
+and api_hash stay with the server; the
 script never reads them. Phases A and B run against
 the server, and also check: getFile answers an absolute path from the server
 and a relative one through tgin, and every download equals the file in the
@@ -934,12 +936,12 @@ def check_args(args):
         raise Abort("--fake --migrate needs --api-url: the cloud-mode fake to log the bot out of")
     if args.files_dir is None:
         raise Abort(
-            "--self-hosted needs --files-dir: the server's --files-dir (its --dir when that is unset) as this machine sees it"
+            "--self-hosted needs --files-dir: the server's --files-dir as this machine sees it"
         )
     if not Path(args.files_dir).is_dir():
         raise Abort(f"--files-dir {args.files_dir} is not a directory")
     if args.server_dir is not None and not args.server_dir.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:[/\\]", args.server_dir):
-        raise Abort("--server-dir must be an absolute path: the server's --files-dir (its --dir when that is unset) as it sees it")
+        raise Abort("--server-dir must be an absolute path: the server's --files-dir as it sees it")
 
 
 def main():
@@ -964,12 +966,12 @@ def main():
     group.add_argument(
         "--files-dir",
         metavar="DIR",
-        help="the server's --files-dir (its --dir when that is unset) as this machine sees it; tgin serves files from it",
+        help="the server's --files-dir as this machine sees it; tgin serves files from it",
     )
     group.add_argument(
         "--server-dir",
         metavar="PATH",
-        help="the server's --files-dir (its --dir when that is unset) as the server sees it, when it differs (a container)",
+        help="the server's --files-dir as the server sees it, when it differs (a container)",
     )
     group.add_argument(
         "--public-url",
