@@ -226,10 +226,15 @@ impl Values {
             Shape::Json => self.json_byte(depth, b),
             Shape::Leading if is_space(b) => {}
             Shape::Leading if b == b'[' || b == b'{' => {
-                value.shape = Shape::Json;
                 if depth + 1 < MAX_DEPTH {
+                    value.shape = Shape::Json;
                     self.json_byte(depth, b);
                 } else {
+                    // Too deep to follow: refused, and the rest of the
+                    // value is read as plain text, so a scan that goes on
+                    // reading (a multipart delimiter releases several
+                    // bytes at once) never indexes past the last level.
+                    value.shape = Shape::Plain;
                     self.found = true;
                 }
             }
@@ -424,14 +429,67 @@ mod tests {
     /// The verdict on a multipart body, fed whole and then byte by byte:
     /// both must agree.
     fn multipart_verdict(body: &[u8]) -> Verdict {
-        let whole = body_verdict(Some(&multipart_type()), body);
-        let mut scan = MultipartScan::new(BOUNDARY.as_bytes());
+        multipart_verdict_with(BOUNDARY.as_bytes(), body)
+    }
+
+    /// [`multipart_verdict`] with the boundary `boundary`.
+    fn multipart_verdict_with(boundary: &[u8], body: &[u8]) -> Verdict {
+        let mut content_type = b"multipart/form-data; boundary=".to_vec();
+        content_type.extend_from_slice(boundary);
+        let content_type = HeaderValue::from_bytes(&content_type).unwrap();
+        let whole = body_verdict(Some(&content_type), body);
+        let Some(parsed) = super::boundary(content_type.as_bytes()) else {
+            assert_eq!(whole, UNREADABLE);
+            return whole;
+        };
+        let mut scan = MultipartScan::new(parsed);
         let bytewise = body
             .chunks(1)
             .find_map(|byte| scan.feed(byte))
             .unwrap_or_else(|| scan.finish());
         assert_eq!(whole, bytewise, "{}", String::from_utf8_lossy(body));
         whole
+    }
+
+    /// A failed delimiter match hands the scan many bytes at once, after
+    /// the one that opened a JSON document at the deepest level: the scan
+    /// reads them all without indexing past its levels. The second
+    /// boundary has no `"`, so it also parses as a quoted MIME parameter.
+    #[test]
+    fn deepest_json_level_takes_any_bytes() {
+        for boundary in [&br#"\\\"[\\\\\\\"Z"#[..], br"\\u0022[\\\\u0022Z"] {
+            let mut body = b"--".to_vec();
+            body.extend_from_slice(boundary);
+            body.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"media\"\r\n\r\n");
+            body.extend_from_slice(br#"["[\"["#);
+            body.extend_from_slice(b"\r\n--");
+            body.extend_from_slice(&boundary[..boundary.len() - 1]);
+            body.push(b'Y');
+            assert_eq!(multipart_verdict_with(boundary, &body), LOCAL);
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+        /// Every scan is total: any bytes, any boundary, whole or byte by
+        /// byte, with the same verdict.
+        #[test]
+        fn scans_are_total(
+            boundary in proptest::collection::vec(proptest::sample::select(&b"\"[{\\Z-"[..]), 1..16),
+            value in proptest::collection::vec(proptest::sample::select(&b"\"[{}]\\\r\n-Zfile:%+&= u0"[..]), 0..96),
+        ) {
+            let mut body = b"--".to_vec();
+            body.extend_from_slice(&boundary);
+            body.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"media\"\r\n\r\n");
+            body.extend_from_slice(&value);
+            body.extend_from_slice(b"\r\n--");
+            body.extend_from_slice(&boundary);
+            body.extend_from_slice(b"--");
+            multipart_verdict_with(&boundary, &body);
+            json_has_local_file(&value);
+            form_has_local_file(&value);
+        }
     }
 
     const LOCAL: Verdict = Verdict::Refused(Refusal::LocalFile);
