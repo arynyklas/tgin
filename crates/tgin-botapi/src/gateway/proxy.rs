@@ -551,8 +551,9 @@ impl Call<'_> {
         let response = match await_headers(send, &progress, bounds).await {
             Waited::Ready(Ok(response)) => response,
             Waited::Ready(Err(_)) if progress.client_failed() => return Err(Failed::ClientClosed),
-            // A body that was empty from the start counts as sent at once,
-            // so a failed connect is told apart by the error.
+            // An empty body counts as sent once hyper has asked for its
+            // end on a connection; a failed connect is told apart by the
+            // error as well.
             Waited::Ready(Err(err)) if err.is_connect() || !progress.ended() => {
                 tracing::warn!(bot = %self.bot.name, method = self.label.as_str(), error = %describe_error(&err), "gateway request failed: {peer} is unreachable");
                 return Err(Failed::Unreachable);
@@ -912,7 +913,10 @@ async fn await_headers<F: Future>(
 /// which keeps its exact length (C§3.2), stamping progress on every frame
 /// and marking its end: after the frame past which it has no more (hyper
 /// stops at the announced length without polling for the end), at its
-/// end, or at once for an empty body.
+/// end, or, for an empty body, when hyper first asks whether it has ended.
+/// hyper asks as it writes the request head on a connection, never before
+/// the connect has finished, so a call whose connect is still being made
+/// has not been sent, empty body or not.
 struct Upload {
     /// Only `size_hint` and `is_end_stream` lock it; `poll_frame` reaches
     /// it through `get_mut`.
@@ -922,9 +926,6 @@ struct Upload {
 
 impl Upload {
     fn new(body: Body, progress: Arc<Progress>) -> Upload {
-        if body.is_end_stream() {
-            progress.finish();
-        }
         Upload {
             body: Mutex::new(body),
             progress,
@@ -1269,13 +1270,16 @@ mod tests {
         }
     }
 
-    /// An empty body has ended from the start; a body of known length ends
-    /// with its last frame, before anything polls for its end (hyper stops
-    /// at the announced length).
+    /// An empty body has ended once hyper asks, which it does on a
+    /// connection, not before; a body of known length ends with its last
+    /// frame, before anything polls for its end (hyper stops at the
+    /// announced length).
     #[tokio::test]
     async fn upload_ends_with_its_last_frame() {
         let progress = Arc::new(Progress::new());
-        let _empty = Upload::new(Body::empty(), Arc::clone(&progress));
+        let empty = Upload::new(Body::empty(), Arc::clone(&progress));
+        assert!(!progress.ended(), "not sent before hyper asks");
+        assert!(empty.is_end_stream());
         assert!(progress.ended());
 
         let progress = Arc::new(Progress::new());

@@ -2805,3 +2805,42 @@ async fn file_origin_bounded_by_the_idle_timeout() {
     frozen.thaw();
     tgin.stop().await;
 }
+
+/// A listener whose accept queue is full and stays full: connecting to it
+/// does not finish (Linux drops the SYN; Windows refuses it only after
+/// about 2 s of retries). The listener and the connection filling its
+/// queue are held for as long as the returned values live.
+async fn unaccepting() -> (SocketAddr, tokio::net::TcpListener, std::net::TcpStream) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let listener = socket.listen(0).expect("listen");
+    let addr = listener.local_addr().expect("address");
+    let filler = std::net::TcpStream::connect(addr).expect("the connection that fills the queue");
+    (addr, listener, filler)
+}
+
+/// A call that never left tgin, because the connection to the server was
+/// still being made, was not executed: an empty-bodied call whose
+/// `response_timeout` (1 s) is shorter than the connect is not answered
+/// "may have been executed" at 1 s. The connect is bounded like an upload,
+/// by `upstream_idle_timeout` (2 s), and answered "unreachable".
+#[tokio::test(start_paused = true)]
+async fn unfinished_connect_is_unreachable() {
+    let frozen = freeze();
+    let (api, _listener, _filler) = unaccepting().await;
+    let config = local_config(&format!("http://{api}"), "connecting", "1s")
+        .replace("upstream_idle_timeout: 1s", "upstream_idle_timeout: 2s");
+    let tgin = start(&config).await;
+    let response = spawn_call(tgin.http.post(tgin.url(&format!("/bot{TOKEN}/getMe"))));
+    unanswered("a call while its connect hangs", &response).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    unanswered("a call at its response_timeout, never sent", &response).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let (status, body) = within("the 502", response).await.expect("sent");
+    assert_eq!((status, body), (502, telegram_error(502, UNREACHABLE)));
+    tgin.assert_metric(
+        r#"tgin_gateway_requests_total{bot="connecting",method="getMe",outcome="unreachable"} 1"#,
+    );
+    frozen.thaw();
+    tgin.stop().await;
+}
