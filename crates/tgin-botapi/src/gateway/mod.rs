@@ -22,8 +22,8 @@ mod reply;
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -81,11 +81,6 @@ pub struct Gateway {
     /// The requests forwarded to Telegram, and the files served from disk,
     /// for the shutdown's drain.
     upstreams: Arc<Upstreams>,
-    /// Each bot token's [`Gate`] while anything still holds it: an entry
-    /// rebuilt for the same token, under another name or after the bot
-    /// left the table and came back, gets the gate its earlier entries'
-    /// calls, still held by the rate limits or a 429, use.
-    gates: Mutex<Vec<(Secret<String>, Weak<Gate>)>>,
 }
 
 /// What a parked bot's calls that would go to a Bot API server or a file
@@ -376,7 +371,6 @@ impl Gateway {
             table: ArcSwap::from_pointee(Table::default()),
             replies: Mutex::new(HashMap::new()),
             upstreams: Arc::default(),
-            gates: Mutex::new(Vec::new()),
         }
     }
 
@@ -430,14 +424,7 @@ impl Gateway {
                 .filter(same_token)
                 .filter(|previous| previous.gateway.rate_limit == bot.gateway.rate_limit)
                 .map(|previous| Arc::clone(&previous.limiter));
-            let gate = self
-                .gates
-                .lock()
-                .iter()
-                .find(|(token, _)| *token == bot.token)
-                .and_then(|(_, gate)| gate.upgrade())
-                .or_else(|| previous.map(|previous| Arc::clone(&previous.gate)))
-                .unwrap_or_default();
+            let gate = previous.map_or_else(Arc::default, |previous| Arc::clone(&previous.gate));
             let name = Arc::clone(&bot.name);
             let limiter = match kept_limiter {
                 Some(limiter) => limiter,
@@ -486,17 +473,6 @@ impl Gateway {
                 self.metrics.remove_bot(&gone.metrics);
                 self.metrics.remove_upstream(&gone.upstream_metrics);
             }
-        }
-        {
-            let mut gates = self.gates.lock();
-            gates.retain(|(token, gate)| {
-                gate.strong_count() > 0 && !entries.iter().any(|entry| entry.token == *token)
-            });
-            gates.extend(
-                entries
-                    .iter()
-                    .map(|entry| (entry.token.clone(), Arc::downgrade(&entry.gate))),
-            );
         }
         self.table.store(Arc::new(Table {
             bots: entries,
@@ -907,67 +883,6 @@ mod tests {
         let mut out = String::new();
         prometheus_client::encoding::text::encode(&mut out, &reg).expect("encode");
         assert!(!out.contains(r#"bot="a""#), "{out}");
-    }
-
-    /// A gateway serving `cfg`, with no bot yet.
-    fn test_gateway(cfg: &config::Config) -> Gateway {
-        use tgin_core::engine::EngineRuntime;
-        use tgin_core::metrics::CoreMetrics;
-        use tgin_runtime::supervisor::Supervisor;
-        use tokio_util::sync::CancellationToken;
-
-        let mut reg = prometheus_client::registry::Registry::with_prefix("tgin");
-        let via = tgin_runtime::http::Via::generate();
-        let engine = Engine::new(
-            cfg,
-            CoreMetrics::register(&mut reg),
-            reqwest::Client::new(),
-            EngineRuntime {
-                supervisor: Arc::new(Supervisor::new()),
-                stop: CancellationToken::new(),
-                force: CancellationToken::new(),
-                via: via.clone(),
-                reply: Default::default(),
-            },
-        )
-        .expect("engine");
-        Gateway::new(Arc::new(engine), GatewayMetrics::register(&mut reg), &via)
-    }
-
-    /// A bot's gate follows its token while anything holds it: renamed, or
-    /// gone from the table and back, the bot gets the gate a call of its
-    /// earlier entry still holds, so parking it refuses that call too. Once
-    /// nothing holds it, a bot coming back gets a fresh one.
-    #[tokio::test]
-    async fn gate_follows_the_token_while_held() {
-        let cfg = config::load(
-            "version: 1\nbots:\n  - { name: a, token: \"1:a\" }\n",
-            std::path::Path::new("tgin.yaml"),
-            &tgin_runtime::config::MapEnv::default(),
-        )
-        .unwrap_or_else(|_| panic!("valid config"));
-        let gateway = test_gateway(&cfg);
-        let named = |name: &str| GatewayBot {
-            name: Arc::from(name),
-            ..gateway_bot(&cfg, "1:a")
-        };
-        gateway.set_bots(vec![named("a")], Vec::new());
-        // A call of `a`, held by the rate limits, holds its entry.
-        let held = Arc::clone(&gateway.table.load().bots[0]);
-        gateway.set_bots(Vec::new(), Vec::new());
-        gateway.set_bots(vec![named("renamed")], Vec::new());
-        let entry = Arc::clone(&gateway.table.load().bots[0]);
-        assert!(Arc::ptr_eq(&held.gate, &entry.gate), "the held gate");
-        gateway.set_parked("renamed", true);
-        assert!(held.gate.enter().is_none(), "the held call is refused");
-
-        drop((held, entry));
-        gateway.set_bots(Vec::new(), Vec::new());
-        gateway.set_bots(vec![named("a")], Vec::new());
-        assert!(
-            !gateway.table.load().bots[0].gate.is_parked(),
-            "nothing held the gate: a fresh one"
-        );
     }
 
     #[tokio::test]
