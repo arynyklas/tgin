@@ -163,6 +163,21 @@ impl Plan {
         client: &reqwest::Client,
         rt: &EngineRuntime,
     ) -> Result<Self, BuildError> {
+        // Before anything is created, metric series included: a refused
+        // config leaves nothing behind.
+        for consumer in &cfg.consumers {
+            let mode = mode(&consumer.kind);
+            let slot = match old.and_then(|old| old.target(&consumer.name)) {
+                Some(target) if target.slot.mode() == mode => Some(&target.slot),
+                _ => retired
+                    .iter()
+                    .find(|s| *s.name == *consumer.name && s.mode() == mode),
+            };
+            if let Some(slot) = slot {
+                check_feed(slot, feed_of(cfg, consumer.id), old)?;
+            }
+        }
+
         let mut report = ReloadReport {
             generation: old.map_or(1, |old| old.generation + 1),
             ..ReloadReport::default()
@@ -257,7 +272,7 @@ impl Plan {
             });
             let slot = match previous {
                 Some((target, written)) if target.slot.mode() == mode => {
-                    let was = check_feed(&target.slot, feed, old)?;
+                    let was = *target.slot.feed.lock();
                     if written.kind != consumer.kind {
                         report.changed.push(consumer.name.clone());
                     }
@@ -276,9 +291,6 @@ impl Plan {
                     let draining = retired
                         .iter()
                         .find(|s| *s.name == *consumer.name && s.mode() == mode);
-                    if let Some(slot) = draining {
-                        check_feed(slot, feed, old)?;
-                    }
                     if let Some((target, _)) = previous {
                         report.changed.push(consumer.name.clone());
                         retiring.push(Arc::clone(&target.slot));
@@ -744,23 +756,18 @@ fn options(
     }
 }
 
-/// The kind of updates `slot` was given so far, when it may take `to` from
-/// now on. It may not when it was given the other kind and still holds
+/// Whether `slot` may take `to` from now on. It may not when it was given
+/// the other kind of updates and still holds
 /// some, or the old generation `old` still gives it that kind: a bot poll
 /// would get account envelopes, or an account consumer Bot API updates.
 /// Clearing them instead would drop updates the operator did not ask to
 /// drop; a consumer of a new name starts empty.
-fn check_feed(
-    slot: &Slot,
-    to: Option<Feed>,
-    old: Option<&EngineState>,
-) -> Result<Option<Feed>, BuildError> {
-    let was = *slot.feed.lock();
-    let (Some(from), Some(to)) = (was, to) else {
-        return Ok(was);
+fn check_feed(slot: &Slot, to: Option<Feed>, old: Option<&EngineState>) -> Result<(), BuildError> {
+    let (Some(from), Some(to)) = (*slot.feed.lock(), to) else {
+        return Ok(());
     };
     if from == to {
-        return Ok(was);
+        return Ok(());
     }
     let fed = old.is_some_and(|old| {
         old.config
@@ -776,7 +783,7 @@ fn check_feed(
             to,
         });
     }
-    Ok(was)
+    Ok(())
 }
 
 /// The settings that changed and need a restart: what the process sets up

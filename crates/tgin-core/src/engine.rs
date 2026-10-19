@@ -82,8 +82,10 @@ pub enum BuildError {
     )]
     SourceIdsExhausted,
     #[error(
-        "consumer `{consumer}` holds {from} updates and would now get {to} updates; a \
-         consumer never mixes the two"
+        "consumer `{consumer}` holds {from} updates and would now get {to} updates, and a \
+         consumer never mixes the two; route the {to} updates to a consumer of another \
+         name, or first apply a config that routes nothing to `{consumer}`, let it drain \
+         (or purge it), then route the {to} updates to it"
     )]
     FeedChanged {
         consumer: String,

@@ -1988,3 +1988,40 @@ async fn drop_oldest_keeps_a_batch_s_newest_updates() {
     assert_eq!(h.engine.admit_batch(acct, &mut batch), Admit::Admitted);
     assert_eq!(poll(&h.pull("raw"), "x", 0).await, [4, 5]);
 }
+
+/// A reload refused for a consumer's feed creates nothing: no metric series
+/// for the bots and consumers it would have added. Its message says how to
+/// proceed.
+#[tokio::test(start_paused = true)]
+async fn refused_feed_change_creates_nothing() {
+    const BOT_FED: &str = r#"version: 1
+server: {}
+bots:
+  - { name: b, token: "1:aaa", routes: [{ to: [q] }] }
+accounts:
+  acct: { api_id: 1, api_hash: h, session_dir: sessions/acct }
+consumers:
+  q: { pull: { auth_token: t } }
+"#;
+    let h = Harness::new(BOT_FED);
+    let refused = r#"version: 1
+server: {}
+bots:
+  - { name: newbot, token: "2:bbb", routes: [{ to: [freshq] }] }
+accounts:
+  acct: { api_id: 1, api_hash: h, session_dir: sessions/acct, routes: [{ to: [q] }] }
+consumers:
+  freshq: { pull: {} }
+  q: { pull: { auth_token: t } }
+"#;
+    let err = h.engine.apply(&load(refused)).expect_err("refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("another name") && text.contains("purge"),
+        "{text}"
+    );
+    let metrics = h.metrics();
+    assert!(!metrics.contains("freshq"), "{metrics}");
+    assert!(!metrics.contains("newbot"), "{metrics}");
+    assert_eq!(h.engine.consumer("freshq").map(|c| c.pending()), None);
+}
