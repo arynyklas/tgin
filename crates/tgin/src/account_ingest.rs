@@ -104,11 +104,13 @@ impl BatchUpdate for Item<'_> {
             user_id: f.sender,
             text: f.text.map(|t| Cow::Borrowed(capped(t))),
             callback_data: None,
-            // An account has no username for a `@bot` suffix to name: the
-            // command matches by its name alone.
-            command: f
-                .command
-                .map(|c| (c.split_once('@').map_or(c, |(name, _)| name), None)),
+            // A `/cmd@bot` is addressed to that bot alone. An account has no
+            // username in the route table, so such a command matches none of
+            // its `commands` rules.
+            command: f.command.map(|c| {
+                c.split_once('@')
+                    .map_or((c, None), |(name, bot)| (name, Some(bot)))
+            }),
         }
     }
 

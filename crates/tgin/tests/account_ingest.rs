@@ -685,3 +685,37 @@ async fn id_failure_is_an_error_not_a_refusal() {
     assert!(matches!(got, Err(IdsError::Exhausted)), "{got:?}");
     assert_eq!(h.pending("feed"), 0);
 }
+
+/// `/start@otherbot` is addressed to another bot: it does not match an
+/// account's `commands: [start]`; `/start` does.
+#[tokio::test]
+async fn suffixed_commands_do_not_match_account_rules() {
+    let routes = "      - match: { commands: [start] }\n        to: [feed]\n";
+    let consumers = "  feed: { pull: { auth_token: tok } }\n";
+    let mut h = Harness::new(&account_config(routes, consumers), ReplyHandle::default());
+    let mut m = manager();
+    let text = |pts: i32, t: &str| {
+        format!(
+            r#"{{"_":"updateNewMessage","pts":{pts},"pts_count":1,"message":{{"_":"message","id":{pts},"peer_id":{{"_":"peerUser","user_id":"3"}},"date":1,"message":"{t}"}}}}"#
+        )
+    };
+    let push = tl(&format!(
+        r#"{{"_":"updates","updates":[{},{},{}],"users":[],"chats":[],"date":1,"seq":0}}"#,
+        text(101, "/start@otherbot hi"),
+        text(102, "/start"),
+        text(103, "/start@ hi"),
+    ));
+    let batches = m.feed_push(push);
+    let batch = the_batch(&mut m, batches);
+    assert_eq!(h.admit(&batch), Admission::Admitted);
+    let (_, v) = get(&h.pull_routes(), "feed", PollPath::Account, "", Some("tok")).await;
+    let result = v["result"].as_array().expect("result");
+    assert_eq!(result.len(), 1, "{v}");
+    assert_eq!(
+        STANDARD
+            .decode(result[0]["tl"].as_str().expect("tl"))
+            .expect("b64"),
+        batch.updates[1].bytes().to_vec(),
+        "only the unsuffixed /start"
+    );
+}
