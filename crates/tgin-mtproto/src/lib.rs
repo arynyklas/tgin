@@ -34,7 +34,7 @@ pub mod updates;
 pub use dc::DcOption;
 pub use error::SessionError;
 pub use schema::TlError;
-pub use sender::{Connected, InitParams, Pushes, RpcOutcome, Sender, SenderError};
+pub use sender::{Connected, InitParams, MAX_REQUEST, Pushes, RpcOutcome, Sender, SenderError};
 pub use session::{AuthKey, ChannelKind, DcAddr, Login, Peer, PeerKind, SessionStore, UpdateState};
 pub use transport::{
     GeneratedKey, Opened, PacketReader, PacketWriter, TcpTransport, Transport, TransportError,

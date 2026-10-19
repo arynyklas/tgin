@@ -14,6 +14,7 @@
 //!
 //! Nothing here logs or keeps request or answer bytes.
 
+use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -64,7 +65,7 @@ pub trait AffectedSink: Send + Sync {
 }
 
 /// An unwrapped request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Call<'a> {
     /// The function's full name, e.g. `messages.sendMessage`.
     pub method: &'static str,
@@ -73,6 +74,17 @@ pub struct Call<'a> {
     /// The update box an affected-pts answer counts in: the channel for a
     /// `channels.*` call with a `channel` field, else the common box.
     pub context: BoxKind,
+}
+
+/// Leaves out the body: it is account content.
+impl fmt::Debug for Call<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Call")
+            .field("method", &self.method)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .field("context", &self.context)
+            .finish()
+    }
 }
 
 /// Why a request is refused before it reaches Telegram.
@@ -287,7 +299,6 @@ pub fn classify(code: i32, message: &str) -> ErrorClass {
 }
 
 /// How [`call`] ended.
-#[derive(Debug)]
 pub enum Answer {
     /// Telegram's `rpc_result`, raw.
     Result(Bytes),
@@ -300,6 +311,21 @@ pub enum Answer {
     },
     /// No outcome; see [`InvokeError`].
     Failed(InvokeError),
+}
+
+/// Leaves out the result's bytes: they are account content.
+impl fmt::Debug for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Result(bytes) => write!(f, "Result(<{} bytes>)", bytes.len()),
+            Self::Error {
+                code,
+                message,
+                class,
+            } => write!(f, "Error({code} {message}, {class:?})"),
+            Self::Failed(e) => write!(f, "Failed({e:?})"),
+        }
+    }
 }
 
 /// Runs one unwrapped call (plan decision 4):
@@ -371,6 +397,23 @@ pub fn rpc_error_bytes(code: i32, message: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_prints_lengths_not_bytes() {
+        let body = [0xab_u8; 12];
+        let call = Call {
+            method: "help.getConfig",
+            body: &body,
+            context: BoxKind::Common,
+        };
+        let call = format!("{call:?}");
+        assert!(
+            call.contains("<12 bytes>") && !call.contains("171"),
+            "{call}"
+        );
+        let answer = format!("{:?}", Answer::Result(Bytes::from_static(&[0xab; 8])));
+        assert_eq!(answer, "Result(<8 bytes>)");
+    }
 
     #[test]
     fn classify_names_each_class() {

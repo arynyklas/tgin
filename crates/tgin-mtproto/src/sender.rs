@@ -403,7 +403,7 @@ impl Sender {
             }
         };
         let init_call = Bytes::from(init.init_call());
-        let max_body = MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - WITHOUT_UPDATES.len();
+        let max_body = MAX_REQUEST;
         let (commands, commands_rx) = mpsc::channel(COMMANDS);
         let (pushes_tx, pushes_rx) = mpsc::channel(tuning.pushes.max(1));
         // A media session's pushes go nowhere: its caller gets a closed
@@ -478,6 +478,10 @@ impl Sender {
         answer.await.unwrap_or(Err(SenderError::NoAnswer))
     }
 }
+
+/// The largest request [`Sender::invoke`] takes: one message's payload,
+/// less the `invokeWithoutUpdates` prefix a media session adds.
+pub const MAX_REQUEST: usize = MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - WITHOUT_UPDATES.len();
 
 /// `invokeWithoutUpdates#bfa9e4b7`, the prefix of every media request.
 const WITHOUT_UPDATES: [u8; 4] =

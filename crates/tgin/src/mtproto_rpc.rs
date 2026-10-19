@@ -22,8 +22,8 @@
 //!   the call was written and may have been executed; tgin never resends
 //!   it. 503 with `Retry-After`: not executed, safe to retry.
 //!
-//! **Bounds.** A TL request is at most [`MAX_TL_BODY`] (1 MiB, about
-//! Telegram's own message bound); a TL-JSON request body at most
+//! **Bounds.** A TL request is at most [`MAX_TL_BODY`] (the sender's
+//! bound, just under 1 MiB); a TL-JSON request body at most
 //! [`MAX_JSON_BODY`]. Upload files with `upload.saveFilePart` /
 //! `upload.saveBigFilePart` in parts of at most 512 KiB.
 //!
@@ -53,8 +53,9 @@ use tgin_runtime::limit::{KeyedLimiter, Quota};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio::time::Instant;
 
-/// The largest TL request: 1 MiB.
-pub const MAX_TL_BODY: usize = 1 << 20;
+/// The largest TL request: the sender's bound, 1 044 428 bytes (just under
+/// 1 MiB).
+pub const MAX_TL_BODY: usize = tgin_mtproto::MAX_REQUEST;
 /// The largest TL-JSON request body: 2 MiB (base64 makes a 512 KiB file
 /// part about 700 KiB).
 pub const MAX_JSON_BODY: usize = 2 << 20;
@@ -284,7 +285,7 @@ fn too_large() -> Response {
     tgin_error(
         StatusCode::PAYLOAD_TOO_LARGE,
         "too_large",
-        "a TL request is at most 1 MiB; upload files in parts with upload.saveFilePart",
+        "a TL request is at most 1 044 428 bytes; upload files in parts with upload.saveFilePart",
     )
 }
 
@@ -316,18 +317,18 @@ fn refusal(refused: &Refused, layer: i32) -> Response {
 }
 
 /// Telegram's bytes, raw or as TL-JSON in `schema`.
-fn telegram_bytes(status: StatusCode, bytes: &[u8], json: bool, mtproto: bool) -> Response {
+fn telegram_bytes(status: StatusCode, bytes: Bytes, json: bool, mtproto: bool) -> Response {
     if !json {
         return (
             status,
             [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes.to_vec(),
+            bytes,
         )
             .into_response();
     }
     let schema = if mtproto { &MTPROTO } else { &API };
     let mut out = String::new();
-    match schema.to_json(bytes, &mut out) {
+    match schema.to_json(&bytes, &mut out) {
         Ok(()) => (status, [(header::CONTENT_TYPE, "application/json")], out).into_response(),
         Err(e) => tgin_error(StatusCode::BAD_GATEWAY, "render_failed", &e.to_string()),
     }
@@ -335,21 +336,21 @@ fn telegram_bytes(status: StatusCode, bytes: &[u8], json: bool, mtproto: bool) -
 
 fn answer_response(answer: Answer, json: bool) -> Response {
     match answer {
-        Answer::Result(bytes) => telegram_bytes(StatusCode::OK, &bytes, json, false),
+        Answer::Result(bytes) => telegram_bytes(StatusCode::OK, bytes, json, false),
         Answer::Error {
             code,
             message,
             class,
         } => {
-            let bytes = rpc_error_bytes(code, &message);
+            let bytes = Bytes::from(rpc_error_bytes(code, &message));
             match class {
                 ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x) => with_retry_after(
-                    telegram_bytes(StatusCode::TOO_MANY_REQUESTS, &bytes, json, true),
+                    telegram_bytes(StatusCode::TOO_MANY_REQUESTS, bytes, json, true),
                     u64::from(x),
                 ),
-                ErrorClass::Frozen => telegram_bytes(StatusCode::FORBIDDEN, &bytes, json, true),
+                ErrorClass::Frozen => telegram_bytes(StatusCode::FORBIDDEN, bytes, json, true),
                 ErrorClass::Migrate(_) | ErrorClass::Other => {
-                    telegram_bytes(StatusCode::OK, &bytes, json, true)
+                    telegram_bytes(StatusCode::OK, bytes, json, true)
                 }
             }
         }

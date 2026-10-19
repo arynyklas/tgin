@@ -484,7 +484,7 @@ async fn max_rps_limits() {
 async fn body_bound_413() {
     let account = FakeAccount::new([]);
     let app = app(Arc::clone(&account));
-    let answer = send(&app, vec![0; (1 << 20) + 4]).await;
+    let answer = send(&app, vec![0; tgin_mtproto::MAX_REQUEST + 4]).await;
     assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(account.calls().is_empty());
 }
