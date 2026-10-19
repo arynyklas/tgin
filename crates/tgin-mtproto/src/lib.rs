@@ -17,7 +17,11 @@
 //! A [`Sender`] holds one connection to one DC and gives every request an
 //! honest outcome: answered, [`SenderError::NotSent`] (never written, one
 //! resend allowed) or [`SenderError::NoAnswer`] (written, never resent).
+//!
+//! [`account`] runs a logged-in account: its supervisor, states, ingest
+//! and RPC.
 
+pub mod account;
 mod dc;
 pub mod decode;
 pub mod envelope;
@@ -47,4 +51,6 @@ pub use sink::{Admission, BatchSink, ID_BLOCK, IdsError, UpdateIds};
 pub use transport::{
     GeneratedKey, Opened, PacketReader, PacketWriter, TcpTransport, Transport, TransportError,
 };
-pub use updates::{Batch, Dropped, Fetch, StateDelta, StoredState, UpdateBytes, UpdateManager};
+pub use updates::{
+    Batch, CatchingUp, Dropped, Fetch, StateDelta, StoredState, UpdateBytes, UpdateManager,
+};

@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 
 # build.rs reads the vendored schemas (schema/*.tl) with grammers' own parser,

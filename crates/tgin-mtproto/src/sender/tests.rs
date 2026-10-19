@@ -1769,3 +1769,163 @@ mod login_framing {
         drop(h);
     }
 }
+
+/// An account on real senders over the scripted transport: a lost
+/// connection and a `new_session_created` each make the sender push
+/// `updatesTooLong`, the update manager asks `getDifference`, and that
+/// call reconnects and brings back what was missed.
+mod account_framing {
+    use super::*;
+    use crate::account::{Account, AccountSpec, AccountState, Connection, Network, Registry};
+    use crate::rpc::BoxFuture;
+    use crate::testkit::{difference, difference_empty, ids, private_message};
+    use crate::{
+        Admission, Batch, BatchSink, IdsError, Peer, PeerKind, SessionStore, UpdateIds, UpdateState,
+    };
+
+    struct FramedNet(Arc<Script>);
+
+    impl Network for FramedNet {
+        fn connect(
+            &self,
+            _dc: DcOption,
+            key: Option<AuthKey>,
+            media: bool,
+        ) -> BoxFuture<'_, Result<Connection, SenderError>> {
+            Box::pin(async move {
+                let mut init = init();
+                init.logged_in = true;
+                init.without_updates = media;
+                let key = key.unwrap_or(AuthKey([4; 256]));
+                let (sender, pushes, _) = Sender::start(
+                    Scripted(Arc::clone(&self.0)),
+                    dc(),
+                    Some(key),
+                    init,
+                    tuning(8),
+                )
+                .await?;
+                Ok(Connection {
+                    session: Arc::new(sender),
+                    pushes,
+                    new_key: None,
+                })
+            })
+        }
+    }
+
+    /// Counts the updates it admits.
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+
+    impl BatchSink for Count {
+        fn admit(
+            &self,
+            batch: &Batch,
+            _ids: &mut UpdateIds,
+            _store: &SessionStore,
+        ) -> Result<Admission, IdsError> {
+            self.0.fetch_add(batch.updates.len(), Ordering::SeqCst);
+            Ok(Admission::Admitted)
+        }
+    }
+
+    /// Answers the next request, which must be `updates.getDifference`.
+    async fn answer_difference(srv: &mut Server, answer: &[u8]) {
+        let req = srv.request().await.requests()[0].clone();
+        assert_eq!(le_u32(&req.body), ids::GET_DIFFERENCE, "a getDifference");
+        srv.answer(req.msg_id, answer);
+    }
+
+    async fn admitted(count: &Count, n: usize) {
+        timeout(WAIT, async {
+            while count.0.load(Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the update is admitted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_connection_and_new_session_catch_up() {
+        let (conns_tx, mut conns) = mpsc::unbounded_channel();
+        let script = Arc::new(Script {
+            modes: Mutex::new(VecDeque::new()),
+            conns: conns_tx,
+            opens: Mutex::new(Vec::new()),
+            init_call: init().init_call(),
+            failing_opens: Mutex::new(0),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = SessionStore::open(tmp.path()).unwrap();
+            store.set_home_key(2, &AuthKey([4; 256])).unwrap();
+            store
+                .record_login(Peer {
+                    id: 42,
+                    kind: PeerKind::User {
+                        bot: Some(false),
+                        is_self: Some(true),
+                    },
+                    access_hash: Some(1),
+                })
+                .unwrap();
+            store
+                .set_update_state(UpdateState {
+                    pts: 10,
+                    qts: 0,
+                    seq: 1,
+                    date: 1,
+                })
+                .unwrap();
+        }
+        let count = Arc::new(Count::default());
+        let account = Account::start(
+            AccountSpec::new("main", tmp.path()),
+            Arc::clone(&count) as Arc<dyn BatchSink>,
+            Arc::new(FramedNet(Arc::clone(&script))),
+            Arc::new(Registry::default()),
+        );
+        let mut srv = timeout(WAIT, conns.recv()).await.unwrap().unwrap();
+        srv.handshake().await;
+        answer_difference(&mut srv, &difference_empty(1, 1)).await;
+        let mut state = account.watch();
+        timeout(WAIT, state.wait_for(|s| *s == AccountState::Running))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The connection drops while a message is sent: the catch-up
+        // reconnects and fetches it.
+        srv.close();
+        let mut srv = timeout(WAIT, conns.recv())
+            .await
+            .expect("the catch-up reconnects")
+            .unwrap();
+        srv.handshake().await;
+        answer_difference(
+            &mut srv,
+            &difference(&[private_message(1, 100, "a")], 11, 1, 1),
+        )
+        .await;
+        admitted(&count, 1).await;
+
+        // Telegram replaced the session: the same connection catches up.
+        let ping = account.rpc();
+        let call =
+            tokio::spawn(async move { ping.invoke(crate::rpc::Route::Main, get_config()).await });
+        let req = srv.request().await.requests()[0].clone();
+        srv.new_session(req.msg_id, 0x5e55);
+        srv.answer(req.msg_id, &ANSWER);
+        assert!(call.await.unwrap().is_ok());
+        answer_difference(
+            &mut srv,
+            &difference(&[private_message(2, 100, "b")], 12, 1, 1),
+        )
+        .await;
+        admitted(&count, 2).await;
+        assert_eq!(script.opens.lock().len(), 2, "one reconnect in all");
+        account.close().await;
+    }
+}

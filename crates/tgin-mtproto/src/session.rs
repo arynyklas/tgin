@@ -429,32 +429,36 @@ impl SessionStore {
         })
     }
 
-    /// Records `batch`'s [`ahead`](crate::Batch::ahead) channels with the
-    /// batch's id as their mark, before the batch is admitted: after a
-    /// crash, they catch up at start. A row keeps its highest mark, so
-    /// marks and [`commit_state`](Self::commit_state) may land in any
-    /// order.
+    /// Records the [`ahead`](crate::Batch::ahead) channels of `batches`
+    /// (every batch one update-manager call returned), each with its
+    /// batch's id as the mark, in one write, before any of them is
+    /// admitted: after a crash, they catch up at start. A row keeps its
+    /// highest mark, so marks and [`commit_state`](Self::commit_state) may
+    /// land in any order.
     ///
-    /// A channel with no stored pts that the batch gives one (an unknown
+    /// A channel with no stored pts that a batch gives one (an unknown
     /// channel's baseline: the state just before its first update) gets it
     /// now: no update below a baseline is owed, and without it a crash
     /// would leave the channel nothing to catch up from.
-    pub fn mark_channels_behind(&self, batch: &Batch) -> Result<(), SessionError> {
-        if batch.ahead.is_empty() {
+    pub fn mark_channels_behind(&self, batches: &[Batch]) -> Result<(), SessionError> {
+        if batches.iter().all(|b| b.ahead.is_empty()) {
             return Ok(());
         }
         self.write(|txn| {
             let mut behind = txn.open_table(CHANNELS_BEHIND)?;
             let mut pts = txn.open_table(CHANNEL_PTS)?;
-            for &channel in &batch.ahead {
-                let current = behind.get(channel)?.map(|g| g.value());
-                if current.is_none_or(|g| g < batch.id) {
-                    behind.insert(channel, batch.id)?;
-                }
-                if pts.get(channel)?.is_none()
-                    && let Some(&(_, p)) = batch.commit.channels.iter().find(|(c, _)| *c == channel)
-                {
-                    pts.insert(channel, p)?;
+            for batch in batches {
+                for &channel in &batch.ahead {
+                    let current = behind.get(channel)?.map(|g| g.value());
+                    if current.is_none_or(|g| g < batch.id) {
+                        behind.insert(channel, batch.id)?;
+                    }
+                    if pts.get(channel)?.is_none()
+                        && let Some(&(_, p)) =
+                            batch.commit.channels.iter().find(|(c, _)| *c == channel)
+                    {
+                        pts.insert(channel, p)?;
+                    }
                 }
             }
             Ok(())
@@ -746,10 +750,10 @@ fn decode_peer(b: &[u8]) -> Option<Peer> {
 mod tests {
     use super::*;
 
-    /// A batch naming `ahead` with id `mark`, its delta's channel rows
-    /// `channels`.
-    fn marks(ahead: &[i64], mark: u64, channels: &[(i64, i32)]) -> Batch {
-        Batch {
+    /// One call's batch naming `ahead` with id `mark`, its delta's channel
+    /// rows `channels`.
+    fn marks(ahead: &[i64], mark: u64, channels: &[(i64, i32)]) -> [Batch; 1] {
+        [Batch {
             id: mark,
             updates: Vec::new(),
             users: bytes::Bytes::new(),
@@ -760,7 +764,7 @@ mod tests {
                 ..StateDelta::default()
             },
             ahead: ahead.to_vec(),
-        }
+        }]
     }
 
     fn me(id: i64) -> Peer {

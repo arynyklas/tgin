@@ -23,9 +23,7 @@ use tokio::time::{Instant, timeout};
 use crate::rpc::{
     AccountRpc, BoxFuture, Charge, ErrorClass, InvokeError, MediaFailure, Route, charged, classify,
 };
-use crate::{
-    AuthKey, DcOption, InitParams, RpcOutcome, Sender, SenderError, SessionError, SessionStore,
-};
+use crate::{AuthKey, RpcOutcome, Sender, SenderError, SessionError, SessionStore};
 
 /// One MTProto session: anything that sends a request and gives its
 /// outcome. [`Sender`] is the real one.
@@ -59,49 +57,6 @@ pub trait Connect: Send + Sync {
         dc: i32,
         key: Option<AuthKey>,
     ) -> BoxFuture<'_, Result<MediaConnected<Self::Session>, SenderError>>;
-}
-
-/// The real [`Connect`]: [`Sender::connect`] over TCP, with the account's
-/// init parameters made `without_updates` and logged in.
-#[derive(Debug)]
-pub struct TcpConnect {
-    init: InitParams,
-    /// The store's DC options; ids missing here use the production table.
-    options: Vec<DcOption>,
-}
-
-impl TcpConnect {
-    #[must_use]
-    pub fn new(mut init: InitParams, options: Vec<DcOption>) -> Self {
-        init.without_updates = true;
-        init.logged_in = true;
-        Self { init, options }
-    }
-}
-
-impl Connect for TcpConnect {
-    type Session = Sender;
-
-    fn connect(
-        &self,
-        dc: i32,
-        key: Option<AuthKey>,
-    ) -> BoxFuture<'_, Result<MediaConnected<Sender>, SenderError>> {
-        Box::pin(async move {
-            let option = self
-                .options
-                .iter()
-                .find(|o| o.id == dc)
-                .copied()
-                .or_else(|| DcOption::production(dc))
-                .ok_or(SenderError::NotSent)?;
-            // A media session's pushes are discarded (its receiver yields
-            // nothing anyway).
-            let (sender, _pushes, new_key) =
-                Sender::connect(option, key, self.init.clone()).await?;
-            Ok((sender, new_key))
-        })
-    }
 }
 
 /// Where authorized media keys are kept, per DC. A key is saved only once

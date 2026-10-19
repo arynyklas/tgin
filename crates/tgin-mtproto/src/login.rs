@@ -919,6 +919,14 @@ impl LoginHandle {
         self.state.borrow().clone()
     }
 
+    /// The login's states as they change, without holding the login: the
+    /// receiver sees the final state, published once the session is
+    /// released, or the sender gone when the login was aborted.
+    #[must_use]
+    pub fn watch(&self) -> watch::Receiver<LoginState> {
+        self.state.clone()
+    }
+
     /// The state once it is no longer [`LoginState::Connecting`].
     pub async fn settled(&self) -> LoginState {
         let mut state = self.state.clone();

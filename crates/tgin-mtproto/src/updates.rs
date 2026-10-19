@@ -208,6 +208,16 @@ pub struct Dropped {
     pub full: u64,
 }
 
+/// The boxes catching up: the common box (with `qts`) while it waits for
+/// or runs `updates.getState` or `getDifference`, and the channels waiting
+/// for or running `updates.getChannelDifference` (those left behind by the
+/// last run included, until they are queued).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatchingUp {
+    pub common: bool,
+    pub channels: usize,
+}
+
 /// One update's bytes (raw or composed, plan decision 7) with its facts.
 #[derive(Clone)]
 pub struct UpdateBytes {
@@ -631,6 +641,21 @@ impl UpdateManager {
     #[must_use]
     pub fn dropped(&self) -> Dropped {
         self.dropped
+    }
+
+    /// The boxes catching up now.
+    #[must_use]
+    pub fn catching_up(&self) -> CatchingUp {
+        let fetching = |ch: &Channel| ch.fetch != ChannelFetch::Idle;
+        let waiting = self
+            .startup
+            .iter()
+            .filter(|c| !self.channels.get(c).is_some_and(fetching))
+            .count();
+        CatchingUp {
+            common: self.fetch.busy(),
+            channels: self.channels.values().filter(|ch| fetching(ch)).count() + waiting,
+        }
     }
 
     /// One push: a boxed `Updates` object.
