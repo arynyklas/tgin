@@ -913,21 +913,11 @@ impl UpdateManager {
     pub fn deadline(&self) -> Instant {
         let now = Instant::now();
         let channel_flood = self.channel_flood.filter(|&d| d > now);
-        if !self.queue.is_empty() && self.in_flight < MAX_CHANNEL_FETCHES {
-            match channel_flood {
-                None => return now,
-                Some(d) => return self.idle_at.min(d).min(self.common_deadline(now)),
-            }
-        }
         let mut at = self.idle_at.min(self.common_deadline(now));
-        match self.fetch {
-            CommonFetch::WantState | CommonFetch::WantDifference => {}
-            CommonFetch::Idle => {
-                if let Some(d) = self.gap_deadline {
-                    at = at.min(d);
-                }
-            }
-            CommonFetch::State { .. } | CommonFetch::Difference { .. } => {}
+        if self.fetch == CommonFetch::Idle
+            && let Some(d) = self.gap_deadline
+        {
+            at = at.min(d);
         }
         for c in self.gapped.iter().chain(&self.retrying) {
             if let Some(ch) = self.channels.get(c) {
@@ -935,6 +925,11 @@ impl UpdateManager {
                     at = at.min(channel_flood.map_or(d, |f| d.max(f)));
                 }
             }
+        }
+        // A queued channel waits only for a free slot and the method's
+        // flood wait.
+        if !self.queue.is_empty() && self.in_flight < MAX_CHANNEL_FETCHES {
+            at = at.min(channel_flood.unwrap_or(now));
         }
         at
     }

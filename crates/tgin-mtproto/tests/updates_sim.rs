@@ -3016,3 +3016,28 @@ async fn channel_flood_wait_holds_every_channel() {
     asked.sort_unstable();
     assert_eq!(asked, [1, 2]);
 }
+
+/// A common gap is fetched after `GAP_HOLD` even while
+/// getChannelDifference waits out a flood wait with a channel queued.
+#[tokio::test(start_paused = true)]
+async fn common_gap_is_fetched_during_a_channel_flood_wait() {
+    let mut m = started(stored(10, &[(1, 5), (2, 7)], &[]));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    let fetch = m.next_action().expect("a channel fetch");
+    m.fetch_flood_wait(fetch, Duration::from_secs(20));
+    let batches = m.feed_push(b(short(&channel_too_long(2, None))));
+    nothing(&mut m, &batches);
+    assert_eq!(m.next_action(), None, "channel 2 waits in the queue");
+    let start = Instant::now();
+    let gap = new_message(&message(1, PeerId::User(100), "x"), 12, 1);
+    let batches = m.feed_push(b(updates(&[gap], NONE, NONE, 1, 0)));
+    commit(&mut m, &batches);
+    assert_eq!(
+        m.deadline(),
+        start + GAP_HOLD,
+        "the gap's hold, not the flood's end"
+    );
+    advance(GAP_HOLD).await;
+    assert!(matches!(m.next_action(), Some(Fetch::GetDifference { .. })));
+}
