@@ -1022,10 +1022,9 @@ mod tests {
         assert!(st.known_users.is_empty());
     }
 
-    /// P8's ordering: a commit reporting a channel caught up and a newer
-    /// mark of that channel (a later batch's) may be written in either
-    /// order, and the newer mark stays. A mark lower than the row's is
-    /// kept out.
+    /// A commit reporting a channel caught up and a newer mark of that
+    /// channel (a later batch's) may be written in either order: the newer
+    /// mark stays. A mark lower than the row's is kept out.
     #[test]
     fn caught_up_never_erases_a_newer_mark() {
         let tmp = tempfile::tempdir().expect("tempdir");
