@@ -738,6 +738,22 @@ async fn all_sources_failed_exits_2() {
     assert_eq!(app.outcome().await, Outcome::AllSourcesFailed);
 }
 
+/// A configured account keeps tgin running when every bot fails: the
+/// account waits for a login, it never fails for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_keeps_tgin_running_when_every_bot_fails() {
+    let runtime = format!(
+        "{QUICK}\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: sessions/main }}"
+    );
+    let (_telegram, app) = failing_sources(&runtime).await;
+    // Without the account, tgin exits within a second or two (see
+    // `all_sources_failed_exits_2`): wait past three of its checks.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert!(!app.run.is_finished(), "tgin shut down");
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::Clean);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signal_while_sources_failed_keeps_draining() {
     let lame_duck = Duration::from_millis(1500);

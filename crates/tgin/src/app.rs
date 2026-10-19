@@ -531,7 +531,7 @@ impl App {
         let reloads = self.handles.reloads.clone();
         let cause = tokio::select! {
             kind = next_terminating(&mut signals, &reloads) => Cause::Signal(kind),
-            () = all_sources_failed(&self.shared.sources) => Cause::AllSourcesFailed,
+            () = all_sources_failed(&self.shared) => Cause::AllSourcesFailed,
         };
         let mut escalate = matches!(cause, Cause::Signal(_));
         let shutdown = self.shutdown(cause);
@@ -852,11 +852,13 @@ async fn next_terminating(signals: &mut Signals, reloads: &ReloadQueue) -> Signa
 }
 
 /// Returns once every source has failed for good, checking each second.
-async fn all_sources_failed(sources: &Sources) {
+/// While the config has an account, never: an account that cannot run
+/// waits for a login, it does not fail for good, so tgin stays up for it.
+async fn all_sources_failed(shared: &Shared) {
     let mut ticks = tokio::time::interval(SOURCES_CHECK);
     loop {
         ticks.tick().await;
-        if sources.all_failed() {
+        if shared.config.load().accounts.is_empty() && shared.sources.all_failed() {
             return;
         }
     }

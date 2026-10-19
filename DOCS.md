@@ -1025,7 +1025,7 @@ Every token compare runs in constant time.
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` (Ctrl+C, Ctrl+Break, closing the console or a system shutdown on Windows) starts the shutdown, as does every source failing for good. tgin then:
+`SIGTERM` or `SIGINT` (Ctrl+C, Ctrl+Break, closing the console or a system shutdown on Windows) starts the shutdown, as does every source failing for good (never while the config has a Telegram account: an account that cannot run waits for a login, it does not fail for good). tgin then:
 
 1. **Stops being ready.** `/readyz` answers `503`, reloads are refused.
 2. **Lame duck** (`runtime.lame_duck`, 5 s; skipped without a `server` block). Everything keeps working, so load balancers can take tgin out of rotation.
@@ -1175,7 +1175,7 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 |---|---|
 | 0 | Clean shutdown, or a command that succeeded. A shutdown signal ends a run this way, also one during start-up. |
 | 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
-| 2 | Every source failed for good: the Bot API server rejected each long-poll bot's token, no webhook bot exists and no bot is parked. |
+| 2 | Every source failed for good: the Bot API server rejected each long-poll bot's token, no webhook bot exists, no bot is parked and the config has no Telegram account. |
 | 64 | Malformed command line (unknown command or option, missing argument, a `tgin admin bot` `--timeout` over `1h`), or `tgin admin bot logout` or `close`, or `tgin admin logout`, without `--yes`. |
 | 130 | A second shutdown signal cut the drain short. |
 
