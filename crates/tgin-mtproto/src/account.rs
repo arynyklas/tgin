@@ -706,6 +706,9 @@ fn observe(shared: &Shared, route: Route, home: i32, outcome: &Result<RpcOutcome
         Err(InvokeError::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown)) if main => {
             shared.main_key_gone();
         }
+        Ok(RpcOutcome::Error { code, message }) if main && lost_authorization(*code, message) => {
+            shared.main_key_gone();
+        }
         Ok(RpcOutcome::Error { code, message })
             if classify(*code, message) == ErrorClass::Frozen =>
         {
@@ -1015,9 +1018,10 @@ impl Ctx {
 }
 
 /// A 401 (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`…) or
-/// `AUTH_KEY_DUPLICATED`: the authorization is gone.
+/// `AUTH_KEY_DUPLICATED`: the authorization is gone. `SESSION_PASSWORD_NEEDED`
+/// is a 401 of a login, never of a logged-in session.
 fn lost_authorization(code: i32, message: &str) -> bool {
-    code == 401 || message == "AUTH_KEY_DUPLICATED"
+    (code == 401 && message != "SESSION_PASSWORD_NEEDED") || message == "AUTH_KEY_DUPLICATED"
 }
 
 /// Refusals of a channel's difference that say the account can no longer

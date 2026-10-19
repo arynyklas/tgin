@@ -636,3 +636,36 @@ async fn a_new_login_clears_frozen() {
     assert_eq!(run.account.state(), AccountState::Running);
     run.account.close().await;
 }
+
+#[test]
+fn an_unauthorized_main_answer_reports_a_gone_key() {
+    let shared = Shared::new(Arc::from("main"));
+    let error = |code, message: &str| {
+        Ok(RpcOutcome::Error {
+            code,
+            message: message.to_owned(),
+        })
+    };
+    let unregistered = error(401, "AUTH_KEY_UNREGISTERED");
+    observe(&shared, Route::Media(4), 2, &unregistered);
+    assert!(!shared.key_gone.load(Ordering::SeqCst), "a media route");
+    observe(
+        &shared,
+        Route::Main,
+        2,
+        &error(401, "SESSION_PASSWORD_NEEDED"),
+    );
+    assert!(!shared.key_gone.load(Ordering::SeqCst), "a login's 401");
+    observe(&shared, Route::Main, 2, &unregistered);
+    assert!(
+        shared.key_gone.swap(false, Ordering::SeqCst),
+        "a 401 on main"
+    );
+    observe(
+        &shared,
+        Route::Media(2),
+        2,
+        &error(406, "AUTH_KEY_DUPLICATED"),
+    );
+    assert!(shared.key_gone.load(Ordering::SeqCst), "duplicated on home");
+}
