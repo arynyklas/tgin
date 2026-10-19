@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -16,6 +16,7 @@ use tgin_core::config::{self, Bot, Config, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
 use tgin_core::reply::ReplyHandle;
+use tgin_mtproto::account::Registry;
 use tgin_runtime::backoff::Backoff;
 use tgin_runtime::config::Env;
 use tgin_runtime::http::{
@@ -28,10 +29,12 @@ use tgin_runtime::supervisor::{Exit, Supervisor};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::accounts::{AccountNetwork, AccountSources, AccountsCollector, Board};
 use crate::admin;
 use crate::cli::{LoadError, VERSION, commit};
 use crate::data_server::DataRoutes;
 use crate::exit::Outcome;
+use crate::mtproto_rpc::RpcEndpoint;
 use crate::reload::{self, ReloadQueue, Reloader, Requests};
 use crate::sources::{Kind, Sources, source_task};
 
@@ -92,6 +95,10 @@ pub struct Boot {
     /// Sets the level of the process's log subscriber, so a reload applies
     /// `log.level`; `None` without one.
     pub log: Option<LogHandle>,
+    /// How the config's accounts reach Telegram: over TCP
+    /// ([`tcp_network`](crate::accounts::tcp_network)); tests replace it
+    /// with a scripted Telegram.
+    pub accounts_network: AccountNetwork,
 }
 
 impl Boot {
@@ -114,6 +121,7 @@ impl Boot {
             env,
             redactor,
             log: None,
+            accounts_network: crate::accounts::tcp_network(),
         })
     }
 }
@@ -186,7 +194,9 @@ pub(crate) struct Shared {
     /// changes `admin.listen` takes effect only after a restart.
     pub(crate) admin_exposed: bool,
     /// The accounts' logins (`/v1/accounts/{name}/login`).
-    pub(crate) accounts: crate::admin::Accounts,
+    pub(crate) accounts: Arc<crate::admin::Accounts>,
+    /// The accounts' supervisors (`GET /v1/accounts`, reloads).
+    pub(crate) account_sources: Arc<AccountSources>,
 }
 
 /// What a starting app shares with whoever stops it, so that a start cut
@@ -204,6 +214,8 @@ struct Handles {
     admin: Arc<Mutex<Option<RunningServer>>>,
     /// The engine and its metrics once built.
     engine: Arc<OnceLock<(Arc<Engine>, CoreMetrics)>>,
+    /// The accounts once their supervisors exist.
+    accounts: Arc<OnceLock<Arc<AccountSources>>>,
     reloads: ReloadQueue,
     /// The queues' receiving ends until the reload task takes them;
     /// requests made while tgin starts wait there.
@@ -244,6 +256,7 @@ impl App {
             env,
             redactor,
             log,
+            accounts_network,
         } = boot;
         let health = Arc::new(Health::default());
         let starting = || Readiness::NotReady("starting".to_owned());
@@ -261,6 +274,15 @@ impl App {
         let mut registry = MetricsRegistry::new(VERSION, commit().unwrap_or("unknown"));
         let core = CoreMetrics::register(registry.registry_mut());
         let gateway_metrics = GatewayMetrics::register(registry.registry_mut());
+        // Flood sleeps of RPC calls end when the process stops ingesting.
+        let endpoint = Arc::new(RpcEndpoint::new(handles.lifecycle.ingest_token()));
+        let board = Arc::new(Board::default());
+        registry
+            .registry_mut()
+            .register_collector(Box::new(AccountsCollector {
+                board: Arc::clone(&board),
+                rpc: endpoint.metrics(),
+            }));
         let metrics = Arc::new(registry);
         let client = http::client(&ClientOptions::default());
         let supervisor = Arc::clone(&handles.supervisor);
@@ -296,6 +318,30 @@ impl App {
 
         let known_secrets: BTreeSet<String> = secrets(&cfg).into_iter().collect();
         let cfg = Arc::new(cfg);
+        // The admin plane's logins and the account supervisors know each
+        // other: a starting account waits for a login of its session, and
+        // a login asks whether its account runs and wakes it at the end.
+        let logins_slot: Arc<OnceLock<Weak<crate::admin::Accounts>>> = Arc::default();
+        let registry = Arc::new(Registry::with_logins({
+            let slot = Arc::clone(&logins_slot);
+            move |name| {
+                slot.get()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|logins| logins.login_in_progress(name))
+            }
+        }));
+        let account_sources = Arc::new(AccountSources::new(
+            Arc::clone(&engine),
+            accounts_network,
+            registry,
+            Arc::clone(&endpoint),
+            board,
+        ));
+        let logins = Arc::new(crate::admin::Accounts::new(Arc::new(
+            crate::admin::Sessions(Arc::clone(&account_sources)),
+        )));
+        let _ = logins_slot.set(Arc::downgrade(&logins));
+        let _ = handles.accounts.set(Arc::clone(&account_sources));
         let shared = Arc::new(Shared {
             lifecycle: Arc::clone(&handles.lifecycle),
             health: Arc::clone(&health),
@@ -317,7 +363,8 @@ impl App {
             ),
             reloads: handles.reloads.clone(),
             admin_exposed: cfg.admin.listen.iter().any(|addr| !addr.ip().is_loopback()),
-            accounts: crate::admin::Accounts::new(Arc::new(crate::admin::Sessions)),
+            accounts: logins,
+            account_sources: Arc::clone(&account_sources),
         });
 
         // Before any source starts, so the probes answer during a slow
@@ -362,6 +409,7 @@ impl App {
                     &|bot| sources.ingest_of(bot),
                     gateway,
                     via,
+                    endpoint,
                 ));
                 let tls_files = server.tls.as_ref().map(|tls| TlsFiles {
                     cert: tls.cert_file.expose().clone(),
@@ -399,6 +447,7 @@ impl App {
         for bot in long_polls {
             sources.start_long_poll(bot);
         }
+        shared.account_sources.apply(&cfg).await;
 
         handles.lifecycle.set_running();
         tracing::info!(version = VERSION, "tgin started");
@@ -539,12 +588,17 @@ impl App {
         }
         lifecycle.ingest_token().cancel();
         self.shared.sources.webhooks_stopped();
+        let accounts = &self.shared.account_sources;
+        // Everything an account admitted is committed by now; its session
+        // serves RPC calls until the close.
+        accounts.stop_ingest();
         engine.begin_drain();
         let gateway = &self.shared.gateway;
+        let rpc = accounts.endpoint();
         // Until nothing is pending and, for `GATEWAY_QUIET` since then, no
-        // call has been forwarded to Telegram; calls the gateway answers
-        // itself, polls included, do not count. Without a data plane no
-        // call can come.
+        // call has been forwarded to Telegram, through the gateway or the
+        // accounts' RPC endpoint; calls the gateway answers itself, polls
+        // included, do not count. Without a data plane no call can come.
         let quiet = if serving {
             GATEWAY_QUIET
         } else {
@@ -558,6 +612,9 @@ impl App {
                     busy = now;
                 } else if let Some(forwarded) = gateway.upstream_busy_at(now) {
                     busy = busy.max(forwarded);
+                }
+                if let Some(called) = rpc.busy_at(now) {
+                    busy = busy.max(called);
                 }
                 if now.saturating_duration_since(busy) >= quiet {
                     return;
@@ -577,6 +634,7 @@ impl App {
         if let Some(server) = server {
             close(server, CLOSE_GRACE, deadline, "data").await;
         }
+        accounts.close(deadline).await;
         let aborted = self.handles.supervisor.shutdown(deadline).await;
         lifecycle.force_token().cancel();
         if aborted > 0 {
@@ -618,6 +676,7 @@ impl Handles {
             server: Arc::new(Mutex::new(None)),
             admin: Arc::new(Mutex::new(None)),
             engine: Arc::new(OnceLock::new()),
+            accounts: Arc::new(OnceLock::new()),
             reloads,
             requests: Arc::new(Mutex::new(Some(requests))),
             stop_reloads: CancellationToken::new(),
@@ -642,6 +701,9 @@ impl Handles {
         if let Some(admin) = admin {
             close(admin, Duration::ZERO, deadline, "admin").await;
         }
+        if let Some(accounts) = self.accounts.get() {
+            accounts.close(deadline).await;
+        }
         self.supervisor.shutdown(deadline).await;
         self.finish();
     }
@@ -657,6 +719,9 @@ impl Handles {
             if let Some(server) = server.lock().take() {
                 server.graceful_shutdown(Duration::ZERO);
             }
+        }
+        if let Some(accounts) = self.accounts.get() {
+            accounts.close(Instant::now()).await;
         }
         self.supervisor.shutdown(Instant::now()).await;
         self.finish();

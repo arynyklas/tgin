@@ -2,6 +2,7 @@
 //! planes, and hot reload.
 
 pub mod account_ingest;
+pub mod accounts;
 pub mod admin;
 pub mod app;
 pub mod cli;

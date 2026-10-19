@@ -413,6 +413,7 @@ impl Reloader {
         );
         self.restart_sources(&cfg, &report).await;
         self.reload_tls(&cfg).await;
+        self.shared.account_sources.apply(&cfg).await;
         // Last, so a login that is slow to end never delays the rest: a
         // login started for an account the reload removed or moved ends.
         self.shared

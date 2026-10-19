@@ -131,7 +131,7 @@ fn app_draining(
     drain: CancellationToken,
 ) -> Router {
     let limiter = Arc::new(AccountLimiter::new(rpc.max_rps));
-    let mut endpoint = RpcEndpoint::new(drain);
+    let endpoint = RpcEndpoint::new(drain);
     endpoint.insert(RpcAccount::new("main", rpc, account, sink, limiter));
     router(Arc::new(endpoint))
 }
@@ -1032,7 +1032,7 @@ fn media_app_with<K: KeyStore + 'static>(
         keys,
         Arc::clone(&limiter) as Arc<dyn Charge>,
     );
-    let mut endpoint = RpcEndpoint::new(CancellationToken::new());
+    let endpoint = RpcEndpoint::new(CancellationToken::new());
     endpoint.insert(RpcAccount::new(
         "main",
         &rpc,

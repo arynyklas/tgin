@@ -35,6 +35,7 @@ use tgin_mtproto::login::{
 use tgin_mtproto::{InitParams, SessionError, SessionStore};
 
 use super::{LoginStatus, LoginUrl};
+use crate::accounts::AccountSources;
 
 /// How long `POST …/login` waits for Telegram's first answer before it
 /// answers `connecting`.
@@ -95,7 +96,8 @@ impl From<SessionError> for Refusal {
 
 /// The account behind the routes.
 pub(crate) trait AccountHandle: Send + Sync + 'static {
-    /// Whether the account runs. Login and logout refuse while it does.
+    /// Whether the account runs (holds, or will take again on its own, its
+    /// session). Login and logout refuse while it does.
     fn running(&self, account: &str) -> bool;
     /// Opens the account's session and starts a login on it.
     fn start_login(
@@ -105,15 +107,19 @@ pub(crate) trait AccountHandle: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<LoginHandle, Refusal>>;
     /// `auth.logOut`, then the session cleared.
     fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>>;
+    /// A login or logout of the account ended, or a login start was given
+    /// up: the account looks at its session again (a logged-out account
+    /// that is now logged in starts).
+    fn changed(&self, account: &str);
 }
 
-/// The production handle: Telegram's DCs over TCP. No account runs yet:
-/// the supervisor that runs them (M3 Part 2, Task 7) answers `running`.
-pub(crate) struct Sessions;
+/// The production handle: Telegram's DCs over TCP, and the accounts'
+/// supervisors.
+pub(crate) struct Sessions(pub(crate) Arc<AccountSources>);
 
 impl AccountHandle for Sessions {
-    fn running(&self, _account: &str) -> bool {
-        false
+    fn running(&self, account: &str) -> bool {
+        self.0.running(account)
     }
 
     fn start_login(
@@ -139,6 +145,10 @@ impl AccountHandle for Sessions {
             let store = SessionStore::open(&dir)?;
             login::log_out(&store, &dial).await.map_err(logout_refusal)
         })
+    }
+
+    fn changed(&self, account: &str) {
+        self.0.wake(account);
     }
 }
 
@@ -234,8 +244,32 @@ impl Accounts {
         for (name, login) in stale {
             tracing::info!(account = %name, "account login closed: the account changed in the config");
             login.close().await;
+            self.handle.changed(&name);
         }
     }
+
+    /// Whether a login of the account `name` is starting or running: it
+    /// holds, or is about to hold, the account's session.
+    pub(crate) fn login_in_progress(&self, name: &str) -> bool {
+        self.logins
+            .lock()
+            .get(name)
+            .is_some_and(|entry| match entry {
+                Entry::Starting { .. } => true,
+                Entry::Running(login) => !login.handle.state().is_final(),
+            })
+    }
+}
+
+/// Tells the account when `login` ends (it may have logged it in). Holds
+/// only the login's state, never the login.
+fn watch_end(handle: Arc<dyn AccountHandle>, name: String, login: &LoginHandle) {
+    let mut state = login.watch();
+    tokio::spawn(async move {
+        // An aborted login drops its sender: it ended too.
+        let _ = state.wait_for(LoginState::is_final).await;
+        handle.changed(&name);
+    });
 }
 
 /// A login of the map, with the config it was started for.
@@ -267,12 +301,16 @@ struct Reservation<'a> {
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        let mut logins = self.accounts.logins.lock();
-        if matches!(
-            logins.get(self.name),
-            Some(Entry::Starting { id, .. }) if *id == self.id
-        ) {
-            logins.remove(self.name);
+        let removed = {
+            let mut logins = self.accounts.logins.lock();
+            let ours = matches!(
+                logins.get(self.name),
+                Some(Entry::Starting { id, .. }) if *id == self.id
+            );
+            ours && logins.remove(self.name).is_some()
+        };
+        if removed {
+            self.accounts.handle.changed(self.name);
         }
     }
 }
@@ -484,6 +522,7 @@ async fn start<S: AccountsState>(
                 match started {
                     Ok(h) if ours => {
                         let h = Arc::new(h);
+                        watch_end(Arc::clone(&accounts.handle), name.clone(), &h);
                         logins.insert(
                             name.clone(),
                             Entry::Running(Login {
@@ -621,6 +660,7 @@ async fn cancel<S: AccountsState>(
         Some(login) => {
             login.close().await;
             tracing::info!(account = %name, "account login cancelled");
+            state.accounts().handle.changed(&name);
             axum::Json(json!({ "cancelled": true })).into_response()
         }
         None => no_login(),
@@ -654,6 +694,7 @@ async fn logout<S: AccountsState>(
     match accounts.handle.log_out(&target).await {
         Ok(()) => {
             tracing::info!(account = %name, "account logged out");
+            accounts.handle.changed(&name);
             axum::Json(json!({ "logged_out": true })).into_response()
         }
         Err(refusal) => refused(&name, &refusal),

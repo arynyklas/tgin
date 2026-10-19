@@ -53,8 +53,10 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -63,6 +65,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt as _;
+use parking_lot::Mutex;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric as _};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use serde::Serialize;
 use tgin_core::config::{self, MethodAcl};
 use tgin_mtproto::SenderError;
@@ -96,27 +103,207 @@ pub const LAYER_HEADER: &str = "x-tgin-layer";
 /// rendered: the body is then Telegram's raw bytes.
 pub const RENDER_HEADER: &str = "x-tgin-render";
 
-/// Every account the endpoint serves, by name.
+/// Every account the endpoint serves, by name. A reload changes the map in
+/// place: requests already running finish on the account they started on.
 pub struct RpcEndpoint {
-    accounts: HashMap<String, Arc<RpcAccount>>,
+    accounts: ArcSwap<HashMap<String, Arc<RpcAccount>>>,
     /// Cancelled when tgin drains: a flood sleep then ends at once, with
     /// 429 and what is left of the wait.
     drain: CancellationToken,
+    /// Calls on their way to Telegram (media setups included), and when the
+    /// last one ended: the drain waits for them.
+    in_flight: AtomicUsize,
+    last: Mutex<Option<Instant>>,
+    metrics: Arc<RpcMetrics>,
 }
 
 impl RpcEndpoint {
     #[must_use]
     pub fn new(drain: CancellationToken) -> Self {
         Self {
-            accounts: HashMap::new(),
+            accounts: ArcSwap::from_pointee(HashMap::new()),
             drain,
+            in_flight: AtomicUsize::new(0),
+            last: Mutex::new(None),
+            metrics: Arc::new(RpcMetrics::default()),
         }
     }
 
-    /// Serves `account` under its name.
-    pub fn insert(&mut self, account: RpcAccount) {
-        self.accounts
-            .insert(account.name.clone(), Arc::new(account));
+    /// Serves `account` under its name, in place of the one it had.
+    pub fn insert(&self, mut account: RpcAccount) {
+        self.metrics.attach(&mut account);
+        let account = Arc::new(account);
+        self.accounts.rcu(|accounts| {
+            let mut accounts = HashMap::clone(accounts);
+            accounts.insert(account.name.clone(), Arc::clone(&account));
+            accounts
+        });
+    }
+
+    /// Stops serving the account `name`.
+    pub fn remove(&self, name: &str) {
+        self.accounts.rcu(|accounts| {
+            let mut accounts = HashMap::clone(accounts);
+            accounts.remove(name);
+            accounts
+        });
+    }
+
+    /// `now` while a call is on its way to Telegram, else when the last one
+    /// ended; `None` before any call.
+    pub fn busy_at(&self, now: Instant) -> Option<Instant> {
+        if self.in_flight.load(Ordering::SeqCst) > 0 {
+            return Some(now);
+        }
+        *self.last.lock()
+    }
+
+    /// The endpoint's `tgin_mtproto_rpc_*` metrics.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<RpcMetrics> {
+        Arc::clone(&self.metrics)
+    }
+}
+
+/// Counts one call on its way to Telegram while it lives.
+struct InFlight<'a>(&'a RpcEndpoint);
+
+impl<'a> InFlight<'a> {
+    fn new(endpoint: &'a RpcEndpoint) -> Self {
+        endpoint.in_flight.fetch_add(1, Ordering::SeqCst);
+        Self(endpoint)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        *self.0.last.lock() = Some(Instant::now());
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How an authenticated request ended, the `outcome` of
+/// `tgin_mtproto_rpc_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Telegram's `rpc_result`.
+    Ok,
+    /// Telegram's `rpc_error` (other than a flood wait).
+    RpcError,
+    /// `FLOOD_WAIT`, `SLOWMODE_WAIT` or an init or media-setup flood wait.
+    FloodWait,
+    /// Written, no answer: it may have been executed.
+    NoAnswer,
+    /// Not executed: not sent, a connection or media-session failure, an
+    /// account that cannot call.
+    NotSent,
+    /// Refused by tgin: body, layer, wrapper, allowlist.
+    Refused,
+    /// The account's `max_rps` or the client's requests in flight.
+    RateLimited,
+}
+
+impl Outcome {
+    pub const ALL: [Self; 7] = [
+        Self::Ok,
+        Self::RpcError,
+        Self::FloodWait,
+        Self::NoAnswer,
+        Self::NotSent,
+        Self::Refused,
+        Self::RateLimited,
+    ];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::RpcError => "rpc_error",
+            Self::FloodWait => "flood_wait",
+            Self::NoAnswer => "no_answer",
+            Self::NotSent => "not_sent",
+            Self::Refused => "refused",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// `tgin_mtproto_rpc_total{account,client,outcome}` and
+/// `tgin_mtproto_rpc_seconds{account}`. Series appear once an account is
+/// served, and live as long as the process: a reload keeps them going.
+#[derive(Debug)]
+pub struct RpcMetrics {
+    calls: Family<RpcLabels, Counter>,
+    seconds: Family<AccountLabel, Histogram, fn() -> Histogram>,
+    /// Whether any account was ever served: before that, no series.
+    used: AtomicBool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RpcLabels {
+    account: String,
+    client: String,
+    outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AccountLabel {
+    account: String,
+}
+
+/// From 5 ms to about 82 s: a flood sleep or a media setup lasts up to a
+/// minute.
+fn rpc_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.005, 2.0, 15))
+}
+
+impl Default for RpcMetrics {
+    fn default() -> Self {
+        Self {
+            calls: Family::default(),
+            seconds: Family::new_with_constructor(rpc_histogram),
+            used: AtomicBool::new(false),
+        }
+    }
+}
+
+impl RpcMetrics {
+    /// Resolves `account`'s handles.
+    fn attach(&self, account: &mut RpcAccount) {
+        self.used.store(true, Ordering::Relaxed);
+        account.seconds = Some(self.seconds.get_or_create_owned(&AccountLabel {
+            account: account.name.clone(),
+        }));
+        for client in &mut account.clients {
+            client.calls = Some(Outcome::ALL.map(|outcome| {
+                self.calls.get_or_create_owned(&RpcLabels {
+                    account: account.name.clone(),
+                    client: client.name.clone(),
+                    outcome: outcome.as_str(),
+                })
+            }));
+        }
+    }
+
+    /// Writes the families into a scrape, once any account was served.
+    pub fn encode(&self, encoder: &mut DescriptorEncoder<'_>) -> std::fmt::Result {
+        if !self.used.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let calls = encoder.encode_descriptor(
+            "mtproto_rpc",
+            "Raw-TL RPC requests by account, client and outcome",
+            None,
+            self.calls.metric_type(),
+        )?;
+        self.calls.encode(calls)?;
+        let seconds = encoder.encode_descriptor(
+            "mtproto_rpc_seconds",
+            "Time from a call's admission to Telegram's answer",
+            None,
+            self.seconds.metric_type(),
+        )?;
+        self.seconds.encode(seconds)
     }
 }
 
@@ -129,21 +316,40 @@ pub const MAX_CLIENT_IN_FLIGHT: usize = 8;
 /// connection that never sent it, or a flood sleep), each `*_MIGRATE` hop,
 /// and the export and import that set up a media session. Share one
 /// between [`RpcAccount::new`] and the account's
-/// [`AccountSessions`](tgin_mtproto::media::AccountSessions).
+/// [`AccountSessions`](tgin_mtproto::media::AccountSessions). A reload
+/// sets a new rate in place ([`AccountLimiter::set_max_rps`]).
 #[derive(Debug)]
-pub struct AccountLimiter(KeyedLimiter<()>);
+pub struct AccountLimiter {
+    max_rps: AtomicU32,
+    limiter: ArcSwap<KeyedLimiter<()>>,
+}
 
 impl AccountLimiter {
     /// `max_rps` per second, bursting to one second's worth.
     #[must_use]
     pub fn new(max_rps: NonZeroU32) -> Self {
-        Self(KeyedLimiter::new(Quota::per_second(max_rps, max_rps)))
+        Self {
+            max_rps: AtomicU32::new(max_rps.get()),
+            limiter: ArcSwap::from_pointee(limiter(max_rps)),
+        }
     }
+
+    /// Applies a new `max_rps`; the bucket starts full when it changed.
+    pub fn set_max_rps(&self, max_rps: NonZeroU32) {
+        if self.max_rps.swap(max_rps.get(), Ordering::Relaxed) != max_rps.get() {
+            self.limiter.store(Arc::new(limiter(max_rps)));
+        }
+    }
+}
+
+fn limiter(max_rps: NonZeroU32) -> KeyedLimiter<()> {
+    KeyedLimiter::new(Quota::per_second(max_rps, max_rps))
 }
 
 impl Charge for AccountLimiter {
     fn charge(&self) -> Result<(), Duration> {
-        self.0
+        self.limiter
+            .load()
             .acquire(&(), Instant::now(), Duration::ZERO)
             .map(drop)
             .map_err(|denied| denied.retry_after)
@@ -159,12 +365,24 @@ pub struct RpcAccount {
     flood_sleep_threshold: Duration,
     rpc: Arc<dyn AccountRpc>,
     sink: Arc<dyn AffectedSink>,
+    seconds: Option<Histogram>,
 }
 
 struct Client {
+    name: String,
     token: Secret<String>,
     acl: MethodAcl,
     in_flight: Arc<Semaphore>,
+    /// By [`Outcome`], once the endpoint serves the account.
+    calls: Option<[Counter; Outcome::ALL.len()]>,
+}
+
+impl Client {
+    fn count(&self, outcome: Outcome) {
+        if let Some(calls) = &self.calls {
+            calls[outcome as usize].inc();
+        }
+    }
 }
 
 impl RpcAccount {
@@ -185,15 +403,18 @@ impl RpcAccount {
                 .clients
                 .iter()
                 .map(|c| Client {
+                    name: c.name.clone(),
                     token: c.token.clone(),
                     acl: c.acl.clone(),
                     in_flight: Arc::new(Semaphore::new(MAX_CLIENT_IN_FLIGHT)),
+                    calls: None,
                 })
                 .collect(),
             limiter,
             flood_sleep_threshold: spec.flood_sleep_threshold,
             rpc,
             sink,
+            seconds: None,
         }
     }
 
@@ -286,17 +507,31 @@ async fn invoke(
         .unwrap_or_default();
     // An unknown account is answered as a wrong token, after a comparison
     // of the same kind, so the answer does not tell which accounts exist.
-    let Some(account) = endpoint.accounts.get(&account) else {
+    let Some(account) = endpoint.accounts.load().get(&account).cloned() else {
         let _ = secret_eq(bearer, UNKNOWN_ACCOUNT_TOKEN);
         return unauthorized();
     };
     let Some(client) = account.client(bearer) else {
         return unauthorized();
     };
+    let (response, outcome) = serve(&endpoint, &account, client, &headers, body).await;
+    client.count(outcome);
+    response
+}
+
+/// An authenticated client's request, and how it ended.
+async fn serve(
+    endpoint: &RpcEndpoint,
+    account: &RpcAccount,
+    client: &Client,
+    headers: &HeaderMap,
+    body: Body,
+) -> (Response, Outcome) {
+    let refused = |response| (response, Outcome::Refused);
     // Held until the answer: bounds what one client makes tgin read,
     // decode and wait on.
     let Ok(_in_flight) = Arc::clone(&client.in_flight).try_acquire_owned() else {
-        return with_retry_after(
+        let response = with_retry_after(
             tgin_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too_many_in_flight",
@@ -304,10 +539,11 @@ async fn invoke(
             ),
             1,
         );
+        return (response, Outcome::RateLimited);
     };
     // The body is read only once the client is known, within
     // BODY_TIMEOUT, and up to the bound of its content type.
-    let json_body = wants_json(&headers, header::CONTENT_TYPE);
+    let json_body = wants_json(headers, header::CONTENT_TYPE);
     let limit = if json_body {
         MAX_JSON_BODY
     } else {
@@ -315,20 +551,20 @@ async fn invoke(
     };
     let body = match tokio::time::timeout(BODY_TIMEOUT, read_body(body, limit)).await {
         Ok(Ok(body)) => body,
-        Ok(Err(BodyError::TooLarge)) => return too_large(),
+        Ok(Err(BodyError::TooLarge)) => return refused(too_large()),
         Ok(Err(BodyError::Broken)) => {
-            return tgin_error(
+            return refused(tgin_error(
                 StatusCode::BAD_REQUEST,
                 "bad_request",
                 "the body could not be read",
-            );
+            ));
         }
         Err(_) => {
-            return tgin_error(
+            return refused(tgin_error(
                 StatusCode::REQUEST_TIMEOUT,
                 "body_timeout",
                 "the request body did not arrive in time",
-            );
+            ));
         }
     };
     let layer = account.rpc.layer();
@@ -337,64 +573,100 @@ async fn invoke(
         .and_then(|v| v.to_str().ok()?.parse::<i32>().ok())
     {
         None => {
-            return tgin_error(
+            return refused(tgin_error(
                 StatusCode::BAD_REQUEST,
                 "layer_required",
                 "X-Tgin-Layer must name the layer the request is serialized in",
-            );
+            ));
         }
-        Some(got) if got != layer => return layer_mismatch(layer),
+        Some(got) if got != layer => return refused(layer_mismatch(layer)),
         Some(_) => {}
     }
     let tl: Bytes = if json_body {
         let Ok(text) = std::str::from_utf8(&body) else {
-            return tgin_error(
+            return refused(tgin_error(
                 StatusCode::BAD_REQUEST,
                 "bad_request",
                 "TL-JSON must be UTF-8",
-            );
+            ));
         };
         let mut out = Vec::new();
         if let Err(e) = API.from_json(text, &mut out) {
-            return tgin_error(StatusCode::BAD_REQUEST, "bad_request", &e.to_string());
+            return refused(tgin_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &e.to_string(),
+            ));
         }
         Bytes::from(out)
     } else {
         body
     };
     if tl.len() > MAX_TL_BODY {
-        return too_large();
+        return refused(too_large());
     }
     let call = match unwrap_request(&tl, layer) {
         Ok(call) => call,
-        Err(refused) => return refusal(&refused, layer),
+        Err(refusal_of) => return refused(refusal(&refusal_of, layer)),
     };
     let method = call.method;
     if !client.acl.allows(method) {
-        return tgin_error(
+        return refused(tgin_error(
             StatusCode::FORBIDDEN,
             "method_not_allowed",
             "the client's allowlist does not allow this method",
-        );
+        ));
     }
     if let Err(retry_after) = account.limiter.charge() {
-        return rate_limited(retry_after);
+        return (rate_limited(retry_after), Outcome::RateLimited);
     }
     let context: BoxKind = call.context;
     let inner = tl.slice_ref(call.body);
-    let answer = tgin_mtproto::rpc::call(
-        account.rpc.as_ref(),
-        account.sink.as_ref(),
-        context,
-        inner,
-        account.flood_sleep_threshold,
-        account.limiter.as_ref(),
-        endpoint.drain.cancelled(),
-    )
-    .await;
-    let response = answer_response(answer, wants_json(&headers, header::ACCEPT), method);
+    let started = Instant::now();
+    let answer = {
+        let _call = InFlight::new(endpoint);
+        tgin_mtproto::rpc::call(
+            account.rpc.as_ref(),
+            account.sink.as_ref(),
+            context,
+            inner,
+            account.flood_sleep_threshold,
+            account.limiter.as_ref(),
+            endpoint.drain.cancelled(),
+        )
+        .await
+    };
+    if let Some(seconds) = &account.seconds {
+        seconds.observe(started.elapsed().as_secs_f64());
+    }
+    let outcome = answer_outcome(&answer);
+    let response = answer_response(answer, wants_json(headers, header::ACCEPT), method);
     tracing::debug!(account = %account.name, method, status = response.status().as_u16(), "mtproto rpc");
-    response
+    (response, outcome)
+}
+
+/// The `outcome` label of an answer from Telegram, or of a call that got
+/// none.
+fn answer_outcome(answer: &Answer) -> Outcome {
+    match answer {
+        Answer::Result(_) => Outcome::Ok,
+        Answer::Error { class, .. } => match class {
+            ErrorClass::FloodWait(_) | ErrorClass::SlowMode(_) => Outcome::FloodWait,
+            _ => Outcome::RpcError,
+        },
+        Answer::Failed(e) => match e {
+            InvokeError::RateLimited { .. } => Outcome::RateLimited,
+            InvokeError::Media {
+                failure: MediaFailure::FloodWait { .. },
+                ..
+            } => Outcome::FloodWait,
+            InvokeError::Media { .. } => Outcome::NotSent,
+            InvokeError::Sender(SenderError::NoAnswer) => Outcome::NoAnswer,
+            InvokeError::Sender(SenderError::InitRefused { code: 420, .. }) => Outcome::FloodWait,
+            InvokeError::Sender(SenderError::BadRequest) => Outcome::Refused,
+            InvokeError::Sender(_) => Outcome::NotSent,
+        },
+    }
 }
 
 /// What an unknown account's bearer is compared with.

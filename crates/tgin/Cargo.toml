@@ -20,6 +20,7 @@ clap.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true
+prometheus-client.workspace = true
 qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true

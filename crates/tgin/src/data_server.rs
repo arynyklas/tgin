@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
 use crate::app;
+use crate::mtproto_rpc::RpcEndpoint;
 
 /// How long a webhook request may take, body included, so a client that
 /// trickles its body cannot hold a connection. Pull routes have no such
@@ -56,6 +57,9 @@ pub(crate) struct DataRoutes {
     /// This process's `Via`: a request carrying it is one of tgin's own
     /// pushes come back, and is refused.
     via: Via,
+    /// The accounts' raw-TL RPC endpoint, served while the config has
+    /// accounts.
+    rpc: Arc<RpcEndpoint>,
 }
 
 impl DataRoutes {
@@ -69,14 +73,16 @@ impl DataRoutes {
         ingest: &dyn Fn(&str) -> CancellationToken,
         gateway: Arc<Gateway>,
         via: Via,
+        rpc: Arc<RpcEndpoint>,
     ) -> Self {
         let served = served(cfg, &Served::default(), engine);
-        let router = router(cfg, server, engine, ingest, served.clone(), &gateway);
+        let router = router(cfg, server, engine, ingest, served.clone(), &gateway, &rpc);
         Self {
             routes: Arc::new(ArcSwap::from_pointee(router)),
             served: Mutex::new(served),
             gateway,
             via,
+            rpc,
         }
     }
 
@@ -118,6 +124,7 @@ impl DataRoutes {
             ingest,
             served.clone(),
             &self.gateway,
+            &self.rpc,
         )));
         *current = served;
     }
@@ -176,6 +183,7 @@ fn router(
     ingest: &dyn Fn(&str) -> CancellationToken,
     served: Served,
     gateway: &Arc<Gateway>,
+    rpc: &Arc<RpcEndpoint>,
 ) -> Router {
     let mut router = Router::new();
     for bot in &cfg.bots {
@@ -234,6 +242,11 @@ fn router(
     );
     for (path, name) in aliases {
         router = router.route(&path, alias(&pull, name));
+    }
+    // Only with accounts: a config without them serves exactly what it
+    // served before they existed.
+    if !cfg.accounts.is_empty() {
+        router = router.merge(crate::mtproto_rpc::router(Arc::clone(rpc)));
     }
     let gateway = Arc::clone(gateway);
     router.fallback(move |req: Request| {

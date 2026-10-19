@@ -2787,6 +2787,7 @@ dependencies = [
  "http-body",
  "mimalloc",
  "parking_lot",
+ "prometheus-client",
  "qrcode",
  "rand",
  "reqwest",

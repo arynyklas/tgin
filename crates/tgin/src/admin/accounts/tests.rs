@@ -24,6 +24,8 @@ const PHONE: &str = "+1 555 0100";
 struct Fake {
     running: AtomicBool,
     dial: ScriptedDial,
+    /// The accounts `changed` was called for, in order.
+    changed: std::sync::Mutex<Vec<String>>,
 }
 
 impl AccountHandle for Fake {
@@ -54,6 +56,13 @@ impl AccountHandle for Fake {
             let store = SessionStore::open(&dir)?;
             login::log_out(&store, &dial).await.map_err(logout_refusal)
         })
+    }
+
+    fn changed(&self, account: &str) {
+        self.changed
+            .lock()
+            .expect("changed")
+            .push(account.to_owned());
     }
 }
 
@@ -94,6 +103,7 @@ fn setup_with(token: bool, phone: Option<&str>, script: Vec<(u32, Reply)>) -> Se
     let fake = Arc::new(Fake {
         running: AtomicBool::new(false),
         dial: ScriptedDial::new(script),
+        changed: std::sync::Mutex::new(Vec::new()),
     });
     let target = Target {
         session_dir: dir.path().join("main"),
@@ -989,4 +999,48 @@ async fn a_dropped_start_releases_its_reservation() {
     .await;
     assert_ne!(text, r#"{"error":"login starting"}"#);
     assert_eq!(status, StatusCode::OK, "{text}");
+}
+
+/// A login that ends tells the account (a logged-out account that is now
+/// logged in starts); a running login counts as in progress until then.
+#[tokio::test(start_paused = true)]
+async fn a_finished_login_wakes_its_account() {
+    let expires = later();
+    let s = setup(
+        None,
+        vec![
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token(b"secret-token", expires)),
+            ),
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_success(77, None)),
+            ),
+        ],
+    );
+    let (status, body) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(s.state.accounts.login_in_progress("main"));
+    assert!(!s.state.accounts.login_in_progress("second"));
+    assert!(s.fake.changed.lock().expect("changed").is_empty());
+
+    assert!(s.fake.dial.push(update_login_token()));
+    let end = poll(&s.app, |st| !matches!(st, LoginStatus::Qr { .. })).await;
+    assert_eq!(end, LoginStatus::LoggedIn { user_id: 77 });
+    timeout(WAIT, async {
+        while s.fake.changed.lock().expect("changed").is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the account is told");
+    assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
+    assert!(!s.state.accounts.login_in_progress("main"));
 }
