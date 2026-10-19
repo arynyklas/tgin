@@ -2,8 +2,8 @@
 //! owned by one process through `{dir}/lock`.
 //!
 //! Every write is one redb transaction, committed before the call returns.
-//! The table layout is the M3 spike's (`spike/m3`, `spikes/m3-grammers`), so
-//! the spike's live authorization imports with a plain copy.
+//! The table layout is kept stable: existing sessions are opened with
+//! it, so an authorization made earlier carries over with a plain copy.
 //!
 //! # Permissions
 //!
@@ -235,7 +235,7 @@ impl SessionStore {
     /// Makes `dc` the home DC with `key`, in one transaction. Once a self
     /// user is recorded the home authorization is the login, so this
     /// refuses with [`SessionError::KeyReplaceRefused`] instead of
-    /// replacing it, or moving home to another DC [C: S4 F8].
+    /// replacing it, or moving home to another DC.
     pub fn set_home_key(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError> {
         self.write(|txn| {
             if txn.open_table(META)?.get(SELF_USER_ID)?.is_some() {
@@ -275,7 +275,7 @@ impl SessionStore {
         }
     }
 
-    /// Records a verified login in one transaction [C: S3 F7]: the self
+    /// Records a verified login in one transaction: the self
     /// user's peer row (`is_self`), `meta.self_user_id` and
     /// `meta.login_unix`. A crash leaves either all three or none.
     pub fn record_login(&self, me: Peer) -> Result<Login, SessionError> {
@@ -529,7 +529,8 @@ impl SessionStore {
 /// first write.
 const MEDIA_KEYS: TableDefinition<i32, &[u8]> = TableDefinition::new("media_keys");
 
-/// Media session keys (plan decision 2).
+/// Media session keys: calls migrated to another DC run
+/// over their own session, never the main one.
 impl SessionStore {
     /// The authorized media key for `dc`, if one is stored.
     pub fn media_key(&self, dc: i32) -> Result<Option<AuthKey>, SessionError> {

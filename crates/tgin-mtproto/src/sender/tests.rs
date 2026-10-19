@@ -869,7 +869,7 @@ async fn bad_server_salt_resends_once_with_new_salt() {
 }
 
 /// `gzip_packed` around an answer and around a push is unwrapped; an
-/// `rpc_error` keeps Telegram's whole message [C: S11 F5].
+/// `rpc_error` keeps Telegram's whole message.
 #[tokio::test(start_paused = true)]
 async fn gzip_and_rpc_error_pass_through() {
     use std::io::Write as _;
@@ -990,7 +990,7 @@ fn too_long() -> Bytes {
     Bytes::from_static(&[0x7e, 0xaf, 0x17, 0xe3])
 }
 
-/// A lost connection tells the update manager to catch up (P1); a −404
+/// A lost connection tells the update manager to catch up; a −404
 /// does not, since there is nothing to catch up with.
 #[tokio::test(start_paused = true)]
 async fn connection_loss_pushes_updates_too_long() {
@@ -1012,7 +1012,7 @@ async fn connection_loss_pushes_updates_too_long() {
 }
 
 /// `new_session_created` means Telegram may have dropped updates: the
-/// sender pushes `updatesTooLong` and takes the new salt (P1).
+/// sender pushes `updatesTooLong` and takes the new salt.
 #[tokio::test(start_paused = true)]
 async fn new_session_created_pushes_updates_too_long() {
     let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
@@ -1030,7 +1030,7 @@ async fn new_session_created_pushes_updates_too_long() {
 }
 
 /// A result whose top constructor is an `Updates` one goes to its caller
-/// and, in wire order with the pushes, to the update stream (P4). Other
+/// and, in wire order with the pushes, to the update stream. Other
 /// results, `messages.affectedMessages` included, go to the caller only.
 #[tokio::test(start_paused = true)]
 async fn update_bearing_result_is_also_pushed_in_wire_order() {
@@ -1139,7 +1139,7 @@ async fn new_session_created_drops_orphaned_pings() {
 }
 
 /// Every connection opens with the sender's own `initConnection` call;
-/// callers' requests wait for its answer and are never wrapped (P5).
+/// callers' requests wait for its answer and are never wrapped.
 #[tokio::test(start_paused = true)]
 async fn init_call_opens_every_connection_and_gates_requests() {
     let init = init();
@@ -1174,7 +1174,7 @@ async fn init_call_opens_every_connection_and_gates_requests() {
 }
 
 /// An unanswered init call ends the connection at its timeout; the
-/// requests waiting behind it were never written (P5).
+/// requests waiting behind it were never written.
 #[tokio::test(start_paused = true)]
 async fn init_timeout_drops_connection_and_waiting_requests_are_not_sent() {
     let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
@@ -1435,7 +1435,7 @@ fn refuse_init(srv: &mut Server, init_msg_id: i64, code: i32, message: &str) {
 }
 
 /// Stands in for the update manager: answers every push with a request,
-/// as Task 5 answers `updatesTooLong` with `getDifference`.
+/// as the update manager answers `updatesTooLong` with `getDifference`.
 fn eager_consumer(h: &mut Harness) -> JoinHandle<()> {
     let mut pushes = h.pushes.take().unwrap();
     let sender = Arc::clone(&h.sender);
@@ -1447,7 +1447,7 @@ fn eager_consumer(h: &mut Harness) -> JoinHandle<()> {
 }
 
 /// A permanent init refusal (a mistyped api_id) costs one connection: it
-/// starts no catch-up, and later requests fail without connecting (P7).
+/// starts no catch-up, and later requests fail without connecting.
 #[tokio::test(start_paused = true)]
 async fn refused_init_latches_without_a_reconnect_loop() {
     let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;

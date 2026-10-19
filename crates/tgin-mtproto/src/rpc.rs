@@ -1,5 +1,5 @@
-//! The account side of the raw-TL RPC endpoint (design §10.6, plan
-//! decisions 3 and 4).
+//! The account side of the raw-TL RPC endpoint (contract in DOCS.md, User
+//! accounts).
 //!
 //! - [`unwrap_request`] reads a downstream request against the api schema:
 //!   `initConnection` and `invokeWithLayer(account layer, …)` are stripped;
@@ -91,11 +91,11 @@ pub enum MediaFailure {
     Failed { what: &'static str },
 }
 
-/// A running account, as the RPC endpoint sees it. Task 7's account
+/// A running account, as the RPC endpoint sees it. The account
 /// supervisor implements it; [`crate::media::AccountSessions`] is the
 /// session-routing part.
 pub trait AccountRpc: Send + Sync {
-    /// The one layer the account serves (plan decision 1).
+    /// The one layer the account serves.
     fn layer(&self) -> i32;
     /// Sends one unwrapped request on `route`.
     fn invoke(&self, route: Route, body: Bytes) -> BoxFuture<'_, Result<RpcOutcome, InvokeError>>;
@@ -151,14 +151,14 @@ pub enum Refused {
     #[error("`{0}` is answered only to tgin's own session; take updates from a consumer")]
     UpdatesMethod(&'static str),
     /// An `auth.*` method that mints or moves an authorization of the
-    /// account: tgin owns them (plan decision 2, ruling P10).
+    /// account: tgin owns them.
     #[error("`{0}` mints or moves an authorization of the account; tgin owns those")]
     AuthorizationMethod(&'static str),
 }
 
-/// Refused whatever a client's allowlist says (ruling P10; the owner may
+/// Refused whatever a client's allowlist says (the owner may
 /// overrule it): each mints or moves an authorization of the account, and
-/// tgin owns the account's authorizations (plan decision 2).
+/// tgin owns the account's authorizations.
 pub const AUTHORIZATION_METHODS: [&str; 8] = [
     "auth.exportAuthorization",
     "auth.importAuthorization",
@@ -418,7 +418,7 @@ impl fmt::Debug for Answer {
     }
 }
 
-/// Runs one unwrapped call (plan decision 4):
+/// Runs one unwrapped call:
 /// - [`SenderError::NotSent`]: sent once more; the sender opens a fresh
 ///   connection for it;
 /// - [`SenderError::NoAnswer`] and every other failure: returned, never

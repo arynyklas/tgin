@@ -12,7 +12,7 @@
 //! - [`peers`]: the peers and access hashes of a `users` or `chats` vector.
 //!
 //! Every slice is a sub-slice of the input: Telegram's bytes, never
-//! re-encoded (plan decision 7). Each checks the bytes as strictly as the
+//! re-encoded. Each checks the bytes as strictly as the
 //! TL-JSON codec does.
 
 use crate::schema::{
@@ -313,8 +313,8 @@ pub struct Container<'a> {
     /// `updatesTooLong`.
     pub constructor: &'static str,
     /// Each update, a boxed `Update`, for `updates` and `updatesCombined`.
-    /// A short form is delivered as its raw short object (plan decision
-    /// 7), so for the four short forms this is the whole input, once; for
+    /// A short form is delivered as its raw short object (so
+    /// Telegram's bytes stay untouched), so for the four short forms this is the whole input, once; for
     /// `updatesTooLong`, empty.
     pub updates: Vec<&'a [u8]>,
     /// The raw `Vector<User>`, vector id and count included.

@@ -1,4 +1,4 @@
-//! The TL-JSON codec of design §10.5, driven by the layer's schema
+//! The TL-JSON codec (see DOCS.md, User accounts), driven by the layer's schema
 //! ([`crate::schema::API`]).
 //!
 //! Mapping: `"_"` = constructor name, then the fields in schema order;
@@ -14,7 +14,7 @@
 //! Decoding TL is strict (see [`crate::schema`]), so every [`to_json`] that
 //! succeeds re-encodes through [`from_json`] to the same bytes. Doubles are
 //! written in Rust's shortest round-trip form and read with Rust's
-//! correctly rounded parser, so a double survives exactly (S11 F2: without
+//! correctly rounded parser, so a double survives exactly (without
 //! exact parsing 327 constructors failed the round trip).
 //!
 //! Neither direction builds a `serde_json::Value`: [`to_json`] writes text

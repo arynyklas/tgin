@@ -27,7 +27,7 @@
 //! - before it drops the manager (shutdown, reload), persists the marks of
 //!   every batch it was given; unadmitted batches may then be dropped.
 //!
-//! # Delivery (plan decision 5)
+//! # Delivery
 //!
 //! Sequenced updates (`pts`, `qts`, a channel's `pts`; 0 is no sequence)
 //! are at least once: a box's state is persisted only after every batch
@@ -54,7 +54,7 @@
 //!   comes back only if Telegram's getDifference signals that channel,
 //!   which tgin cannot check.
 //!
-//! # Catch-up (plan decision 6)
+//! # Catch-up
 //!
 //! The common box (with `qts` and `seq`) catches up with
 //! `updates.getDifference`, at start and on a gap still open after
@@ -64,7 +64,7 @@
 //! it never caught up); no other channel catches up at start. Pushes for
 //! any box that is not catching up are delivered as they come.
 //!
-//! # Bytes (plan decision 7)
+//! # Bytes
 //!
 //! A pushed update is its raw TL, cut from the container; a short form is
 //! the raw short object. A difference's messages become `updateNewMessage`,
@@ -180,7 +180,8 @@ impl StateDelta {
 }
 
 /// A call the ingest session runs for the manager. Only the ingest session
-/// calls `updates.getState` or a difference [C: S14 (b)].
+/// calls `updates.getState` or a difference, so two sessions never race on
+/// the state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fetch {
     /// `updates.getState`; feed the answer to
@@ -218,7 +219,7 @@ pub struct CatchingUp {
     pub channels: usize,
 }
 
-/// One update's bytes (raw or composed, plan decision 7) with its facts.
+/// One update's bytes (raw or composed) with its facts.
 #[derive(Clone)]
 pub struct UpdateBytes {
     bytes: Bytes,
@@ -1233,7 +1234,7 @@ impl UpdateManager {
                 self.qts = qts;
                 self.seq = d.seq.unwrap_or(self.seq);
                 self.date = d.date.unwrap_or(self.date);
-                // The whole difference is one commit [C: S5]: its state goes
+                // The whole difference is one commit: its state goes
                 // on its last batch.
                 self.switch(&mut out, &home);
                 self.touch_common_all(&mut out);
@@ -1549,8 +1550,8 @@ impl UpdateManager {
         }
     }
 
-    /// A short update naming a user whose access hash is not cached
-    /// [C: S9].
+    /// A short update naming a user whose access hash is not cached,
+    /// so it cannot be resolved without a difference.
     fn unknown_peer(&self, f: &UpdateFacts<'_>) -> bool {
         if !matches!(
             f.constructor,
@@ -1917,7 +1918,7 @@ impl UpdateManager {
         out.open.common = true;
     }
 
-    /// Composes a difference's message into an update (plan decision 7):
+    /// Composes a difference's message into an update:
     /// the constructor id, the raw message, then the trailing ints.
     fn compose(&mut self, out: &mut Out, id: u32, message: &[u8], tail: &[i32]) {
         let mut b = Vec::with_capacity(4 + message.len() + 4 * tail.len());

@@ -8,7 +8,7 @@
 //!
 //! The account serves one layer, 230 ([`schema::API`]). [`decode`] reads the
 //! routing and update-state facts of Telegram's bytes straight from that
-//! schema; [`tl_json`] renders the same bytes as TL-JSON (design §10.5) and
+//! schema; [`tl_json`] renders the same bytes as TL-JSON (see DOCS.md, User accounts) and
 //! back. [`updates`] is tgin's own update-state handling and gap recovery
 //! over those bytes.
 //!

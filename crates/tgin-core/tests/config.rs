@@ -3853,8 +3853,8 @@ consumers:
     assert!(err.hint.is_some(), "{err}");
 }
 
-/// `api_id` takes `${env:…}` and `${file:…}`, as design §12's example
-/// writes it; it is checked once expanded, and is not a secret.
+/// `api_id` takes `${env:…}` and `${file:…}`, as the documented
+/// account example writes it; it is checked once expanded, and is not a secret.
 #[test]
 fn api_id_interpolates() {
     let yaml = "version: 1\naccounts:\n  main: { api_id: \"${env:TG_API_ID}\", api_hash: h, session_dir: s }\n";

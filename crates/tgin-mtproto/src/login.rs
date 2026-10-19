@@ -2,8 +2,7 @@
 //! code flow, and the shared 2FA SRP step (<https://core.telegram.org/api/srp>),
 //! over tgin's own [`Sender`].
 //!
-//! Ported from the M3 spike (`spike/m3` `74ad0e5`, `login.rs` and
-//! `code_login.rs`) with its R7 fixes:
+//! Beyond the plain flows, it guards the account:
 //! - **The identity gate.** With a `phone` in the config, the logged-in
 //!   user's phone must match it. On a mismatch the new key is logged out
 //!   (`auth.logOut`). Once Telegram confirms it, the session is reset and
@@ -558,7 +557,8 @@ async fn whoami<L: Link>(link: &L) -> Result<Option<Me>, Fail> {
 }
 
 /// After a login-producing call was written without an answer: did it log
-/// in? [`whoami`] says [C: S3 F7].
+/// in? [`whoami`] says, so a lost answer neither
+/// double-logs in nor resets a live key.
 async fn probe<L: Link>(link: &L) -> Result<Step, LoginError> {
     match whoami(link).await? {
         Some(me) => Ok(Step::Authorized(me)),
@@ -713,7 +713,7 @@ fn srp_inputs(info: tl::types::account::Password) -> Result<Srp, LoginError> {
     };
     let srp_b = info.srp_b.ok_or(LoginError::PasswordParams("no srp_B"))?;
     let srp_id = info.srp_id.ok_or(LoginError::PasswordParams("no srp_id"))?;
-    // grammers pads both to 256 bytes and panics on more [C: S3 F8].
+    // grammers pads both to 256 bytes and panics on more.
     if srp_b.len() > SRP_MAX {
         return Err(LoginError::PasswordParams("srp_B longer than 256 bytes"));
     }

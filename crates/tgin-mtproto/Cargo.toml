@@ -18,7 +18,7 @@ base64.workspace = true
 bytes.workspace = true
 fd-lock.workspace = true
 flate2.workspace = true
-# grammers 0.11 family, exact pins (Task 1's confinement check keeps them
+# grammers 0.11 family, exact pins (the xtask confinement check keeps them
 # in this crate). The sender uses the transport framing, the auth key
 # exchange and the MTProto 2.0 cipher; its message loop is tgin's own.
 grammers-crypto = { version = "=0.11.0", default-features = false }

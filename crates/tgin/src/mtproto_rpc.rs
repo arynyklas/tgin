@@ -1,4 +1,4 @@
-//! The raw-TL RPC endpoint (design §10.6, plan decisions 3 and 4):
+//! The raw-TL RPC endpoint (contract in DOCS.md, User accounts):
 //! `POST /mtproto/v1/{account}/invoke`.
 //!
 //! A request carries `Authorization: Bearer <client token>` (compared in
@@ -14,8 +14,7 @@
 //! methods (`updates.getState`, `getDifference`, `getChannelDifference`)
 //! and the `auth.*` methods that mint or move an authorization of the
 //! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
-//! account's authorizations (plan decision 2). The second refusal is
-//! ruling P10; the owner may overrule it.
+//! account's authorizations. The owner may lift the second refusal.
 //!
 //! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
 //! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]

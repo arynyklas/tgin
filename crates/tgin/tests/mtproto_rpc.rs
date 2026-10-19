@@ -1,4 +1,4 @@
-//! The raw-TL RPC endpoint against a fake account (plan Task 9).
+//! The raw-TL RPC endpoint against a fake account.
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
