@@ -191,6 +191,17 @@ pub const SETUP_DEADLINE: Duration = Duration::from_secs(60);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Whether a media sender's own failure leaves it unusable: Telegram does
+/// not know its key (transport −404), refused its init call for good (not
+/// a 420 flood wait), or it refused the request as malformed.
+fn session_dead(e: &SenderError) -> bool {
+    match e {
+        SenderError::KeyRevoked | SenderError::KeyUnknown | SenderError::BadRequest => true,
+        SenderError::InitRefused { code, .. } => *code != 420,
+        _ => false,
+    }
+}
+
 /// One DC's media session. `ready` is read without waiting on a setup
 /// in progress; `setup` serializes the setup of this DC only.
 struct Dc<S> {
@@ -338,7 +349,14 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         // The export and the import.
         charged(self.charge.as_ref())?;
         charged(self.charge.as_ref())?;
-        self.authorize(dc, session.as_ref()).await?;
+        if let Err((error, session_dead)) = self.authorize(dc, session.as_ref()).await {
+            // A session the media sender itself cannot use is not kept:
+            // the next attempt makes a new key.
+            if session_dead {
+                setup.unauthorized = None;
+            }
+            return Err(error);
+        }
         self.keys
             .save(dc, &key)
             .map_err(|_| failed(dc, "the session store failed"))?;
@@ -378,19 +396,27 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
     }
 
     /// `auth.exportAuthorization(dc)` on the main session, then
-    /// `auth.importAuthorization` on `media`.
-    async fn authorize(&self, dc: i32, media: &C::Session) -> Result<(), InvokeError> {
+    /// `auth.importAuthorization` on `media`. A failure says whether the
+    /// media session itself is unusable ([`session_dead`]); export-side
+    /// refusals and transient failures leave it usable.
+    async fn authorize(&self, dc: i32, media: &C::Session) -> Result<(), (InvokeError, bool)> {
         const EXPORT: &str = "auth.exportAuthorization";
         const IMPORT: &str = "auth.importAuthorization";
         let export = tl::functions::auth::ExportAuthorization { dc_id: dc }.to_bytes();
         let bytes = match self.main.invoke(Bytes::from(export)).await {
             Ok(RpcOutcome::Result(bytes)) => bytes,
-            Ok(RpcOutcome::Error { message, .. }) => return Err(refused(dc, EXPORT, &message)),
-            Err(e) => return Err(setup_error(dc, EXPORT, &e)),
+            Ok(RpcOutcome::Error { message, .. }) => {
+                return Err((refused(dc, EXPORT, &message), false));
+            }
+            Err(e) => return Err((setup_error(dc, EXPORT, &e), false)),
         };
         let tl::enums::auth::ExportedAuthorization::Authorization(exported) =
-            tl::enums::auth::ExportedAuthorization::from_bytes(&bytes)
-                .map_err(|_| failed(dc, "auth.exportAuthorization answer unreadable"))?;
+            tl::enums::auth::ExportedAuthorization::from_bytes(&bytes).map_err(|_| {
+                (
+                    failed(dc, "auth.exportAuthorization answer unreadable"),
+                    false,
+                )
+            })?;
         let import = tl::functions::auth::ImportAuthorization {
             id: exported.id,
             bytes: exported.bytes,
@@ -398,8 +424,8 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         .to_bytes();
         match media.invoke(Bytes::from(import)).await {
             Ok(RpcOutcome::Result(_)) => Ok(()),
-            Ok(RpcOutcome::Error { message, .. }) => Err(refused(dc, IMPORT, &message)),
-            Err(e) => Err(setup_error(dc, IMPORT, &e)),
+            Ok(RpcOutcome::Error { message, .. }) => Err((refused(dc, IMPORT, &message), false)),
+            Err(e) => Err((setup_error(dc, IMPORT, &e), session_dead(&e))),
         }
     }
 }

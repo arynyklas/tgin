@@ -1145,6 +1145,34 @@ async fn media_import_refused_is_503_and_retry_repeats_only_export_import() {
     assert_eq!(*keys.0.lock(), vec![(4, AuthKey([7; 256]))]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn media_sender_failure_on_import_drops_the_session() {
+    let keys = Arc::new(FakeKeys::default());
+    let m = media_app(
+        [
+            migrate(4),
+            sender_ok(EXPORTED),
+            migrate(4),
+            sender_ok(EXPORTED),
+        ],
+        [
+            Err(SenderError::KeyUnknown),
+            sender_ok(IMPORTED),
+            sender_ok(FILE),
+        ],
+        2,
+        Arc::clone(&keys),
+    );
+    let first = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let second = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(second.status, StatusCode::OK);
+    // The session whose key DC 4 does not know is not reused.
+    assert_eq!(*m.connects.lock(), vec![(4, false), (4, false)]);
+    assert_eq!(*keys.0.lock(), vec![(4, AuthKey([7; 256]))]);
+}
+
 #[tokio::test]
 async fn media_no_answer_during_setup_is_not_executed() {
     for (main, media) in [
