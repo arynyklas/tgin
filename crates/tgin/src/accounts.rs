@@ -62,9 +62,6 @@ struct Running {
 /// How long a logout waits for a running account's RPC calls before it
 /// closes the account's session.
 pub(crate) const PARK_RPC_WAIT: Duration = Duration::from_secs(10);
-/// How long starting an account waits for it to read its session and
-/// claim its user, so accounts claim in config order.
-const CHECK_WAIT: Duration = Duration::from_secs(5);
 
 /// The accounts of the running config.
 pub(crate) struct AccountSources {
@@ -105,8 +102,9 @@ impl AccountSources {
         &self.endpoint
     }
 
-    /// Makes the running accounts those of `cfg`: starts the new ones, in
-    /// config order (of two accounts of one user, the first wins), stops
+    /// Makes the running accounts those of `cfg`: starts the new ones (of
+    /// two accounts of one Telegram user, one runs and the other reports
+    /// `failed{duplicate_account}`; which one is unspecified), stops
     /// the removed ones, restarts those whose `api_id`, `api_hash` or
     /// `session_dir` changed (the old one releases the session first), and
     /// applies `rpc` changes in place.
@@ -163,20 +161,19 @@ impl AccountSources {
                 }
             }
         }
-        starting.sort_by_key(|a| cfg.accounts.iter().position(|c| c.name == a.name));
         // Closing releases their users: an account refused as a duplicate
         // of one of them looks again.
         for account in closing {
             account.close().await;
         }
         for config in starting {
-            self.start(config).await;
+            self.start(config);
         }
     }
 
     /// Starts the account of `config`, unless the shutdown stopped the
-    /// accounts, and waits (bounded) until it has claimed its user.
-    async fn start(&self, config: config::Account) {
+    /// accounts.
+    fn start(&self, config: config::Account) {
         let limiter = Arc::new(AccountLimiter::new(config.rpc.max_rps));
         let account = {
             // Under the lock the shutdown stops the accounts with: an
@@ -219,7 +216,6 @@ impl AccountSources {
             .write()
             .insert(config.name.clone(), account.clone());
         tracing::info!(account = %config.name, "account started");
-        let _ = tokio::time::timeout(CHECK_WAIT, account.checked()).await;
     }
 
     /// Whether the account `name` holds, or will take again on its own,
@@ -242,7 +238,7 @@ impl AccountSources {
         };
         tracing::info!(account = %name, "the account is parked for a logout");
         run.account.park(PARK_RPC_WAIT).await;
-        self.start(run.config).await;
+        self.start(run.config);
     }
 
     /// The session of account `name` changed outside it (a login or a

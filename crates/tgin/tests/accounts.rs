@@ -348,9 +348,9 @@ async fn unmatched_account_updates_are_counted() {
     tgin.stop().await;
 }
 
-/// Two accounts of one config, both logged in as one user: the first in
-/// config order runs, the second waits as a duplicate until the first is
-/// removed. The removed account's series go with it.
+/// Two accounts of one config, both logged in as one user: one runs, the
+/// other waits as a duplicate until the first is removed. The removed
+/// account's series go with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_duplicate_runs_once_its_user_is_released() {
     let net = FakeNetwork::new();
@@ -415,44 +415,47 @@ async fn a_duplicate_runs_once_its_user_is_released() {
     .await
     .expect("one runs, one fails");
     let s = states().await;
-    assert!(
-        s.contains(&("main".into(), "running".into(), String::new())),
-        "{s:?}"
-    );
-    assert!(
-        s.contains(&("second".into(), "failed".into(), "duplicate_account".into())),
-        "{s:?}"
-    );
-    assert_eq!(tgin.call(CLIENT_A).await.status(), 200);
-    let unmatched = r#"tgin_routes_unmatched_total{source="main"} 1"#;
+    let winner = s
+        .iter()
+        .find(|a| a.1 == "running")
+        .expect("one runs")
+        .0
+        .clone();
+    let loser = s.iter().find(|a| a.1 == "failed").expect("one fails");
+    assert_eq!(loser.2, "duplicate_account", "{s:?}");
+    let loser = loser.0.clone();
+    let unmatched = format!(r#"tgin_routes_unmatched_total{{source="{winner}"}} 1"#);
     timeout(PATIENCE, async {
         while !tgin.metrics.encode().lines().any(|l| l == unmatched) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("main's update is unmatched");
+    .expect("the winner's update is unmatched");
 
-    // Without main, second takes the user.
+    // Without the winner, the other takes the user.
     tgin.reload(
         &yaml
-            .replace("  main:\n", "  first:\n")
-            .replace("sessions/main", "sessions/first"),
+            .replace(&format!("  {winner}:\n"), "  first:\n")
+            .replace(&format!("sessions/{winner}"), "sessions/first"),
     )
     .await;
     timeout(PATIENCE, async {
         while !states()
             .await
-            .contains(&("second".into(), "running".into(), String::new()))
+            .contains(&(loser.clone(), "running".into(), String::new()))
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("second runs");
+    .expect("the other runs");
     let metrics = tgin.metrics.encode();
-    for gone in [r#"account="main""#, r#"source="main""#] {
-        assert!(!metrics.contains(gone), "{gone} still in:\n{metrics}");
+    for gone in [
+        format!(r#"account="{winner}""#),
+        format!(r#"source="{winner}""#),
+    ] {
+        assert!(!metrics.contains(&gone), "{gone} still in:\n{metrics}");
     }
     tgin.stop().await;
 }

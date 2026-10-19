@@ -556,13 +556,6 @@ impl Account {
         }
         self.close().await
     }
-
-    /// Whether the account has passed its start-up checks once (the
-    /// session read, its user claimed or refused), or ended a run.
-    pub async fn checked(&self) {
-        let mut rx = self.0.shared.checked.subscribe();
-        let _ = rx.wait_for(|&checked| checked).await;
-    }
 }
 
 /// One RPC call on the account's sessions while it lives.
@@ -615,7 +608,6 @@ struct Shared {
     /// RPC calls on the sessions now, and a wake when the last one ends.
     rpc_calls: AtomicUsize,
     rpc_idle: Notify,
-    checked: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -636,13 +628,7 @@ impl Shared {
             wake: Notify::new(),
             rpc_calls: AtomicUsize::new(0),
             rpc_idle: Notify::new(),
-            checked: watch::Sender::new(false),
         }
-    }
-
-    /// The start-up checks are done (or a run ended before them).
-    fn mark_checked(&self) {
-        self.checked.send_replace(true);
     }
 
     fn set_state(&self, state: AccountState) {
@@ -866,7 +852,6 @@ async fn supervise(ctx: Arc<Ctx>) {
         let run = tokio::spawn(run(Arc::clone(&ctx)));
         let _abort = AbortOnDrop(run.abort_handle());
         let end = ended(&ctx, run.await);
-        ctx.shared.mark_checked();
         ctx.shared.disconnected();
         let at = match end {
             End::Stopped => break,
@@ -984,7 +969,6 @@ async fn run(ctx: Arc<Ctx>) -> End {
         ctx.registry.park_duplicate(shared);
         return End::Wait;
     }
-    shared.mark_checked();
     shared.home_dc.store(dc, Ordering::Relaxed);
     let options: Vec<DcOption> = match store.dc_options() {
         Ok(options) => options
