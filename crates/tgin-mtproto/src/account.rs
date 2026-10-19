@@ -327,13 +327,20 @@ impl Registry {
         }
     }
 
-    /// Claims `user` for `account`; the account already holding it
-    /// otherwise.
-    fn claim(&self, user: i64, account: &Arc<str>) -> Result<(), Arc<str>> {
+    /// Claims `user` for `shared`'s account; the account already holding it
+    /// otherwise, and then `shared` is woken when a user is released. The
+    /// waiter is registered under the same lock as the claim, so a release
+    /// cannot fall between the refusal and the registration.
+    fn claim(&self, user: i64, shared: &Arc<Shared>) -> Result<(), Arc<str>> {
+        let account = &shared.name;
         let mut users = self.users.lock();
         users.retain(|_, holder| holder != account);
         match users.get(&user) {
-            Some(holder) => Err(Arc::clone(holder)),
+            Some(holder) => {
+                // Lock order: `users`, then `duplicates`.
+                self.duplicates.lock().push(Arc::downgrade(shared));
+                Err(Arc::clone(holder))
+            }
             None => {
                 users.insert(user, Arc::clone(account));
                 Ok(())
@@ -342,26 +349,20 @@ impl Registry {
     }
 
     /// Forgets `account`'s user; when it held one, the accounts refused as
-    /// its duplicates look again.
+    /// duplicates look again.
     fn release(&self, account: &str) {
-        let released = {
+        let parked = {
             let mut users = self.users.lock();
             let before = users.len();
             users.retain(|_, holder| &**holder != account);
-            users.len() != before
-        };
-        if released {
-            let parked = std::mem::take(&mut *self.duplicates.lock());
-            for shared in parked.iter().filter_map(Weak::upgrade) {
-                shared.wake.notify_one();
+            if users.len() == before {
+                return;
             }
+            std::mem::take(&mut *self.duplicates.lock())
+        };
+        for shared in parked.iter().filter_map(Weak::upgrade) {
+            shared.wake.notify_one();
         }
-    }
-
-    /// `shared`'s account was refused as a duplicate: woken on the next
-    /// release.
-    fn park_duplicate(&self, shared: &Arc<Shared>) {
-        self.duplicates.lock().push(Arc::downgrade(shared));
     }
 
     fn login_in_progress(&self, account: &str) -> bool {
@@ -962,11 +963,10 @@ async fn run(ctx: Arc<Ctx>) -> End {
         Ok(Known::Broken) => return ctx.needs_login(),
         Err(e) => return ctx.storage_failed(&e),
     };
-    if let Err(holder) = ctx.registry.claim(user, name) {
+    if let Err(holder) = ctx.registry.claim(user, shared) {
         tracing::error!(account = %name, other = %holder, "the account is logged in as the same Telegram user as another account; it does not start");
         shared.set_state(AccountState::Failed(Failure::DuplicateAccount));
-        // Woken when an account releases its user.
-        ctx.registry.park_duplicate(shared);
+        // `claim` registered it: woken when an account releases its user.
         return End::Wait;
     }
     shared.home_dc.store(dc, Ordering::Relaxed);

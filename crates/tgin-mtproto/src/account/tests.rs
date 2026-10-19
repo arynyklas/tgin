@@ -766,3 +766,19 @@ async fn a_channel_answer_keeps_flood_wait_showing() {
     );
     run.account.close().await;
 }
+
+/// A refused claim registers its waiter under the claim's own lock: a
+/// release right after it, before the account parks, still wakes it.
+#[tokio::test]
+async fn a_release_right_after_a_refused_claim_wakes_it() {
+    let registry = Registry::default();
+    let first = Arc::new(Shared::new(Arc::from("first")));
+    let second = Arc::new(Shared::new(Arc::from("second")));
+    assert!(registry.claim(USER, &first).is_ok());
+    assert!(registry.claim(USER, &second).is_err());
+    registry.release("first");
+    timeout(Duration::from_secs(1), second.wake.notified())
+        .await
+        .expect("woken");
+    assert!(registry.claim(USER, &second).is_ok(), "the user is free");
+}
