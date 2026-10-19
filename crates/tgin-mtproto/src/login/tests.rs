@@ -1241,3 +1241,136 @@ async fn a_hanging_leftover_probe_is_bounded() {
     let store = wait_reopen(&tmp).await;
     assert_eq!(store.home_dc().expect("home"), Some(4));
 }
+
+/// The code login starts on DC 2. An account homed elsewhere answers
+/// `auth.sendCode` (or, later, `auth.signIn`) with `303 *_MIGRATE_X`: the
+/// login makes a new key on DC X, stores it as home, and sends the request
+/// once more there.
+#[tokio::test]
+async fn code_login_follows_a_migrate() {
+    for (name, send_reply) in [
+        ("phone", Reply::Rpc(303, "PHONE_MIGRATE_4")),
+        ("network", Reply::Rpc(303, "NETWORK_MIGRATE_4")),
+        ("user", Reply::Rpc(303, "USER_MIGRATE_4")),
+    ] {
+        let (h, dial, tmp) = begin(
+            Method::Code,
+            Some(PHONE),
+            vec![
+                (ids::SEND_CODE, send_reply),
+                (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+                (
+                    ids::SIGN_IN,
+                    Reply::Ok(authorization(51, Some("88800000000"))),
+                ),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(settled(&h).await, LoginState::CodeSent { .. }),
+            "{name}"
+        );
+        assert_eq!(
+            h.submit_code("12345".into()).await,
+            Ok(LoginState::LoggedIn { user_id: 51 }),
+            "{name}"
+        );
+        assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)], "{name}");
+        assert_eq!(
+            dial.calls(),
+            vec![
+                (FIRST_DC, ids::SEND_CODE),
+                (4, ids::SEND_CODE),
+                (4, ids::SIGN_IN)
+            ],
+            "{name}"
+        );
+        drop(h);
+        let store = wait_reopen(&tmp).await;
+        assert_eq!(store.home_dc().expect("home"), Some(4), "{name}");
+        assert!(store.login().expect("login").is_some(), "{name}");
+    }
+}
+
+/// `auth.signIn` moved to another DC is sent once more there; a wrong code
+/// on the new DC stays a retryable answer.
+#[tokio::test]
+async fn sign_in_follows_a_migrate() {
+    let (h, dial, tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+            (ids::SIGN_IN, Reply::Rpc(303, "USER_MIGRATE_5")),
+            (ids::SIGN_IN, Reply::Rpc(400, "PHONE_CODE_INVALID")),
+            (
+                ids::SIGN_IN,
+                Reply::Ok(authorization(52, Some("88800000000"))),
+            ),
+        ],
+    )
+    .await;
+    settled(&h).await;
+    assert_eq!(
+        h.submit_code("1".into()).await,
+        Err(LoginError::CodeInvalid)
+    );
+    assert_eq!(
+        h.submit_code("2".into()).await,
+        Ok(LoginState::LoggedIn { user_id: 52 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (5, false)]);
+    assert_eq!(
+        dial.calls(),
+        vec![
+            (FIRST_DC, ids::SEND_CODE),
+            (FIRST_DC, ids::SIGN_IN),
+            (5, ids::SIGN_IN),
+            (5, ids::SIGN_IN)
+        ]
+    );
+    drop(h);
+    assert_eq!(wait_reopen(&tmp).await.home_dc().expect("home"), Some(5));
+}
+
+/// A second move after the first is not followed: `MigrateLoop`.
+#[tokio::test]
+async fn code_login_follows_one_migrate_only() {
+    let (h, dial, _tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_4")),
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_5")),
+        ],
+    )
+    .await;
+    assert_eq!(
+        end(&h).await,
+        LoginState::Failed(LoginError::MigrateLoop { dc: 5 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)]);
+}
+
+/// `auth.signIn` moved again after `auth.sendCode` was moved: a loop, not
+/// followed; no third DC is dialled.
+#[tokio::test]
+async fn sign_in_moved_after_send_code_moved_is_a_loop() {
+    let (h, dial, _tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_4")),
+            (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+            (ids::SIGN_IN, Reply::Rpc(303, "USER_MIGRATE_5")),
+        ],
+    )
+    .await;
+    settled(&h).await;
+    h.submit_code("1".into()).await.expect("handed over");
+    assert_eq!(
+        end(&h).await,
+        LoginState::Failed(LoginError::MigrateLoop { dc: 5 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)]);
+}

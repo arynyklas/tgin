@@ -489,6 +489,11 @@ enum Step {
         timeout: Option<i32>,
         hash: String,
     },
+    /// `303 *_MIGRATE_X`: the request belongs on DC `dc`; it was not
+    /// executed here.
+    Moved {
+        dc: i32,
+    },
     /// A final state that is not a login (email, payment).
     Stop(LoginState),
     Authorized(Me),
@@ -513,6 +518,7 @@ impl fmt::Debug for Step {
                 .field("kind", kind)
                 .field("timeout", timeout)
                 .finish_non_exhaustive(),
+            Self::Moved { dc } => f.debug_struct("Moved").field("dc", dc).finish(),
             Self::Stop(state) => f.debug_tuple("Stop").field(state).finish(),
             Self::Authorized(me) => f.debug_tuple("Authorized").field(me).finish(),
         }
@@ -639,11 +645,27 @@ async fn send_code<L: Link>(
         }),
     };
     use tl::enums::auth::SentCode;
-    match call(link, &request).await? {
-        SentCode::Code(code) => Ok(sent_code(code.r#type, code.timeout, code.phone_code_hash)),
-        SentCode::Success(s) => authorized(s.authorization),
-        SentCode::PaymentRequired(_) => Ok(Step::Stop(LoginState::PaymentRequired)),
+    match call(link, &request).await {
+        Ok(SentCode::Code(code)) => Ok(sent_code(code.r#type, code.timeout, code.phone_code_hash)),
+        Ok(SentCode::Success(s)) => authorized(s.authorization),
+        Ok(SentCode::PaymentRequired(_)) => Ok(Step::Stop(LoginState::PaymentRequired)),
+        Err(f) => match moved_to(&f) {
+            Some(dc) => Ok(Step::Moved { dc }),
+            None => Err(f.into()),
+        },
     }
+}
+
+/// The DC a `303 PHONE_MIGRATE_X`, `NETWORK_MIGRATE_X` or `USER_MIGRATE_X`
+/// names: the phone's account lives there, and the request belongs there.
+fn moved_to(f: &Fail) -> Option<i32> {
+    let Fail::Rpc { code: 303, message } = f else {
+        return None;
+    };
+    ["PHONE_MIGRATE_", "NETWORK_MIGRATE_", "USER_MIGRATE_"]
+        .iter()
+        .find_map(|prefix| message.strip_prefix(prefix))
+        .and_then(|dc| dc.parse().ok())
 }
 
 fn sent_code(kind: tl::enums::auth::SentCodeType, timeout: Option<i32>, hash: String) -> Step {
@@ -683,7 +705,10 @@ async fn sign_in<L: Link>(
     };
     match call(link, &request).await {
         Ok(auth) => authorized(auth),
-        Err(f) => after_auth_failure(link, f).await,
+        Err(f) => match moved_to(&f) {
+            Some(dc) => Ok(Step::Moved { dc }),
+            None => after_auth_failure(link, f).await,
+        },
     }
 }
 
@@ -1048,6 +1073,7 @@ pub async fn start<D: Dial>(
         commands,
         wrong_passwords: 0,
         wrong_codes: 0,
+        moved: false,
     };
     let task = tokio::spawn(flow.run(begin));
     Ok(LoginHandle {
@@ -1181,6 +1207,8 @@ struct Flow<D: Dial> {
     /// Wrong passwords and codes so far: each is spent on the real account.
     wrong_passwords: u32,
     wrong_codes: u32,
+    /// The code login followed a `*_MIGRATE_X` to another DC.
+    moved: bool,
 }
 
 /// One connection of the flow, its pushes drained.
@@ -1253,6 +1281,17 @@ impl<D: Dial> Flow<D> {
         Ok(Conn::new(link, pushes))
     }
 
+    /// A request was moved to DC `dc` (`303 *_MIGRATE_X`): a new key there,
+    /// stored as home. A login follows one move; a second is a loop.
+    async fn follow(&mut self, dc: i32) -> Result<Conn<D::Link>, LoginError> {
+        if self.moved {
+            return Err(LoginError::MigrateLoop { dc });
+        }
+        self.moved = true;
+        tracing::info!(dc, "login: the account lives on another DC");
+        self.connect(dc).await
+    }
+
     async fn drive(&mut self, method: Method) -> Result<LoginState, LoginError> {
         let qr_deadline = Instant::now() + QR_LIFETIME;
         let mut conn = self.connect(FIRST_DC).await?;
@@ -1261,7 +1300,13 @@ impl<D: Dial> Flow<D> {
             Method::Qr => export(&conn.link, api_id, &api_hash).await,
             Method::Code => {
                 let phone = self.params.phone.clone().ok_or(LoginError::NoPhone)?;
-                send_code(&conn.link, &phone, api_id, &api_hash).await
+                match send_code(&conn.link, &phone, api_id, &api_hash).await {
+                    Ok(Step::Moved { dc }) => {
+                        conn = self.follow(dc).await?;
+                        send_code(&conn.link, &phone, api_id, &api_hash).await
+                    }
+                    step => step,
+                }
             }
         };
         let mut imported = false;
@@ -1291,7 +1336,7 @@ impl<D: Dial> Flow<D> {
                 }
                 Step::NeedPassword { hint } => {
                     self.publish(LoginState::NeedPassword { hint });
-                    step = self.answer(&conn.link, &Wanted::Password, None).await;
+                    step = self.answer(&mut conn, &Wanted::Password, None).await;
                 }
                 Step::CodeSent {
                     kind,
@@ -1299,8 +1344,10 @@ impl<D: Dial> Flow<D> {
                     hash,
                 } => {
                     self.publish(LoginState::CodeSent { kind, timeout });
-                    step = self.answer(&conn.link, &Wanted::Code, Some(&hash)).await;
+                    step = self.answer(&mut conn, &Wanted::Code, Some(&hash)).await;
                 }
+                // A request moved once already was moved again.
+                Step::Moved { dc } => return Err(LoginError::MigrateLoop { dc }),
                 Step::Stop(state) => return Ok(state),
                 Step::Authorized(me) => return self.conclude(&conn.link, &me).await,
             }
@@ -1333,7 +1380,7 @@ impl<D: Dial> Flow<D> {
     /// retryable failure is answered and the wait goes on.
     async fn answer(
         &mut self,
-        link: &D::Link,
+        conn: &mut Conn<D::Link>,
         wanted: &Wanted,
         hash: Option<&str>,
     ) -> Result<Step, LoginError> {
@@ -1347,10 +1394,22 @@ impl<D: Dial> Flow<D> {
                 return Err(LoginError::NotExpected);
             };
             let step = match (&command.input, wanted) {
-                (Input::Password(pw), Wanted::Password) => check_password(link, pw.clone()).await,
+                (Input::Password(pw), Wanted::Password) => {
+                    check_password(&conn.link, pw.clone()).await
+                }
                 (Input::Code(code), Wanted::Code) => {
-                    let phone = self.params.phone.as_deref().unwrap_or_default();
-                    sign_in(link, phone, hash.unwrap_or_default(), code).await
+                    let phone = self.params.phone.clone().unwrap_or_default();
+                    let hash = hash.unwrap_or_default();
+                    match sign_in(&conn.link, &phone, hash, code).await {
+                        Ok(Step::Moved { dc }) => match self.follow(dc).await {
+                            Ok(moved) => {
+                                *conn = moved;
+                                sign_in(&conn.link, &phone, hash, code).await
+                            }
+                            Err(e) => Err(e),
+                        },
+                        step => step,
+                    }
                 }
                 _ => {
                     let _ = command.reply.send(Err(LoginError::NotExpected));
