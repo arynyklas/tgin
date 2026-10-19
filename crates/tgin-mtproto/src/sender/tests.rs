@@ -922,6 +922,55 @@ async fn new_session_created_pushes_updates_too_long() {
     assert_eq!(next.salt, 0x5e55, "the new session's salt");
 }
 
+/// A result whose top constructor is an `Updates` one goes to its caller
+/// and, in wire order with the pushes, to the update stream (P4). Other
+/// results, `messages.affectedMessages` included, go to the caller only.
+#[tokio::test(start_paused = true)]
+async fn update_bearing_result_is_also_pushed_in_wire_order() {
+    fn rpc_result(req_msg_id: i64, result: &[u8]) -> Vec<u8> {
+        let mut body = RPC_RESULT.to_le_bytes().to_vec();
+        body.extend_from_slice(&req_msg_id.to_le_bytes());
+        body.extend_from_slice(result);
+        body
+    }
+
+    let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    let call = h.invoke(get_config());
+    let req = srv.request().await.requests()[0].msg_id;
+    srv.send(&[
+        (true, update(1)),
+        (true, rpc_result(req, &update(9))),
+        (true, update(2)),
+    ]);
+    assert_eq!(
+        outcome(call).await.unwrap(),
+        RpcOutcome::Result(update(9).into())
+    );
+    for n in [1, 9, 2] {
+        let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+        assert_eq!(push, update(n));
+    }
+
+    let affected =
+        tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages {
+            pts: 10,
+            pts_count: 1,
+        })
+        .to_bytes();
+    let call = h.invoke(get_nearest_dc());
+    let req = srv.request().await.requests()[0].msg_id;
+    srv.answer(req, &affected);
+    assert_eq!(
+        outcome(call).await.unwrap(),
+        RpcOutcome::Result(affected.into())
+    );
+    assert!(
+        timeout(WAIT, pushes.recv()).await.is_err(),
+        "affected* results are not pushed"
+    );
+}
+
 /// Requests written before `new_session_created`'s `first_msg_id` went to
 /// a session whose answers are lost: they get `NoAnswer`. Later ones are
 /// still answered.

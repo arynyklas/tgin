@@ -48,8 +48,10 @@
 //! [`Sender::connect`] returns, as received (`gzip_packed` unwrapped). The
 //! channel is bounded; while it is full the loop reads no further frames,
 //! RPC answers included, but still writes the acks it owes and its pings.
-//! Once the receiver is dropped, pushes are discarded. Updates that come
-//! back as a request's `rpc_result` go to that request's caller only.
+//! Once the receiver is dropped, pushes are discarded. A request's result
+//! whose top constructor is an `Updates` one goes to its caller and also,
+//! in wire order with the pushes, to the receiver (ruling P4);
+//! `messages.affected*` results reach only the caller.
 //!
 //! # What the sender never does
 //!
@@ -116,6 +118,17 @@ const MSG_RESEND_ANS_REQ: u32 = tl::types::MsgResendAnsReq::CONSTRUCTOR_ID;
 const DESTROY_SESSION_OK: u32 = tl::types::DestroySessionOk::CONSTRUCTOR_ID;
 const DESTROY_SESSION_NONE: u32 = tl::types::DestroySessionNone::CONSTRUCTOR_ID;
 const HTTP_WAIT: u32 = tl::types::HttpWait::CONSTRUCTOR_ID;
+/// The `Updates` constructors. A request's result with one of these on top
+/// changes the account's update state, so it is also pushed (ruling P4).
+const UPDATES: [u32; 7] = [
+    tl::types::UpdatesTooLong::CONSTRUCTOR_ID,
+    tl::types::UpdateShortMessage::CONSTRUCTOR_ID,
+    tl::types::UpdateShortChatMessage::CONSTRUCTOR_ID,
+    tl::types::UpdateShort::CONSTRUCTOR_ID,
+    tl::types::UpdatesCombined::CONSTRUCTOR_ID,
+    tl::types::Updates::CONSTRUCTOR_ID,
+    tl::types::UpdateShortSentMessage::CONSTRUCTOR_ID,
+];
 
 /// What `initConnection` tells Telegram, and how the connection is used.
 #[derive(Clone)]
@@ -515,9 +528,13 @@ impl Shared {
     /// The session's update stream may have a gap: tell the update
     /// manager, on main sessions.
     fn session_lost(&mut self) {
+        self.push(Bytes::from_static(&UPDATES_TOO_LONG));
+    }
+
+    /// One update container for the update manager, on main sessions.
+    fn push(&mut self, updates: Bytes) {
         if !self.without_updates {
-            self.backlog
-                .push_back(Bytes::from_static(&UPDATES_TOO_LONG));
+            self.backlog.push_back(updates);
         }
     }
 
@@ -1012,7 +1029,21 @@ impl Conn {
             RPC_RESULT => {
                 let req_msg_id = i64_at(&body, 4).ok_or(bad())?;
                 let outcome = rpc_outcome(body.slice(12..), true);
-                self.resolve(req_msg_id, outcome)?;
+                let updates = match &outcome {
+                    Ok(RpcOutcome::Result(result))
+                        if u32_at(result, 0).is_some_and(|id| UPDATES.contains(&id)) =>
+                    {
+                        Some(result.clone())
+                    }
+                    _ => None,
+                };
+                // A request's own updates also reach the update manager,
+                // in wire order with the pushes.
+                if self.resolve(req_msg_id, outcome)?
+                    && let Some(updates) = updates
+                {
+                    st.push(updates);
+                }
             }
             MSG_CONTAINER => {
                 let count = u32_at(&body, 4).ok_or(bad())?;
@@ -1061,18 +1092,19 @@ impl Conn {
         Ok(())
     }
 
-    /// An answer for the message `msg_id`.
+    /// An answer for the message `msg_id`. `true` when it was a caller's
+    /// request.
     fn resolve(
         &mut self,
         msg_id: i64,
         outcome: Result<RpcOutcome, SenderError>,
-    ) -> Result<(), Cause> {
+    ) -> Result<bool, Cause> {
         let Some(i) = self
             .pending
             .iter()
             .position(|p| p.slot.msg_id() == Some(msg_id))
         else {
-            return Ok(());
+            return Ok(false);
         };
         let p = self.pending.remove(i);
         match p.what {
@@ -1086,9 +1118,10 @@ impl Conn {
             },
             What::Request { reply, .. } => {
                 let _ = reply.send(outcome);
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Telegram ignored the message `bad_msg_id` (a request or a container).
