@@ -33,6 +33,9 @@
 //! is dropped) and whenever Telegram reports `new_session_created`, the
 //! sender pushes a synthetic `updatesTooLong`: the update manager then
 //! calls `getDifference`, which reconnects and re-subscribes the session.
+//! That is the only signal: a connection that fails before its init call
+//! completes pushes nothing, so a caller whose catch-up call fails must
+//! retry it itself.
 //!
 //! Every connection opens with the sender's own init call,
 //! `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`; no
@@ -45,8 +48,10 @@
 //! - a 4xx refusal of the init call latches: every later request gets
 //!   [`SenderError::InitRefused`] without connecting, until the sender is
 //!   rebuilt; a 420 `FLOOD_WAIT_X` latches for X seconds;
-//! - a transport −429 (too many connections) delays the next connection by
-//!   1 s, doubling to 60 s; a completed init resets it.
+//! - every other failure before init (a transport −429, an init timeout, a
+//!   5xx answer to the init call, a socket closed early, a failed connect)
+//!   delays the next connection by 1 s, doubling to 60 s; a completed init
+//!   resets the delay.
 //!
 //! # Pushes
 //!
@@ -590,19 +595,26 @@ impl Shared {
         match cause {
             // A 4xx refusal of initConnection holds: retrying cannot help
             // until the sender is rebuilt, except FLOOD_WAIT_X, which holds
-            // for X seconds.
+            // for X seconds, or for good when X is past the clock's range.
             Cause::InitRefused { code, message } if (400..500).contains(code) => {
-                let until = (*code == 420).then(|| now + flood_wait(message));
+                let until = if *code == 420 {
+                    now.checked_add(flood_wait(message))
+                } else {
+                    None
+                };
                 self.refused = Some((*code, message.clone(), until));
             }
-            // Too many connections from this address: back off, 1 s
-            // doubling to 60 s.
-            Cause::Transport(TransportError::Status(429)) => {
-                self.backoff = (self.backoff * 2).clamp(MIN_BACKOFF, MAX_BACKOFF);
-                self.retry_at = Some(now + self.backoff);
-            }
+            Cause::Shutdown => {}
+            // Any other failure before init: back off.
+            _ if !init_done => self.back_off(now),
             _ => {}
         }
+    }
+
+    /// Delays the next connection: 1 s, doubling to 60 s.
+    fn back_off(&mut self, now: Instant) {
+        self.backoff = (self.backoff * 2).clamp(MIN_BACKOFF, MAX_BACKOFF);
+        self.retry_at = Some(now + self.backoff);
     }
 }
 
@@ -796,6 +808,7 @@ impl<T: Transport> Actor<T> {
                         Ok(opened) => return Some((opened.reader, opened.writer, Some(command))),
                         Err(e) => {
                             tracing::debug!(dc = self.st.dc_id, error = %e, "mtproto connect failed");
+                            self.st.back_off(Instant::now());
                             let _ = command.reply.send(Err(SenderError::NotSent));
                             while let Ok(queued) = self.commands.try_recv() {
                                 let _ = queued.reply.send(Err(SenderError::NotSent));

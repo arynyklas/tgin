@@ -99,6 +99,8 @@ struct Script {
     opens: Mutex<Vec<bool>>,
     /// The init call every connection must open with.
     init_call: Vec<u8>,
+    /// How many of the next `open`s fail.
+    failing_opens: Mutex<usize>,
 }
 
 #[derive(Clone)]
@@ -114,6 +116,13 @@ impl Transport for Scripted {
         key: Option<&AuthKey>,
     ) -> Result<Opened<ScriptReader, ScriptWriter>, TransportError> {
         self.0.opens.lock().push(key.is_some());
+        {
+            let mut failing = self.0.failing_opens.lock();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(TransportError::Closed);
+            }
+        }
         let mode = self.0.modes.lock().pop_front().unwrap_or(Writes::Deliver);
         let (to_client, from_server) = mpsc::unbounded_channel();
         let (to_server, from_client) = mpsc::unbounded_channel();
@@ -612,6 +621,7 @@ impl Harness {
             conns: conns_tx,
             opens: Mutex::new(Vec::new()),
             init_call: init.init_call(),
+            failing_opens: Mutex::new(0),
         });
         let key = Some(AuthKey([9; 256]));
         let (sender, pushes, new_key) =
@@ -1537,4 +1547,114 @@ async fn minus_429_backs_off_reconnects() {
     let _call = h.invoke(get_config());
     h.next_conn().await;
     assert_eq!(failed_at.elapsed().as_secs(), 1, "the backoff starts over");
+}
+
+/// How a connection fails before its init call completes.
+#[derive(Clone, Copy, Debug)]
+enum PreInit {
+    Timeout,
+    ServerError,
+    Closed,
+}
+
+/// Fails the connection `srv` before init the way `kind` says; the request
+/// waiting behind the init call ends.
+async fn fail_before_init(
+    srv: &mut Server,
+    kind: PreInit,
+    call: JoinHandle<Result<RpcOutcome, SenderError>>,
+) {
+    let init_msg = srv.init_packet().await;
+    srv.no_request().await;
+    match kind {
+        PreInit::Timeout => {}
+        PreInit::ServerError => refuse_init(srv, init_msg.msg_id, 500, "INTERNAL"),
+        PreInit::Closed => srv.close(),
+    }
+    let result = timeout(Duration::from_secs(60), call)
+        .await
+        .expect("the call ends")
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(SenderError::NotSent | SenderError::InitRefused { code: 500, .. })
+        ),
+        "{kind:?}: {result:?}"
+    );
+}
+
+/// An init timeout, a 5xx answer to the init call and a socket closed
+/// before init each delay the next connection, 1 s then 2 s; none of them
+/// pushes a catch-up.
+#[tokio::test(start_paused = true)]
+async fn every_pre_init_failure_backs_off() {
+    for kind in [PreInit::Timeout, PreInit::ServerError, PreInit::Closed] {
+        let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+        let mut pushes = h.pushes.take().unwrap();
+        let mut call = h.invoke(get_config());
+        for expected in [1, 2] {
+            fail_before_init(&mut srv, kind, call).await;
+            let failed_at = tokio::time::Instant::now();
+            call = h.invoke(get_config());
+            srv = timeout(Duration::from_secs(120), h.conns.recv())
+                .await
+                .expect("the sender reconnects")
+                .unwrap();
+            assert_eq!(failed_at.elapsed().as_secs(), expected, "{kind:?}");
+        }
+        assert!(pushes.try_recv().is_err(), "{kind:?}: no catch-up");
+    }
+}
+
+/// A failed connect backs off the next one too.
+#[tokio::test(start_paused = true)]
+async fn failed_connect_backs_off() {
+    let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    srv.close();
+    // The catch-up push shows the connection has ended.
+    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+    *h.script.failing_opens.lock() = 2;
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        outcome(h.invoke(get_config())).await,
+        Err(SenderError::NotSent)
+    ));
+    assert_eq!(started.elapsed().as_secs(), 0, "after a good init: at once");
+    let failed_at = tokio::time::Instant::now();
+    assert!(matches!(
+        outcome(h.invoke(get_config())).await,
+        Err(SenderError::NotSent)
+    ));
+    assert_eq!(failed_at.elapsed().as_secs(), 1);
+    let failed_at = tokio::time::Instant::now();
+    let _call = h.invoke(get_config());
+    h.next_conn().await;
+    assert_eq!(failed_at.elapsed().as_secs(), 2);
+}
+
+/// A FLOOD_WAIT past the clock's range keeps the refusal until the sender
+/// is rebuilt, instead of overflowing.
+#[tokio::test(start_paused = true)]
+async fn huge_flood_wait_latches_for_good() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let init_msg = srv.init_packet().await;
+    refuse_init(
+        &mut srv,
+        init_msg.msg_id,
+        420,
+        "FLOOD_WAIT_18446744073709551615",
+    );
+    assert!(matches!(
+        outcome(call).await,
+        Err(SenderError::InitRefused { code: 420, .. })
+    ));
+    tokio::time::sleep(Duration::from_secs(86_400)).await;
+    assert!(matches!(
+        outcome(h.invoke(get_config())).await,
+        Err(SenderError::InitRefused { code: 420, .. })
+    ));
+    assert!(h.conns.try_recv().is_err(), "no reconnect");
 }
