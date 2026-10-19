@@ -350,8 +350,10 @@ async fn same_user_twice_fails_second() {
     assert!(second.sink.seen().is_empty(), "nor receives anything");
     assert!(!second.account.state().active());
     assert_eq!(first.account.state(), AccountState::Running);
-    second.account.close().await;
+    // The first one gone, the second takes the user.
     first.account.close().await;
+    until(&second.account, running).await;
+    second.account.close().await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -311,6 +311,8 @@ type LoginCheck = Box<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct Registry {
     users: Mutex<HashMap<i64, Arc<str>>>,
     logins: Option<LoginCheck>,
+    /// Accounts refused as duplicates, woken when a user is released.
+    duplicates: Mutex<Vec<Weak<Shared>>>,
 }
 
 impl Registry {
@@ -321,6 +323,7 @@ impl Registry {
         Self {
             users: Mutex::new(HashMap::new()),
             logins: Some(Box::new(logins)),
+            duplicates: Mutex::new(Vec::new()),
         }
     }
 
@@ -338,8 +341,27 @@ impl Registry {
         }
     }
 
+    /// Forgets `account`'s user; when it held one, the accounts refused as
+    /// its duplicates look again.
     fn release(&self, account: &str) {
-        self.users.lock().retain(|_, holder| &**holder != account);
+        let released = {
+            let mut users = self.users.lock();
+            let before = users.len();
+            users.retain(|_, holder| &**holder != account);
+            users.len() != before
+        };
+        if released {
+            let parked = std::mem::take(&mut *self.duplicates.lock());
+            for shared in parked.iter().filter_map(Weak::upgrade) {
+                shared.wake.notify_one();
+            }
+        }
+    }
+
+    /// `shared`'s account was refused as a duplicate: woken on the next
+    /// release.
+    fn park_duplicate(&self, shared: &Arc<Shared>) {
+        self.duplicates.lock().push(Arc::downgrade(shared));
     }
 
     fn login_in_progress(&self, account: &str) -> bool {
@@ -958,8 +980,11 @@ async fn run(ctx: Arc<Ctx>) -> End {
     if let Err(holder) = ctx.registry.claim(user, name) {
         tracing::error!(account = %name, other = %holder, "the account is logged in as the same Telegram user as another account; it does not start");
         shared.set_state(AccountState::Failed(Failure::DuplicateAccount));
+        // Woken when an account releases its user.
+        ctx.registry.park_duplicate(shared);
         return End::Wait;
     }
+    shared.mark_checked();
     shared.home_dc.store(dc, Ordering::Relaxed);
     let options: Vec<DcOption> = match store.dc_options() {
         Ok(options) => options
