@@ -44,14 +44,17 @@ class Tgin:
         return f"{self.base}/c/{urllib.parse.quote(consumer, safe='')}/mtproto/v1/getUpdates?{query}"
 
     def invoke(self, request, timeout=90):
-        """Sends a Telethon request; returns its result. A 429, or a 503 with
-        Retry-After, was not executed: retried after Retry-After, `attempts`
-        times in all. A 502 no_answer may have run and is never retried."""
+        """Sends a Telethon request; returns its result. tgin's own short waits
+        (a 503 with Retry-After, 429 too_many_in_flight or rate_limited; the
+        call was not executed) are retried after Retry-After, up to 60 s,
+        `attempts` times in all. Telegram's flood and slow-mode waits, media
+        and init flood waits, and a 502 no_answer (it may have run) raise."""
         for attempt in range(1, self.attempts + 1):
             try:
                 return self._invoke_once(request, timeout)
             except TginError as e:
-                if attempt == self.attempts or e.retry_after is None or e.status not in (429, 503):
+                own = e.status == 503 or e.error in ("too_many_in_flight", "rate_limited")
+                if attempt == self.attempts or not own or e.retry_after is None or e.retry_after > 60:
                     raise
                 time.sleep(e.retry_after)
 
@@ -94,8 +97,8 @@ def poll(tgin, consumer, consumer_token, instance, timeout=30):
             offset = envelope["update_id"] + 1  # acknowledges everything up to this id; ids skip
             try:
                 parsed = parse_envelope(envelope)
-            except TypeNotFoundError:
-                log.warning("skipped update %s: %s is not in Telethon's layer",
-                            envelope["update_id"], envelope["constructor"])
+            except TypeNotFoundError as e:  # never log str(e): it holds the account's bytes
+                log.warning("skipped update %s: constructor %08x is not in Telethon's layer",
+                            envelope["update_id"], e.invalid_constructor_id)
                 continue
             yield (envelope, *parsed)
