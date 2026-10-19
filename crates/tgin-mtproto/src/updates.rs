@@ -46,7 +46,7 @@
 //! bytes (constructor id, the raw message, then the difference's final
 //! `pts` and a `pts_count` of 0, or its final `qts`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::Range;
 
@@ -493,10 +493,11 @@ pub struct UpdateManager {
     /// Channels waiting for a fetch slot, in arrival order.
     queue: VecDeque<i64>,
     in_flight: usize,
-    /// Channels with a gap deadline.
-    gapped: HashSet<i64>,
+    /// Channels with a gap deadline. Ordered sets here and below: what the
+    /// manager does never depends on hash order, so a run replays exactly.
+    gapped: BTreeSet<i64>,
     /// Channels waiting for a failed fetch's retry.
-    retrying: HashSet<i64>,
+    retrying: BTreeSet<i64>,
     /// The common box's failed fetch is asked again then.
     retry_at: Option<Instant>,
     backoff: Duration,
@@ -508,7 +509,7 @@ pub struct UpdateManager {
     next_origin: u64,
     dropped: Dropped,
     /// Channels persisted as behind ([`Batch::ahead`]), not yet caught up.
-    ahead: HashSet<i64>,
+    ahead: BTreeSet<i64>,
     /// Newly ahead, for the next batch's `ahead`.
     ahead_new: Vec<i64>,
     /// Channels behind at start, queued once the start-up difference ends.
@@ -557,8 +558,8 @@ impl UpdateManager {
             channels,
             queue: VecDeque::new(),
             in_flight: 0,
-            gapped: HashSet::new(),
-            retrying: HashSet::new(),
+            gapped: BTreeSet::new(),
+            retrying: BTreeSet::new(),
             retry_at: None,
             backoff: Duration::ZERO,
             ahead: startup.iter().copied().collect(),
