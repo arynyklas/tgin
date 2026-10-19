@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 
 use super::model::{
-    At, ByteSize, Cidr, HumanDuration, IpAllowlist, Name, RawConfig, SecretText, Split, Target,
-    Template, WebhookSecret, WorkerThreads,
+    ApiId, At, ByteSize, Cidr, HumanDuration, IpAllowlist, Name, RawConfig, SecretText, Split,
+    Target, Template, WebhookSecret, WorkerThreads,
 };
 
 /// What [`Name`] accepts; `validate` checks the same rule.
@@ -145,6 +145,22 @@ impl JsonSchema for WorkerThreads {
             "oneOf": [
                 { "const": "auto", "description": "One per CPU." },
                 { "type": "integer", "minimum": 1 }
+            ]
+        })
+    }
+}
+
+impl JsonSchema for ApiId {
+    fn schema_name() -> Cow<'static, str> {
+        "ApiId".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "The app's `api_id`, at least 1: a number, or text with `${env:NAME}` or `${file:PATH}` (relative to the config file) that expands to one.",
+            "oneOf": [
+                { "type": "integer", "minimum": 1, "maximum": i32::MAX },
+                { "type": "string", "minLength": 1 }
             ]
         })
     }

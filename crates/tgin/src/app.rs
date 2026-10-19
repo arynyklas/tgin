@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tgin_botapi::ApiError;
 use tgin_botapi::gateway::{Gateway, GatewayBot, GatewayMetrics};
-use tgin_core::config::{self, Bot, Config, ConsumerKind, Ingress, Webhook, WebhookSecret};
+use tgin_core::config::{self, Bot, Config, Ingress, Webhook, WebhookSecret};
 use tgin_core::engine::{BuildError, Engine, EngineRuntime};
 use tgin_core::metrics::CoreMetrics;
 use tgin_core::reply::ReplyHandle;
@@ -687,13 +687,15 @@ impl Connections {
     }
 }
 
-/// Every secret value of `cfg`, for log redaction: bot tokens, their '~'
-/// forms (a self-hosted server's directory name for the bot) and their
-/// `%3A` and `%3a` forms (as a `files.url` origin's paths carry them),
-/// webhook secrets (automatic ones derived), the admin token, pull
-/// `auth_token`s and push endpoint `secret_token`s.
+/// Every secret value of `cfg`, for log redaction: every secret the config
+/// expanded ([`Config::secrets`]: bot tokens, webhook and push
+/// `secret_token`s, the admin token, pull `auth_token`s, accounts'
+/// `api_hash`es, phones and RPC client tokens), with the forms derived
+/// from them: bot tokens' '~' forms (a self-hosted server's directory name
+/// for the bot) and `%3A` and `%3a` forms (as a `files.url` origin's paths
+/// carry them), and automatic webhook secrets.
 pub fn secrets(cfg: &Config) -> Vec<String> {
-    let mut secrets = Vec::new();
+    let mut secrets = cfg.secrets().to_vec();
     for bot in &cfg.bots {
         let token = bot.token.expose();
         secrets.extend(config::Upstream::token_dirs(token));
@@ -702,25 +704,6 @@ pub fn secrets(cfg: &Config) -> Vec<String> {
             && let Some(secret) = webhook_secret(bot, hook)
         {
             secrets.push(secret.expose().clone());
-        }
-    }
-    if let Some(token) = &cfg.admin.token {
-        secrets.push(token.expose().clone());
-    }
-    for consumer in &cfg.consumers {
-        match &consumer.kind {
-            ConsumerKind::Pull(pull) => {
-                if let Some(token) = &pull.auth_token {
-                    secrets.push(token.expose().clone());
-                }
-            }
-            ConsumerKind::Push(push) => {
-                for endpoint in &push.endpoints {
-                    if let Some(token) = &endpoint.secret_token {
-                        secrets.push(token.expose().clone());
-                    }
-                }
-            }
         }
     }
     secrets

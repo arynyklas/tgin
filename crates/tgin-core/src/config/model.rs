@@ -30,9 +30,10 @@ pub(super) const REDACTED: &str = "[redacted]";
 
 /// The configuration file, version 1.
 ///
-/// Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`) and
-/// fields holding URLs or file paths expand `${env:NAME}` and `${file:PATH}`
-/// references; every other value is literal.
+/// Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`,
+/// `api_hash`, `phone`), an account's `api_id`, and fields holding URLs
+/// or file paths expand `${env:NAME}` and `${file:PATH}` references; every
+/// other value is literal.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 #[schemars(title = "tgin configuration, version 1")]
@@ -62,6 +63,12 @@ pub struct RawConfig {
     /// The Telegram bots updates come from.
     #[serde(default)]
     pub bots: Vec<Bot>,
+    /// The Telegram user accounts updates come from, by name, served over
+    /// MTProto.
+    // A located key would hide the name from error paths, so an account's
+    // errors point at its value instead.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub accounts: IndexMap<Name, At<Account>>,
     /// Where updates go, by name.
     // A located key would hide the name from error paths, so a consumer's
     // errors point at its value instead.
@@ -527,6 +534,138 @@ pub enum TextMatch {
     Equals(Vec<String>),
 }
 
+/// One Telegram user account. Its name must differ from every bot's.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct Account {
+    /// The `api_id` of your Telegram app (my.telegram.org), at least 1.
+    /// Accounts may share one app. Supports `${env:…}` and `${file:…}`;
+    /// it is not a secret.
+    pub api_id: At<ApiId>,
+    /// The app's `api_hash`, a secret.
+    pub api_hash: SecretText,
+    /// Where the account's session lives: its auth keys and update state.
+    /// Required, and one per account; a relative path resolves against the
+    /// config file's directory. One tgin process holds it at a time, under
+    /// a lock that works within one OS only, so never share it across
+    /// hosts, bind mounts or network filesystems. Supports `${env:…}` and
+    /// `${file:…}`.
+    pub session_dir: Template,
+    /// The account's phone number, a secret: tgin checks the logged-in
+    /// account against it and never logs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<SecretText>,
+    #[serde(default)]
+    pub rpc: Rpc,
+    /// Rules in order; the first match wins.
+    #[serde(default)]
+    pub routes: Vec<At<AccountRoute>>,
+}
+
+/// The MTProto RPC endpoint of one account.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+pub struct Rpc {
+    /// Most requests per second the account sends Telegram, over all
+    /// clients.
+    #[schemars(range(min = 1))]
+    pub max_rps: At<u32>,
+    /// A `FLOOD_WAIT` or `SLOWMODE_WAIT` up to this long is slept out and
+    /// the request retried; a longer one answers 429 with `Retry-After`.
+    pub flood_sleep_threshold: At<HumanDuration>,
+    /// Who may call the account, by name.
+    pub clients: IndexMap<Name, At<RpcClient>>,
+}
+
+/// One downstream allowed to call the account.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct RpcClient {
+    /// The bearer token the client sends; unique within the account.
+    pub token: SecretText,
+    /// Methods the client may call: `*`, `<namespace>.*` such as
+    /// `messages.*`, or a method name such as `messages.sendMessage`.
+    /// Empty, it may call none. `auth.*` and the other account-changing
+    /// methods are allowed only when listed by exact name.
+    #[serde(default)]
+    #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
+    pub allow: Vec<At<String>>,
+    /// Methods the client may never call, with `allow`'s syntax; deny
+    /// wins.
+    #[serde(default)]
+    #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
+    pub deny: Vec<At<String>>,
+}
+
+/// What an RPC `allow` or `deny` entry may be; `validate` checks the same
+/// rule with [`MethodGlob::parse`](super::acl::MethodGlob::parse).
+pub(super) const METHOD_GLOB_PATTERN: &str =
+    "^(\\*|[A-Za-z][A-Za-z0-9_]*\\.\\*|([A-Za-z][A-Za-z0-9_]*\\.)?[A-Za-z][A-Za-z0-9_]*)$";
+
+/// One routing rule of an account.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AccountRoute {
+    /// When the rule applies. Omitted, it matches every update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#match: Option<AccountMatch>,
+    /// Where matching updates go; every entry receives the update.
+    pub to: Vec<At<Target>>,
+}
+
+/// Account rule predicates, on MTProto facts: values within a list are
+/// alternatives, fields must all hold, and an empty list matches anything.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
+pub struct AccountMatch {
+    /// Update constructors, such as `updateNewMessage`.
+    pub constructors: Vec<String>,
+    /// Peer ids: a user, chat or channel, in Bot API form (`-100…` for a
+    /// channel).
+    pub peer_ids: Vec<i64>,
+    /// Sender user ids.
+    pub user_ids: Vec<i64>,
+    /// Commands, with or without the leading `/`: 1 to 32 ASCII letters,
+    /// digits or `_`, with no `@bot` suffix.
+    #[schemars(inner(regex(pattern = "^/?[A-Za-z0-9_]{1,32}$")))]
+    pub commands: Vec<At<String>>,
+    /// Message text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextMatch>,
+}
+
+impl AccountMatch {
+    /// Whether every update satisfies these predicates.
+    pub fn is_empty(&self) -> bool {
+        self.constructors.is_empty()
+            && self.peer_ids.is_empty()
+            && self.user_ids.is_empty()
+            && self.commands.is_empty()
+            && self.text.is_none()
+    }
+}
+
+/// How a consumer receives account updates: the envelope alone (`raw`), or
+/// with the update also rendered as TL-JSON (`tl_json`). `tl_json` needs a
+/// consumer that only accounts feed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Render {
+    /// The envelope, with the update as Telegram's TL bytes.
+    #[default]
+    Raw,
+    /// The envelope, with the update also as TL-JSON.
+    TlJson,
+}
+
+impl Render {
+    /// Left out of `/v1/config`, so that a config without accounts renders
+    /// as before.
+    fn is_raw(render: &At<Render>) -> bool {
+        render.value == Render::Raw
+    }
+}
+
 /// A route target: a consumer name, `{split: …}` or `{all: […]}`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
@@ -602,6 +741,11 @@ pub struct Pull {
     /// those another bot left before a reload stay. Off, the flag is
     /// ignored.
     pub honor_drop_pending: bool,
+    /// How account updates are rendered; `tl_json` only for a consumer
+    /// that accounts alone feed.
+    #[serde(skip_serializing_if = "Render::is_raw")]
+    #[schemars(extend("default" = "raw"))]
+    pub render: At<Render>,
 }
 
 /// tgin posts each update to HTTP endpoints, with retries and a circuit
@@ -650,6 +794,11 @@ pub struct Push {
     /// flag is ignored.
     #[serde(default)]
     pub honor_drop_pending: bool,
+    /// How account updates are rendered; `tl_json` only for a consumer
+    /// that accounts alone feed.
+    #[serde(default = "defaults::render", skip_serializing_if = "Render::is_raw")]
+    #[schemars(extend("default" = "raw"))]
+    pub render: At<Render>,
 }
 
 /// What tgin does with a Bot API method call in an endpoint's response
@@ -1086,6 +1235,52 @@ impl Serialize for WorkerThreads {
         match self {
             Self::Auto => serializer.serialize_str("auto"),
             Self::Count(n) => serializer.serialize_u64(n.get() as u64),
+        }
+    }
+}
+
+/// An account's `api_id`: a number, or text with `${env:…}` or
+/// `${file:…}` references, which resolution expands and checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiId {
+    Number(i64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for ApiId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ApiIdVisitor;
+
+        impl Visitor<'_> for ApiIdVisitor {
+            type Value = ApiId;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an api_id number, or text with `${env:…}` or `${file:…}`")
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ApiId, E> {
+                Ok(ApiId::Number(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ApiId, E> {
+                // Out of range either way; resolution reports it.
+                Ok(ApiId::Number(i64::try_from(v).unwrap_or(i64::MAX)))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ApiId, E> {
+                Ok(ApiId::Text(v.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(ApiIdVisitor)
+    }
+}
+
+impl Serialize for ApiId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Number(n) => serializer.serialize_i64(*n),
+            Self::Text(text) => serializer.serialize_str(text),
         }
     }
 }

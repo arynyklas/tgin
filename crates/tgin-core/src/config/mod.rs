@@ -1,6 +1,7 @@
 //! The configuration file, version 1: its serde model ([`model`]),
 //! validation, resolution into a [`Config`], and JSON Schema.
 
+mod acl;
 mod defaults;
 pub mod model;
 mod resolve;
@@ -13,12 +14,13 @@ use std::time::Duration;
 
 use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
+pub use self::acl::{ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, MethodAcl, MethodGlob, account_changing};
 pub use self::model::RawConfig;
 pub use self::resolve::{
-    Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Files, Gateway, Ingress,
-    IpAllowlist, Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit, RateMode, Reload,
-    Retry, Runtime, Server, Tls, Upstream, UpstreamKind, Webhook, WebhookReply, WebhookRules,
-    WebhookSecret,
+    Account, Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Files, Gateway,
+    Ingress, IpAllowlist, Log, LogFormat, LogLevel, LongPoll, Pull, Push, Rate, RateLimit,
+    RateMode, Reload, Render, Retry, Rpc, RpcClient, Runtime, Server, Tls, Upstream, UpstreamKind,
+    Webhook, WebhookReply, WebhookRules, WebhookSecret,
 };
 pub use self::schema::schema;
 pub use self::sensitive::{Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
