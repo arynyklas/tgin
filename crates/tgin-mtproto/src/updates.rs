@@ -403,6 +403,8 @@ struct Pending {
     common_epoch: Option<u32>,
     channel_epochs: Vec<(i64, u32)>,
     unsequenced: u64,
+    /// It carries no update: nothing to refuse.
+    empty: bool,
     status: Status,
 }
 
@@ -1142,6 +1144,11 @@ impl UpdateManager {
     /// Batch `id` was not admitted. Its boxes roll back to the committed
     /// state and fetch their difference; its unsequenced updates are
     /// counted as dropped. Returns the state to persist now, if any.
+    ///
+    /// A batch with no updates had nothing to admit: refusing it counts as
+    /// [`committed`](Self::committed). Its state (an adopted channel's
+    /// baseline, a getState, a difference's last state) stays, so the
+    /// updates the state was set for are not dropped below a new baseline.
     pub fn refused(&mut self, id: u64) -> Option<StateDelta> {
         self.resolve(id, Status::Refused)
     }
@@ -1152,7 +1159,7 @@ impl UpdateManager {
         if p.status != Status::Open {
             return None;
         }
-        p.status = status;
+        p.status = if p.empty { Status::Committed } else { status };
         let mut delta = StateDelta::default();
         while self
             .pending
@@ -1742,6 +1749,7 @@ impl UpdateManager {
                 .filter_map(|c| self.channels.get(c).map(|ch| (*c, ch.epoch)))
                 .collect(),
             unsequenced: open.unsequenced,
+            empty: open.updates.is_empty(),
             status: Status::Open,
         });
         out.batches.push(Batch {

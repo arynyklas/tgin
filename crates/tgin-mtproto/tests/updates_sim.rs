@@ -818,7 +818,10 @@ async fn rollback_on_fresh_account_resyncs_with_get_state() {
     // Refused while a difference is in flight: its answer is stale.
     let mut m = fresh();
     assert_eq!(m.next_action(), Some(Fetch::GetState));
+    let u = new_message(&message(1, PeerId::User(5), "a"), 21, 1);
+    assert!(m.feed_push(b(updates(&[u], NONE, NONE, 2, 0))).is_empty());
     let batches = m.feed_state(b(state(20, 6, 2, 4)));
+    assert_eq!(all_updates(&batches).len(), 1);
     m.feed_push(too_long());
     assert!(matches!(
         m.next_action(),
@@ -1014,6 +1017,37 @@ async fn deadline_is_now_when_a_fetch_is_due() {
         Some(Fetch::GetChannelDifference { channel: 1, .. })
     ));
     assert_eq!(m.deadline(), now + Duration::from_secs(1));
+}
+
+/// An unknown channel's baseline comes in a batch with no updates. Refusing
+/// it counts as committing it: otherwise the channel would forget its
+/// state, adopt a later update's as a new baseline, and never fetch the
+/// updates between.
+#[tokio::test(start_paused = true)]
+async fn refused_batch_without_updates_keeps_its_state() {
+    let mut m = started(stored(10, &[], &[5]));
+    let post = |id: u32, pts: i32| {
+        new_channel_message(&message(id, PeerId::Channel(4), &format!("p{id}")), pts, 1)
+    };
+    let batches = m.feed_push(b(updates(&[post(1, 8)], NONE, NONE, 2, 0)));
+    assert_eq!(batches.len(), 2, "the baseline, then the update");
+    assert!(batches[0].updates.is_empty());
+    assert_eq!(
+        m.refused(batches[0].id),
+        Some(StateDelta {
+            channels: vec![(4, 7)],
+            ..StateDelta::default()
+        })
+    );
+    assert_eq!(commit(&mut m, &batches[1..]).channels, vec![(4, 8)]);
+    // pts 9 never came: 10 waits, and channel 4 fetches from 8.
+    let batches = m.feed_push(b(updates(&[post(3, 10)], NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    advance(GAP_HOLD).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 4, pts: 8 })
+    );
 }
 
 #[tokio::test(start_paused = true)]
