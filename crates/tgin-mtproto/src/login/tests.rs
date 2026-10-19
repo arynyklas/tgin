@@ -760,3 +760,29 @@ fn login_token_push_is_recognised() {
     assert!(!is_login_token(&updates_too_long()));
     assert!(!is_login_token(&[1, 2]));
 }
+
+/// Whoever sees a login's end may use the session at once: the store is
+/// released before the final state is published. On a multi-thread
+/// runtime the watcher runs beside the flow, so publishing first would let
+/// this open hit `Held`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn final_state_is_published_after_the_session_is_released() {
+    for round in 0..20 {
+        let (h, _dial, tmp) = begin(
+            Method::Qr,
+            None,
+            vec![(
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_success(8, None)),
+            )],
+        );
+        assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 8 });
+        let opened = SessionStore::open(tmp.path());
+        assert!(
+            opened.is_ok(),
+            "round {round}: the session is still held after the end was published"
+        );
+        drop(opened);
+        drop(h);
+    }
+}

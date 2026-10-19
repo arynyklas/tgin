@@ -43,7 +43,7 @@ grammers-tl-parser = "=1.2.2"
 grammers-tl-types = { version = "=0.11.0", default-features = false, features = ["tl-api", "tl-mtproto", "deserializable-functions"] }
 parking_lot.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 
 # The two-process ownership race: its own `main` is both the race driver and,
 # re-run with `TGIN_LOCK_CHILD_DIR`, the contender. A test target, so cargo

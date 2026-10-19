@@ -990,15 +990,25 @@ enum Wanted {
 }
 
 impl<D: Dial> Flow<D> {
-    async fn run(mut self, method: Method) {
-        let end = match self.drive(method).await {
+    async fn run(self, method: Method) {
+        let mut flow = self;
+        let end = match flow.drive(method).await {
             Ok(state) => state,
             Err(e) => LoginState::Failed(e),
         };
         tracing::info!(state = end.name(), "login ended");
-        self.state.send_replace(end);
+        // The session is released before anyone can see the end: a caller
+        // that logs out (or in) right after it must not find it held.
+        let Flow {
+            store,
+            state,
+            mut commands,
+            ..
+        } = flow;
+        drop(store);
         // A late command gets no state.
-        self.commands.close();
+        commands.close();
+        state.send_replace(end);
     }
 
     /// A new key on `dc`, stored as home before it is used.

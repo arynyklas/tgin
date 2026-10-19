@@ -516,3 +516,64 @@ async fn unconfirmed_logout_keeps_the_session() {
     let store = reopen(&s.dir).await;
     assert_eq!(store.home_dc().expect("home"), Some(2));
 }
+
+/// Right after a login's end is seen, the session is free: a logout after
+/// `logged_in`, and a new login after `failed`, never get 409 `session
+/// held`. Multi-thread, as the admin server runs, 20 rounds each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_free_right_after_the_login_ends() {
+    for round in 0..20 {
+        let s = setup(
+            None,
+            vec![
+                (
+                    ids::EXPORT_LOGIN_TOKEN,
+                    Reply::Ok(login_token_success(77, None)),
+                ),
+                (ids::LOG_OUT, Reply::Ok(logged_out())),
+            ],
+        );
+        let (status, body) = call(
+            &s.app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        assert_eq!(parse(&body), LoginStatus::LoggedIn { user_id: 77 });
+        let (status, body) = call(&s.app, "POST", "/v1/accounts/main/logout", "").await;
+        assert_eq!(status, StatusCode::OK, "round {round}: logout: {body}");
+
+        let s = setup(
+            None,
+            vec![
+                (ids::EXPORT_LOGIN_TOKEN, Reply::Rpc(400, "API_ID_INVALID")),
+                (
+                    ids::EXPORT_LOGIN_TOKEN,
+                    Reply::Ok(login_token_success(78, None)),
+                ),
+            ],
+        );
+        let (_, body) = call(
+            &s.app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await;
+        assert!(
+            matches!(parse(&body), LoginStatus::Failed { .. }),
+            "round {round}: {body}"
+        );
+        let (status, body) = call(
+            &s.app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "round {round}: login again: {body}");
+        assert_eq!(parse(&body), LoginStatus::LoggedIn { user_id: 78 });
+    }
+}
