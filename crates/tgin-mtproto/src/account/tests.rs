@@ -683,3 +683,36 @@ async fn a_cut_short_close_leaves_the_task_to_abort() {
     run.account.abort();
     assert!(!run.account.close().await, "the abort ended it");
 }
+
+#[tokio::test(start_paused = true)]
+async fn park_waits_for_rpc_calls_then_releases_the_session() {
+    let net = FakeNetwork::new();
+    net.answer(|call| match call.ctor() {
+        ids::GET_DIFFERENCE => Reply::Ok(crate::testkit::difference_empty(1, 1)),
+        _ => Reply::Later(Duration::from_secs(3), Box::new(Reply::Ok(Vec::new()))),
+    });
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    let rpc = run.account.rpc();
+    let call =
+        tokio::spawn(async move { rpc.invoke(Route::Main, Bytes::from_static(&[0; 4])).await });
+    timeout(WAIT, async {
+        while net.ctors().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the call reaches Telegram");
+    let parked = Instant::now();
+    assert!(run.account.park(Duration::from_secs(10)).await);
+    assert_eq!(
+        Instant::now().duration_since(parked),
+        Duration::from_secs(3)
+    );
+    assert!(
+        call.await.expect("no panic").is_ok(),
+        "the call was answered"
+    );
+    drop(SessionStore::open(run.dir.path()).expect("the session is free"));
+}

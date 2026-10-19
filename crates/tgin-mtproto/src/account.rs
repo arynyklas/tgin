@@ -512,6 +512,53 @@ impl Account {
         self.0.close.cancel();
         self.0.abort.abort();
     }
+
+    /// Parks the account so another holder (a logout) can use its session:
+    /// stops the ingest (everything admitted is committed), waits up to
+    /// `rpc_wait` for its RPC calls on their way to Telegram, then closes
+    /// it, releasing the session. Start a new [`Account`] to run it again.
+    pub async fn park(&self, rpc_wait: Duration) -> bool {
+        self.0.ingest.cancel();
+        let shared = &self.0.shared;
+        let idle = async {
+            loop {
+                let notified = shared.rpc_idle.notified();
+                if shared.rpc_calls.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        if tokio::time::timeout(rpc_wait, idle).await.is_err() {
+            tracing::warn!(account = %shared.name, "RPC calls still running when the account was parked");
+        }
+        self.close().await
+    }
+
+    /// Whether the account has passed its start-up checks once (the
+    /// session read, its user claimed or refused), or ended a run.
+    pub async fn checked(&self) {
+        let mut rx = self.0.shared.checked.subscribe();
+        let _ = rx.wait_for(|&checked| checked).await;
+    }
+}
+
+/// One RPC call on the account's sessions while it lives.
+struct RpcCall<'a>(&'a Shared);
+
+impl<'a> RpcCall<'a> {
+    fn new(shared: &'a Shared) -> Self {
+        shared.rpc_calls.fetch_add(1, Ordering::SeqCst);
+        Self(shared)
+    }
+}
+
+impl Drop for RpcCall<'_> {
+    fn drop(&mut self) {
+        if self.0.rpc_calls.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.rpc_idle.notify_waiters();
+        }
+    }
 }
 
 /// The budget when the spec gives none.
@@ -543,6 +590,10 @@ struct Shared {
     key_gone: AtomicBool,
     signal: Notify,
     wake: Notify,
+    /// RPC calls on the sessions now, and a wake when the last one ends.
+    rpc_calls: AtomicUsize,
+    rpc_idle: Notify,
+    checked: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -561,7 +612,15 @@ impl Shared {
             key_gone: AtomicBool::new(false),
             signal: Notify::new(),
             wake: Notify::new(),
+            rpc_calls: AtomicUsize::new(0),
+            rpc_idle: Notify::new(),
+            checked: watch::Sender::new(false),
         }
+    }
+
+    /// The start-up checks are done (or a run ended before them).
+    fn mark_checked(&self) {
+        self.checked.send_replace(true);
     }
 
     fn set_state(&self, state: AccountState) {
@@ -694,7 +753,10 @@ impl AccountRpc for RpcPort {
                 }));
             };
             let home = self.shared.home_dc.load(Ordering::Relaxed);
-            let outcome = sessions.invoke(route, body).await;
+            let outcome = {
+                let _call = RpcCall::new(&self.shared);
+                sessions.invoke(route, body).await
+            };
             observe(&self.shared, route, home, &outcome);
             outcome
         })
@@ -782,6 +844,7 @@ async fn supervise(ctx: Arc<Ctx>) {
         let run = tokio::spawn(run(Arc::clone(&ctx)));
         let _abort = AbortOnDrop(run.abort_handle());
         let end = ended(&ctx, run.await);
+        ctx.shared.mark_checked();
         ctx.shared.disconnected();
         let at = match end {
             End::Stopped => break,
