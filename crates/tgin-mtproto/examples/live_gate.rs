@@ -732,6 +732,9 @@ fn import(args: &Args, paths: &Paths) -> Result<(), AnyError> {
         .find(|(dc, _)| *dc == home)
         .map(|(_, key)| key.clone())
         .ok_or("the source session has no key for its home DC")?;
+    // Only the home key is used; media DCs get keys of their own, authorized
+    // on first use.
+    keys.retain(|(dc, _)| *dc == home);
     let left_state = src.update_state()?;
     let left_channels = src.channel_pts()?.len();
     drop(src);
@@ -748,11 +751,6 @@ fn import(args: &Args, paths: &Paths) -> Result<(), AnyError> {
         dst.set_dc_option(*dc, *addr)?;
     }
     dst.set_home_key(home, &home_key)?;
-    for (dc, key) in &keys {
-        if *dc != home {
-            dst.set_dc_key(*dc, key)?;
-        }
-    }
     let recorded = dst.record_login(me)?;
 
     // Read back.

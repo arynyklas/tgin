@@ -544,14 +544,8 @@ fn difference_slices_match_typed() {
     fn state(d: &Difference<'_>, s: &enums::updates::State) -> bool {
         let enums::updates::State::State(s) = s;
         raw(d.state, &enums::updates::State::State(s.clone()))
-            && (d.pts, d.qts, d.date, d.seq, d.unread_count)
-                == (
-                    Some(s.pts),
-                    Some(s.qts),
-                    Some(s.date),
-                    Some(s.seq),
-                    Some(s.unread_count),
-                )
+            && (d.pts, d.qts, d.date, d.seq)
+                == (Some(s.pts), Some(s.qts), Some(s.date), Some(s.seq))
     }
 
     let plan = Plan::new(&API);
@@ -563,16 +557,13 @@ fn difference_slices_match_typed() {
             let d = difference(bytes).map_err(|e| format!("difference: {e}"))?;
             let ok = if d.constructor.starts_with("updates.channel") {
                 match Cd::from_bytes(bytes).map_err(|e| format!("grammers: {e}"))? {
-                    Cd::Empty(t) => {
-                        d.is_final == t.r#final && d.pts == Some(t.pts) && d.timeout == t.timeout
-                    }
+                    Cd::Empty(t) => d.is_final == t.r#final && d.pts == Some(t.pts),
                     Cd::TooLong(t) => {
                         let dialog_pts = match &t.dialog {
                             enums::Dialog::Dialog(dialog) => dialog.pts,
                             _ => None,
                         };
                         d.is_final == t.r#final
-                            && d.timeout == t.timeout
                             && raw(d.dialog, &t.dialog)
                             && d.pts == dialog_pts
                             && eq(&d.new_messages, &t.messages)
@@ -582,7 +573,6 @@ fn difference_slices_match_typed() {
                     Cd::Difference(t) => {
                         d.is_final == t.r#final
                             && d.pts == Some(t.pts)
-                            && d.timeout == t.timeout
                             && eq(&d.new_messages, &t.new_messages)
                             && eq(&d.other_updates, &t.other_updates)
                             && raw(d.chats, &t.chats)

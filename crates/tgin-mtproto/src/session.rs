@@ -247,18 +247,6 @@ impl SessionStore {
         })
     }
 
-    /// Stores a media DC's key. The home DC's key goes through
-    /// [`set_home_key`](Self::set_home_key) only.
-    pub fn set_dc_key(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError> {
-        self.write(|txn| {
-            if txn.open_table(HOME_DC)?.get(HOME_KEY)?.map(|v| v.value()) == Some(dc) {
-                return Err(SessionError::HomeDc { dc });
-            }
-            txn.open_table(AUTH_KEYS)?.insert(dc, key.0.as_slice())?;
-            Ok(())
-        })
-    }
-
     /// The recorded login, if any.
     pub fn login(&self) -> Result<Option<Login>, SessionError> {
         let txn = self.db.begin_read()?;
@@ -825,7 +813,7 @@ mod tests {
         }
         // The media path cannot reach the home key either.
         assert!(matches!(
-            s.set_dc_key(2, &AuthKey([3; 256])),
+            s.set_media_key(2, &AuthKey([3; 256])),
             Err(SessionError::HomeDc { dc: 2 })
         ));
         drop(s);
@@ -879,7 +867,6 @@ mod tests {
         };
         s.set_dc_option(2, addr).expect("dc");
         s.set_home_key(2, &AuthKey([1; 256])).expect("home");
-        s.set_dc_key(4, &AuthKey([4; 256])).expect("media");
         s.set_media_key(3, &AuthKey([3; 256])).expect("media key");
         s.record_login(me(42)).expect("login");
         s.set_update_state(UpdateState {
@@ -967,7 +954,6 @@ mod tests {
             s.set_dc_option(2, addr(2)).expect("dc 2");
             s.set_dc_option(4, addr(4)).expect("dc 4");
             s.set_home_key(2, &AuthKey([2; 256])).expect("home key");
-            s.set_dc_key(4, &AuthKey([4; 256])).expect("dc 4 key");
             s.put_peers(&peers).expect("peers");
             s.set_update_state(state).expect("state");
             s.set_channel_pts(99, 5).expect("chan");
@@ -983,7 +969,7 @@ mod tests {
         );
         assert_eq!(s.home_dc().expect("home"), Some(2));
         assert_eq!(s.auth_key(2).expect("key 2"), Some(AuthKey([2; 256])));
-        assert_eq!(s.auth_key(4).expect("key 4"), Some(AuthKey([4; 256])));
+        assert_eq!(s.auth_key(4).expect("key 4"), None);
         assert_eq!(s.auth_key(5).expect("key 5"), None);
         for p in &peers {
             assert_eq!(s.peer(p.dialog_id()).expect("peer").as_ref(), Some(p));

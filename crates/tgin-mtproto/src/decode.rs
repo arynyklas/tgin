@@ -393,9 +393,13 @@ pub struct Difference<'a> {
     /// The raw `Vector<Chat>`, vector id and count included.
     pub chats: Option<&'a [u8]>,
     /// The raw boxed `updates.State`: `state` of `updates.difference`,
-    /// `intermediate_state` of `updates.differenceSlice`.
+    /// `intermediate_state` of `updates.differenceSlice` (the tests check
+    /// the cut).
+    #[cfg(test)]
     pub state: Option<&'a [u8]>,
-    /// The raw boxed `Dialog` of `updates.channelDifferenceTooLong`.
+    /// The raw boxed `Dialog` of `updates.channelDifferenceTooLong` (the
+    /// tests check the cut).
+    #[cfg(test)]
     pub dialog: Option<&'a [u8]>,
     /// The state to continue from: the `state`'s or `intermediate_state`'s
     /// fields; `differenceEmpty`'s `date` and `seq`; `differenceTooLong`'s
@@ -405,11 +409,8 @@ pub struct Difference<'a> {
     pub qts: Option<i32>,
     pub date: Option<i32>,
     pub seq: Option<i32>,
-    pub unread_count: Option<i32>,
     /// A channel difference's `final` flag.
     pub is_final: bool,
-    /// A channel difference's `timeout`.
-    pub timeout: Option<i32>,
 }
 
 /// Cuts one boxed difference into its parts.
@@ -430,15 +431,15 @@ pub fn difference(bytes: &[u8]) -> Result<Difference<'_>, TlError> {
         other_updates: Vec::new(),
         users: None,
         chats: None,
+        #[cfg(test)]
         state: None,
+        #[cfg(test)]
         dialog: None,
         pts: None,
         qts: None,
         date: None,
         seq: None,
-        unread_count: None,
         is_final: false,
-        timeout: None,
     };
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
@@ -461,20 +462,27 @@ pub fn difference(bytes: &[u8]) -> Result<Difference<'_>, TlError> {
                     ("users", _) => d.users = Some(slice(&mut r, ty)?),
                     ("chats", _) => d.chats = Some(slice(&mut r, ty)?),
                     ("state" | "intermediate_state", Ty::Boxed(_)) => {
+                        #[cfg(test)]
                         let start = r.pos;
                         ints(&mut r, ty, &mut d, true)?;
-                        d.state = Some(&bytes[start..r.pos]);
+                        #[cfg(test)]
+                        {
+                            d.state = Some(&bytes[start..r.pos]);
+                        }
                     }
                     ("dialog", Ty::Boxed(_)) => {
+                        #[cfg(test)]
                         let start = r.pos;
                         ints(&mut r, ty, &mut d, false)?;
-                        d.dialog = Some(&bytes[start..r.pos]);
+                        #[cfg(test)]
+                        {
+                            d.dialog = Some(&bytes[start..r.pos]);
+                        }
                     }
                     ("final", Ty::True) => d.is_final = true,
                     ("pts", Ty::Int) => d.pts = Some(r.i32()?),
                     ("date", Ty::Int) => d.date = Some(r.i32()?),
                     ("seq", Ty::Int) => d.seq = Some(r.i32()?),
-                    ("timeout", Ty::Int) => d.timeout = Some(r.i32()?),
                     _ => API.skip_value(&mut r, ty, 1)?,
                 }
             }
@@ -491,7 +499,6 @@ pub struct State {
     pub qts: i32,
     pub date: i32,
     pub seq: i32,
-    pub unread_count: i32,
 }
 
 /// Reads one boxed `updates.State` (the answer to `updates.getState`).
@@ -512,7 +519,6 @@ pub fn state(bytes: &[u8]) -> Result<State, TlError> {
                     ("qts", Ty::Int) => s.qts = r.i32()?,
                     ("date", Ty::Int) => s.date = r.i32()?,
                     ("seq", Ty::Int) => s.seq = r.i32()?,
-                    ("unread_count", Ty::Int) => s.unread_count = r.i32()?,
                     _ => API.skip_value(&mut r, ty, 1)?,
                 }
             }
@@ -604,7 +610,7 @@ fn peer_entry(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Option<Peer>, T
 }
 
 /// One boxed object of type `ty`, keeping its top-level `pts`, and with
-/// `state` also its `qts`, `date`, `seq` and `unread_count`; everything
+/// `state` also its `qts`, `date` and `seq`; everything
 /// else is skipped.
 fn ints(
     r: &mut Reader<'_>,
@@ -629,7 +635,6 @@ fn ints(
                     ("qts", Ty::Int) if state => d.qts = Some(r.i32()?),
                     ("date", Ty::Int) if state => d.date = Some(r.i32()?),
                     ("seq", Ty::Int) if state => d.seq = Some(r.i32()?),
-                    ("unread_count", Ty::Int) if state => d.unread_count = Some(r.i32()?),
                     _ => API.skip_value(r, ty, 2)?,
                 }
             }

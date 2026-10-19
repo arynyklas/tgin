@@ -12,7 +12,8 @@ pub enum SessionError {
     /// authorization: replacing it would silently log the account out.
     #[error("refusing to replace the auth key of home DC {dc}: the account is logged in")]
     KeyReplaceRefused { dc: i32 },
-    /// The home DC's key goes through `set_home_key`, never `set_dc_key`.
+    /// The home DC's key goes through `set_home_key`, never through
+    /// `set_media_key`.
     #[error("DC {dc} is the home DC; its key is set by set_home_key")]
     HomeDc { dc: i32 },
     #[error("session I/O: {0}")]
