@@ -12,6 +12,7 @@ This is the manual of tgin 1.0. The key-by-key reference of the config file is [
 - [Webhook ingress](#webhook-ingress)
 - [Bot API gateway](#bot-api-gateway)
 - [Self-hosted Bot API servers](#self-hosted-bot-api-servers)
+- [User accounts (MTProto)](#user-accounts-mtproto)
 - [Hot reload](#hot-reload)
 - [Admin API v1](#admin-api-v1)
 - [`tgin admin`](#tgin-admin)
@@ -28,6 +29,7 @@ tgin sits between the Telegram Bot API and the processes that handle a bot's upd
 
 - **Bots** (`bots`). Each bot has a unique name, a token, a Bot API server (its **upstream**: Telegram's, unless `api_url` or `upstream` names another) and at most one **ingress**: `long_poll` (tgin calls `getUpdates` on the Bot API server) or `webhook` (the server posts updates to tgin). A bot without an ingress receives nothing.
 - **Upstreams** (`upstreams`). Named Bot API servers: Telegram's (`kind: cloud`) or a self-hosted `telegram-bot-api` (`kind: local`), whose files tgin can serve ([Self-hosted Bot API servers](#self-hosted-bot-api-servers)).
+- **Accounts** (`accounts`). Telegram user accounts that tgin logs in and runs over MTProto: their updates go to consumers as envelopes, and downstreams call Telegram as the account through tgin ([User accounts (MTProto)](#user-accounts-mtproto)).
 - **Consumers** (`consumers`). A named destination for updates, in one of two modes:
   - **pull**: downstream bots fetch updates from tgin with a Telegram-shaped `getUpdates` call on `/c/<consumer>/getUpdates` (and on any alias path), or through the [gateway](#bot-api-gateway) on `/c/<consumer>/bot<token>/getUpdates`. Several processes may poll one pull consumer; they compete for its updates. A pull consumer serves exactly one bot: two bots routing to the same pull consumer is a config error.
   - **push**: tgin posts each update to one or more HTTP endpoints, with retries and a circuit breaker per endpoint. Several bots may route to one push consumer; the `X-Tgin-Source` header names the bot.
@@ -66,7 +68,7 @@ tgin: tgin.yaml has 1 error
 
 `tgin config validate` lists the errors (all validation errors at once; a YAML syntax or shape error alone) and warnings, and exits 1 on errors; `tgin config print` prints the config as JSON with defaults filled in (except a webhook's omitted `path`, which defaults to `/webhook/<bot name>`) and secrets redacted; `tgin config schema` prints the JSON Schema ([schema/tgin.v1.schema.json](schema/tgin.v1.schema.json)), which YAML editors can use (`# yaml-language-server: $schema=…`). Every `${env:…}` the file references must be set for these commands too.
 
-**References.** Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`) and fields holding URLs or file paths (including webhook `path` and pull `aliases`) expand references; every other value is literal.
+**References.** Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`, an account's `api_hash`, `phone` and RPC client `token`s), an account's `api_id`, and fields holding URLs or file paths (including webhook `path`, pull `aliases` and an account's `session_dir`) expand references; every other value is literal.
 
 - `${env:NAME}` is the environment variable `NAME`; an unset variable is an error.
 - `${file:PATH}` is the content of the file, minus one trailing newline. A relative `PATH` is relative to the config file's directory.
@@ -86,6 +88,7 @@ File-path fields (`server.tls.cert_file`, `server.tls.key_file`, a webhook's `ce
 | `upstreams` | Bot API servers by name: `kind`, `url`, `local_mode`, `files`, `response_timeout` ([Self-hosted Bot API servers](#self-hosted-bot-api-servers)) | none; `local_mode: false`, `response_timeout` `1m` (`cloud`) or `10m` (`local`) |
 | `bots` | Bots with `name`, `token`, `api_url` or `upstream`, `allow_local_files`, `gateway`, `ingress`, `routes` | `api_url: https://api.telegram.org`, `allow_local_files: false` |
 | `consumers` | Pull and push consumers by name | see below |
+| `accounts` | Telegram user accounts by name: `api_id`, `api_hash`, `session_dir`, `phone`, `rpc` (`max_rps`, `flood_sleep_threshold`, `clients`), `routes` ([User accounts (MTProto)](#user-accounts-mtproto)) | none; `max_rps: 20`, `flood_sleep_threshold: 10s` |
 
 Names of bots, consumers and upstreams are 1 to 63 lowercase letters, digits and `-`, starting with a letter or digit.
 
@@ -583,6 +586,249 @@ tgin never logs the server's URL or a bot's directory or file path on it; each b
 
 [examples/self-hosted](examples/self-hosted) runs the server, built from [docker/telegram-bot-api](docker/telegram-bot-api), in local mode next to tgin and one bot: the server shares a network with tgin alone and publishes no port, its files volume is mounted read-only in tgin at the server's own path (`files.dir`), and the bot reaches the server only through tgin's gateway. Its `compose.fake.yaml` runs the same stack against the fake Bot API in local mode, without Telegram.
 
+## User accounts (MTProto)
+
+Besides bots, tgin can run Telegram **user accounts** (`accounts`). tgin logs each account in itself, speaks MTProto to Telegram on its own connection, routes the account's updates to consumers as [envelopes](#envelope-v1), and lets downstream programs call Telegram as the account through a raw-TL [RPC endpoint](#rpc-endpoint). The account's authorization never leaves tgin: downstreams get updates and a filtered call path, not the session.
+
+```yaml
+admin:
+  token: ${file:/run/secrets/admin_token}   # required for login and logout
+accounts:
+  main:
+    api_id: ${env:TG_API_ID}
+    api_hash: ${env:TG_API_HASH}
+    session_dir: ./sessions/main
+    phone: ${env:TG_PHONE}                    # optional; checks who logs in
+    rpc:
+      max_rps: 20
+      flood_sleep_threshold: 10s
+      clients:
+        worker:
+          token: ${file:/run/secrets/worker_rpc_token}
+          allow: ["messages.*", "users.getUsers"]
+          deny: [messages.deleteHistory]
+    routes:
+      - match: {commands: [ping]}
+        to: [commands]
+      - to: [main-pull]
+consumers:
+  main-pull:
+    pull:
+      auth_token: ${file:/run/secrets/main_pull_token}
+  commands:
+    push:
+      endpoints: [{url: "http://worker:8000/updates"}]
+```
+
+Account names follow the rules of bot names and must differ from every bot's. Every key is in the [config reference](docs/config-reference.md#account). A Telethon adapter for both endpoints is in [examples/mtproto](examples/mtproto).
+
+### Telegram's terms
+
+Running a user account through tgin makes it an unofficial client, and the account is yours to lose:
+
+- Use your **own `api_id`** and `api_hash`, from [my.telegram.org](https://my.telegram.org), never one copied from another app.
+- Telegram **watches unofficial clients**, and it can limit, freeze or ban an account that behaves unlike a person. An account Telegram freezes shows `frozen`.
+- **No spam**: no bulk messages, mass invites or scraping of people who did not ask for it.
+- **No AI training** on the data the account sees: it is other people's messages.
+
+### Login
+
+An account logs in through the admin API, by QR or by a code, with `tgin admin login <account>` ([`tgin admin`](#tgin-admin)) or the routes below. The routes need `admin.token`: without one they answer `403 admin.token required for account login`, even on a loopback listener, because a token-less loopback API is open to every local user and to web pages, through cross-site requests and DNS rebinding. Loading a config with accounts and no token logs a warning. Whoever holds the admin token can log the account in and out, read the live `tg://login` URL while a QR login runs, and spend up to 5 password or code attempts per login on the real account, so give the token only to people trusted with the account. Login answers carry `Cache-Control: no-store`; the URL, codes and passwords are never logged.
+
+| Method and path | Answer |
+|---|---|
+| `POST /v1/accounts/<name>/login` `{"method":"qr"}` or `{"method":"code"}` | `200` the login's state |
+| `GET /v1/accounts/<name>/login` | `200` the login's state (the current QR included) |
+| `POST /v1/accounts/<name>/login/code` `{"code"}`, `/login/password` `{"password"}` | `200` the login's state |
+| `DELETE /v1/accounts/<name>/login` | `200 {"cancelled":true}` |
+| `POST /v1/accounts/<name>/logout` | `200 {"logged_out":true}` |
+
+- **QR.** The answer is `{"state":"qr","url":"tg://login?token=…","expires":…}`; tgin renews the token by itself until it is scanned (in the account's app: Settings > Devices > Link Desktop Device).
+- **Code.** tgin sends a login code to the config's `phone` and answers `code_sent`; without a `phone` the code login fails (`no_phone`).
+- A cloud password then gives `need_password`. A login ends in one of these states:
+  - `logged_in`;
+  - `need_email_setup`: Telegram wants a login email first, which only an official app can add; add one there, then log in again;
+  - `need_email_code`: Telegram sent the code to the login email, which tgin does not support; log in by QR instead;
+  - `payment_required`: Telegram asks for a payment before it sends a code; log in by QR instead;
+  - `failed`, with a `reason`.
+- **Identity gate.** With a `phone` in the config, a login by an account with another phone is logged out again and fails (`wrong_account`). When Telegram does not confirm that logout, the login fails `wrong_account_not_logged_out`: the other account's key stays in the session, without a recorded login. Run `tgin admin logout <account> --yes` to log that key out and clear the session, then log in again.
+- **Lifetime and attempts.** An unscanned QR login ends `failed` (`expired`) after 5 minutes, and so does a login that waits 5 minutes for a code or password. A fifth wrong code or password ends the login (`code_attempts`, `password_attempts`). `DELETE …/login` ends a login at once (`tgin admin login` sends it on Ctrl+C), and a reload ends one whose account it removed or whose `session_dir` or `phone` it changed.
+- **A leftover key.** When a key is stored without a recorded login (a login whose answer was lost, say), the next login first asks Telegram about it, for up to 20 s. With a `phone` configured, a key still logged in goes through the identity gate and is adopted. Without a `phone`, nothing says it is the right account, so it is logged out (`auth.logOut`) and the login starts fresh: a crash between a scan and the end of the login then costs one more scan. No clear answer in time gives `409 session unverified` and changes nothing.
+- **Logout** calls `auth.logOut` and clears the session (keys, login, peers, update state; the directory stays). A running account is parked for it first: its ingest stops with everything admitted committed, its RPC calls get up to 10 s, and it releases the session. It then shows `logged_out`, or runs again on its key when Telegram did not confirm the logout (`502 logout unconfirmed`, nothing cleared).
+- Failures: `400 invalid body`, `403 admin.token required for account login`, `404 unknown account`, `404 no login`, `409 account running` (a login while the account runs: log out first), `409 logout in progress`, `409 logged in`, `409 session held` (by another process), `409 session unverified`, `409 login in progress` (with the other method), `409 login starting` (a second request while a login is starting), `409 login cancelled` (a DELETE or a reload cancelled a login that was still starting), `422` with an `error` and a `reason` for a wrong code or password (`code_invalid`, `password_invalid`: try again) or for a code or password the login is not waiting for (`not_expected`), `500 session store failed`, `502 logout unconfirmed`.
+
+An account starts once its login ends, without a restart.
+
+### Session directory
+
+`session_dir` holds one account's session: its auth keys, home DC, peers, update state and the `update_id` mark, in `session.redb`, with a lock file beside it. A relative path is relative to the config file's directory. Give every account its own directory.
+
+One process holds a session directory at a time, under an OS file lock taken before the store opens; a second process gets `session held` (`failed{session_held}` for a running account). The lock works within one OS instance only, so **never share a session directory across hosts, bind mounts or network filesystems**: two hosts would both take the lock, and two processes on one authorization fight over its update stream. On Unix the directory is created `0700` and its files `0600`; on Windows the directory's ACL is yours to set. The directory holds the account's keys: whoever reads it can act as the account.
+
+### Account states
+
+`GET /v1/accounts` (admin token) lists every configured account; no field is a secret.
+
+```console
+$ curl -s -H "Authorization: Bearer $(cat admin_token)" http://127.0.0.1:9090/v1/accounts
+{"accounts":[{"name":"main","state":"running","layer":230,"home_dc":2,
+  "catching_up":{"common":false,"channels":0}}]}
+```
+
+- `state`: `logged_out` (with `"login_in_progress": true` while a login of this process holds the session), `connecting`, `running`, `flood_wait`, `frozen` (Telegram answered `FROZEN_*`: the account is read-only; it stays so until the account restarts, is logged out or needs a new login), `needs_login` (Telegram no longer accepts the authorization: log out and in again) or `failed`.
+- `flood_wait` has `until`, in unix seconds. It means one of two things. Telegram refused the main session's init call with a flood wait: the account is offline and connects again at `until`. Or Telegram asked for a flood wait on a catch-up call (`updates.getState`, `getDifference`): the account stays connected, receives live updates and serves RPC, and catch-up resumes at `until`.
+- `failed` carries a `reason` and `retrying`: `duplicate_account` and `init_refused` (Telegram refused the init call, `API_ID_INVALID` say) are not retried; `session_held`, `storage`, `connect` and `panicked` are, after a backoff from 1 s doubling to 60 s.
+- `home_dc` is `null` until the session was read; `catching_up` shows whether the common box and how many channels are catching up.
+
+**Duplicate accounts.** Two accounts of one process logged in as the same Telegram user would fight over one update stream. One of them runs and the other reports `failed{duplicate_account}`; which one is not specified. The other starts when the first gives the user up.
+
+### Envelope v1
+
+Every account update reaches a consumer as one JSON object, an **envelope**:
+
+```json
+{"update_id":42,"account":"main","layer":230,"constructor":"updateNewMessage",
+ "received_at":"2026-10-19T12:34:56.789Z","tl":"<base64>","users":"<base64>","chats":"<base64>"}
+```
+
+| Field | Meaning |
+|---|---|
+| `update_id` | Strictly increasing per account, starting at 1, never repeated across restarts, and **not contiguous**: ids reserved by a run that stopped are skipped. Use it for `offset`; never compute the next id. |
+| `account` | The account's name. |
+| `layer` | The TL layer of `tl`, `users` and `chats`: the account's one layer. |
+| `constructor` | The update's constructor name, such as `updateNewMessage`. For an `updateShort` it names the wrapped update (`updateUserStatus`, say); the other short forms name themselves (`updateShortMessage`, `updateShortChatMessage`, `updateShortSentMessage`). |
+| `received_at` | When tgin admitted the update: wall-clock time, RFC 3339 UTC with milliseconds. Every update of one batch shares it, and it is not monotonic (it follows the system clock). |
+| `tl` | The update's TL bytes: an `Update` object, except for Telegram's short forms (below). |
+| `users`, `chats` | The raw `Vector<User>` and `Vector<Chat>` of the push or difference the update came with. |
+| `update` | Only with `render: tl_json` on the consumer: the update as TL-JSON. Left out when tgin's codec refuses the bytes (logged as `the update has no TL-JSON`). |
+
+`tl`, `users` and `chats` are standard base64 with padding.
+
+- **Pushed updates** are Telegram's bytes as received.
+- **Short forms** are delivered as Telegram's raw short `Updates` object, not as an `Update`: `tl` of an `updateShort` is the whole `updateShort` (its `date` included) while `constructor` names the update inside it, and `updateShortMessage`, `updateShortChatMessage` and `updateShortSentMessage` arrive as themselves. Parse `tl` as an `Updates` object when `constructor` is a short form, or when the object's constructor id is not the update's.
+- **Catch-up updates** (from `getDifference` or `getChannelDifference`) are composed from the difference's messages as `updateNewMessage`, `updateNewChannelMessage` or `updateNewEncryptedMessage`. The first two carry the difference's final `pts` (not the message's own) and a `pts_count` of 0; `updateNewEncryptedMessage` carries the difference's final `qts` and has no `pts_count`.
+
+A consumer takes bot updates or account updates, never both, and `render: tl_json` is allowed only on a consumer that accounts alone feed. Push consumers post the envelope with `X-Tgin-Source: <account>` and `X-Tgin-Update-Type: <constructor>`.
+
+### Pull and push
+
+- **Pull.** A pull consumer an account feeds is served at `GET` or `POST /c/<consumer>/mtproto/v1/getUpdates` and at its `aliases`, with the parameters, leases and `offset` acknowledgements of [`getUpdates`](#pull-consumers-the-getupdates-endpoint); `result` holds envelopes. `/c/<consumer>/getUpdates` answers `404` for it, as the account path does for a bot's consumer. `auth_token` is **required**: an account's updates are private, and no bot token stands behind them, so validation refuses an account-fed pull consumer without one, and the poll answers `401` without it. A pull consumer serves one account, since each account's `update_id`s make their own offsets.
+- **Push.** Push consumers deliver envelopes like bot updates, with retries, breakers and dead letters. `webhook_reply` is ignored for an account consumer (an account update has no bot to run a reply as, so the answer is not read), and `accept_set_webhook` is refused when only an account feeds the consumer.
+- `honor_drop_pending` has no effect on an account's updates: `drop_pending_updates` drops only the calling bot's.
+- **A feed change is refused.** A consumer keeps the kind of updates it was first given. A reload that would route account updates to a consumer that still holds bot updates (or the reverse) is rejected with the consumer's name: route the new updates to a consumer of another name, or first apply a config that routes nothing to it, let it drain (or purge it), then route the new updates to it.
+
+### Account rules
+
+`accounts.<name>.routes` are tried in order and the first match wins, as for bots; a rule without `match` matches everything, and targets (`to`, `split`, `all`) are the same. An update no rule matches is dropped and counted in `tgin_routes_unmatched_total{source="<account>"}`. `match` fields hold MTProto facts:
+
+| Field | Matches |
+|---|---|
+| `constructors` | The update's constructor, such as `updateNewMessage` or `updateNewChannelMessage`. |
+| `peer_ids` | The chat, in Bot API form: a user's id, `-<id>` for a basic group, `-100<id>` for a channel or supergroup. |
+| `user_ids` | The sender's user id. |
+| `commands` | A leading command, with or without the `/`, 1 to 32 letters, digits or `_`. Only an unsuffixed command matches: an account has no bot username, so `/start@somebot` matches no `commands` rule. Match addressed commands with `text` (`prefix: ["/start@somebot"]`). |
+| `text` | The message text, first 4 KiB, by `prefix`, `regex` or `equals`. |
+
+Values in one list are alternatives; all given fields must hold.
+
+### Delivery
+
+tgin keeps its own update state per account, by Telegram's [rules](https://core.telegram.org/api/updates): a **common box** (`pts`, `qts`) and one box per channel. It persists a box's state only after every batch up to the one that moved it is admitted, and catches up with `updates.getDifference` (the common box, at start and on a gap) and `updates.getChannelDifference` (a channel, on a gap in it, on `updateChannelTooLong`, or at start when the last run left it behind).
+
+- **At least once, for sequenced updates, to `backpressure` consumers, while the process lives.** Updates that carry a `pts` or `qts` are admitted to every target or to none. When a `backpressure` target is full, the batch is refused, the box rolls back to its last committed state and fetches the updates again after a backoff (1 s, doubling to 60 s, reset when the box next commits). A box commits as soon as its batch is queued, so across a crash or restart the replay brings back only updates that were received and not yet admitted.
+  - Queues stay in memory, as for bots ([Delivery semantics](#delivery-semantics)): envelopes still queued, leased or waiting for a push retry are lost when tgin crashes, is killed, or ends a shutdown drain before they are delivered, and no catch-up brings them back.
+  - `on_full: drop_oldest` on an account's consumer is an explicit choice to lose updates when it is full.
+  - Not covered: an envelope larger than a target's `capacity_bytes` (dropped for that target, `reason="oversized"`), and a push dead letter.
+  - **Common box: at least once.** **Channel boxes: to be confirmed** against Telegram. For a channel there is one known crash window: from the moment a channel's push is received until the marks of the call that fed it are durable. Telegram treats such a push as delivered and only tgin knew the channel moved, so a quiet channel does not bring it back. Every other crash point replays it.
+- **Unsequenced updates** (no `pts`/`qts`: typing, user status, some read marks such as `updateReadChannelOutbox`…) are best effort: those of a refused batch are not fetched again, and are counted in `tgin_mtproto_updates_dropped_total{reason="full"}`.
+- **Not owed, by design:** an unknown channel's updates before its first one; a channel's updates before its fetch failed for good or its answer could not be decoded (its state starts again); what a `differenceTooLong` or `channelDifferenceTooLong` skips (Telegram cannot send it any more); a post lost with a connection whose session Telegram replaced, unless Telegram's `getDifference` signals that channel. An update tgin cannot decode is skipped and counted (`reason="undecodable"`).
+- **No dedup.** A replay may repeat updates already delivered, under new `update_id`s. Deduplicate on the update's own ids (a message's peer and id, say) if it matters.
+
+### RPC endpoint
+
+`POST /mtproto/v1/<account>/invoke` on the data plane (served only when the config has accounts) runs one call as the account.
+
+**Request.**
+
+- `Authorization: Bearer <token>` of one of the account's `rpc.clients`, compared in constant time. The account and the token are checked from the headers before the body is read; an unknown account answers like a wrong token.
+- `X-Tgin-Layer: <layer>`: the layer the body is serialized in. It must be the account's.
+- The body: the call as TL (`Content-Type: application/octet-stream`, at most 1 044 428 bytes), or as TL-JSON (`Content-Type: application/json`, at most 2 MiB), which tgin encodes. It must arrive within 30 s. Upload files with `upload.saveFilePart` or `upload.saveBigFilePart`, in parts of at most 512 KiB.
+- `Accept: application/json` renders the answer as TL-JSON, by the called function's result type. An answer that cannot be rendered is sent raw with `X-Tgin-Render: raw`: the call has run, so that is never an error.
+
+**Unwrapping.** A client library's first call is usually wrapped: tgin strips `invokeWithLayer(<the account's layer>, …)` and `initConnection(…)`, since it owns the connection. Any other wrapper (`invokeAfterMsg`, `invokeWithoutUpdates`, `invokeWithTakeout`…) is refused, as is an `invokeWithLayer` naming another layer. What is left must be one whole function call, strictly valid TL of the account's layer.
+
+**Always refused**, whatever a client's `allow` says:
+
+- the update methods `updates.getState`, `updates.getDifference` and `updates.getChannelDifference`: updates come from consumers;
+- the `auth.*` methods that mint or move an authorization of the account, since tgin owns its authorizations: `auth.exportAuthorization`, `auth.importAuthorization`, `auth.acceptLoginToken`, `auth.exportLoginToken`, `auth.importLoginToken`, `auth.bindTempAuthKey`, `auth.importBotAuthorization`, `auth.importWebTokenAuthorization`.
+
+**Allowlist.** A client's `allow` and `deny` hold `*`, `<namespace>.*` or a method name, matched case-sensitively; deny wins, and an empty `allow` allows nothing. Methods that log the account in or out or change the account itself are allowed only by an `allow` entry naming them exactly, never by a glob (`*` included), and the loader warns about such a client:
+
+- `ACCOUNT_CHANGING`: `auth.*`, `account.*`, `contacts.acceptContact`, `contacts.addContact`, `contacts.deleteByPhones`, `contacts.deleteContacts`, `contacts.importContacts`, `contacts.updateContactNote`, `contacts.resetSaved`, `contacts.toggleTopPeers`, `photos.uploadProfilePhoto`, `photos.updateProfilePhoto`, `photos.deletePhotos`, `photos.uploadContactProfilePhoto`, `help.acceptTermsOfService`.
+- `ACCOUNT_READ_ONLY`, the `account.*` getters that `account.*` or `*` still grants: `account.getAccountTTL`, `account.getAuthorizations`, `account.getAutoDownloadSettings`, `account.getAutoSaveSettings`, `account.getBotBusinessConnection`, `account.getBusinessChatLinks`, `account.getChannelDefaultEmojiStatuses`, `account.getChannelRestrictedStatusEmojis`, `account.getChatThemes`, `account.getCollectibleEmojiStatuses`, `account.getConnectedBots`, `account.getContactSignUpNotification`, `account.getContentSettings`, `account.getDefaultBackgroundEmojis`, `account.getDefaultEmojiStatuses`, `account.getDefaultGroupPhotoEmojis`, `account.getDefaultProfilePhotoEmojis`, `account.getGlobalPrivacySettings`, `account.getMultiWallPapers`, `account.getNotifyExceptions`, `account.getNotifySettings`, `account.getPaidMessagesRevenue`, `account.getPrivacy`, `account.getReactionsNotifySettings`, `account.getRecentEmojiStatuses`, `account.getSavedMusicIds`, `account.getSavedRingtones`, `account.getTheme`, `account.getThemes`, `account.getUniqueGiftChatThemes`, `account.getWallPaper`, `account.getWallPapers`, `account.getWebAuthorizations`, `account.getWebBrowserSettings`. Getters left out on purpose (`account.getTmpPassword`, `account.getPassword`, `account.getPasswordSettings`, `account.getPasskeys`, the Passport getters) and any getter of a later layer stay exact-listing only.
+
+Before granting `account.*` or `*`, note that `account.getAuthorizations` and `account.getWebAuthorizations` show the account's sessions with their IP addresses, and that `messages.acceptUrlAuth` (a `messages.*` method) logs the account in to a website: a web authorization minted outside `auth.*`. Before granting `contacts.*` or `*`, note that `contacts.block`, `contacts.unblock`, `contacts.setBlocked` (the block list), `contacts.editCloseFriends` and `contacts.resetTopPeerRating` change the account but are not in `ACCOUNT_CHANGING`, so a glob grants them. Deny them when the client should not have that.
+
+**Limits.** A client has at most 8 requests in flight (else `429 too_many_in_flight`). `rpc.max_rps` (default 20) bounds the requests the account writes to Telegram for all its clients: each call, each resend, each `*_MIGRATE` hop and a media session's export and import count.
+
+**Calls.** A call that was never written is sent once more on a fresh connection; a call that was written is never resent. A `*_MIGRATE_X` answer (a file on another DC, say) sends the call once to a media session on DC X. The pts of a `messages.affected*` answer go to the account's update state, so the update manager does not see a gap.
+
+**Flood waits.** A `FLOOD_WAIT_X` (or `FLOOD_PREMIUM_WAIT_X`) with X up to `rpc.flood_sleep_threshold` (default `10s`, at most `60s`) is slept out once and the call sent again; a longer one, or a second one, and every `SLOWMODE_WAIT_X`, answer `429` with `Retry-After: X` and Telegram's `rpc_error` as the body. A shutdown cuts a sleep short, answering `429` with what is left of the wait.
+
+**Answers.** Telegram's answers keep their bytes (TL, or TL-JSON when asked); tgin's own errors are JSON `{"error","description"}`.
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | Telegram's result | The call ran. |
+| `200` | Telegram's `rpc_error` | Telegram refused the call (any error not listed below). |
+| `400` | `bad_request` | The body could not be read, is not UTF-8 TL-JSON, is not valid TL of the layer, or is not a function. |
+| `400` | `layer_required` | No `X-Tgin-Layer`. |
+| `400` | `wrapper_refused` | A wrapper other than `invokeWithLayer` and `initConnection`. |
+| `401` | `unauthorized` | No or wrong client token, or an unknown account. |
+| `403` | `method_not_allowed` | The client's allowlist does not allow the method. |
+| `403` | `updates_method`, `authorization_method` | An always-refused method. |
+| `403` | Telegram's `rpc_error` | `FROZEN_*`: the account is frozen. |
+| `408` | `body_timeout` | The body did not arrive within 30 s. |
+| `409` | `layer_mismatch` | `X-Tgin-Layer`, or an `invokeWithLayer`, names another layer. |
+| `413` | `too_large` | Over the body bound. |
+| `429` | Telegram's `rpc_error` | `FLOOD_WAIT_X` past the threshold, or `SLOWMODE_WAIT_X`; `Retry-After: X`. |
+| `429` | `too_many_in_flight` | The client's 8 requests in flight; `Retry-After: 1`. |
+| `429` | `rate_limited` | The account's `max_rps`; not executed; `Retry-After`. |
+| `429` | `media_flood_wait`, `init_flood_wait` | Telegram asked tgin to wait while it set up a media session or a connection; not executed; `Retry-After`. |
+| `502` | `no_answer` | The call was written and no answer came: **it may have run**. tgin never resends it; decide yourself whether a repeat is safe. |
+| `502` | `init_refused` | Telegram refused the connection's init call; not executed. |
+| `503` | `not_sent` | Not executed (not connected, Telegram unreachable or the call ignored); safe to retry; `Retry-After: 1`. |
+| `503` | `media_session` | The media session could not be set up; not executed; `Retry-After: 1`. |
+| `503` | `account_unavailable` | The account is logged out or needs a new login. |
+
+Every `503` that carries `Retry-After` means the call was not executed and is safe to retry; later versions may add more such answers, so key on the status, not on the `error` word. `503 account_unavailable` has no `Retry-After`: it needs an operator.
+
+Request and answer bodies are never logged. The shutdown waits for calls in flight.
+
+### One layer per account
+
+Telegram's TL schema changes with every layer, and one authorization serving several layers at once does not work reliably, so each account serves exactly one layer: the one tgin is built with, **230** in this release (the layer of the grammers crates tgin pins). Envelopes carry it in `layer`, `GET /v1/accounts` shows it, and RPC requests must name it in `X-Tgin-Layer`.
+
+A tgin release that upgrades grammers to a new layer changes the layer of every account at once. Such an upgrade ships only in a minor release, never in a patch release, and the CHANGELOG says so: it is the one exception to the [compatibility rule](#admin-api-v1). After such an upgrade: RPC clients that still send the old layer get `409 layer_mismatch` until they move to the new one; consumers get envelopes of the new layer, so check `layer` before parsing `tl`; and constructors the new layer changed parse differently.
+
+### Account metrics
+
+With accounts configured, `/metrics` adds:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `tgin_mtproto_account_state` | gauge | `account`, `state` | 1 for the account's current state, 0 for the others. |
+| `tgin_mtproto_updates_total` | counter | `account` | Updates the account admitted. |
+| `tgin_mtproto_updates_dropped_total` | counter | `account`, `reason` | `undecodable`: a push, update or fetch answer the decoder refused, skipped; `full`: unsequenced updates of a refused batch. |
+| `tgin_mtproto_rpc_total` | counter | `account`, `client`, `outcome` | RPC requests of authenticated clients, by `outcome`: `ok`, `rpc_error`, `flood_wait`, `no_answer`, `not_sent`, `refused` (by tgin) or `rate_limited`. |
+| `tgin_mtproto_rpc_seconds` | histogram | `account` | From a call's admission to Telegram's answer; buckets from 5 ms, doubling, 15 of them. |
+
+A config without accounts exports none of them. An account's consumers count in the `tgin_consumer_*` and `tgin_delivery_*` families like a bot's, and `tgin_routes_unmatched_total` counts its unmatched updates under `source="<account>"`.
+
+### Accounts and reloads
+
+A reload starts added accounts, stops removed ones, restarts an account whose `api_id`, `api_hash` or `session_dir` changed (the old one releases the session first), and applies `rpc` and `routes` changes in place.
+
 ## Hot reload
 
 **Triggers.** A reload re-reads the config file. It runs on:
@@ -635,6 +881,8 @@ The admin plane is its own plain-HTTP listener, `admin.listen` (default `127.0.0
 | `POST /v1/consumers/<name>/drain` | token | `204` |
 | `POST /v1/consumers/<name>/purge` | token | `200 {"purged":N}` |
 | `POST /v1/bots/<name>/logout`, `/close` | token | `200 {"bot","left","upstream","result"}`; `400`, `404`, `409`, `502` or `504` ([Moving a bot between servers](#moving-a-bot-between-servers)) |
+| `GET /v1/accounts` | token | `200 {"accounts":[…]}` ([Account states](#account-states)) |
+| `POST`, `GET`, `DELETE /v1/accounts/<name>/login`; `POST …/login/code`, `…/login/password`, `…/logout` | token, always (`403` without `admin.token`) | [Login](#login) |
 
 **Auth.** The token is sent as `Authorization: Bearer <admin.token>` and compared in constant time; a request without it gets `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer`. Without `admin.token` the API needs no token, which validation allows only when every `admin.listen` address is a loopback address. An unknown consumer answers `404 {"error":"unknown consumer"}`, an unknown bot `404 {"error":"unknown bot"}`.
 
@@ -696,7 +944,7 @@ $ tgin admin login <account>          # --code: a login code to the config's pho
 $ tgin admin logout <account> --yes
 ```
 
-`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. An unscanned QR expires after 5 minutes, as does a wait for a code or password; Ctrl+C ends the login on tgin too. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns), both refuse while the account runs, and the QR's URL, codes and passwords are never logged.
+`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. An unscanned QR expires after 5 minutes, as does a wait for a code or password; Ctrl+C ends the login on tgin too. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns). A login refuses while the account runs (`409 account running`); a logout parks a running account first ([Login](#login)). The QR's URL, codes and passwords are never logged. There is no listing command: `GET /v1/accounts` lists the accounts ([Account states](#account-states)).
 
 | Option | Environment | Meaning |
 |---|---|---|
@@ -743,7 +991,7 @@ Exit codes: 0 on success; 1 when the token file cannot be read, the API cannot b
 | `tgin_bot_info` | gauge | `bot`, `upstream` | 1 for each bot; `upstream` is the name of its upstream, or `api_url` for the shorthand. A reload that changes the upstream's name or URL replaces the series. |
 | `tgin_upstream_up` | gauge | `bot` | 1 after any HTTP answer from the bot's Bot API server (to its long poll, `getMe`, `setWebhook` and the like, gateway calls and webhook replies), whatever the status; 0 after a connect failure, a timeout or a lost connection. Absent until the bot's first outcome. A downstream that stalls its own upload, and a `files.url` origin, do not count. Kept across reloads that keep the upstream's name and URL. |
 
-Apart from `tgin_build_info`'s, every label value is a bot or consumer name, an upstream name (in `tgin_bot_info` only), an endpoint index, a method name from tgin's table or a fixed word, so no series carries a URL or a token. A bot's series go when a reload removes it; a consumer's when its drain ends. Metrics follow the admin API's [compatibility rule](#admin-api-v1).
+Apart from `tgin_build_info`'s, every label value is a bot, account, RPC client or consumer name, an upstream name (in `tgin_bot_info` only), an endpoint index, a method name from tgin's table or a fixed word, so no series carries a URL or a token. A bot's series go when a reload removes it; a consumer's when its drain ends. Metrics follow the admin API's [compatibility rule](#admin-api-v1). The `tgin_mtproto_*` families are listed under [Account metrics](#account-metrics).
 
 ## Logging
 
@@ -753,7 +1001,7 @@ Logs go to stdout, as `text` or `json` lines (`log.format`, fixed at start). `lo
 
 **Secrets.** Write secrets as `${env:…}` or `${file:…}` references rather than literally, so the config file can be shared. `${file:…}` suits Docker and Kubernetes secrets mounted as files. An empty secret is an error. Config errors never quote a secret: a malformed reference in a secret or URL field is reported without its text, and YAML errors carry the path, line and column without the source line.
 
-**Redaction.** Every log line is masked before it is written: each secret of every config loaded since start (bot tokens, also with `:` written as `~`, as a self-hosted server may name a bot's directory, and as `%3A` or `%3a`, as a file origin's paths carry it; webhook secrets, `admin.token`, pull `auth_token`s, push `secret_token`s) and anything shaped like a bot token is replaced by `#####`. Secrets shorter than 8 characters are not masked, as they would match ordinary words; use long random secrets. `/v1/status` and `/v1/config` redact as described under [Admin API v1](#admin-api-v1), and metric labels hold no URLs. The gateway never logs a request path, an upstream URL, or a file's path on a self-hosted server, since all of them carry the bot token.
+**Redaction.** Every log line is masked before it is written: each secret of every config loaded since start (bot tokens, also with `:` written as `~`, as a self-hosted server may name a bot's directory, and as `%3A` or `%3a`, as a file origin's paths carry it; webhook secrets, `admin.token`, pull `auth_token`s, push `secret_token`s, accounts' `api_hash`es, phones and RPC client tokens) and anything shaped like a bot token is replaced by `#####`. Secrets shorter than 8 characters are not masked, as they would match ordinary words; use long random secrets. `/v1/status` and `/v1/config` redact as described under [Admin API v1](#admin-api-v1), and metric labels hold no URLs. The gateway never logs a request path, an upstream URL, or a file's path on a self-hosted server, since all of them carry the bot token. An account's login URL, codes and passwords, and RPC request and answer bodies, are never logged.
 
 **Auth model.**
 
@@ -761,6 +1009,10 @@ Logs go to stdout, as `text` or `json` lines (`log.format`, fixed at start). `lo
 |---|---|
 | Admin plane (`/v1/*`, `/metrics`) | `admin.token` as a bearer token; required unless every admin listener is on loopback. `/metrics` can be opened with `admin.public_metrics`. `/livez` and `/readyz` are always open. |
 | Pull consumers | Optional `auth_token` per consumer, as a bearer token. Without it, anyone who can reach the data plane can take the consumer's updates. |
+| Account pull consumers | `auth_token` required; the account path answers `401` without it. |
+| Account login routes | `admin.token`, always, also on loopback; its holder can log the account in and out ([Login](#login)). |
+| MTProto RPC endpoint | A client `token` per downstream, with a method allowlist; a client allowed `ACCOUNT_CHANGING` methods is trusted as much as the account ([RPC endpoint](#rpc-endpoint)). |
+| Session directory | Holds the account's auth keys: anyone who reads it can act as the account ([Session directory](#session-directory)). |
 | Webhook ingress | `secret_token` (`auto` by default) checked before the body is read; optional `ip_allowlist`; `trusted_proxies` decides whose `X-Forwarded-For` counts. |
 | Bot API gateway | The bot token in the path, compared in constant time with every configured bot's token; an unknown token gets `401` and nothing goes to the Bot API server. Its holder acts as the bot, polls the pull consumers the bot routes to, downloads the bot's own files, and, with `accept_set_webhook`, chooses where a push consumer posts ([trust model](#setwebhook-capture)); with `allow_local_files` on a server other than the Telegram cloud, it may read the server's disk ([`file:` references](#local-mode-and-file-references)). |
 | Push endpoints | The endpoint's `secret_token` is sent as `X-Telegram-Bot-Api-Secret-Token`, for the downstream to check. |

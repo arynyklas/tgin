@@ -65,6 +65,38 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   reload restarts an account whose `api_id`, `api_hash` or `session_dir`
   changed and applies its `rpc` settings in place; the shutdown waits for
   RPC calls in flight.
+- `accounts` in the config: Telegram user accounts by name, each with
+  `api_id` (`${env:…}` and `${file:…}` allowed), `api_hash`, a
+  `session_dir` of its own, an optional `phone`, `rpc` (`max_rps`,
+  `flood_sleep_threshold`, `clients` with a token and `allow`/`deny`
+  method globs) and `routes`. Account rules match `constructors`,
+  `peer_ids` (Bot API form), `user_ids`, `commands` (unsuffixed only) and
+  `text`, and target consumers like bot rules.
+- Account updates reach consumers as envelope v1: JSON with `update_id`
+  (strictly increasing per account, never repeated, not contiguous),
+  `account`, `layer`, `constructor`, `received_at` and the update's TL,
+  users and chats in base64; `render: tl_json` adds the update as TL-JSON.
+  A pull consumer an account feeds is served on
+  `/c/<consumer>/mtproto/v1/getUpdates` and needs `auth_token`; a consumer
+  takes bot updates or account updates, never both, and a reload that
+  would switch one is refused.
+- tgin keeps each account's update state itself, with gap recovery by
+  `getDifference` and `getChannelDifference`: sequenced updates of the
+  common box reach `backpressure` consumers at least once while the
+  process lives (channel boxes: to be confirmed; see DOCS § Delivery),
+  a refused batch is fetched again after a backoff, and there is no
+  dedup. Each account serves one layer, 230; a change of that layer ships
+  only in a minor release, and the CHANGELOG says so.
+- `POST /mtproto/v1/{account}/invoke` runs one raw-TL (or TL-JSON) call as
+  the account for an RPC client: `X-Tgin-Layer` must be the account's
+  layer (230); `invokeWithLayer` and `initConnection` are stripped, other
+  wrappers refused; the update methods and the `auth.*` methods that mint
+  or move an authorization are always refused; account-changing methods
+  need an exact `allow` entry. Flood waits up to `flood_sleep_threshold`
+  are slept out once, longer ones answer `429` with `Retry-After`; a call
+  written without an answer gets `502 no_answer` and is never resent.
+- `examples/mtproto`: a Telethon adapter for the RPC endpoint and an
+  account's pull consumer.
 - Self-hosted Bot API servers: `upstreams` names Bot API servers (`kind:
   cloud` or `local`, `url`, `local_mode`, `files`, `response_timeout`), and
   a bot picks one with `upstream`; `api_url` stays the shorthand for an
@@ -229,6 +261,8 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   port of TDLib's `HttpReader` under the Boost Software License 1.0
   (`LICENSES/BSL-1.0.txt`). The other crates stay MIT.
 - The minimum supported Rust version is 1.89.
+- `tgin-mtproto`, the user-account engine, is the only crate that may
+  depend on grammers (`cargo xtask grammers-confinement` checks it in CI).
 
 ### Changed
 
@@ -273,6 +307,12 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   rewritten. Bot directory names (the token, with `:` or `~`) and the
   `%3A` forms of each token are masked in logs like the token. A
   `files.url` origin's access logs record every bot's token.
+- Accounts' `api_hash`es, phones and RPC client tokens are masked in logs
+  like other secrets; login URLs, codes, passwords and RPC bodies are
+  never logged. The account login routes need `admin.token` even on a
+  loopback listener, and their answers carry `Cache-Control: no-store`.
+  An account's session directory is created `0700`, its files `0600`
+  (Unix), under a lock that one process holds.
 - tgin never acts on its own pushes: each push carries tgin's `Via`, and
   both planes answer `508 Loop Detected` to a request carrying it, so a
   push endpoint (a `setWebhook` runtime endpoint included) cannot make tgin
@@ -288,6 +328,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   and ring are out of the build graph; one aws-lc-rs provider serves the
   HTTP client and the TLS listener.
 - CI runs `cargo deny check` on every push and pull request.
+- grammers 0.11 (`grammers-crypto`, `grammers-mtproto`, `grammers-tl-types`,
+  exact pins) and redb 4.1 for the account session store, in
+  `tgin-mtproto` only.
 
 ### Docs
 
@@ -298,6 +341,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   generated config reference; PERF.md compares
   tgin 1.0 with the original engine (`4f0971a`) and lists the changes
   behind the difference.
+- DOCS describes user accounts over MTProto: login, the session
+  directory, envelope v1, the RPC contract, one layer per account, the
+  delivery claim, account rules, metrics and Telegram's terms.
 - Added `SECURITY.md` (supported versions, private reporting, verifying
   release attestations) and this changelog.
 
