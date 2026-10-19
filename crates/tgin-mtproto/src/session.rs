@@ -20,7 +20,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 
 use crate::SessionError;
 use crate::lock::{DirLock, lock_dir};
-use crate::updates::{StateDelta, StoredState};
+use crate::updates::{Batch, StateDelta, StoredState};
 
 /// DC id → `ipv4(4) port(2) ipv6(16) port(2)`, ports little-endian.
 const DC_OPTIONS: TableDefinition<i32, &[u8]> = TableDefinition::new("dc_options");
@@ -426,21 +426,32 @@ impl SessionStore {
         })
     }
 
-    /// Records a batch's [`ahead`](crate::Batch::ahead) channels with the
-    /// batch's id as their `mark`, before the batch is admitted: after a
+    /// Records `batch`'s [`ahead`](crate::Batch::ahead) channels with the
+    /// batch's id as their mark, before the batch is admitted: after a
     /// crash, they catch up at start. A row keeps its highest mark, so
     /// marks and [`commit_state`](Self::commit_state) may land in any
     /// order.
-    pub fn mark_channels_behind(&self, channels: &[i64], mark: u64) -> Result<(), SessionError> {
-        if channels.is_empty() {
+    ///
+    /// A channel with no stored pts that the batch gives one (an unknown
+    /// channel's baseline: the state just before its first update) gets it
+    /// now: no update below a baseline is owed, and without it a crash
+    /// would leave the channel nothing to catch up from.
+    pub fn mark_channels_behind(&self, batch: &Batch) -> Result<(), SessionError> {
+        if batch.ahead.is_empty() {
             return Ok(());
         }
         self.write(|txn| {
             let mut behind = txn.open_table(CHANNELS_BEHIND)?;
-            for &channel in channels {
+            let mut pts = txn.open_table(CHANNEL_PTS)?;
+            for &channel in &batch.ahead {
                 let current = behind.get(channel)?.map(|g| g.value());
-                if current.is_none_or(|g| g < mark) {
-                    behind.insert(channel, mark)?;
+                if current.is_none_or(|g| g < batch.id) {
+                    behind.insert(channel, batch.id)?;
+                }
+                if pts.get(channel)?.is_none()
+                    && let Some(&(_, p)) = batch.commit.channels.iter().find(|(c, _)| *c == channel)
+                {
+                    pts.insert(channel, p)?;
                 }
             }
             Ok(())
@@ -686,6 +697,23 @@ fn decode_peer(b: &[u8]) -> Option<Peer> {
 mod tests {
     use super::*;
 
+    /// A batch naming `ahead` with id `mark`, its delta's channel rows
+    /// `channels`.
+    fn marks(ahead: &[i64], mark: u64, channels: &[(i64, i32)]) -> Batch {
+        Batch {
+            id: mark,
+            updates: Vec::new(),
+            users: bytes::Bytes::new(),
+            chats: bytes::Bytes::new(),
+            peers: Vec::new(),
+            commit: StateDelta {
+                channels: channels.to_vec(),
+                ..StateDelta::default()
+            },
+            ahead: ahead.to_vec(),
+        }
+    }
+
     fn me(id: i64) -> Peer {
         Peer {
             id,
@@ -797,7 +825,8 @@ mod tests {
         })
         .expect("state");
         s.set_channel_pts(9, 10).expect("channel");
-        s.mark_channels_behind(&[9], 3).expect("behind");
+        s.mark_channels_behind(&marks(&[9], 3, &[]))
+            .expect("behind");
         s.set_update_id(77).expect("update_id");
 
         s.reset_for_login().expect("reset");
@@ -965,8 +994,9 @@ mod tests {
             date: 4,
         })
         .expect("state");
-        s.mark_channels_behind(&[5, 6, 7], 2).expect("behind");
-        s.mark_channels_behind(&[], 9).expect("none");
+        s.mark_channels_behind(&marks(&[5, 6, 7], 2, &[]))
+            .expect("behind");
+        s.mark_channels_behind(&marks(&[], 9, &[])).expect("none");
         s.commit_state(&StateDelta {
             pts: Some(10),
             seq: Some(30),
@@ -1005,16 +1035,34 @@ mod tests {
             ..StateDelta::default()
         };
         // The newer mark lands first, then the older caught-up.
-        s.mark_channels_behind(&[1, 2], 4).expect("first mark");
-        s.mark_channels_behind(&[1], 9).expect("newer mark");
+        s.mark_channels_behind(&marks(&[1, 2], 4, &[]))
+            .expect("first mark");
+        s.mark_channels_behind(&marks(&[1], 9, &[]))
+            .expect("newer mark");
         s.commit_state(&caught_up(1, 4)).expect("stale caught-up");
         s.commit_state(&caught_up(2, 4)).expect("caught-up");
         assert_eq!(s.stored_state().expect("stored").behind, vec![(1, 9)]);
         // A stale mark after its own caught-up: kept out of a newer row.
-        s.mark_channels_behind(&[1], 5).expect("older mark");
+        s.mark_channels_behind(&marks(&[1], 5, &[]))
+            .expect("older mark");
         assert_eq!(s.stored_state().expect("stored").behind, vec![(1, 9)]);
         s.commit_state(&caught_up(1, 9)).expect("caught-up");
         assert!(s.stored_state().expect("stored").behind.is_empty());
+    }
+
+    /// A mark that gives an unknown channel its baseline stores it: after a
+    /// crash the channel catches up from there. A stored pts is never
+    /// moved by a mark (only `commit_state` moves it).
+    #[test]
+    fn mark_stores_an_unknown_channels_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        s.set_channel_pts(2, 40).expect("known");
+        s.mark_channels_behind(&marks(&[1, 2, 3], 6, &[(1, 7), (2, 50)]))
+            .expect("mark");
+        let st = s.stored_state().expect("stored");
+        assert_eq!(st.channels, vec![(1, 7), (2, 40)]);
+        assert_eq!(st.behind, vec![(1, 6), (2, 6), (3, 6)]);
     }
 
     /// A directory and files that already exist with wider modes are

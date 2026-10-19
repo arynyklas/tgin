@@ -12,10 +12,12 @@
 //!   backoff) or
 //!   [`fetch_failed_permanently`](UpdateManager::fetch_failed_permanently);
 //!   it calls `next_action` again by [`deadline`](UpdateManager::deadline);
-//! - persists each [`Batch`]'s [`ahead`](Batch::ahead) channels with the
-//!   batch's id as their mark
-//!   ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind)),
-//!   offers the batch to admission, in id order, then reports
+//! - persists the marks of every [`Batch`] a call returned (its
+//!   [`ahead`](Batch::ahead) channels with the batch's id as their mark,
+//!   and an unknown channel's baseline:
+//!   [`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind))
+//!   before it offers the first of them to admission; then offers each
+//!   batch to admission, in id order, and reports
 //!   [`committed`](UpdateManager::committed) or
 //!   [`refused`](UpdateManager::refused), and persists the [`StateDelta`]
 //!   either returns ([`SessionStore::commit_state`](crate::SessionStore::commit_state)).
@@ -34,8 +36,8 @@
 //! its sequenced updates come back; its unsequenced ones are counted in
 //! [`Dropped::full`]. There is no dedup: replays may repeat updates.
 //!
-//! A crash loses a channel's update in one window only: after the feed
-//! call that returned its batch, before that batch's mark is durable. Only
+//! A crash loses a channel's update in one window only: after the call
+//! that returned its batch, before that call's marks are durable. Only
 //! the client knew the channel moved, so a quiet channel (no later post,
 //! no signal from Telegram) does not bring it back. Every other crash
 //! point replays it (the channel catches up at start). This is the one
