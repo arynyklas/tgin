@@ -80,7 +80,13 @@ pub(crate) struct AccountSources {
     /// notified, then it waits for `go`).
     #[cfg(test)]
     before_restart: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Test seam: runs once, right after an account was launched.
+    #[cfg(test)]
+    after_launch: Mutex<Option<LaunchHook>>,
 }
+
+#[cfg(test)]
+type LaunchHook = Box<dyn FnOnce(&AccountSources) + Send>;
 
 /// What [`AccountSources::launch`] starts from.
 enum Launch<'a> {
@@ -108,6 +114,8 @@ impl AccountSources {
             stopped: AtomicBool::new(false),
             #[cfg(test)]
             before_restart: Mutex::new(None),
+            #[cfg(test)]
+            after_launch: Mutex::new(None),
         }
     }
 
@@ -200,7 +208,7 @@ impl AccountSources {
     }
 
     fn launch(&self, from: Launch<'_>) {
-        let (account, config, limiter) = {
+        let config = {
             // Under the lock the shutdown stops the accounts with: an
             // account started here is stopped by it, or not started.
             let mut running = self.running.lock();
@@ -227,29 +235,39 @@ impl AccountSources {
                 (self.network)(&config),
                 Arc::clone(&self.registry),
             );
+            // Listed, served and shown together, under the lock a reload
+            // removes accounts with: a removal never leaves one of the three
+            // behind.
+            self.endpoint.insert(RpcAccount::new(
+                &config.name,
+                &config.rpc,
+                account.rpc(),
+                account.affected(),
+                Arc::clone(&limiter),
+            ));
+            self.board
+                .0
+                .write()
+                .insert(config.name.clone(), account.clone());
             running.insert(
                 config.name.clone(),
                 Running {
-                    account: account.clone(),
+                    account,
                     config: config.clone(),
-                    limiter: Arc::clone(&limiter),
+                    limiter,
                     parked: false,
                 },
             );
-            (account, config, limiter)
+            config
         };
-        self.endpoint.insert(RpcAccount::new(
-            &config.name,
-            &config.rpc,
-            account.rpc(),
-            account.affected(),
-            limiter,
-        ));
-        self.board
-            .0
-            .write()
-            .insert(config.name.clone(), account.clone());
         tracing::info!(account = %config.name, "account started");
+        #[cfg(test)]
+        {
+            let hook = self.after_launch.lock().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
     }
 
     /// Whether the account `name` holds, or will take again on its own,
@@ -678,5 +696,26 @@ mod tests {
             "the reload's config"
         );
         until_running(&now).await;
+    }
+
+    /// A reload that removes an account right after its launch leaves
+    /// nothing of it behind: not its status, not its RPC entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_right_after_a_launch_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        logged_in(dir.path());
+        let cfg = config(dir.path(), "h", true);
+        let net = FakeNetwork::new();
+        let sources = sources(&cfg, &net);
+        let empty = config(dir.path(), "h", false);
+        *sources.after_launch.lock() = Some(Box::new(move |sources: &AccountSources| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(sources.apply(&empty));
+            });
+        }));
+        sources.apply(&cfg).await;
+        assert!(account(&sources).is_none(), "removed");
+        assert!(sources.statuses().is_empty(), "no status left");
+        assert!(!sources.endpoint.serves("main"), "no RPC entry left");
     }
 }

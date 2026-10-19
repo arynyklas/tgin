@@ -145,6 +145,12 @@ impl RpcEndpoint {
         }
     }
 
+    /// Whether the account `name` is served.
+    #[cfg(test)]
+    pub(crate) fn serves(&self, name: &str) -> bool {
+        self.accounts.load().contains_key(name)
+    }
+
     /// Stops serving the account `name` and removes its series.
     pub fn remove(&self, name: &str) {
         let previous = self.accounts.load().get(name).cloned();
