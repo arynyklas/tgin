@@ -782,19 +782,28 @@ impl UpdateManager {
         None
     }
 
-    /// When [`next_action`](Self::next_action) may next have something
-    /// that is not due now: a gap's hold, a failed fetch's retry, or the
-    /// idle difference.
+    /// When to call [`next_action`](Self::next_action) next: now when a
+    /// fetch is due (a pending common fetch past its retry time, or a
+    /// queued channel with a free slot), else the earliest of a gap's
+    /// hold, a failed fetch's retry and the idle difference. A caller may
+    /// sleep until it after every call that feeds or reports anything.
     #[must_use]
     pub fn deadline(&self) -> Instant {
-        let mut at = self.idle_at;
-        if self.fetch == CommonFetch::Idle
-            && let Some(d) = self.gap_deadline
-        {
-            at = at.min(d);
+        let now = Instant::now();
+        if !self.queue.is_empty() && self.in_flight < MAX_CHANNEL_FETCHES {
+            return now;
         }
-        if let Some(d) = self.retry_at {
-            at = at.min(d);
+        let mut at = self.idle_at;
+        match self.fetch {
+            CommonFetch::WantState | CommonFetch::WantDifference => {
+                at = at.min(self.retry_at.unwrap_or(now));
+            }
+            CommonFetch::Idle => {
+                if let Some(d) = self.gap_deadline {
+                    at = at.min(d);
+                }
+            }
+            CommonFetch::State { .. } | CommonFetch::Difference { .. } => {}
         }
         for c in self.gapped.iter().chain(&self.retrying) {
             if let Some(ch) = self.channels.get(c) {

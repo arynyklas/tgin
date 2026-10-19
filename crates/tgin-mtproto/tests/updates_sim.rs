@@ -19,7 +19,7 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::tl_json::from_json;
-use tgin_mtproto::updates::{GAP_HOLD, MAX_CHANNEL_FETCHES};
+use tgin_mtproto::updates::{GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES};
 use tgin_mtproto::{Batch, Fetch, PeerKind, StateDelta, StoredState, UpdateManager, UpdateState};
 use tokio::time::{Duration, Instant, advance};
 
@@ -990,6 +990,30 @@ async fn failed_channel_fetch_backs_off_permanent_drops_state() {
     assert_eq!(all_updates(&batches), vec![b(held)]);
     assert_eq!(commit(&mut m, &batches).channels, vec![(1, 8), (1, 9)]);
     assert_eq!(m.next_action(), None);
+}
+
+/// A caller sleeping until `deadline()` runs a due fetch at once: a
+/// reconnect's getDifference, a signalled channel, a fetch asked again
+/// after its backoff; only then the idle difference.
+#[tokio::test(start_paused = true)]
+async fn deadline_is_now_when_a_fetch_is_due() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let now = Instant::now();
+    assert_eq!(m.deadline(), now + IDLE_DIFFERENCE, "nothing due");
+    m.feed_push(too_long());
+    assert_eq!(m.deadline(), now, "the reconnect's difference");
+    let f = m.next_action().expect("asked");
+    assert_eq!(m.deadline(), now + IDLE_DIFFERENCE, "in flight");
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), now + Duration::from_secs(1), "its retry");
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    assert_eq!(m.deadline(), now, "a queued channel with a free slot");
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, .. })
+    ));
+    assert_eq!(m.deadline(), now + Duration::from_secs(1));
 }
 
 #[tokio::test(start_paused = true)]
