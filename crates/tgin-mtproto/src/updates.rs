@@ -4,8 +4,9 @@
 //! It is a pure state machine over bytes. It does no I/O: pushes and fetch
 //! answers go in, batches and fetch actions come out. The caller
 //! - feeds every push ([`feed_push`](UpdateManager::feed_push)), including
-//!   the `Updates` answers the sender copies into the push stream and the
-//!   synthetic `updatesTooLong` it adds when a connection ends;
+//!   the `Updates` answers the sender copies into the push stream, its
+//!   synthetic `updatesTooLong` on `new_session_created`, and its
+//!   [`CONNECTION_ENDED`] signal when a connection ends;
 //! - runs each [`Fetch`] from [`next_action`](UpdateManager::next_action)
 //!   on the ingest session and feeds the answer back, or reports
 //!   [`fetch_failed`](UpdateManager::fetch_failed) (asked again after a
@@ -95,6 +96,11 @@ pub const MAX_CHANNEL_FETCHES: usize = 4;
 /// backs off getDifference).
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(60);
+/// What the sender pushes when a connection that finished its init call
+/// ends: the session's update stream may have a gap. Not TL (no schema
+/// constructor has this id), so it is never mistaken for Telegram's
+/// `updatesTooLong`, which comes on a live session.
+pub const CONNECTION_ENDED: &[u8] = b"\0end";
 /// Held (out-of-order) updates per box. Beyond it, a sequenced update is
 /// dropped from memory; the box's state has not moved past it, so the
 /// difference brings it back.
@@ -681,20 +687,31 @@ impl UpdateManager {
         }
     }
 
-    /// One push: a boxed `Updates` object.
+    /// One push: a boxed `Updates` object, or the sender's
+    /// [`CONNECTION_ENDED`] signal.
     ///
-    /// `updatesTooLong` (Telegram's, or the sender's synthetic one after a
-    /// dropped connection or `new_session_created`) starts a common
-    /// `updates.getDifference`, and is never lost:
+    /// `updatesTooLong` (Telegram's, or the sender's after
+    /// `new_session_created`) and [`CONNECTION_ENDED`] start a common
+    /// `updates.getDifference`, and are never lost:
     /// - while one is pending (not yet asked), more join it, so a
-    ///   reconnect's two signals run one chain;
+    ///   reconnect's signals run one chain;
     /// - while a call is in flight, exactly one more difference follows
     ///   the chain's end, since that call may predate the signal.
+    ///
+    /// `updatesTooLong` also cuts a pending retry short: it came on a live
+    /// session, so the server is reachable. [`CONNECTION_ENDED`] does not:
+    /// the connection that sent it is gone, and on a path that drops every
+    /// connection after its init call, cutting the retry short would ask
+    /// once a second forever instead of backing off.
     ///
     /// A call lost with the connection comes back through
     /// [`fetch_failed`](Self::fetch_failed).
     pub fn feed_push(&mut self, container: Bytes) -> Vec<Batch> {
         self.idle_at = Instant::now() + IDLE_DIFFERENCE;
+        if container.as_ref() == CONNECTION_ENDED {
+            self.want_difference();
+            return Vec::new();
+        }
         let c = match decode::container(&container) {
             Ok(c) => c,
             Err(e) => {
@@ -703,10 +720,8 @@ impl UpdateManager {
             }
         };
         if c.constructor == "updatesTooLong" {
-            // A pending retry is cut short: the signal (Telegram's, or the
-            // sender's on a new connection) shows the server is reachable
-            // again. The sender sends one per connection end or new
-            // session, so this cannot loop.
+            // A pending retry is cut short: the signal came on a live
+            // session, so the server is reachable again.
             self.retry_at = None;
             self.backoff = Duration::ZERO;
             self.want_difference();
@@ -2102,5 +2117,24 @@ fn facts_of(h: &Held) -> UpdateFacts<'_> {
             text: None,
             command: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONNECTION_ENDED;
+    use crate::schema::{API, MTPROTO};
+
+    /// The connection-end signal is no TL object of either schema, so no
+    /// push from Telegram can be mistaken for it, nor it for one.
+    #[test]
+    fn connection_ended_is_not_tl() {
+        let id = CONNECTION_ENDED
+            .first_chunk::<4>()
+            .map(|b| u32::from_le_bytes(*b))
+            .expect("four bytes");
+        assert!(API.ctor_by_id(id).is_none());
+        assert!(MTPROTO.ctor_by_id(id).is_none());
+        assert!(crate::decode::container(CONNECTION_ENDED).is_err());
     }
 }

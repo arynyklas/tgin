@@ -42,7 +42,9 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::tl_json::from_json;
-use tgin_mtproto::updates::{GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES, RETRY_MIN};
+use tgin_mtproto::updates::{
+    CONNECTION_ENDED, GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES, RETRY_MIN,
+};
 use tgin_mtproto::{Batch, Fetch, PeerKind, StateDelta, StoredState, UpdateManager, UpdateState};
 use tokio::time::{Duration, Instant, advance};
 
@@ -1459,6 +1461,38 @@ async fn signal_cuts_a_pending_retry_short() {
     assert_eq!(m.next_action(), Some(f), "the channel at once");
 }
 
+/// A path that drops every connection after its init call: each catch-up
+/// call fails, and each drop makes the sender push its connection-end
+/// signal. The signal asks for a difference but never cuts the backoff
+/// short, so the gaps between calls double up to 60 s instead of a call a
+/// second forever. Telegram's own `updatesTooLong`, on a live session,
+/// still cuts it short.
+#[tokio::test(start_paused = true)]
+async fn dropped_connections_back_off_to_a_minute() {
+    let mut m = started(stored(10, &[], &[5]));
+    assert!(m.feed_push(connection_ended()).is_empty());
+    let mut f = m.next_action().expect("the catch-up");
+    let mut gaps = Vec::new();
+    for _ in 0..9 {
+        // The call is lost with the connection, which then ends.
+        m.fetch_failed(f);
+        assert!(m.feed_push(connection_ended()).is_empty());
+        assert_eq!(m.next_action(), None, "no call before the backoff");
+        let asked = Instant::now();
+        advance(m.deadline().saturating_duration_since(asked)).await;
+        f = m.next_action().expect("asked again");
+        assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
+        gaps.push((Instant::now() - asked).as_secs());
+    }
+    assert_eq!(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    m.fetch_failed(f);
+    assert!(m.feed_push(too_long()).is_empty());
+    assert!(
+        matches!(m.next_action(), Some(Fetch::GetDifference { .. })),
+        "a live session's signal asks at once"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn affected_pts_advance_the_box() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));
@@ -1478,6 +1512,12 @@ async fn affected_pts_advance_the_box() {
 
 fn too_long() -> Bytes {
     b(T::new(UPDATES_TOO_LONG).done())
+}
+
+/// The sender's signal that a connection which finished its init call
+/// ended.
+fn connection_ended() -> Bytes {
+    Bytes::from_static(CONNECTION_ENDED)
 }
 
 /// After a reconnect the sender pushes two synthetic `updatesTooLong` (the
@@ -2876,9 +2916,13 @@ async fn too_long_keeps_a_refusal_backoff() {
     advance(RETRY_MIN).await;
     let f = m.next_action().expect("the refetch");
     assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
-    // A failed fetch's retry is cut short as before.
+    // A failed fetch's retry is cut short by Telegram's `updatesTooLong`,
+    // which comes on a live session, but not by the sender's
+    // connection-end signal.
     m.fetch_failed(f);
     assert_eq!(m.next_action(), None);
+    assert!(m.feed_push(connection_ended()).is_empty());
+    assert_eq!(m.next_action(), None, "a dropped connection waits it out");
     assert!(m.feed_push(too_long()).is_empty());
     assert!(matches!(
         m.next_action(),

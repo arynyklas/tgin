@@ -22,9 +22,10 @@
 //!    then, in order, `admit`, and the state `committed` or `refused`
 //!    returns, persisted; the batch's peers are merged on admission.
 //!
-//! A connection that drops, or a `new_session_created`, makes the sender
-//! push `updatesTooLong`; the manager answers it with `getDifference`,
-//! which reconnects. A fetch that fails is reported back to the manager
+//! A connection that drops makes the sender push its connection-end
+//! signal, and a `new_session_created` an `updatesTooLong`; the manager
+//! answers either with `getDifference`, which reconnects (only the second
+//! cuts a backed-off retry short). A fetch that fails is reported back to the manager
 //! (`fetch_failed`, or `fetch_failed_permanently` for a refusal asking
 //! again cannot fix), never dropped.
 //!

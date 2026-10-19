@@ -984,21 +984,28 @@ async fn mark_logged_in_turns_minus_404_into_key_revoked() {
     assert!(matches!(result, Err(SenderError::KeyRevoked)), "{result:?}");
 }
 
-/// The synthetic `updatesTooLong` the sender pushes when the session's
-/// update stream may have a gap.
+/// The synthetic `updatesTooLong` the sender pushes on
+/// `new_session_created`, on a live connection.
 fn too_long() -> Bytes {
     Bytes::from_static(&[0x7e, 0xaf, 0x17, 0xe3])
 }
 
-/// A lost connection tells the update manager to catch up; a −404
-/// does not, since there is nothing to catch up with.
+/// What the sender pushes when a connection that finished its init call
+/// ends.
+fn connection_ended() -> Bytes {
+    Bytes::from_static(crate::updates::CONNECTION_ENDED)
+}
+
+/// A lost connection tells the update manager to catch up, with its own
+/// signal (not `updatesTooLong`, which shows a live session); a −404 does
+/// not, since there is nothing to catch up with.
 #[tokio::test(start_paused = true)]
-async fn connection_loss_pushes_updates_too_long() {
+async fn connection_loss_pushes_connection_ended() {
     let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
     let mut pushes = h.pushes.take().unwrap();
     srv.close();
     let push = timeout(WAIT, pushes.recv()).await.unwrap();
-    assert_eq!(push, Some(too_long()));
+    assert_eq!(push, Some(connection_ended()));
 
     let call = h.invoke(get_config());
     let mut fresh = h.ready_conn().await;
@@ -1341,7 +1348,10 @@ async fn missing_pong_ends_the_connection() {
         .expect("the pong timeout ends the call")
         .unwrap();
     assert!(matches!(result, Err(SenderError::NoAnswer)), "{result:?}");
-    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+    assert_eq!(
+        timeout(WAIT, pushes.recv()).await,
+        Ok(Some(connection_ended()))
+    );
 }
 
 /// Acks that went out in a packet Telegram ignored are sent again.
@@ -1534,7 +1544,10 @@ async fn minus_429_backs_off_reconnects() {
     srv.answer(packet.requests()[0].msg_id, &ANSWER);
     assert_eq!(outcome(call).await.unwrap(), answered());
     srv.close();
-    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+    assert_eq!(
+        timeout(WAIT, pushes.recv()).await,
+        Ok(Some(connection_ended()))
+    );
     let started = tokio::time::Instant::now();
     let call = h.invoke(get_config());
     let mut srv = h.next_conn().await;
@@ -1614,7 +1627,10 @@ async fn failed_connect_backs_off() {
     let mut pushes = h.pushes.take().unwrap();
     srv.close();
     // The catch-up push shows the connection has ended.
-    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+    assert_eq!(
+        timeout(WAIT, pushes.recv()).await,
+        Ok(Some(connection_ended()))
+    );
     *h.script.failing_opens.lock() = 2;
     let started = tokio::time::Instant::now();
     assert!(matches!(
