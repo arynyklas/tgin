@@ -3824,3 +3824,58 @@ consumers:
     assert_message(&err, "account `a`");
     assert!(err.hint.is_some(), "{err}");
 }
+
+/// `api_id` takes `${env:…}` and `${file:…}`, as design §12's example
+/// writes it; it is checked once expanded, and is not a secret.
+#[test]
+fn api_id_interpolates() {
+    let yaml = "version: 1\naccounts:\n  main: { api_id: \"${env:TG_API_ID}\", api_hash: h, session_dir: s }\n";
+    let cfg = config::load(
+        yaml,
+        Path::new("tgin.yaml"),
+        &env(&[("TG_API_ID", "424242")]),
+    )
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert_eq!(cfg.accounts[0].api_id, 424242);
+    assert_eq!(
+        config::redacted_json(&cfg)["accounts"]["main"]["api_id"],
+        "${env:TG_API_ID}"
+    );
+    for bad in ["0", "-3", "12ab", "99999999999"] {
+        let errors = config::load(yaml, Path::new("tgin.yaml"), &env(&[("TG_API_ID", bad)]))
+            .err()
+            .unwrap_or_else(|| panic!("{bad} loaded"));
+        assert_eq!(errors.len(), 1, "{}", render(&errors));
+        assert_at(&errors[0], "accounts.main.api_id", pos(yaml, "\"${env"));
+        assert_message(&errors[0], "positive");
+    }
+    let errors = config::load(yaml, Path::new("tgin.yaml"), &env(&[])).unwrap_err();
+    assert_message(&errors[0], "TG_API_ID");
+    let mut files = MapEnv::default();
+    files
+        .files
+        .insert(PathBuf::from("/run/secrets/api-id"), "777\n".into());
+    let cfg = config::load(
+        &yaml.replace("${env:TG_API_ID}", "${file:/run/secrets/api-id}"),
+        Path::new("tgin.yaml"),
+        &files,
+    )
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert_eq!(cfg.accounts[0].api_id, 777);
+}
+
+/// D16: a pull consumer an account feeds needs `auth_token`.
+#[test]
+fn account_pull_consumer_needs_auth_token() {
+    let yaml = r#"version: 1
+server: {}
+accounts:
+  a: { api_id: 1, api_hash: h, session_dir: sa, routes: [{ to: [feed] }] }
+consumers:
+  feed: { pull: {} }
+"#;
+    let err = single_error(yaml);
+    assert_at(&err, "consumers.feed.pull.auth_token", pos(yaml, "{ pull"));
+    assert_message(&err, "account `a`");
+    assert!(err.hint.is_some(), "{err}");
+}

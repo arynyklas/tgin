@@ -163,18 +163,11 @@ fn accounts(raw: &RawConfig, diag: &mut Diagnostics) {
                     .hint("metrics and logs name a source by its name alone; give the account a name no bot has"),
             );
         }
-        self::account(raw, diag, &path, &account.value, account.location);
+        self::account(raw, diag, &path, &account.value);
     }
 }
 
-fn account(raw: &RawConfig, diag: &mut Diagnostics, path: &str, account: &Account, at: Location) {
-    if account.api_id.value < 1 {
-        diag.error(
-            format!("{path}.api_id"),
-            known(account.api_id.location, at),
-            "`api_id` must be a positive number, as my.telegram.org gives it",
-        );
-    }
+fn account(raw: &RawConfig, diag: &mut Diagnostics, path: &str, account: &Account) {
     at_least_one(diag, format!("{path}.rpc.max_rps"), &account.rpc.max_rps);
     duration(
         diag,
@@ -388,6 +381,19 @@ fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
                         consumer.location,
                     ))
                     .hint("give an account's push consumer its `endpoints`, and remove `accept_set_webhook`"),
+                );
+            }
+            // D16: no bot token authorizes an account's pull routes.
+            if let (Some(account), Consumer::Pull(pull)) = (account_of[index], &consumer.value)
+                && pull.auth_token.is_none()
+            {
+                diag.errors.push(
+                    ConfigError::new(format!(
+                        "pull consumer `{}` is fed by account `{account}`, so it needs `auth_token`",
+                        name.as_str()
+                    ))
+                    .at(located(format!("{path}.pull.auth_token"), consumer.location))
+                    .hint("an account's updates have no bot token to authorize their pollers; set a bearer `auth_token`, such as `${file:/run/secrets/…}`"),
                 );
             }
             continue;

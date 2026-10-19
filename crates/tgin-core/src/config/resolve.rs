@@ -1239,7 +1239,9 @@ impl Resolver<'_> {
                 self.compile_rule(&format!("{path}.routes[{j}]"), route.location, &spec);
                 rules.push(spec);
             }
-            let (Some(api_hash), Some(session_dir), Some(phone), Some(max_rps)) = (
+            let api_id = self.api_id(&path, &a.api_id);
+            let (Some(api_id), Some(api_hash), Some(session_dir), Some(phone), Some(max_rps)) = (
+                api_id,
                 api_hash,
                 session_dir,
                 phone.map_or(Some(None), |phone| phone.map(Some)),
@@ -1249,7 +1251,7 @@ impl Resolver<'_> {
             };
             out.push(Account {
                 name: name.as_str().to_owned(),
-                api_id: a.api_id.value,
+                api_id,
                 api_hash,
                 session_dir,
                 phone,
@@ -1262,6 +1264,35 @@ impl Resolver<'_> {
             });
         }
         out
+    }
+
+    /// An `api_id`, expanded: a number from 1 to `i32::MAX`, as
+    /// my.telegram.org gives it. It is not a secret, but an expanded value
+    /// is never quoted: a mistyped reference may name a file that holds one.
+    fn api_id(&mut self, path: &str, api_id: &At<raw::ApiId>) -> Option<i32> {
+        let path = format!("{path}.api_id");
+        let (number, shown) = match &api_id.value {
+            raw::ApiId::Number(n) => (i32::try_from(*n).ok(), format!(", not `{n}`")),
+            raw::ApiId::Text(text) => {
+                let text = Template(At {
+                    value: text.clone(),
+                    location: api_id.location,
+                });
+                let value = self.template(&path, &text)?;
+                (value.trim().parse::<i32>().ok(), String::new())
+            }
+        };
+        match number {
+            Some(n) if n >= 1 => Some(n),
+            _ => {
+                self.diag.errors.push(
+                    ConfigError::new(format!("`api_id` must be a positive number{shown}"))
+                        .at(located(path, api_id.location))
+                        .hint("use the api_id my.telegram.org shows for your app"),
+                );
+                None
+            }
+        }
     }
 
     /// A `session_dir`, absolute: relative to the config file's directory,

@@ -31,9 +31,9 @@ pub(super) const REDACTED: &str = "[redacted]";
 /// The configuration file, version 1.
 ///
 /// Only secrets (`token`, `secret_token`, `auth_token`, `admin.token`,
-/// `api_hash`, `phone`) and fields holding URLs or file paths expand
-/// `${env:NAME}` and `${file:PATH}` references; every other value is
-/// literal.
+/// `api_hash`, `phone`), an account's `api_id`, and fields holding URLs
+/// or file paths expand `${env:NAME}` and `${file:PATH}` references; every
+/// other value is literal.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 #[schemars(title = "tgin configuration, version 1")]
@@ -538,10 +538,10 @@ pub enum TextMatch {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Account {
-    /// The `api_id` of your Telegram app (my.telegram.org). Accounts may
-    /// share one app.
-    #[schemars(range(min = 1))]
-    pub api_id: At<i32>,
+    /// The `api_id` of your Telegram app (my.telegram.org), at least 1.
+    /// Accounts may share one app. Supports `${env:…}` and `${file:…}`;
+    /// it is not a secret.
+    pub api_id: At<ApiId>,
     /// The app's `api_hash`, a secret.
     pub api_hash: SecretText,
     /// Where the account's session lives: its auth keys and update state.
@@ -1233,6 +1233,52 @@ impl Serialize for WorkerThreads {
         match self {
             Self::Auto => serializer.serialize_str("auto"),
             Self::Count(n) => serializer.serialize_u64(n.get() as u64),
+        }
+    }
+}
+
+/// An account's `api_id`: a number, or text with `${env:…}` or
+/// `${file:…}` references, which resolution expands and checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiId {
+    Number(i64),
+    Text(String),
+}
+
+impl<'de> Deserialize<'de> for ApiId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ApiIdVisitor;
+
+        impl Visitor<'_> for ApiIdVisitor {
+            type Value = ApiId;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an api_id number, or text with `${env:…}` or `${file:…}`")
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<ApiId, E> {
+                Ok(ApiId::Number(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ApiId, E> {
+                // Out of range either way; resolution reports it.
+                Ok(ApiId::Number(i64::try_from(v).unwrap_or(i64::MAX)))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<ApiId, E> {
+                Ok(ApiId::Text(v.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(ApiIdVisitor)
+    }
+}
+
+impl Serialize for ApiId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Number(n) => serializer.serialize_i64(*n),
+            Self::Text(text) => serializer.serialize_str(text),
         }
     }
 }
