@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 tgin-botapi.workspace = true
 tgin-core.workspace = true
+tgin-mtproto.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

@@ -20,6 +20,8 @@ mod dc;
 pub mod decode;
 mod error;
 mod lock;
+pub mod media;
+pub mod rpc;
 pub mod schema;
 mod sender;
 mod session;

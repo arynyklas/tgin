@@ -1,0 +1,417 @@
+//! The raw-TL RPC endpoint (design §10.6, plan decisions 3 and 4):
+//! `POST /mtproto/v1/{account}/invoke`.
+//!
+//! A request carries `Authorization: Bearer <client token>` (compared in
+//! constant time), `X-Tgin-Layer: <layer>` (the layer the body is
+//! serialized in; it must be the account's) and the call:
+//! `application/octet-stream` TL, or with `Content-Type: application/json`
+//! TL-JSON that the codec encodes. `Accept: application/json` renders the
+//! answer as TL-JSON.
+//!
+//! The pipeline: unwrap the call ([`tgin_mtproto::rpc::unwrap_request`]),
+//! the client's allowlist (deny wins; empty denies), the account's
+//! `max_rps` limiter, then [`tgin_mtproto::rpc::call`] on the account.
+//!
+//! Answers:
+//! - Telegram's `rpc_result`: 200, its bytes as Telegram sent them.
+//! - Telegram's `rpc_error`: 200 with the `rpc_error` object, except
+//!   `FLOOD_WAIT_X` (after one sleep when X ≤ `flood_sleep_threshold`) and
+//!   `SLOWMODE_WAIT_X`: 429 with `Retry-After: X`; `FROZEN_*`: 403. The
+//!   body is the `rpc_error` in every case.
+//! - tgin's own errors: JSON `{"error","description"}`. 502 `no_answer`:
+//!   the call was written and may have been executed; tgin never resends
+//!   it. 503 with `Retry-After`: not executed, safe to retry.
+//!
+//! **Bounds.** A TL request is at most [`MAX_TL_BODY`] (1 MiB, about
+//! Telegram's own message bound); a TL-JSON request body at most
+//! [`MAX_JSON_BODY`]. Upload files with `upload.saveFilePart` /
+//! `upload.saveBigFilePart` in parts of at most 512 KiB.
+//!
+//! Request and answer bodies are never logged.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use serde::Serialize;
+use tgin_core::config::{self, MethodAcl};
+use tgin_mtproto::SenderError;
+use tgin_mtproto::decode::BoxKind;
+use tgin_mtproto::rpc::{
+    AccountRpc, AffectedSink, Answer, ErrorClass, InvokeError, Refused, classify, rpc_error_bytes,
+    unwrap_request,
+};
+use tgin_mtproto::schema::{API, MTPROTO};
+use tgin_runtime::limit::{KeyedLimiter, Quota};
+use tgin_runtime::secret::{Secret, secret_eq};
+use tokio::time::Instant;
+
+/// The largest TL request: 1 MiB.
+pub const MAX_TL_BODY: usize = 1 << 20;
+/// The largest TL-JSON request body: 2 MiB (base64 makes a 512 KiB file
+/// part about 700 KiB).
+pub const MAX_JSON_BODY: usize = 2 << 20;
+
+/// The header naming the request's layer.
+pub const LAYER_HEADER: &str = "x-tgin-layer";
+
+/// Every account the endpoint serves, by name.
+#[derive(Default)]
+pub struct RpcEndpoint {
+    accounts: HashMap<String, Arc<RpcAccount>>,
+}
+
+impl RpcEndpoint {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serves `account` under its name.
+    pub fn insert(&mut self, account: RpcAccount) {
+        self.accounts
+            .insert(account.name.clone(), Arc::new(account));
+    }
+}
+
+/// One account's RPC side: its clients, its limiter and the running
+/// account.
+pub struct RpcAccount {
+    name: String,
+    clients: Vec<Client>,
+    limiter: KeyedLimiter<()>,
+    flood_sleep_threshold: Duration,
+    rpc: Arc<dyn AccountRpc>,
+    sink: Arc<dyn AffectedSink>,
+}
+
+struct Client {
+    token: Secret<String>,
+    acl: MethodAcl,
+}
+
+impl RpcAccount {
+    /// The RPC side of account `name`, configured by `spec`
+    /// (`accounts.<name>.rpc`), calling `rpc` and feeding affected pts to
+    /// `sink`.
+    #[must_use]
+    pub fn new(
+        name: &str,
+        spec: &config::Rpc,
+        rpc: Arc<dyn AccountRpc>,
+        sink: Arc<dyn AffectedSink>,
+    ) -> Self {
+        let max_rps = spec.max_rps;
+        // `max_rps` per second, bursting to one second's worth.
+        let quota = Quota::new(max_rps, Duration::from_secs(1), max_rps)
+            .unwrap_or_else(|_| unreachable!("one second is a positive period"));
+        Self {
+            name: name.to_owned(),
+            clients: spec
+                .clients
+                .iter()
+                .map(|c| Client {
+                    token: c.token.clone(),
+                    acl: c.acl.clone(),
+                })
+                .collect(),
+            limiter: KeyedLimiter::new(quota),
+            flood_sleep_threshold: spec.flood_sleep_threshold,
+            rpc,
+            sink,
+        }
+    }
+
+    /// The client whose token `bearer` is. Every token is compared, in
+    /// constant time, whichever matches.
+    fn client(&self, bearer: &[u8]) -> Option<&Client> {
+        let mut found = None;
+        for client in &self.clients {
+            if secret_eq(bearer, client.token.expose().as_bytes()) && found.is_none() {
+                found = Some(client);
+            }
+        }
+        found
+    }
+}
+
+/// The endpoint's routes, with the body bound.
+pub fn router(endpoint: Arc<RpcEndpoint>) -> Router {
+    Router::new()
+        .route("/mtproto/v1/{account}/invoke", post(invoke))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
+        .with_state(endpoint)
+}
+
+#[derive(Serialize)]
+struct ErrorBody<'a> {
+    error: &'a str,
+    description: &'a str,
+}
+
+fn tgin_error(status: StatusCode, error: &str, description: &str) -> Response {
+    (status, axum::Json(ErrorBody { error, description })).into_response()
+}
+
+fn with_retry_after(mut response: Response, secs: u64) -> Response {
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(secs.max(1)));
+    response
+}
+
+fn wants_json(headers: &HeaderMap, name: header::HeaderName) -> bool {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("application/json"))
+}
+
+async fn invoke(
+    State(endpoint): State<Arc<RpcEndpoint>>,
+    Path(account): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Some(account) = endpoint.accounts.get(&account) else {
+        return tgin_error(StatusCode::NOT_FOUND, "unknown_account", "no such account");
+    };
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "));
+    let Some(client) = bearer.and_then(|b| account.client(b)) else {
+        return tgin_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "a valid client bearer token is required",
+        );
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return too_large();
+        }
+        Err(_) => {
+            return tgin_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "the body could not be read",
+            );
+        }
+    };
+    let layer = account.rpc.layer();
+    match headers
+        .get(LAYER_HEADER)
+        .and_then(|v| v.to_str().ok()?.parse::<i32>().ok())
+    {
+        None => {
+            return tgin_error(
+                StatusCode::BAD_REQUEST,
+                "layer_required",
+                "X-Tgin-Layer must name the layer the request is serialized in",
+            );
+        }
+        Some(got) if got != layer => return layer_mismatch(layer),
+        Some(_) => {}
+    }
+    let tl: Bytes = if wants_json(&headers, header::CONTENT_TYPE) {
+        let Ok(text) = std::str::from_utf8(&body) else {
+            return tgin_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "TL-JSON must be UTF-8",
+            );
+        };
+        let mut out = Vec::new();
+        if let Err(e) = API.from_json(text, &mut out) {
+            return tgin_error(StatusCode::BAD_REQUEST, "bad_request", &e.to_string());
+        }
+        Bytes::from(out)
+    } else {
+        body
+    };
+    if tl.len() > MAX_TL_BODY {
+        return too_large();
+    }
+    let call = match unwrap_request(&tl, layer) {
+        Ok(call) => call,
+        Err(refused) => return refusal(&refused, layer),
+    };
+    let method = call.method;
+    if !client.acl.allows(method) {
+        return tgin_error(
+            StatusCode::FORBIDDEN,
+            "method_not_allowed",
+            "the client's allowlist does not allow this method",
+        );
+    }
+    if let Err(denied) = account.limiter.acquire(&(), Instant::now(), Duration::ZERO) {
+        let secs = denied.retry_after.as_secs() + u64::from(denied.retry_after.subsec_nanos() > 0);
+        return with_retry_after(
+            tgin_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "the account's max_rps is reached",
+            ),
+            secs,
+        );
+    }
+    let context: BoxKind = call.context;
+    let inner = tl.slice_ref(call.body);
+    let answer = tgin_mtproto::rpc::call(
+        account.rpc.as_ref(),
+        account.sink.as_ref(),
+        context,
+        inner,
+        account.flood_sleep_threshold,
+    )
+    .await;
+    let response = answer_response(answer, wants_json(&headers, header::ACCEPT));
+    tracing::debug!(account = %account.name, method, status = response.status().as_u16(), "mtproto rpc");
+    response
+}
+
+fn too_large() -> Response {
+    tgin_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large",
+        "a TL request is at most 1 MiB; upload files in parts with upload.saveFilePart",
+    )
+}
+
+fn layer_mismatch(layer: i32) -> Response {
+    tgin_error(
+        StatusCode::CONFLICT,
+        "layer_mismatch",
+        &format!("the account serves layer {layer} only"),
+    )
+}
+
+fn refusal(refused: &Refused, layer: i32) -> Response {
+    match refused {
+        Refused::ForeignLayer { .. } => layer_mismatch(layer),
+        Refused::UpdatesMethod(_) => tgin_error(
+            StatusCode::FORBIDDEN,
+            "updates_method",
+            &refused.to_string(),
+        ),
+        Refused::Wrapper(_) => tgin_error(
+            StatusCode::BAD_REQUEST,
+            "wrapper_refused",
+            &refused.to_string(),
+        ),
+        Refused::Malformed(_) | Refused::NotAFunction(_) => {
+            tgin_error(StatusCode::BAD_REQUEST, "bad_request", &refused.to_string())
+        }
+    }
+}
+
+/// Telegram's bytes, raw or as TL-JSON in `schema`.
+fn telegram_bytes(status: StatusCode, bytes: &[u8], json: bool, mtproto: bool) -> Response {
+    if !json {
+        return (
+            status,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes.to_vec(),
+        )
+            .into_response();
+    }
+    let schema = if mtproto { &MTPROTO } else { &API };
+    let mut out = String::new();
+    match schema.to_json(bytes, &mut out) {
+        Ok(()) => (status, [(header::CONTENT_TYPE, "application/json")], out).into_response(),
+        Err(e) => tgin_error(StatusCode::BAD_GATEWAY, "render_failed", &e.to_string()),
+    }
+}
+
+fn answer_response(answer: Answer, json: bool) -> Response {
+    match answer {
+        Answer::Result(bytes) => telegram_bytes(StatusCode::OK, &bytes, json, false),
+        Answer::Error {
+            code,
+            message,
+            class,
+        } => {
+            let bytes = rpc_error_bytes(code, &message);
+            match class {
+                ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x) => with_retry_after(
+                    telegram_bytes(StatusCode::TOO_MANY_REQUESTS, &bytes, json, true),
+                    u64::from(x),
+                ),
+                ErrorClass::Frozen => telegram_bytes(StatusCode::FORBIDDEN, &bytes, json, true),
+                ErrorClass::Migrate(_) | ErrorClass::Other => {
+                    telegram_bytes(StatusCode::OK, &bytes, json, true)
+                }
+            }
+        }
+        Answer::Failed(e) => failure(&e),
+    }
+}
+
+fn unavailable(error: &str, description: &str) -> Response {
+    with_retry_after(
+        tgin_error(StatusCode::SERVICE_UNAVAILABLE, error, description),
+        1,
+    )
+}
+
+fn failure(e: &InvokeError) -> Response {
+    let InvokeError::Sender(e) = e else {
+        return tgin_error(StatusCode::BAD_GATEWAY, "media_session", &e.to_string());
+    };
+    match e {
+        SenderError::NoAnswer => tgin_error(
+            StatusCode::BAD_GATEWAY,
+            "no_answer",
+            "the call may have been executed",
+        ),
+        SenderError::NotSent => unavailable("not_sent", "the call was not executed; retry it"),
+        SenderError::BadMessage { .. } => {
+            unavailable("not_sent", "Telegram ignored the call; it was not executed")
+        }
+        SenderError::Connect(_) => unavailable(
+            "not_sent",
+            "Telegram could not be reached; the call was not executed",
+        ),
+        SenderError::InitRefused { code, message } => match classify(*code, message) {
+            ErrorClass::FloodWait(x) if *code == 420 => with_retry_after(
+                tgin_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "init_flood_wait",
+                    "Telegram refused the connection's init call for now; the call was not executed",
+                ),
+                u64::from(x),
+            ),
+            _ if *code == 420 => with_retry_after(
+                tgin_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "init_flood_wait",
+                    "Telegram refused the connection's init call for now; the call was not executed",
+                ),
+                1,
+            ),
+            _ => tgin_error(
+                StatusCode::BAD_GATEWAY,
+                "init_refused",
+                "Telegram refused the connection's init call; the call was not executed",
+            ),
+        },
+        SenderError::KeyRevoked | SenderError::KeyUnknown => tgin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account_unavailable",
+            "the account needs a new login",
+        ),
+        SenderError::BadRequest => tgin_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the request is not whole TL words or is too large",
+        ),
+    }
+}

@@ -2764,6 +2764,7 @@ dependencies = [
  "serde_json",
  "tgin-botapi",
  "tgin-core",
+ "tgin-mtproto",
  "tgin-runtime",
  "thiserror",
  "tokio",

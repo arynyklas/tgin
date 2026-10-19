@@ -57,6 +57,7 @@ subtle = "2.6.1"
 tempfile = "3.27.0"
 tgin-botapi = { path = "crates/tgin-botapi" }
 tgin-core = { path = "crates/tgin-core" }
+tgin-mtproto = { path = "crates/tgin-mtproto" }
 tgin-runtime = { path = "crates/tgin-runtime" }
 thiserror = "2.0.21"
 tokio = "1.53.3"
