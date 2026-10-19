@@ -2,8 +2,9 @@
 //! call through the account.
 //!
 //! A glob is one of:
-//! - `*`: every method;
-//! - `<namespace>.*`, such as `messages.*`: every method of the namespace;
+//! - `*`: every method a glob may grant;
+//! - `<namespace>.*`, such as `messages.*`: every method of the namespace
+//!   a glob may grant;
 //! - a method name, such as `messages.sendMessage` or `ping`: that method.
 //!
 //! Names are TL names, `[A-Za-z][A-Za-z0-9_]*` with at most one
@@ -11,34 +12,92 @@
 //! glob: no `*` inside a name, no `?`, no character classes.
 //!
 //! A client may call a method when an `allow` glob matches it and no `deny`
-//! glob does; with no `allow`, it may call nothing. The methods of
-//! [`ACCOUNT_CHANGING`] (less [`ACCOUNT_READ_ONLY`]) are the exception:
-//! only an `allow` entry that names the method exactly allows one, never a
-//! glob.
+//! glob does; with no `allow`, it may call nothing. A glob grants only
+//! methods of the [`GLOB_NAMESPACES`] that are not [`ACCOUNT_CHANGING`]
+//! (apart from [`ACCOUNT_READ_ONLY`]): every other method, whatever its
+//! namespace, is granted only by an `allow` entry that names it exactly
+//! ([`exact_only`]). A namespace a later layer adds is exact-only until it
+//! is reviewed.
 
-/// Methods that log the account in or out, or change the account itself:
-/// its profile, settings, privacy, sessions, password or address book.
-/// A `<namespace>.*` entry covers the whole namespace, apart from the
+/// The namespaces whose methods a glob (`*` or `<namespace>.*`) may grant,
+/// reviewed for layer 230: what a userbot does with chats, messages,
+/// media and the profile it reads. Every other namespace, such as `auth`,
+/// `bots`, `payments`, `wallet`, `premium`, `fragment` or `smsjobs`, moves
+/// assets, logs in, or is unreviewed, and needs exact listing.
+pub const GLOB_NAMESPACES: [&str; 13] = [
+    // Settings and profile; a glob grants only the getters of
+    // `ACCOUNT_READ_ONLY`, as `account.*` is account-changing.
+    "account",  // Channels and supergroups the account uses or administers.
+    "channels", // Contacts, less the address-book and block-list changes below.
+    "contacts", // Configuration and app information.
+    "help",     // Localization strings.
+    "langpack", // Chats and messages, less the methods below.
+    "messages", // Calls and group calls.
+    "phone",    // Profile photos, less the account's own and contacts' photo changes.
+    "photos",   // Channel and message statistics, read-only.
+    "stats",    // Sticker sets the account creates and edits.
+    "stickers", // Stories, less the account-wide toggle below.
+    "stories",  // File upload and download.
+    "upload",   // User profiles, read-only.
+    "users",
+];
+
+/// Methods of the [`GLOB_NAMESPACES`] that move assets or change the
+/// account itself: its profile, settings, privacy, sessions, password,
+/// address book, block list, chat folders and logins on other sites. A
+/// `<namespace>.*` entry covers the whole namespace, apart from the
 /// getters of [`ACCOUNT_READ_ONLY`].
 ///
 /// A glob never allows these, `*` included: an operator lists each one
 /// exactly in a client's `allow`, and the loader warns about it.
-pub const ACCOUNT_CHANGING: [&str; 15] = [
-    "auth.*",
+pub const ACCOUNT_CHANGING: [&str; 40] = [
     "account.*",
+    // Sets the price of messages to the channel, in Stars.
+    "channels.updatePaidMessagesPrice",
     "contacts.acceptContact",
     "contacts.addContact",
+    "contacts.block",
+    "contacts.blockFromReplies",
     "contacts.deleteByPhones",
     "contacts.deleteContacts",
+    "contacts.editCloseFriends",
     "contacts.importContacts",
-    "contacts.updateContactNote",
     "contacts.resetSaved",
+    "contacts.resetTopPeerRating",
+    "contacts.setBlocked",
     "contacts.toggleTopPeers",
-    "photos.uploadProfilePhoto",
-    "photos.updateProfilePhoto",
-    "photos.deletePhotos",
-    "photos.uploadContactProfilePhoto",
+    "contacts.unblock",
+    "contacts.updateContactNote",
     "help.acceptTermsOfService",
+    // Logs the account in to a website.
+    "messages.acceptUrlAuth",
+    "messages.checkUrlAuthMatchCode",
+    "messages.clearAllDrafts",
+    "messages.deletePhoneCallHistory",
+    // Web views hand a bot the account's identity, and may pay.
+    "messages.prolongWebView",
+    "messages.requestAppWebView",
+    "messages.requestChatJoinWebView",
+    "messages.requestMainWebView",
+    "messages.requestSimpleWebView",
+    "messages.requestWebView",
+    // Spends Stars.
+    "messages.sendPaidReaction",
+    "messages.setDefaultHistoryTTL",
+    "messages.setDefaultReaction",
+    // Installs a bot in the attachment menu, with write access.
+    "messages.toggleBotInAttachMenu",
+    // Chat folders.
+    "messages.toggleDialogFilterTags",
+    // Approves a paid suggested post, which moves its price.
+    "messages.toggleSuggestedPostApproval",
+    "messages.updateDialogFilter",
+    "messages.updateDialogFiltersOrder",
+    "photos.deletePhotos",
+    "photos.updateProfilePhoto",
+    "photos.uploadContactProfilePhoto",
+    "photos.uploadProfilePhoto",
+    "stories.toggleAllStoriesHidden",
 ];
 
 /// The `account.get*` methods of layer 230 that only read settings, which
@@ -120,10 +179,7 @@ impl MethodGlob {
     pub fn matches(&self, method: &str) -> bool {
         match self {
             MethodGlob::Any => true,
-            MethodGlob::Namespace(namespace) => method
-                .strip_prefix(namespace.as_str())
-                .and_then(|rest| rest.strip_prefix('.'))
-                .is_some_and(|name| !name.is_empty()),
+            MethodGlob::Namespace(namespace) => in_namespace(method, namespace),
             MethodGlob::Exact(name) => name == method,
         }
     }
@@ -136,13 +192,33 @@ pub fn account_changing(method: &str) -> bool {
     let listed = ACCOUNT_CHANGING
         .iter()
         .any(|entry| match entry.strip_suffix(".*") {
-            Some(namespace) => method
-                .strip_prefix(namespace)
-                .and_then(|rest| rest.strip_prefix('.'))
-                .is_some_and(|name| !name.is_empty()),
+            Some(namespace) => in_namespace(method, namespace),
             None => *entry == method,
         });
     listed && !ACCOUNT_READ_ONLY.contains(&method)
+}
+
+/// Whether a glob may grant `namespace`'s methods.
+pub fn glob_namespace(namespace: &str) -> bool {
+    GLOB_NAMESPACES.contains(&namespace)
+}
+
+/// Whether only an exact `allow` entry grants `method`: it has no
+/// namespace, its namespace is not one of [`GLOB_NAMESPACES`], or it is
+/// [`account_changing`]. Allocates nothing.
+pub fn exact_only(method: &str) -> bool {
+    match method.split_once('.') {
+        Some((namespace, _)) => !glob_namespace(namespace) || account_changing(method),
+        None => true,
+    }
+}
+
+/// Whether `method` is `<namespace>.<name>`, with a name.
+fn in_namespace(method: &str, namespace: &str) -> bool {
+    method
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|name| !name.is_empty())
 }
 
 /// A client's `allow` and `deny` globs.
@@ -154,12 +230,12 @@ pub struct MethodAcl {
 
 impl MethodAcl {
     /// Whether the client may call `method`: deny wins, and an
-    /// [`ACCOUNT_CHANGING`] method needs an exact `allow` entry.
+    /// [`exact_only`] method needs an exact `allow` entry.
     pub fn allows(&self, method: &str) -> bool {
         if self.deny.iter().any(|glob| glob.matches(method)) {
             return false;
         }
-        if account_changing(method) {
+        if exact_only(method) {
             return self
                 .allow
                 .iter()

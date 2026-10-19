@@ -3992,3 +3992,66 @@ fn accounts_without_admin_token_warn() {
     let cfg = load_account(&account_yaml("")).expect("loads");
     assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
 }
+
+/// A glob grants only methods of the reviewed namespaces that change
+/// nothing account-wide; every other method needs an exact entry.
+#[test]
+fn glob_grants_only_reviewed_namespaces() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"*\", \"messages.*\", \"payments.*\", \"wallet.*\", \"futurens.*\"] }, e: { token: u, allow: [payments.getStarsStatus, messages.sendPaidReaction, futurens.doThing] } } } }\n",
+    );
+    let glob = &cfg.accounts[0].rpc.clients[0].acl;
+    let exact = &cfg.accounts[0].rpc.clients[1].acl;
+    for method in [
+        "messages.sendMessage",
+        "channels.joinChannel",
+        "upload.getFile",
+        "users.getUsers",
+    ] {
+        assert!(!config::exact_only(method), "{method}");
+        assert!(glob.allows(method), "{method}");
+    }
+    for method in [
+        "messages.sendPaidReaction",
+        "messages.setDefaultHistoryTTL",
+        "messages.setDefaultReaction",
+        "messages.requestWebView",
+        "messages.requestSimpleWebView",
+        "messages.requestAppWebView",
+        "messages.requestMainWebView",
+        "messages.requestChatJoinWebView",
+        "messages.prolongWebView",
+        "messages.checkUrlAuthMatchCode",
+        "messages.acceptUrlAuth",
+        "messages.toggleBotInAttachMenu",
+        "messages.updateDialogFilter",
+        "messages.toggleSuggestedPostApproval",
+        "channels.updatePaidMessagesPrice",
+        "contacts.block",
+        "contacts.setBlocked",
+        "contacts.editCloseFriends",
+        "stories.toggleAllStoriesHidden",
+        "payments.getStarsStatus",
+        "payments.sendStarsForm",
+        "wallet.getWallets",
+        "smsjobs.join",
+        "premium.applyBoost",
+        "bots.setBotInfo",
+        "fragment.getCollectibleInfo",
+        "auth.logOut",
+        "futurens.doThing",
+        "ping",
+    ] {
+        assert!(config::exact_only(method), "{method}");
+        assert!(!glob.allows(method), "{method}");
+    }
+    assert!(exact.allows("payments.getStarsStatus"));
+    assert!(exact.allows("messages.sendPaidReaction"));
+    assert!(exact.allows("futurens.doThing"));
+    assert!(!exact.allows("payments.sendStarsForm"));
+    for namespace in [
+        "payments", "wallet", "smsjobs", "premium", "bots", "fragment", "auth",
+    ] {
+        assert!(!config::glob_namespace(namespace), "{namespace}");
+    }
+}

@@ -250,18 +250,11 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
         .collect();
     for (k, glob) in client.allow.iter().enumerate() {
         match MethodGlob::parse(&glob.value) {
-            Some(MethodGlob::Namespace(namespace))
-                if acl::ACCOUNT_CHANGING.contains(&glob.value.as_str())
-                    && !acl::ACCOUNT_READ_ONLY.iter().any(|getter| {
-                        getter
-                            .strip_prefix(namespace.as_str())
-                            .is_some_and(|rest| rest.starts_with('.'))
-                    }) =>
-            {
+            Some(MethodGlob::Namespace(namespace)) if !acl::glob_namespace(&namespace) => {
                 useless.push((k, glob));
             }
             Some(MethodGlob::Exact(method))
-                if acl::account_changing(&method) && !deny.iter().any(|d| d.matches(&method)) =>
+                if acl::exact_only(&method) && !deny.iter().any(|d| d.matches(&method)) =>
             {
                 exact.push((k, glob));
             }
