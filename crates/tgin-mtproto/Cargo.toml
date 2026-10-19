@@ -43,8 +43,12 @@ grammers-tl-parser = "=1.2.2"
 # The decoder and codec property tests compare with grammers' typed
 # (de)serializers, functions and mtproto.tl included.
 grammers-tl-types = { version = "=0.11.0", default-features = false, features = ["tl-api", "tl-mtproto", "deserializable-functions"] }
+# The live-gate example (examples/live_gate.rs) drives the test bot over the
+# Bot API and its children, and logs the account to a file.
+reqwest = { workspace = true, features = ["json"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tracing-subscriber.workspace = true
 
 # The two-process ownership race: its own `main` is both the race driver and,
 # re-run with `TGIN_LOCK_CHILD_DIR`, the contender. A test target, so cargo

@@ -1,0 +1,101 @@
+# The live-gate soak: a tgin-mtproto account for 7 days under its
+# supervisor, with induced restarts and network cuts. See
+# tests/smoke/live_gate.md. Build and start from the repository root:
+#   docker compose -f tests/smoke/live_gate/compose.yaml build
+#   docker compose -f tests/smoke/live_gate/compose.yaml up -d
+#
+# The session directory is bind-mounted into the account container alone;
+# nothing else may open it until the soak is stopped.
+name: tgin-soak
+
+x-gate: &gate
+  image: tgin-live-gate:soak
+  pull_policy: never
+  restart: unless-stopped
+  # The session directory and the data volume are root's.
+  user: "0:0"
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "10"
+
+services:
+  account:
+    <<: *gate
+    build:
+      context: ../../..
+      dockerfile: tests/smoke/live_gate/Dockerfile
+    container_name: tgin-soak-account
+    command: [soak, --session, /session, --data, /data, --api-env, /secrets/telegram-api.env, --token-file, /secrets/bot-token]
+    # TGIN_GATE_USER and TGIN_GATE_CHANNEL: kept outside the repository.
+    env_file: ${TGIN_SECRETS:-C:/Users/user/.tgin-secrets}/m3-gate.env
+    networks: [tgin-soak-net]
+    volumes:
+      - type: bind
+        source: ${TGIN_SOAK_SESSION:-C:/Users/user/.tgin-secrets/m3-account/session}
+        target: /session
+      - tgin-soak-data:/data
+      - type: bind
+        source: ${TGIN_SECRETS:-C:/Users/user/.tgin-secrets}/telegram-api.env
+        target: /secrets/telegram-api.env
+        read_only: true
+      - type: bind
+        source: ${TGIN_SECRETS:-C:/Users/user/.tgin-secrets}/bot-token
+        target: /secrets/bot-token
+        read_only: true
+
+  heartbeat:
+    <<: *gate
+    container_name: tgin-soak-heartbeat
+    command: [heartbeat, --data, /data, --token-file, /secrets/bot-token]
+    env_file: ${TGIN_SECRETS:-C:/Users/user/.tgin-secrets}/m3-gate.env
+    # Its own network: the account's cuts do not stop the heartbeats.
+    networks: [tgin-soak-bot]
+    volumes:
+      - tgin-soak-data:/data
+      - type: bind
+        source: ${TGIN_SECRETS:-C:/Users/user/.tgin-secrets}/bot-token
+        target: /secrets/bot-token
+        read_only: true
+    depends_on: [account]
+
+  baseline:
+    <<: *gate
+    container_name: tgin-soak-baseline
+    command: [baseline, --data, /data]
+    network_mode: none
+    volumes:
+      - tgin-soak-data:/data
+
+  chaos:
+    build:
+      context: .
+      dockerfile: chaos.Dockerfile
+    image: tgin-live-gate:chaos
+    pull_policy: never
+    container_name: tgin-soak-chaos
+    restart: unless-stopped
+    environment:
+      ACCOUNT: tgin-soak-account
+      NET: tgin-soak-net
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - tgin-soak-data:/data
+    depends_on: [account]
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
+networks:
+  tgin-soak-net:
+    name: tgin-soak-net
+  tgin-soak-bot:
+    name: tgin-soak-bot
+
+volumes:
+  tgin-soak-data:
+    name: tgin-soak-data
