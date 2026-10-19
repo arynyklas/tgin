@@ -242,6 +242,33 @@ async fn get_difference_403() {
 }
 
 #[tokio::test]
+async fn authorization_methods_refused_even_when_listed() {
+    let account = FakeAccount::new([]);
+    let acl = MethodAcl {
+        allow: vec![
+            MethodGlob::Any,
+            MethodGlob::Exact("auth.exportAuthorization".to_owned()),
+            MethodGlob::Exact("auth.acceptLoginToken".to_owned()),
+        ],
+        deny: Vec::new(),
+    };
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, acl),
+    );
+    for body in [
+        r#"{"_":"auth.exportAuthorization","dc_id":4}"#,
+        r#"{"_":"auth.acceptLoginToken","token":"AQID"}"#,
+    ] {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(answer.error(), "authorization_method");
+    }
+    assert!(account.calls().is_empty());
+}
+
+#[tokio::test]
 async fn allowlist_deny_by_default() {
     let account = FakeAccount::new([ok(NEAREST)]);
     let empty = app_with(

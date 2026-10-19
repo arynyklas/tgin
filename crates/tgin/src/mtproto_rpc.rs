@@ -8,6 +8,13 @@
 //! TL-JSON that the codec encodes. `Accept: application/json` renders the
 //! answer as TL-JSON.
 //!
+//! tgin refuses with 403, whatever a client's allowlist says, the update
+//! methods (`updates.getState`, `getDifference`, `getChannelDifference`)
+//! and the `auth.*` methods that mint or move an authorization of the
+//! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
+//! account's authorizations (plan decision 2). The second refusal is
+//! ruling P10; the owner may overrule it.
+//!
 //! The pipeline: unwrap the call ([`tgin_mtproto::rpc::unwrap_request`]),
 //! the client's allowlist (deny wins; empty denies), the account's
 //! `max_rps` limiter, then [`tgin_mtproto::rpc::call`] on the account.
@@ -300,6 +307,11 @@ fn layer_mismatch(layer: i32) -> Response {
 fn refusal(refused: &Refused, layer: i32) -> Response {
     match refused {
         Refused::ForeignLayer { .. } => layer_mismatch(layer),
+        Refused::AuthorizationMethod(_) => tgin_error(
+            StatusCode::FORBIDDEN,
+            "authorization_method",
+            &refused.to_string(),
+        ),
         Refused::UpdatesMethod(_) => tgin_error(
             StatusCode::FORBIDDEN,
             "updates_method",

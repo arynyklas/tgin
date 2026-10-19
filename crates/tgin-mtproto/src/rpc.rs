@@ -4,7 +4,8 @@
 //! - [`unwrap_request`] reads a downstream request against the api schema:
 //!   `initConnection` and `invokeWithLayer(account layer, …)` are stripped;
 //!   any other wrapper (a function with a `query:!X` field), a foreign
-//!   layer, and the update-state methods are refused. What is left is one
+//!   layer, the update-state methods and the `auth.*` methods that mint or
+//!   move an authorization ([`AUTHORIZATION_METHODS`]) are refused. What is left is one
 //!   whole, strictly checked function call.
 //! - [`call`] runs that call on an [`AccountRpc`] with the answer rules:
 //!   one resend of a request never written, never a resend of one that may
@@ -108,7 +109,25 @@ pub enum Refused {
     /// updates come from consumers.
     #[error("`{0}` is answered only to tgin's own session; take updates from a consumer")]
     UpdatesMethod(&'static str),
+    /// An `auth.*` method that mints or moves an authorization of the
+    /// account: tgin owns them (plan decision 2, ruling P10).
+    #[error("`{0}` mints or moves an authorization of the account; tgin owns those")]
+    AuthorizationMethod(&'static str),
 }
+
+/// Refused whatever a client's allowlist says (ruling P10; the owner may
+/// overrule it): each mints or moves an authorization of the account, and
+/// tgin owns the account's authorizations (plan decision 2).
+pub const AUTHORIZATION_METHODS: [&str; 8] = [
+    "auth.exportAuthorization",
+    "auth.importAuthorization",
+    "auth.acceptLoginToken",
+    "auth.exportLoginToken",
+    "auth.importLoginToken",
+    "auth.bindTempAuthKey",
+    "auth.importBotAuthorization",
+    "auth.importWebTokenAuthorization",
+];
 
 const UPDATES_METHODS: [&str; 3] = [
     "updates.getState",
@@ -137,6 +156,9 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
             "initConnection" => rest = &rest[query_start(&mut r, ctor)?..],
             name if is_wrapper(ctor) => return Err(Refused::Wrapper(name)),
             name if UPDATES_METHODS.contains(&name) => return Err(Refused::UpdatesMethod(name)),
+            name if AUTHORIZATION_METHODS.contains(&name) => {
+                return Err(Refused::AuthorizationMethod(name));
+            }
             method => {
                 let context = check_call(&mut r, ctor)?;
                 r.finish()?;
