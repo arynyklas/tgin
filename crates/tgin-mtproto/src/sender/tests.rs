@@ -1,0 +1,818 @@
+//! The sender against a scripted transport that speaks plain MTProto
+//! packets: the test plays Telegram, one message at a time.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
+
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use super::*;
+use crate::{AuthKey, DcAddr, Opened};
+
+/// Bounded wait for anything the test expects; the clock is paused, so it
+/// passes only once the runtime is idle.
+const WAIT: Duration = Duration::from_secs(5);
+const ANSWER: [u8; 8] = [0x15, 0xc4, 0xb5, 0x1c, 0, 0, 0, 0];
+
+fn tuning(pushes: usize) -> Tuning {
+    Tuning {
+        pushes,
+        ping_interval: Duration::from_secs(3600),
+        pong_timeout: Duration::from_secs(3600),
+    }
+}
+
+fn dc() -> DcOption {
+    DcOption {
+        id: 2,
+        addr: DcAddr {
+            ipv4: "127.0.0.1:1".parse().unwrap(),
+            ipv6: "[::1]:1".parse().unwrap(),
+        },
+    }
+}
+
+fn init() -> InitParams {
+    let mut init = InitParams::new(12345);
+    init.device_model = "test device".into();
+    init.app_version = "0.0.0-test".into();
+    init
+}
+
+fn get_config() -> Bytes {
+    tl::functions::help::GetConfig {}.to_bytes().into()
+}
+
+fn get_nearest_dc() -> Bytes {
+    tl::functions::help::GetNearestDc {}.to_bytes().into()
+}
+
+/// grammers' typed wrapper around `query`: the independent expectation for
+/// the sender's byte-composed one.
+fn typed_init<Q: Serializable>(init: &InitParams, query: Q) -> Vec<u8> {
+    tl::functions::InvokeWithLayer {
+        layer: tl::LAYER,
+        query: tl::functions::InitConnection {
+            api_id: init.api_id,
+            device_model: init.device_model.clone(),
+            system_version: init.system_version.clone(),
+            app_version: init.app_version.clone(),
+            system_lang_code: init.system_lang_code.clone(),
+            lang_pack: init.lang_pack.clone(),
+            lang_code: init.lang_code.clone(),
+            proxy: None,
+            params: None,
+            query,
+        },
+    }
+    .to_bytes()
+}
+
+/// A pushed update container; `n` tells them apart.
+fn update(n: u8) -> Vec<u8> {
+    // `updatesTooLong#e317af7e` padded with a marker word: any body that is
+    // not a service message is a push.
+    let mut body = tl::enums::Updates::TooLong.to_bytes();
+    body.extend_from_slice(&[n, 0xee, 0xee, 0xee]);
+    body
+}
+
+/// What a scripted connection's writer does with packets.
+#[derive(Clone, Copy)]
+enum Writes {
+    /// Every packet is handed over at once.
+    Deliver,
+    /// Each packet waits for the test's verdict.
+    Gated,
+}
+
+struct Script {
+    modes: Mutex<VecDeque<Writes>>,
+    conns: mpsc::UnboundedSender<Server>,
+    /// Whether each `open` had a key.
+    opens: Mutex<Vec<bool>>,
+}
+
+#[derive(Clone)]
+struct Scripted(Arc<Script>);
+
+impl Transport for Scripted {
+    type Reader = ScriptReader;
+    type Writer = ScriptWriter;
+
+    async fn open(
+        &self,
+        _dc: &DcOption,
+        key: Option<&AuthKey>,
+    ) -> Result<Opened<ScriptReader, ScriptWriter>, TransportError> {
+        self.0.opens.lock().push(key.is_some());
+        let mode = self.0.modes.lock().pop_front().unwrap_or(Writes::Deliver);
+        let (to_client, from_server) = mpsc::unbounded_channel();
+        let (to_server, from_client) = mpsc::unbounded_channel();
+        let (gate, verdicts) = mpsc::unbounded_channel();
+        let (attempt, attempts) = mpsc::unbounded_channel();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let server = Server {
+            to_client: Some(to_client),
+            from_client,
+            gate,
+            attempts,
+            taken: Arc::clone(&taken),
+            session_id: None,
+            next_msg_id: (1_800_000_000 << 32) | 1,
+            seq: 0,
+        };
+        self.0.conns.send(server).unwrap();
+        Ok(Opened {
+            reader: ScriptReader { from_server, taken },
+            writer: ScriptWriter {
+                to_server,
+                mode,
+                verdicts,
+                attempt,
+                queued: None,
+                announced: false,
+            },
+            generated: None,
+        })
+    }
+}
+
+struct ScriptReader {
+    from_server: mpsc::UnboundedReceiver<Result<Bytes, TransportError>>,
+    /// Frames the sender has read.
+    taken: Arc<AtomicUsize>,
+}
+
+impl PacketReader for ScriptReader {
+    async fn recv(&mut self) -> Result<Bytes, TransportError> {
+        match self.from_server.recv().await {
+            Some(Ok(packet)) => {
+                self.taken.fetch_add(1, Ordering::SeqCst);
+                Ok(packet)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(TransportError::Closed),
+        }
+    }
+}
+
+struct ScriptWriter {
+    to_server: mpsc::UnboundedSender<Vec<u8>>,
+    mode: Writes,
+    verdicts: mpsc::UnboundedReceiver<bool>,
+    attempt: mpsc::UnboundedSender<()>,
+    queued: Option<Vec<u8>>,
+    announced: bool,
+}
+
+impl PacketWriter for ScriptWriter {
+    fn queue(&mut self, packet: &[u8]) {
+        self.queued = Some(packet.to_vec());
+        self.announced = false;
+    }
+
+    async fn flush(&mut self) -> Result<(), TransportError> {
+        if let Writes::Gated = self.mode {
+            if !self.announced {
+                self.announced = true;
+                let _ = self.attempt.send(());
+            }
+            if self.verdicts.recv().await != Some(true) {
+                return Err(TransportError::Closed);
+            }
+        }
+        let packet = self.queued.take().unwrap_or_default();
+        self.to_server
+            .send(packet)
+            .map_err(|_| TransportError::Closed)
+    }
+
+    fn is_flushed(&self) -> bool {
+        self.queued.is_none()
+    }
+}
+
+/// One message of a packet.
+#[derive(Debug, Clone)]
+struct Msg {
+    msg_id: i64,
+    seqno: i32,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct Packet {
+    salt: i64,
+    session_id: i64,
+    container: Option<i64>,
+    msgs: Vec<Msg>,
+}
+
+fn le_i64(b: &[u8]) -> i64 {
+    i64::from_le_bytes(b[..8].try_into().unwrap())
+}
+
+fn le_i32(b: &[u8]) -> i32 {
+    i32::from_le_bytes(b[..4].try_into().unwrap())
+}
+
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes(b[..4].try_into().unwrap())
+}
+
+/// `(msg, next offset)`.
+fn parse_msg(b: &[u8], at: usize) -> (Msg, usize) {
+    let len = usize::try_from(le_i32(&b[at + 12..])).unwrap();
+    let start = at + 16;
+    let msg = Msg {
+        msg_id: le_i64(&b[at..]),
+        seqno: le_i32(&b[at + 8..]),
+        body: b[start..start + len].to_vec(),
+    };
+    (msg, start + len)
+}
+
+impl Packet {
+    fn parse(raw: &[u8]) -> Self {
+        let (outer, _) = parse_msg(raw, 16);
+        let (container, msgs) = if le_u32(&outer.body) == MSG_CONTAINER {
+            let count = le_i32(&outer.body[4..]);
+            let mut at = 8;
+            let mut msgs = Vec::new();
+            for _ in 0..count {
+                let (msg, next) = parse_msg(&outer.body, at);
+                msgs.push(msg);
+                at = next;
+            }
+            assert!(
+                msgs.iter().all(|m| m.msg_id < outer.msg_id),
+                "container id is the largest"
+            );
+            (Some(outer.msg_id), msgs)
+        } else {
+            (None, vec![outer])
+        };
+        Self {
+            salt: le_i64(raw),
+            session_id: le_i64(&raw[8..]),
+            container,
+            msgs,
+        }
+    }
+
+    /// Messages other than `msgs_ack`.
+    fn requests(&self) -> Vec<Msg> {
+        self.msgs
+            .iter()
+            .filter(|m| le_u32(&m.body) != MSGS_ACK)
+            .cloned()
+            .collect()
+    }
+
+    /// Every msg_id acknowledged in this packet.
+    fn acks(&self) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for m in self.msgs.iter().filter(|m| le_u32(&m.body) == MSGS_ACK) {
+            assert_eq!(m.seqno % 2, 0, "msgs_ack is not content-related");
+            assert_eq!(le_u32(&m.body[4..]), VECTOR);
+            let n = usize::try_from(le_i32(&m.body[8..])).unwrap();
+            ids.extend((0..n).map(|i| le_i64(&m.body[12 + 8 * i..])));
+        }
+        ids
+    }
+
+    /// What Telegram names when it ignores this packet.
+    fn bad_msg_id(&self) -> i64 {
+        self.container.unwrap_or(self.msgs[0].msg_id)
+    }
+}
+
+/// The test's end of one scripted connection.
+struct Server {
+    to_client: Option<mpsc::UnboundedSender<Result<Bytes, TransportError>>>,
+    from_client: mpsc::UnboundedReceiver<Vec<u8>>,
+    gate: mpsc::UnboundedSender<bool>,
+    attempts: mpsc::UnboundedReceiver<()>,
+    taken: Arc<AtomicUsize>,
+    session_id: Option<i64>,
+    next_msg_id: i64,
+    seq: i32,
+}
+
+impl Server {
+    /// The next packet the sender wrote.
+    async fn packet(&mut self) -> Packet {
+        let raw = timeout(WAIT, self.from_client.recv())
+            .await
+            .expect("the sender writes a packet")
+            .expect("the connection is open");
+        let packet = Packet::parse(&raw);
+        let session = *self.session_id.get_or_insert(packet.session_id);
+        assert_eq!(packet.session_id, session, "one session per connection");
+        packet
+    }
+
+    /// The next packet that carries more than acks.
+    async fn request(&mut self) -> Packet {
+        loop {
+            let packet = self.packet().await;
+            if !packet.requests().is_empty() {
+                return packet;
+            }
+        }
+    }
+
+    /// The sender writes nothing but acks within [`WAIT`].
+    async fn no_request(&mut self) {
+        loop {
+            match timeout(WAIT, self.from_client.recv()).await {
+                Err(_) | Ok(None) => return,
+                Ok(Some(raw)) => {
+                    let packet = Packet::parse(&raw);
+                    assert!(packet.requests().is_empty(), "unexpected {packet:?}");
+                }
+            }
+        }
+    }
+
+    /// The writer is waiting at the gate with a packet.
+    async fn write_attempt(&mut self) {
+        timeout(WAIT, self.attempts.recv())
+            .await
+            .expect("the sender tries to write")
+            .expect("writer alive");
+    }
+
+    /// The gated write fails: the connection takes none of the packet.
+    fn refuse_write(&self) {
+        self.gate.send(false).unwrap();
+    }
+
+    /// Sends one packet of messages `(content_related, body)`, in a
+    /// container when there are several. Returns their msg_ids.
+    fn send(&mut self, msgs: &[(bool, Vec<u8>)]) -> Vec<i64> {
+        let session = self.session_id.expect("the sender wrote first");
+        let mut ids = Vec::new();
+        let mut inner = Vec::new();
+        for (content, body) in msgs {
+            let id = self.next_msg_id;
+            self.next_msg_id += 4;
+            let seq = if *content {
+                self.seq += 1;
+                self.seq * 2 - 1
+            } else {
+                self.seq * 2
+            };
+            inner.extend_from_slice(&id.to_le_bytes());
+            inner.extend_from_slice(&seq.to_le_bytes());
+            inner.extend_from_slice(&i32::try_from(body.len()).unwrap().to_le_bytes());
+            inner.extend_from_slice(body);
+            ids.push(id);
+        }
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0x5a17_i64.to_le_bytes());
+        packet.extend_from_slice(&session.to_le_bytes());
+        if msgs.len() == 1 {
+            packet.extend_from_slice(&inner);
+        } else {
+            let id = self.next_msg_id;
+            self.next_msg_id += 4;
+            packet.extend_from_slice(&id.to_le_bytes());
+            packet.extend_from_slice(&(self.seq * 2).to_le_bytes());
+            packet.extend_from_slice(&i32::try_from(inner.len() + 8).unwrap().to_le_bytes());
+            packet.extend_from_slice(&MSG_CONTAINER.to_le_bytes());
+            packet.extend_from_slice(&i32::try_from(msgs.len()).unwrap().to_le_bytes());
+            packet.extend_from_slice(&inner);
+        }
+        // Telegram pads its plaintext; the sender must ignore the padding.
+        packet.extend_from_slice(&[0x5f; 12]);
+        self.to_client
+            .as_ref()
+            .expect("connection open")
+            .send(Ok(packet.into()))
+            .unwrap();
+        ids
+    }
+
+    /// `rpc_result` for `req_msg_id`. Returns its msg_id.
+    fn answer(&mut self, req_msg_id: i64, result: &[u8]) -> i64 {
+        let mut body = RPC_RESULT.to_le_bytes().to_vec();
+        body.extend_from_slice(&req_msg_id.to_le_bytes());
+        body.extend_from_slice(result);
+        self.send(&[(true, body)])[0]
+    }
+
+    /// `bad_server_salt` for the message `bad_msg_id`.
+    fn bad_server_salt(&mut self, bad_msg_id: i64, new_salt: i64) {
+        let body = tl::enums::BadMsgNotification::BadServerSalt(tl::types::BadServerSalt {
+            bad_msg_id,
+            bad_msg_seqno: 1,
+            error_code: 48,
+            new_server_salt: new_salt,
+        })
+        .to_bytes();
+        self.send(&[(false, body)]);
+    }
+
+    /// The transport fails with `error` (a −404, say) and the connection
+    /// ends.
+    fn fail(&mut self, error: TransportError) {
+        if let Some(to_client) = self.to_client.take() {
+            to_client.send(Err(error)).unwrap();
+        }
+    }
+
+    /// Telegram closes the connection.
+    fn close(&mut self) {
+        self.to_client = None;
+    }
+
+    fn frames_taken(&self) -> usize {
+        self.taken.load(Ordering::SeqCst)
+    }
+}
+
+struct Harness {
+    sender: Arc<Sender>,
+    pushes: Option<mpsc::Receiver<Bytes>>,
+    conns: mpsc::UnboundedReceiver<Server>,
+    script: Arc<Script>,
+}
+
+impl Harness {
+    async fn start(init: InitParams, modes: &[Writes], pushes: usize) -> (Self, Server) {
+        let (conns_tx, mut conns) = mpsc::unbounded_channel();
+        let script = Arc::new(Script {
+            modes: Mutex::new(modes.iter().copied().collect()),
+            conns: conns_tx,
+            opens: Mutex::new(Vec::new()),
+        });
+        let key = Some(AuthKey([9; 256]));
+        let (mut sender, new_key) = Sender::start(
+            Scripted(Arc::clone(&script)),
+            dc(),
+            key,
+            init,
+            tuning(pushes),
+        )
+        .await
+        .unwrap();
+        assert!(new_key.is_none(), "the sender made no key");
+        let first = conns.recv().await.unwrap();
+        let pushes = sender.pushes();
+        let harness = Self {
+            sender: Arc::new(sender),
+            pushes,
+            conns,
+            script,
+        };
+        (harness, first)
+    }
+
+    fn invoke(&self, body: Bytes) -> JoinHandle<Result<RpcOutcome, SenderError>> {
+        let sender = Arc::clone(&self.sender);
+        tokio::spawn(async move { sender.invoke(body).await })
+    }
+
+    async fn next_conn(&mut self) -> Server {
+        timeout(WAIT, self.conns.recv())
+            .await
+            .expect("the sender opens a connection")
+            .unwrap()
+    }
+
+    fn opens(&self) -> Vec<bool> {
+        self.script.opens.lock().clone()
+    }
+}
+
+async fn outcome(
+    call: JoinHandle<Result<RpcOutcome, SenderError>>,
+) -> Result<RpcOutcome, SenderError> {
+    timeout(WAIT, call).await.expect("the call ends").unwrap()
+}
+
+fn answered() -> RpcOutcome {
+    RpcOutcome::Result(Bytes::from_static(&ANSWER))
+}
+
+/// Answers one `help.getConfig`, so the connection is initialized and the
+/// server knows the session.
+async fn first_call(h: &Harness, srv: &mut Server) {
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_write_is_not_sent() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Gated, Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    srv.write_attempt().await;
+    srv.refuse_write();
+
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::NotSent)), "{result:?}");
+    assert!(
+        srv.from_client.try_recv().is_err(),
+        "nothing reached the connection"
+    );
+    assert!(
+        h.conns.try_recv().is_err(),
+        "the sender does not resend on its own"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_written_then_drop_is_no_answer() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    assert_eq!(packet.requests().len(), 1, "the request was written");
+    srv.close();
+
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::NoAnswer)), "{result:?}");
+    // Never resent: no new connection, nothing more on the old one.
+    srv.no_request().await;
+    assert!(h.conns.try_recv().is_err(), "no fresh connection");
+    assert_eq!(h.opens(), [true]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn drop_before_write_is_not_sent_and_resend_uses_fresh_connection() {
+    let init = init();
+    let (mut h, mut srv) = Harness::start(init.clone(), &[Writes::Gated, Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    // The packet waits at the gate: the connection has none of it.
+    srv.write_attempt().await;
+    srv.close();
+
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::NotSent)), "{result:?}");
+    assert!(
+        srv.from_client.try_recv().is_err(),
+        "nothing reached the first connection"
+    );
+
+    // The one allowed resend goes on a fresh connection, with the same key,
+    // as that connection's first request.
+    let call = h.invoke(get_config());
+    let mut fresh = h.next_conn().await;
+    let packet = fresh.request().await;
+    let requests = packet.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].body,
+        typed_init(&init, tl::functions::help::GetConfig {})
+    );
+    fresh.answer(requests[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+    assert_eq!(h.opens(), [true, true]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bad_server_salt_resends_once_with_new_salt() {
+    let (h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let first = srv.request().await;
+    assert_eq!(first.salt, 0, "an existing key starts without a salt");
+    let sent = first.requests()[0].clone();
+
+    srv.bad_server_salt(first.bad_msg_id(), 0x5a1f);
+    let again = srv.request().await;
+    assert_eq!(again.salt, 0x5a1f, "resent with the new salt");
+    let resent = again.requests()[0].clone();
+    assert_ne!(resent.msg_id, sent.msg_id, "a new msg_id");
+    assert_eq!(
+        resent.body, sent.body,
+        "the same request, still initializing"
+    );
+    srv.answer(resent.msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+
+    // Once: a request ignored twice fails instead of going out a third time.
+    let call = h.invoke(get_nearest_dc());
+    let first = srv.request().await;
+    assert_eq!(first.salt, 0x5a1f, "later packets keep the salt");
+    srv.bad_server_salt(first.bad_msg_id(), 0x5a20);
+    let again = srv.request().await;
+    assert_eq!(again.salt, 0x5a20);
+    srv.bad_server_salt(again.bad_msg_id(), 0x5a21);
+    let result = outcome(call).await;
+    assert!(
+        matches!(result, Err(SenderError::BadMessage { code: 48 })),
+        "{result:?}"
+    );
+    srv.no_request().await;
+}
+
+/// `gzip_packed` around an answer and around a push is unwrapped; an
+/// `rpc_error` keeps Telegram's whole message [C: S11 F5].
+#[tokio::test(start_paused = true)]
+async fn gzip_and_rpc_error_pass_through() {
+    use std::io::Write as _;
+
+    fn gzip_packed(data: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(data).unwrap();
+        let mut body = GZIP_PACKED.to_le_bytes().to_vec();
+        body.extend(gz.finish().unwrap().to_bytes());
+        body
+    }
+
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    let big = vec![0x42; 4096];
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &gzip_packed(&big));
+    assert_eq!(
+        outcome(call).await.unwrap(),
+        RpcOutcome::Result(Bytes::from(big))
+    );
+
+    srv.send(&[(true, gzip_packed(&update(7)))]);
+    let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+    assert_eq!(push, update(7));
+
+    let call = h.invoke(get_nearest_dc());
+    let packet = srv.request().await;
+    let error = tl::enums::RpcError::Error(tl::types::RpcError {
+        error_code: 500,
+        error_message: "INTERDC_2_CALL_ERROR".into(),
+    });
+    srv.answer(packet.requests()[0].msg_id, &error.to_bytes());
+    assert_eq!(
+        outcome(call).await.unwrap(),
+        RpcOutcome::Error {
+            code: 500,
+            message: "INTERDC_2_CALL_ERROR".into()
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn container_of_pushes_split_in_order() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    first_call(&h, &mut srv).await;
+
+    let ids = srv.send(&[(true, update(1)), (true, update(2)), (true, update(3))]);
+    for n in 1..=3 {
+        let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+        assert_eq!(
+            push,
+            update(n),
+            "push {n}: the container's message, as sent"
+        );
+    }
+    // Each one is acknowledged.
+    let mut acked = Vec::new();
+    while !ids.iter().all(|id| acked.contains(id)) {
+        acked.extend(srv.packet().await.acks());
+    }
+    assert!(
+        timeout(WAIT, pushes.recv()).await.is_err(),
+        "nothing else was pushed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn minus_404_on_logged_in_key_is_key_revoked() {
+    let mut init = init();
+    init.logged_in = true;
+    let (mut h, mut srv) = Harness::start(init, &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    srv.request().await;
+    srv.fail(TransportError::Status(404));
+
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::KeyRevoked)), "{result:?}");
+
+    // The key stays dead: no reconnect, no new key.
+    let result = outcome(h.invoke(get_config())).await;
+    assert!(matches!(result, Err(SenderError::KeyRevoked)), "{result:?}");
+    assert!(h.conns.try_recv().is_err(), "no fresh connection");
+    assert_eq!(h.opens(), [true], "never opened without the key");
+}
+
+#[tokio::test(start_paused = true)]
+async fn minus_404_before_login_is_key_unknown() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    srv.request().await;
+    srv.fail(TransportError::Status(404));
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::KeyUnknown)), "{result:?}");
+    assert!(h.conns.try_recv().is_err(), "no fresh connection");
+    assert_eq!(h.opens(), [true]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn init_wraps_only_first_request() {
+    let init = init();
+    let (mut h, mut srv) = Harness::start(init.clone(), &[Writes::Deliver], 8).await;
+    let first = h.invoke(get_config());
+    tokio::task::yield_now().await;
+    let second = h.invoke(get_nearest_dc());
+
+    let packet = srv.request().await;
+    let requests = packet.requests();
+    assert_eq!(requests.len(), 1, "the second request waits for the init");
+    assert_eq!(
+        requests[0].body,
+        typed_init(&init, tl::functions::help::GetConfig {})
+    );
+    assert_eq!(&requests[0].body[4..8], &tl::LAYER.to_le_bytes());
+    srv.no_request().await;
+    srv.answer(requests[0].msg_id, &ANSWER);
+
+    let packet = srv.request().await;
+    let requests = packet.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, get_nearest_dc(), "not wrapped again");
+    srv.answer(requests[0].msg_id, &ANSWER);
+    assert_eq!(outcome(first).await.unwrap(), answered());
+    assert_eq!(outcome(second).await.unwrap(), answered());
+
+    // Each connection's first request is wrapped.
+    srv.close();
+    let call = h.invoke(get_nearest_dc());
+    let mut fresh = h.next_conn().await;
+    let packet = fresh.request().await;
+    let requests = packet.requests();
+    assert_eq!(
+        requests[0].body,
+        typed_init(&init, tl::functions::help::GetNearestDc {})
+    );
+    fresh.answer(requests[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_updates_wrapper_on_media_sessions() {
+    let mut init = init();
+    init.without_updates = true;
+    let (h, mut srv) = Harness::start(init.clone(), &[Writes::Deliver], 8).await;
+    assert!(h.pushes.is_none(), "a media session hands out no pushes");
+
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    let requests = packet.requests();
+    let wrapped = tl::functions::InvokeWithoutUpdates {
+        query: tl::functions::help::GetConfig {},
+    };
+    assert_eq!(requests[0].body, typed_init(&init, wrapped));
+    srv.answer(requests[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+
+    let call = h.invoke(get_nearest_dc());
+    let packet = srv.request().await;
+    let requests = packet.requests();
+    let wrapped = tl::functions::InvokeWithoutUpdates {
+        query: tl::functions::help::GetNearestDc {},
+    };
+    assert_eq!(requests[0].body, wrapped.to_bytes());
+    srv.answer(requests[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pushes_channel_full_pauses_reads_not_acks() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 2).await;
+    let mut pushes = h.pushes.take().unwrap();
+    first_call(&h, &mut srv).await;
+    srv.no_request().await; // the ack for the answer
+    let taken = srv.frames_taken();
+
+    // Three pushes for a channel of two, then a fourth frame.
+    let first = srv.send(&[(true, update(1)), (true, update(2)), (true, update(3))]);
+    let later = srv.send(&[(true, update(4))]);
+
+    // The acks it owes go out while the channel is full ...
+    let mut acked = Vec::new();
+    while !first.iter().all(|id| acked.contains(id)) {
+        acked.extend(srv.packet().await.acks());
+    }
+    // ... but the next frame stays unread.
+    srv.no_request().await;
+    assert_eq!(srv.frames_taken(), taken + 1, "reading paused");
+
+    // Draining the channel resumes reading, in order.
+    for n in 1..=4 {
+        let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+        assert_eq!(push, update(n));
+    }
+    let mut acked = Vec::new();
+    while !acked.contains(&later[0]) {
+        acked.extend(srv.packet().await.acks());
+    }
+    assert_eq!(srv.frames_taken(), taken + 2);
+}

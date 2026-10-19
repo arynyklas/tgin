@@ -23,6 +23,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 fd-lock = "4.0.4"
+flate2 = "1.1.10"
 form_urlencoded = "1.2.2"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 gungraun = "0.20.0"
