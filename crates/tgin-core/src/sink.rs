@@ -32,10 +32,12 @@ pub trait BatchUpdate {
     fn update_id(&self) -> i64;
     /// For `X-Tgin-Update-Type`.
     fn update_type(&self) -> &'static str;
-    /// The payload consumers receive. Called at most once per admission
-    /// attempt, possibly again on a retry: return the same bytes.
+    /// The payload of consumers with `render: raw`; called only when one
+    /// is routed to, at most once per admission attempt (possibly again on
+    /// a retry: return the same bytes).
     fn payload(&mut self) -> Bytes;
     /// The payload of consumers with `render: tl_json`; called only when
-    /// one is routed to, otherwise as [`BatchUpdate::payload`].
+    /// one is routed to, after [`BatchUpdate::payload`] when both are, and
+    /// otherwise as it.
     fn rendered(&mut self) -> Bytes;
 }

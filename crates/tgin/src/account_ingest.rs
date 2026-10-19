@@ -132,7 +132,12 @@ impl BatchUpdate for Item<'_> {
         if let Some(rendered) = &self.rendered {
             return rendered.clone();
         }
-        let rendered = match envelope::rendered(&self.meta, self.update, self.users, self.chats) {
+        // The raw envelope, when built, is extended rather than encoded again.
+        let built = match &self.payload {
+            Some(raw) => envelope::with_update(raw, self.update),
+            None => envelope::rendered(&self.meta, self.update, self.users, self.chats),
+        };
+        let rendered = match built {
             Ok(rendered) => rendered,
             Err(err) => {
                 // The decoder took these bytes, so the codec should too.

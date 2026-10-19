@@ -1730,6 +1730,8 @@ accounts:
         to: [raw]
       - match: { constructors: [updateNewChannelMessage] }
         to: [{ all: [r1, r2] }]
+      - match: { constructors: [updateEditMessage] }
+        to: [{ all: [raw, r1] }]
 consumers:
   raw: { pull: { auth_token: t0, capacity: 3 } }
   r1: { pull: { auth_token: t1, render: tl_json } }
@@ -1806,8 +1808,8 @@ async fn rendered_built_once_and_only_for_tl_json_targets() {
     assert_eq!((batch[0].payloads, batch[0].rendered), (1, 0), "raw only");
     assert_eq!(
         (batch[1].payloads, batch[1].rendered),
-        (1, 1),
-        "rendered once for two tl_json consumers"
+        (0, 1),
+        "rendered once for two tl_json consumers, and no raw form"
     );
     assert_eq!((batch[2].payloads, batch[2].rendered), (0, 0), "unrouted");
     assert_eq!(
@@ -1822,6 +1824,13 @@ async fn rendered_built_once_and_only_for_tl_json_targets() {
     }
     let mut none = [Counted::new("updateUserStatus", 4)];
     assert_eq!(h.engine.admit_batch(acct, &mut none), Admit::Unroutable);
+    let mut both = [Counted::new("updateEditMessage", 5)];
+    assert_eq!(h.engine.admit_batch(acct, &mut both), Admit::Admitted);
+    assert_eq!(
+        (both[0].payloads, both[0].rendered),
+        (1, 1),
+        "each form once"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -69,6 +69,24 @@ pub fn rendered(
     Ok(Bytes::from(out))
 }
 
+/// [`rendered`] from the update's [`raw`] envelope `raw`, which it extends
+/// with `"update"` instead of encoding the update and its entities again.
+///
+/// # Errors
+///
+/// The TL-JSON codec refused the update's bytes.
+pub fn with_update(raw: &[u8], update: &UpdateBytes) -> Result<Bytes, TlError> {
+    let mut json = String::new();
+    tl_json::to_json(update.bytes(), &mut json)?;
+    let head = raw.strip_suffix(b"}").unwrap_or(raw);
+    let mut out = Vec::with_capacity(head.len() + UPDATE_KEY.len() + json.len() + 1);
+    out.extend_from_slice(head);
+    out.extend_from_slice(UPDATE_KEY);
+    out.extend_from_slice(json.as_bytes());
+    out.push(b'}');
+    Ok(Bytes::from(out))
+}
+
 const UPDATE_KEY: &[u8] = b",\"update\":";
 
 /// The envelope's length, `extra` bytes before the closing brace included;
@@ -279,6 +297,7 @@ mod tests {
         assert_eq!(b64(&v["tl"]), u.bytes().to_vec(), "the raw bytes stay");
         let plain = raw(&meta(7), &u, &empty, &empty);
         assert_eq!(&bytes[..plain.len() - 1], &plain[..plain.len() - 1]);
+        assert_eq!(with_update(&plain, &u).expect("renders"), bytes);
     }
 
     #[test]

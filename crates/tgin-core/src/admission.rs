@@ -254,9 +254,9 @@ impl Engine {
     /// updates, as it would one by one. [`Admit::Unroutable`] when no rule
     /// matches any update.
     ///
-    /// Payloads are built only for routed updates, and
-    /// [`BatchUpdate::rendered`] only for those routed to a `render:
-    /// tl_json` consumer.
+    /// Each payload is built once, and only the forms a routed target
+    /// takes: [`BatchUpdate::payload`] for targets with `render: raw`,
+    /// [`BatchUpdate::rendered`] for those with `render: tl_json`.
     pub fn admit_batch<U: BatchUpdate>(&self, source: SourceId, updates: &mut [U]) -> Admit {
         let state = self.shared.state.load();
         if let Some(admit) = self.admit_batch_on(&state, source, updates) {
@@ -318,8 +318,9 @@ impl Engine {
                     raw = true;
                 }
             }
-            let _ = raw;
-            r.payload = Some(update.payload());
+            if raw {
+                r.payload = Some(update.payload());
+            }
             if tl_json {
                 r.rendered = Some(update.rendered());
             }
