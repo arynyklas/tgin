@@ -9,7 +9,11 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use parking_lot::Mutex;
-use tgin::mtproto_rpc::{AccountLimiter, RpcAccount, RpcEndpoint, router};
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::DescriptorEncoder;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::registry::Registry;
+use tgin::mtproto_rpc::{AccountLimiter, RpcAccount, RpcEndpoint, RpcMetrics, router};
 use tgin_core::config::{MethodAcl, MethodGlob, Rpc, RpcClient};
 use tgin_mtproto::decode::BoxKind;
 use tgin_mtproto::media::{AccountSessions, Connect, KeyStore, MediaConnected, Session};
@@ -135,6 +139,37 @@ fn app_draining(
     let endpoint = RpcEndpoint::new(drain);
     endpoint.insert(RpcAccount::new("main", rpc, account, sink, limiter));
     router(Arc::new(endpoint))
+}
+
+/// The endpoint's `tgin_mtproto_rpc_*` series, as text.
+fn series(metrics: &Arc<RpcMetrics>) -> String {
+    #[derive(Debug)]
+    struct Series(Arc<RpcMetrics>);
+    impl Collector for Series {
+        fn encode(&self, mut encoder: DescriptorEncoder<'_>) -> std::fmt::Result {
+            self.0.encode(&mut encoder)
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register_collector(Box::new(Series(Arc::clone(metrics))));
+    let mut out = String::new();
+    encode(&mut out, &registry).expect("encoded");
+    out
+}
+
+/// An app on `account`, with its metrics.
+fn app_metered(account: Arc<dyn AccountRpc>, rpc: &Rpc) -> (Router, Arc<RpcMetrics>) {
+    let limiter = Arc::new(AccountLimiter::new(rpc.max_rps));
+    let endpoint = RpcEndpoint::new(CancellationToken::new());
+    endpoint.insert(RpcAccount::new(
+        "main",
+        rpc,
+        account,
+        Arc::<FakeSink>::default(),
+        limiter,
+    ));
+    let metrics = endpoint.metrics();
+    (router(Arc::new(endpoint)), metrics)
 }
 
 fn app(account: Arc<FakeAccount>) -> Router {
@@ -473,6 +508,76 @@ async fn flood_sleep_ends_on_drain() {
     assert_eq!(account.calls().len(), 1);
 }
 
+const SEND_A: &str = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerChannel","channel_id":"7","access_hash":"1"},"message":"hi","random_id":"1"}"#;
+const SEND_B: &str = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerChannel","channel_id":"8","access_hash":"1"},"message":"hi","random_id":"2"}"#;
+
+fn rate_limited_count(metrics: &Arc<RpcMetrics>) -> String {
+    series(metrics)
+        .lines()
+        .find(|l| {
+            l.starts_with(
+                r#"mtproto_rpc_total{account="main",client="bot",outcome="rate_limited"}"#,
+            )
+        })
+        .unwrap_or_default()
+        .rsplit(' ')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test(start_paused = true)]
+async fn flood_wait_above_threshold_is_remembered_per_method() {
+    let account = FakeAccount::new([err(420, "FLOOD_WAIT_300"), ok(NEAREST), ok(NEAREST)]);
+    let (app, metrics) = app_metered(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        &rpc_config(100, allow_all()),
+    );
+    let first = send(&app, tl(SEND_A)).await;
+    assert_eq!(first.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.retry_after(), Some("300"));
+    tokio::time::advance(Duration::from_secs(100)).await;
+    // Answered here, for any peer, without calling Telegram.
+    for body in [SEND_A, SEND_B] {
+        let again = send(&app, tl(body)).await;
+        assert_eq!(again.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(again.retry_after(), Some("200"));
+        assert_eq!(again.body, Bytes::from(rpc_error_tl(420, "FLOOD_WAIT_200")));
+    }
+    assert_eq!(account.calls().len(), 1);
+    assert_eq!(rate_limited_count(&metrics), "2");
+    // Another method is not held back.
+    assert_eq!(send(&app, tl(GET_CONFIG)).await.status, StatusCode::OK);
+    // Once the wait is over, the method goes to Telegram again.
+    tokio::time::advance(Duration::from_secs(200)).await;
+    assert_eq!(send(&app, tl(SEND_A)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_wait_is_remembered_per_method_and_peer() {
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST), ok(NEAREST)]);
+    let (app, metrics) = app_metered(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        &rpc_config(100, allow_all()),
+    );
+    assert_eq!(send(&app, tl(SEND_A)).await.retry_after(), Some("30"));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let again = send(&app, tl(SEND_A)).await;
+    assert_eq!(again.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(again.retry_after(), Some("20"));
+    assert_eq!(
+        again.body,
+        Bytes::from(rpc_error_tl(420, "SLOWMODE_WAIT_20"))
+    );
+    assert_eq!(rate_limited_count(&metrics), "1");
+    // Another chat is not held back.
+    assert_eq!(send(&app, tl(SEND_B)).await.status, StatusCode::OK);
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert_eq!(send(&app, tl(SEND_A)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 3);
+}
+
 #[tokio::test(start_paused = true)]
 async fn flood_above_threshold_429_retry_after() {
     let account = FakeAccount::new([err(420, "FLOOD_WAIT_60"), err(420, "SLOWMODE_WAIT_7")]);
@@ -483,6 +588,8 @@ async fn flood_above_threshold_429_retry_after() {
     assert_eq!(flood.retry_after(), Some("60"));
     assert_eq!(flood.body, Bytes::from(rpc_error_tl(420, "FLOOD_WAIT_60")));
     assert_eq!(start.elapsed(), Duration::ZERO);
+    // After the wait, the method goes to Telegram again.
+    tokio::time::advance(Duration::from_secs(60)).await;
     let slow = send(&app, tl(GET_CONFIG)).await;
     assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(slow.retry_after(), Some("7"));

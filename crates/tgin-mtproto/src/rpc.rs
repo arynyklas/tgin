@@ -24,7 +24,7 @@ use tokio::time::{Instant, sleep_until};
 
 use bytes::Bytes;
 
-use crate::decode::BoxKind;
+use crate::decode::{BoxKind, PeerId};
 use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, present};
 use crate::{RpcOutcome, SenderError, TlError};
 
@@ -118,6 +118,9 @@ pub struct Call<'a> {
     /// call targets (its `channel`, `parent_peer` or `peer`), else the
     /// common box.
     pub context: BoxKind,
+    /// The user, chat or channel the call targets (its `channel`,
+    /// `parent_peer` or `peer`), if it names one.
+    pub peer: Option<PeerId>,
 }
 
 /// Leaves out the body: it is account content.
@@ -127,6 +130,7 @@ impl fmt::Debug for Call<'_> {
             .field("method", &self.method)
             .field("body", &format_args!("<{} bytes>", self.body.len()))
             .field("context", &self.context)
+            .field("peer", &self.peer)
             .finish()
     }
 }
@@ -204,12 +208,13 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
                 return Err(Refused::AuthorizationMethod(name));
             }
             method => {
-                let context = check_call(&mut r, ctor)?;
+                let (context, peer) = check_call(&mut r, ctor)?;
                 r.finish()?;
                 return Ok(Call {
                     method,
                     body: rest,
                     context,
+                    peer,
                 });
             }
         }
@@ -247,7 +252,12 @@ fn query_start(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<usize, TlError
 ///   channel it names, else the common box; its `peer` is then a saved
 ///   dialog of the account's own Saved Messages;
 /// - any other call: the channel its `peer` names, else the common box.
-fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlError> {
+///
+/// Also returns the peer that field names.
+fn check_call(
+    r: &mut Reader<'_>,
+    ctor: &'static Ctor,
+) -> Result<(BoxKind, Option<PeerId>), TlError> {
     let channels = ctor.name.starts_with("channels.");
     let has_parent = ctor.params.iter().any(|p| p.name == "parent_peer");
     let target = if channels {
@@ -257,7 +267,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlErro
     } else {
         "peer"
     };
-    let mut channel = None;
+    let mut peer = None;
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -269,33 +279,36 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlErro
                 let start = r.pos;
                 API.skip_value(r, ty, 1)?;
                 if p.name == target {
-                    channel = channel_id(&r.buf[start..r.pos]);
+                    peer = peer_id(&r.buf[start..r.pos]);
                 }
             }
         }
     }
-    Ok(match channel {
-        Some(id) => BoxKind::Channel(id),
-        None if channels => BoxKind::None,
-        None => BoxKind::Common,
-    })
+    let context = match peer {
+        Some(PeerId::Channel(id)) => BoxKind::Channel(id),
+        _ if channels => BoxKind::None,
+        _ => BoxKind::Common,
+    };
+    Ok((context, peer))
 }
 
-/// The `channel_id` of an `inputChannel`, `inputChannelFromMessage`,
-/// `inputPeerChannel` or `inputPeerChannelFromMessage` (already checked);
-/// `None` for any other peer.
-fn channel_id(bytes: &[u8]) -> Option<i64> {
+/// The peer an `InputPeer` or `InputChannel` names (already checked):
+/// `inputChannel`, `inputChannelFromMessage`, `inputPeerChannel` and
+/// `inputPeerChannelFromMessage` a channel, `inputPeerChat` a chat,
+/// `inputPeerUser` and `inputPeerUserFromMessage` a user; `None` for any
+/// other (`inputPeerSelf`, `inputPeerEmpty`).
+fn peer_id(bytes: &[u8]) -> Option<PeerId> {
     let mut r = Reader::new(bytes);
     let ctor = API.read_ctor(&mut r, None).ok()?;
-    if !matches!(
-        ctor.name,
+    let (role, make): (Role, fn(i64) -> PeerId) = match ctor.name {
         "inputChannel"
-            | "inputChannelFromMessage"
-            | "inputPeerChannel"
-            | "inputPeerChannelFromMessage"
-    ) {
-        return None;
-    }
+        | "inputChannelFromMessage"
+        | "inputPeerChannel"
+        | "inputPeerChannelFromMessage" => (Role::ChannelId, PeerId::Channel),
+        "inputPeerChat" => (Role::ChatId, PeerId::Chat),
+        "inputPeerUser" | "inputPeerUserFromMessage" => (Role::UserId, PeerId::User),
+        _ => return None,
+    };
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -306,8 +319,8 @@ fn channel_id(bytes: &[u8]) -> Option<i64> {
                 if !present(&words, *flag) {
                     continue;
                 }
-                if p.role == Role::ChannelId {
-                    return r.i64().ok();
+                if p.role == role {
+                    return r.i64().ok().map(make);
                 }
                 API.skip_value(&mut r, ty, 1).ok()?;
             }
@@ -525,6 +538,7 @@ mod tests {
             method: "help.getConfig",
             body: &body,
             context: BoxKind::Common,
+            peer: None,
         };
         let call = format!("{call:?}");
         assert!(
