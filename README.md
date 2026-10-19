@@ -57,7 +57,7 @@ graph LR
 - **Rules.** Route by update type, chat, chat type, user, command, text or callback data; send an update to one consumer, to several, or to one of a group (round robin, sticky by chat, or weighted).
 - **A Bot API gateway.** A bot framework points its Bot API base URL at tgin (`http://tgin:8080/c/<consumer>`): its `getUpdates` polls the consumer, and its other calls go through tgin, which forwards them to the bot's Bot API server (streaming uploads and downloads, holding the bot's sends to Telegram's flood limits, retrying a short `429` once) and answers `getMe`, the webhook methods, `logOut` and `close` itself, so a downstream cannot disturb tgin or the bot's other downstreams through them. aiogram, python-telegram-bot, grammY and Telegraf are tested end to end.
 - **Self-hosted Bot API servers.** A bot can talk to your own `telegram-bot-api` instead of `api.telegram.org`: tgin serves its files from the server's disk, refuses requests that would make a local-mode server read its own files, takes its webhooks over plain HTTP, and moves bots between servers with `tgin admin bot logout|close`.
-- **User accounts over MTProto.** tgin logs a Telegram user account in (QR or code, through `tgin admin login`), keeps its own update state (sequenced updates reach `backpressure` consumers at least once), routes its updates to consumers as JSON envelopes of raw TL, and lets downstreams call Telegram as the account through a raw-TL endpoint with a per-client method allowlist; the authorization never leaves tgin.
+- **User accounts over MTProto.** tgin logs a Telegram user account in (QR or code, through `tgin admin login`), keeps its own update state (sequenced updates of the common box reach `backpressure` consumers at least once while the process lives; channels to be confirmed, see [Delivery](DOCS.md#delivery)), routes its updates to consumers as JSON envelopes of raw TL, and lets downstreams call Telegram as the account through a raw-TL endpoint with a per-client method allowlist; the authorization never leaves tgin.
 - **Pull consumers** speak Telegram's `getUpdates`. Updates are leased and acknowledged by `offset`; one lost by a crashed bot instance goes to another after its lease times out.
 - **Push consumers** post each update to HTTP endpoints with retries, backoff, per-endpoint circuit breakers and optional per-chat ordering. An endpoint can answer with a Bot API call (a webhook reply), which tgin makes, and a webhook bot can register its URL with `setWebhook` on tgin.
 - **Bounded queues** per consumer, with backpressure to the source or dropping the oldest updates, your choice per consumer.
@@ -168,7 +168,7 @@ tgin 1.0 against the original engine it was forked from ([chesnokpeter/tgin](htt
 - [ ] First-class microservices patterns
 - [ ] Analytics collection
 - [ ] Per-bot caching layer
-- [ ] Userbot support
+- [x] User accounts (MTProto)
 - [x] End-to-end bot tests
 
 ## Goal
