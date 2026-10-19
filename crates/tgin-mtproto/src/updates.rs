@@ -1081,8 +1081,11 @@ impl UpdateManager {
                 Some(p) if p > self.pts => {
                     // The box jumps to `p`: no difference from there brings
                     // back the held pushes it covers, so they go as they
-                    // are (as `feed_state` does). Those already applied go.
-                    let local = self.pts;
+                    // are (as `feed_state` does). Those already committed
+                    // go: cut at the committed pts, not the in-memory one,
+                    // so a push applied by a pending batch survives that
+                    // batch's refusal (duplicates are allowed, losses not).
+                    let local = self.committed.pts;
                     let (covered, rest): (Vec<Held>, Vec<Held>) =
                         std::mem::take(&mut self.held_pts)
                             .into_iter()
@@ -1188,11 +1191,14 @@ impl UpdateManager {
             // back: the held pushes it covers go as they are (as for
             // `differenceTooLong`); its `messages` are only the latest.
             if let Some(ch) = self.channels.get_mut(&channel) {
-                let local = old.unwrap_or(0);
+                // Cut at the committed pts, not the in-memory one: a held
+                // push applied by a pending batch must survive that batch's
+                // refusal (duplicates are allowed, losses are not).
+                let local = self.committed_channels.get(&channel).copied().unwrap_or(0);
                 let (covered, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut ch.held)
                     .into_iter()
                     .partition(|h| h.pts <= pts);
-                // Those already applied go.
+                // Those already committed go.
                 let mut covered: Vec<Held> =
                     covered.into_iter().filter(|h| h.pts > local).collect();
                 ch.held = rest;

@@ -700,6 +700,97 @@ async fn too_long_skips_held_updates_already_applied() {
     );
 }
 
+/// A too-long answer cuts held pushes at the committed pts, not the
+/// in-memory one: a push applied only by a pending slice still goes out,
+/// so a refusal of that slice and a second too-long answer lose nothing.
+#[tokio::test(start_paused = true)]
+async fn too_long_keeps_held_updates_past_the_committed_state() {
+    // Common box: 12 held for a gap, 11 fed during the catch-up.
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let msg = |i: u32| message(i, PeerId::User(5), &format!("m{i}"));
+    let u11 = new_message(&msg(11), 11, 1);
+    let u12 = new_message(&msg(12), 12, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&u12), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    advance(GAP_HOLD).await;
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&u11), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    let slice = m.feed_difference(b(difference(
+        &Diff {
+            msgs: &[msg(11)],
+            ..EMPTY_DIFF
+        },
+        &state(11, 5, 2, 3),
+        true,
+    )));
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 11, .. })
+    ));
+    // The slice is still pending: the live 11 goes out with 12, in the
+    // order they arrived.
+    let jump = m.feed_difference(b(T::new(DIFFERENCE_TOO_LONG).int(14).done()));
+    assert_eq!(all_updates(&jump), vec![b(u12), b(u11)]);
+    // The slice is refused; the refetch from 10 is too long again.
+    assert_eq!(m.refused(slice[0].id), None);
+    for batch in &jump {
+        m.committed(batch.id);
+    }
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+    let again = m.feed_difference(b(T::new(DIFFERENCE_TOO_LONG).int(14).done()));
+    assert!(
+        all_updates(&again).is_empty(),
+        "nothing held is left to lose"
+    );
+    commit(&mut m, &again);
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 14, .. })
+    ));
+    let batches = m.feed_difference(b(difference_empty(2, 3)));
+    commit(&mut m, &batches);
+
+    // Channel: 7 held for a gap, 6 fed during the catch-up.
+    let post = |id: u32| message(id, PeerId::Channel(1), &format!("p{id}"));
+    let p6 = new_channel_message(&post(6), 6, 1);
+    let p7 = new_channel_message(&post(7), 7, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&p7), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    advance(GAP_HOLD).await;
+    let f = m.next_action();
+    assert_eq!(f, Some(Fetch::GetChannelDifference { channel: 1, pts: 5 }));
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&p6), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    let _first_part = m.feed_channel_difference(
+        1,
+        b(channel_difference(
+            false,
+            6,
+            &Diff {
+                msgs: &[post(6)],
+                ..EMPTY_DIFF
+            },
+        )),
+    );
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 6 })
+    );
+    let jump = m.feed_channel_difference(1, b(channel_difference_too_long(1, 9, &[post(9)])));
+    assert_eq!(
+        all_updates(&jump),
+        vec![b(p7), b(p6), b(new_channel_message(&post(9), 9, 0))],
+        "the first part is pending: the live 6 goes out too, in arrival order"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn live_push_not_blocked_by_1000_channel_catchup() {
     let behind: Vec<(i64, i32)> = (1..=1000).map(|c| (c, 1)).collect();
