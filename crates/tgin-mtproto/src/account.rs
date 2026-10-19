@@ -1140,7 +1140,7 @@ struct Ingest<'a> {
     /// What [`UpdateManager::dropped`] said last.
     dropped: Dropped,
     /// What [`UpdateManager::flood_wait`] said last.
-    flood: Option<Instant>,
+    flood: Option<(Instant, SystemTime)>,
 }
 
 impl Ingest<'_> {
@@ -1331,16 +1331,20 @@ impl Ingest<'_> {
         );
         self.dropped = dropped;
         // The common box waits out Telegram's flood wait: the account shows
-        // it until then.
+        // it until then, whatever answered meanwhile (a channel's fetch, an
+        // RPC call), re-asserted on every turn.
         let flood = self.manager.flood_wait();
-        if flood != self.flood {
-            self.flood = flood;
-            match flood {
-                Some(until) => shared.set_state(AccountState::FloodWait {
-                    until: SystemTime::now() + until.saturating_duration_since(Instant::now()),
-                }),
-                None => shared.connected(),
+        if flood != self.flood.map(|(at, _)| at) {
+            self.flood = flood.map(|at| {
+                let until = SystemTime::now() + at.saturating_duration_since(Instant::now());
+                (at, until)
+            });
+            if flood.is_none() {
+                shared.connected();
             }
+        }
+        if let Some((_, until)) = self.flood {
+            shared.set_state(AccountState::FloodWait { until });
         }
     }
 }

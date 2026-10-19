@@ -718,3 +718,51 @@ async fn park_waits_for_rpc_calls_then_releases_the_session() {
     );
     drop(SessionStore::open(run.dir.path()).expect("the session is free"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_channel_answer_keeps_flood_wait_showing() {
+    let net = FakeNetwork::new();
+    net.answer(|call| match call.ctor() {
+        ids::GET_DIFFERENCE => Reply::Rpc(420, "FLOOD_WAIT_30"),
+        ids::GET_CHANNEL_DIFFERENCE => Reply::Ok(tl_bytes(
+            r#"{"_":"updates.channelDifferenceEmpty","final":true,"pts":21}"#,
+        )),
+        _ => Reply::Rpc(400, "NOT_SCRIPTED"),
+    });
+    let registry = Arc::new(Registry::default());
+    let dir = tempfile::tempdir().expect("tempdir");
+    logged_in(dir.path(), USER);
+    {
+        let store = SessionStore::open(dir.path()).expect("store");
+        store.set_channel_pts(8, 20).expect("channel");
+        store
+            .put_peers(&[Peer {
+                id: 8,
+                kind: PeerKind::Channel { kind: None },
+                access_hash: Some(5),
+            }])
+            .expect("peer");
+    }
+    let run = start_in("main", dir, &net, &registry);
+    until(&run.account, |s| {
+        matches!(s, AccountState::FloodWait { .. })
+    })
+    .await;
+    assert!(net.push(updates(&[
+        r#"{"_":"updateChannelTooLong","channel_id":"8"}"#.to_owned()
+    ])));
+    timeout(WAIT, async {
+        while !net.ctors().contains(&ids::GET_CHANNEL_DIFFERENCE) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the channel is fetched");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        matches!(run.account.state(), AccountState::FloodWait { .. }),
+        "{:?}",
+        run.account.state()
+    );
+    run.account.close().await;
+}
