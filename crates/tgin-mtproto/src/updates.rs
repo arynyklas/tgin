@@ -36,12 +36,23 @@
 //! its sequenced updates come back; its unsequenced ones are counted in
 //! [`Dropped::full`]. There is no dedup: replays may repeat updates.
 //!
-//! A crash loses a channel's update in one window only: after the call
-//! that returned its batch, before that call's marks are durable. Only
-//! the client knew the channel moved, so a quiet channel (no later post,
-//! no signal from Telegram) does not bring it back. Every other crash
-//! point replays it (the channel catches up at start). This is the one
-//! exception to at-least-once for channel boxes.
+//! The one crash window for a channel: from the moment its push is
+//! received (still in the sender's buffers or the pushes channel counts)
+//! until the marks of the call that fed it are durable. Telegram treats the
+//! push as delivered and only the client knew the channel moved, so a quiet
+//! channel (no later post, no signal from Telegram) does not bring it back.
+//! Every other crash point replays it (the channel catches up at start).
+//!
+//! By design, the manager does not owe:
+//! - an unknown channel's updates before its first one (its state starts
+//!   just before it);
+//! - a channel's updates before its fetch failed for good or its answer
+//!   could not be decoded (its state is dropped and starts again);
+//! - what a `differenceTooLong` or `channelDifferenceTooLong` skips
+//!   (Telegram cannot send it any more);
+//! - a post lost with a connection whose session Telegram replaced: it
+//!   comes back only if Telegram's getDifference signals that channel,
+//!   which tgin cannot check.
 //!
 //! # Catch-up (plan decision 6)
 //!
