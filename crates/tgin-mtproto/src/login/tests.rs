@@ -1181,6 +1181,52 @@ fn step_debug_hides_token_and_hash() {
     }
 }
 
+/// Without a `phone`, a leftover logged-in key cannot be checked, so it is
+/// never adopted: it is logged out and the login starts fresh. An
+/// unconfirmed logout refuses and changes nothing.
+#[tokio::test]
+async fn a_leftover_key_without_a_phone_is_logged_out() {
+    let (tmp, store) = self::store();
+    store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![
+        (ids::GET_USERS, Reply::Ok(users(31, Some("79990000000")))),
+        (ids::LOG_OUT, Reply::Ok(logged_out())),
+        (
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token_success(8, None)),
+        ),
+    ]);
+    let h = start(store, dial.clone(), params(None), Method::Qr)
+        .await
+        .expect("start");
+    assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 8 });
+    assert_eq!(dial.dials(), vec![(4, true), (FIRST_DC, false)]);
+    assert!(dial.done());
+    drop(h);
+    let store = wait_reopen(&tmp).await;
+    assert_eq!(store.auth_key(4).expect("old key"), None);
+    assert_eq!(
+        store.login().expect("login").map(|l| l.self_user_id),
+        Some(8)
+    );
+
+    let (tmp, store) = self::store();
+    store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![
+        (ids::GET_USERS, Reply::Ok(users(31, None))),
+        (ids::LOG_OUT, Reply::NoAnswer),
+    ]);
+    assert!(matches!(
+        start(store, dial.clone(), params(None), Method::Qr).await,
+        Err(StartError::Unverified(_))
+    ));
+    assert!(dial.done());
+    let store = wait_reopen(&tmp).await;
+    assert_eq!(store.home_dc().expect("home"), Some(4));
+    assert_eq!(store.auth_key(4).expect("key"), Some(AuthKey([7; 256])));
+    assert_eq!(store.login().expect("login"), None);
+}
+
 /// Telegram never answering about a leftover key ends the start at
 /// [`LEFTOVER_DEADLINE`], unverified, with the session unchanged.
 #[tokio::test(start_paused = true)]

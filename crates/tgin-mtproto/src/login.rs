@@ -989,7 +989,12 @@ impl LoginHandle {
 /// A recorded login is refused ([`StartError::LoggedIn`]). A home key left
 /// without one (a login whose answer was lost, say) may still be logged
 /// in, so it is asked first ([`whoami`]), within [`LEFTOVER_DEADLINE`]:
-/// - logged in: it goes through the identity gate and is recorded;
+/// - logged in, with a `phone` configured: it goes through the identity
+///   gate and, when it matches, is recorded;
+/// - logged in, with no `phone` to check it against: it is logged out
+///   (`auth.logOut`), since nothing says it is the right account, and the
+///   login starts fresh. So a crash between a scan and the login marker
+///   costs one more scan when no `phone` is configured;
 /// - unknown to Telegram: the session is reset and the login starts on
 ///   [`FIRST_DC`] with a new key;
 /// - no clear answer in time, or an unconfirmed logout: refused
@@ -1049,7 +1054,7 @@ async fn ask_leftover<D: Dial>(
     dial: &D,
     dc: i32,
     key: AuthKey,
-    _params: &LoginParams,
+    params: &LoginParams,
     method: Method,
 ) -> Result<Begin<D::Link>, StartError> {
     let unverified = |e: String| StartError::Unverified(e);
@@ -1061,7 +1066,16 @@ async fn ask_leftover<D: Dial>(
     let conn = Conn::new(link, pushes);
     match whoami(&conn.link).await {
         Ok(None) => Ok(Begin::Fresh(method)),
-        Ok(Some(me)) => Ok(Begin::Recovered(conn, me)),
+        Ok(Some(me)) if params.phone.is_some() => Ok(Begin::Recovered(conn, me)),
+        // Logged in, and nothing to check the account against: never
+        // adopt it.
+        Ok(Some(_)) => match log_out_key(&conn.link).await {
+            Ok(()) => {
+                tracing::info!("login: a key left logged in by an unfinished login was logged out");
+                Ok(Begin::Fresh(method))
+            }
+            Err(f) => Err(unverified(LoginError::from(f).to_string())),
+        },
         Err(f) => Err(unverified(LoginError::from(f).to_string())),
     }
 }
