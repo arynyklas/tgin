@@ -1924,10 +1924,26 @@ impl Persisted {
 struct Decided {
     id: u64,
     admitted: bool,
-    /// Refusing it rolls the common box back (when still current).
+    /// Refused with updates: reporting it rolls back the boxes it moved
+    /// (when still current).
     rolls_back: bool,
-    /// The mirrored epoch it was returned in.
+    /// It moved the common box.
+    common: bool,
+    /// The mirrored common epoch of the call that returned it.
     epoch: u32,
+    /// The channels it moved, each with its mirrored epoch then.
+    channels: Vec<(i64, u32)>,
+}
+
+/// A call on the way.
+struct Call {
+    f: Fetch,
+    /// The answer, when computed at request time.
+    early: Option<Answer>,
+    /// The mirrored common epoch when it was asked.
+    epoch: u32,
+    /// For a channel call, the channel's mirrored epoch when it was asked.
+    chan_epoch: u32,
 }
 
 /// An answer computed when its call was asked.
@@ -1953,7 +1969,7 @@ struct Sim<'a> {
     /// Calls on the way. Some answers are computed when asked, as a server
     /// does, and fed after pushes that came later: an answer may predate
     /// the pushes fed before it.
-    in_flight: VecDeque<(Fetch, Option<Answer>, u32)>,
+    in_flight: VecDeque<Call>,
     /// Events the client got: their push was fed, or an accepted answer
     /// covered them. The server signals the channels of the
     /// others not on the way (`updateChannelTooLong` in getDifference):
@@ -1982,6 +1998,9 @@ struct Sim<'a> {
     /// batch that moved the common box in the current epoch is reported. A
     /// call asked in an older epoch is stale.
     epoch: u32,
+    /// Each channel's epoch, mirrored likewise: it moves when a refused
+    /// batch that moved the channel in its current epoch is reported.
+    chan_epochs: HashMap<i64, u32>,
     /// A getDifference failed for good: a getState resync may follow, and
     /// what it skips is not owed (Telegram cannot serve that pts).
     resync_due: bool,
@@ -2019,6 +2038,7 @@ impl<'a> Sim<'a> {
             refused_run: false,
             open: VecDeque::new(),
             epoch: 0,
+            chan_epochs: HashMap::new(),
             resync_due: false,
             exempt: HashSet::new(),
             point: 0,
@@ -2047,6 +2067,7 @@ impl<'a> Sim<'a> {
         self.refused_run = false;
         self.open.clear();
         self.epoch = 0;
+        self.chan_epochs.clear();
         true
     }
 
@@ -2058,17 +2079,27 @@ impl<'a> Sim<'a> {
             .flat_map(|b| b.ahead.iter().copied())
             .collect();
         if !ahead.is_empty() && self.tick() {
-            // Killed before the marks were durable: the stated exception.
-            // What those channels missed so far is not owed.
-            self.exempt.extend(
-                self.s.events[..self.done]
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| matches!(e.kind, Kind::Chan(c) if ahead.contains(&c)))
-                    .map(|(i, _)| i),
-            );
+            // Killed before the marks were durable: the stated window.
+            // What those channels got and had not admitted is lost; what is
+            // on the way or never sent stays owed (the server's signal
+            // brings it back).
+            let lost: Vec<usize> = self.s.events[..self.done]
+                .iter()
+                .enumerate()
+                .filter(|&(i, e)| {
+                    matches!(e.kind, Kind::Chan(c) if ahead.contains(&c))
+                        && self.received.contains(&i)
+                        && !self.admitted.contains(&i)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            self.exempt.extend(lost);
             return;
         }
+        // The epochs the manager stamped this call's batches with: as they
+        // were before any of them is reported.
+        let epoch = self.epoch;
+        let chan_epochs = self.chan_epochs.clone();
         for batch in &batches {
             self.persisted.mark(batch);
         }
@@ -2083,25 +2114,36 @@ impl<'a> Sim<'a> {
             } else {
                 self.refused_run |= !batch.updates.is_empty();
             }
-            // Whether it moved the common box: a common field in its delta,
-            // or a sequenced common or qts update.
-            let common = batch.commit.pts.is_some()
+            // The boxes it moved: a field or channel row in its delta, or a
+            // sequenced update.
+            let mut common = batch.commit.pts.is_some()
                 || batch.commit.qts.is_some()
                 || batch.commit.seq.is_some()
-                || batch.commit.date.is_some()
-                || batch.updates.iter().any(|u| {
-                    let f = u.facts();
-                    match f.box_kind {
-                        BoxKind::Common => f.pts.is_some_and(|p| p != 0),
-                        BoxKind::Qts => f.qts.is_some_and(|q| q != 0),
-                        _ => false,
+                || batch.commit.date.is_some();
+            let mut channels: Vec<i64> = batch.commit.channels.iter().map(|&(c, _)| c).collect();
+            for u in &batch.updates {
+                let f = u.facts();
+                match f.box_kind {
+                    BoxKind::Common => common |= f.pts.is_some_and(|p| p != 0),
+                    BoxKind::Qts => common |= f.qts.is_some_and(|q| q != 0),
+                    BoxKind::Channel(c)
+                        if f.pts.is_some_and(|p| p != 0) && !channels.contains(&c) =>
+                    {
+                        channels.push(c);
                     }
-                });
+                    _ => {}
+                }
+            }
             self.open.push_back(Decided {
                 id: batch.id,
                 admitted,
-                rolls_back: !admitted && !batch.updates.is_empty() && common,
-                epoch: self.epoch,
+                rolls_back: !admitted && !batch.updates.is_empty(),
+                common,
+                epoch,
+                channels: channels
+                    .into_iter()
+                    .map(|c| (c, chan_epochs.get(&c).copied().unwrap_or(0)))
+                    .collect(),
             });
             if self.tick() {
                 return; // decided, not reported
@@ -2110,6 +2152,16 @@ impl<'a> Sim<'a> {
             if self.rng.chance(70) && self.report() {
                 return;
             }
+        }
+    }
+
+    /// Whether the manager has rolled the call's box back since it asked.
+    fn stale(&self, call: &Call) -> bool {
+        match call.f {
+            Fetch::GetChannelDifference { channel, .. } => {
+                call.chan_epoch != self.chan_epochs.get(&channel).copied().unwrap_or(0)
+            }
+            _ => call.epoch != self.epoch,
         }
     }
 
@@ -2130,23 +2182,40 @@ impl<'a> Sim<'a> {
             } else {
                 self.m.refused(b.id)
             };
-            if b.rolls_back && b.epoch == self.epoch {
-                self.epoch += 1;
-                // Calls asked before the rollback are stale now; a stale
-                // call may fail as well as answer, for good or not.
-                let mut kept = VecDeque::new();
-                for (f, early, asked) in std::mem::take(&mut self.in_flight) {
-                    let common = !matches!(f, Fetch::GetChannelDifference { .. });
-                    match self.rng.below(4) {
-                        0 if common => self.m.fetch_failed(f),
-                        1 if common => {
-                            let batches = self.m.fetch_failed_permanently(f);
-                            assert!(batches.is_empty(), "a common failure returns nothing");
-                        }
-                        _ => kept.push_back((f, early, asked)),
+            if b.rolls_back {
+                let mut rolled = false;
+                if b.common && b.epoch == self.epoch {
+                    self.epoch += 1;
+                    rolled = true;
+                }
+                for &(c, e) in &b.channels {
+                    let current = self.chan_epochs.entry(c).or_insert(0);
+                    if *current == e {
+                        *current += 1;
+                        rolled = true;
                     }
                 }
-                self.in_flight = kept;
+                if rolled {
+                    // Calls asked before the rollback are stale now; a
+                    // stale call may fail as well as answer, for good or
+                    // not. A stale call failing for good abandons nothing.
+                    let mut kept = VecDeque::new();
+                    for call in std::mem::take(&mut self.in_flight) {
+                        if !self.stale(&call) {
+                            kept.push_back(call);
+                            continue;
+                        }
+                        match self.rng.below(4) {
+                            0 => self.m.fetch_failed(call.f),
+                            1 => {
+                                let batches = self.m.fetch_failed_permanently(call.f);
+                                assert!(batches.is_empty(), "a stale failure returns nothing");
+                            }
+                            _ => kept.push_back(call),
+                        }
+                    }
+                    self.in_flight = kept;
+                }
             }
             if let Some(d) = d {
                 self.persisted.apply(&d);
@@ -2195,7 +2264,18 @@ impl<'a> Sim<'a> {
     fn pump(&mut self) {
         while let Some(f) = self.m.next_action() {
             let early = self.rng.chance(50).then(|| self.compute(f));
-            self.in_flight.push_back((f, early, self.epoch));
+            let chan_epoch = match f {
+                Fetch::GetChannelDifference { channel, .. } => {
+                    self.chan_epochs.get(&channel).copied().unwrap_or(0)
+                }
+                _ => 0,
+            };
+            self.in_flight.push_back(Call {
+                f,
+                early,
+                epoch: self.epoch,
+                chan_epoch,
+            });
         }
     }
 
@@ -2508,7 +2588,9 @@ impl<'a> Sim<'a> {
             }
             30..58 => self.deliver(),
             58..76 => {
-                if let Some((f, early, asked)) = self.in_flight.pop_front() {
+                if let Some(call) = self.in_flight.pop_front() {
+                    let stale = self.stale(&call);
+                    let Call { f, early, .. } = call;
                     match self.rng.below(100) {
                         0..5 => self.m.fetch_failed(f),
                         // An error asking again cannot fix (for example
@@ -2517,9 +2599,10 @@ impl<'a> Sim<'a> {
                             // Only a current call's failure resyncs with
                             // getState; a stale one's catches up from the
                             // committed state.
-                            self.resync_due |=
-                                matches!(f, Fetch::GetDifference { .. }) && asked == self.epoch;
-                            if let Fetch::GetChannelDifference { channel, .. } = f {
+                            self.resync_due |= matches!(f, Fetch::GetDifference { .. }) && !stale;
+                            if let Fetch::GetChannelDifference { channel, .. } = f
+                                && !stale
+                            {
                                 // The channel's state is dropped by design:
                                 // what it missed so far is not owed, and it
                                 // is unknown again (owed from its next
@@ -2546,8 +2629,8 @@ impl<'a> Sim<'a> {
                 // The connection ends: its pushes and calls are lost, and
                 // the sender adds `updatesTooLong`.
                 self.net.clear();
-                for (f, _, _) in std::mem::take(&mut self.in_flight) {
-                    self.m.fetch_failed(f);
+                for call in std::mem::take(&mut self.in_flight) {
+                    self.m.fetch_failed(call.f);
                 }
                 let batches = self.m.feed_push(b(T::new(UPDATES_TOO_LONG).done()));
                 self.take(batches);
@@ -2574,8 +2657,8 @@ impl<'a> Sim<'a> {
                     self.got(i);
                     let batches = self.m.feed_push(p);
                     self.take(batches);
-                } else if let Some((f, early, _)) = self.in_flight.pop_front() {
-                    self.answer(f, early);
+                } else if let Some(call) = self.in_flight.pop_front() {
+                    self.answer(call.f, call.early);
                 } else if !self.open.is_empty() {
                     self.report();
                 } else {
