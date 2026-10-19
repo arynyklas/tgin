@@ -2860,3 +2860,109 @@ async fn channel_refusal_paces_its_refetch() {
         })
     );
 }
+
+/// `updatesTooLong` during a refusal's backoff cuts no wait short: the
+/// consumer may still be full. (It still cuts a failed fetch's retry
+/// short: the server is reachable again.)
+#[tokio::test(start_paused = true)]
+async fn too_long_keeps_a_refusal_backoff() {
+    let mut m = started(stored(10, &[], &[5]));
+    let u11 = new_message(&message(1, PeerId::User(5), "a"), 11, 1);
+    let batches = m.feed_push(b(updates(&[u11], NONE, NONE, 2, 0)));
+    m.refused(batches[0].id);
+    assert!(m.feed_push(too_long()).is_empty());
+    assert_eq!(m.next_action(), None, "the refusal still waits");
+    assert_eq!(m.deadline(), Instant::now() + RETRY_MIN);
+    advance(RETRY_MIN).await;
+    let f = m.next_action().expect("the refetch");
+    assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
+    // A failed fetch's retry is cut short as before.
+    m.fetch_failed(f);
+    assert_eq!(m.next_action(), None);
+    assert!(m.feed_push(too_long()).is_empty());
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+}
+
+/// `updateChannelTooLong` during a channel's refusal backoff does not
+/// refetch it at once either.
+#[tokio::test(start_paused = true)]
+async fn channel_too_long_keeps_a_refusal_backoff() {
+    let c = 77;
+    let mut m = started(stored(10, &[(c, 20)], &[5]));
+    let post = message(1, PeerId::Channel(c), "p");
+    let batches = m.feed_push(b(updates(
+        &[new_channel_message(&post, 21, 1)],
+        NONE,
+        &[channel(c)],
+        2,
+        0,
+    )));
+    for batch in &batches {
+        if batch.updates.is_empty() {
+            m.committed(batch.id);
+        } else {
+            m.refused(batch.id);
+        }
+    }
+    for batch in m.feed_push(b(short(&channel_too_long(c, None)))) {
+        m.committed(batch.id);
+    }
+    assert_eq!(m.next_action(), None, "the refusal still waits");
+    assert_eq!(m.deadline(), Instant::now() + RETRY_MIN);
+    advance(RETRY_MIN).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference {
+            channel: c,
+            pts: 20
+        })
+    );
+}
+
+/// A channel refused while its fetch is in flight: the stale answer
+/// queues it again, and the queue still waits for the refusal's backoff.
+#[tokio::test(start_paused = true)]
+async fn stale_channel_answer_waits_for_the_refusal_backoff() {
+    let c = 77;
+    let mut m = started(stored(10, &[(c, 20)], &[5]));
+    let post = message(1, PeerId::Channel(c), "p");
+    let posted = m.feed_push(b(updates(
+        &[new_channel_message(&post, 21, 1)],
+        NONE,
+        &[channel(c)],
+        2,
+        0,
+    )));
+    let signal = m.feed_push(b(short(&channel_too_long(c, None))));
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference {
+            channel: c,
+            pts: 21
+        })
+    );
+    for batch in posted.iter().chain(&signal) {
+        if batch.updates.is_empty() {
+            m.committed(batch.id);
+        } else {
+            m.refused(batch.id);
+        }
+    }
+    assert!(
+        m.feed_channel_difference(c, b(channel_difference_empty(true, 21)))
+            .is_empty(),
+        "a stale answer"
+    );
+    assert_eq!(m.next_action(), None, "the refusal still waits");
+    advance(RETRY_MIN).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference {
+            channel: c,
+            pts: 20
+        })
+    );
+}

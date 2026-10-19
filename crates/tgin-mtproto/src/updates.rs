@@ -416,6 +416,10 @@ struct Channel {
     /// The backoff of the refetch after a refusal: grows per refusal, and
     /// only a committed batch of the channel resets it.
     refusals: Duration,
+    /// A refused batch's refetch waits until then. Apart from `retry_at`:
+    /// a signal that the server is reachable cuts a failed fetch's retry
+    /// short, never a refusal's wait for a full consumer.
+    refused_until: Option<Instant>,
     /// Bumped when a refused batch rolls the channel back.
     epoch: u32,
 }
@@ -432,7 +436,14 @@ impl Channel {
             retry_at: None,
             backoff: Duration::ZERO,
             refusals: Duration::ZERO,
+            refused_until: None,
         }
+    }
+
+    /// When a fetch of the channel may be asked: after both a failed
+    /// fetch's retry and a refusal's wait.
+    fn ready_at(&self) -> Option<Instant> {
+        wait_for(self.retry_at, self.refused_until)
     }
 }
 
@@ -545,13 +556,15 @@ pub struct UpdateManager {
     gapped: BTreeSet<i64>,
     /// Channels waiting for a failed fetch's retry.
     retrying: BTreeSet<i64>,
-    /// The common box's failed fetch, or the refetch of its refused batch,
-    /// is asked again then.
+    /// The common box's failed fetch is asked again then.
     retry_at: Option<Instant>,
     backoff: Duration,
     /// The backoff of the refetch after a refusal: grows per refusal, and
     /// only a committed batch of the common box resets it.
     refusals: Duration,
+    /// The common box's refetch after a refusal waits until then; apart
+    /// from `retry_at`, which `updatesTooLong` cuts short.
+    refused_until: Option<Instant>,
     known_users: HashSet<i64>,
     committed: UpdateState,
     committed_channels: HashMap<i64, i32>,
@@ -623,6 +636,7 @@ impl UpdateManager {
             retry_at: None,
             backoff: Duration::ZERO,
             refusals: Duration::ZERO,
+            refused_until: None,
             ahead: startup.iter().copied().collect(),
             startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
@@ -781,12 +795,13 @@ impl UpdateManager {
         if self.idle_at <= now {
             self.idle_at = now + IDLE_DIFFERENCE;
         }
-        let retry_due = self.retry_at.is_none_or(|d| d <= now);
+        let retry_due = wait_for(self.retry_at, self.refused_until).is_none_or(|d| d <= now);
         match self.fetch {
             CommonFetch::WantState if retry_due => {
                 self.fetch = CommonFetch::State { epoch: self.epoch };
                 self.again = false;
                 self.retry_at = None;
+                self.refused_until = None;
                 return Some(Fetch::GetState);
             }
             CommonFetch::WantDifference if retry_due => {
@@ -794,6 +809,7 @@ impl UpdateManager {
                 // This call postdates every signal so far.
                 self.again = false;
                 self.retry_at = None;
+                self.refused_until = None;
                 return Some(Fetch::GetDifference {
                     pts: self.pts,
                     qts: self.qts,
@@ -810,7 +826,7 @@ impl UpdateManager {
                 .filter(|c| {
                     self.channels
                         .get(c)
-                        .and_then(|ch| ch.retry_at)
+                        .and_then(Channel::ready_at)
                         .is_none_or(|d| d <= now)
                 })
                 .collect();
@@ -818,6 +834,7 @@ impl UpdateManager {
                 self.retrying.remove(&c);
                 if let Some(ch) = self.channels.get_mut(&c) {
                     ch.retry_at = None;
+                    ch.refused_until = None;
                     if ch.fetch == ChannelFetch::Wanted {
                         self.queue.push_back(c);
                     }
@@ -855,8 +872,8 @@ impl UpdateManager {
             if ch.fetch != ChannelFetch::Wanted {
                 continue;
             }
-            if ch.retry_at.is_some_and(|d| d > now) {
-                // Backing off after a refusal: queued again when it ends.
+            if ch.ready_at().is_some_and(|d| d > now) {
+                // Backing off: queued again when the wait ends.
                 self.retrying.insert(c);
                 continue;
             }
@@ -865,6 +882,7 @@ impl UpdateManager {
                 continue;
             };
             ch.fetch = ChannelFetch::InFlight { epoch: ch.epoch };
+            ch.refused_until = None;
             // This call postdates every signal so far.
             ch.again = false;
             self.in_flight += 1;
@@ -876,7 +894,8 @@ impl UpdateManager {
     /// When to call [`next_action`](Self::next_action) next: now when a
     /// fetch is due (a pending common fetch past its retry time, or a
     /// queued channel with a free slot), else the earliest of a gap's
-    /// hold, a failed fetch's retry and the idle difference. A caller may
+    /// hold, a box's next fetch (after both a failed fetch's retry and a
+    /// refusal's wait) and the idle difference. A caller may
     /// sleep until it after every call that feeds or reports anything.
     #[must_use]
     pub fn deadline(&self) -> Instant {
@@ -887,7 +906,7 @@ impl UpdateManager {
         let mut at = self.idle_at;
         match self.fetch {
             CommonFetch::WantState | CommonFetch::WantDifference => {
-                at = at.min(self.retry_at.unwrap_or(now));
+                at = at.min(wait_for(self.retry_at, self.refused_until).unwrap_or(now));
             }
             CommonFetch::Idle => {
                 if let Some(d) = self.gap_deadline {
@@ -898,7 +917,7 @@ impl UpdateManager {
         }
         for c in self.gapped.iter().chain(&self.retrying) {
             if let Some(ch) = self.channels.get(c) {
-                for d in [ch.deadline, ch.retry_at].into_iter().flatten() {
+                for d in [ch.deadline, ch.ready_at()].into_iter().flatten() {
                     at = at.min(d);
                 }
             }
@@ -933,7 +952,7 @@ impl UpdateManager {
                 }
                 self.fetch = want;
                 self.backoff = next_backoff(self.backoff);
-                self.retry_at = Some(later(self.retry_at, now + self.backoff));
+                self.retry_at = Some(now + self.backoff);
             }
             Fetch::GetChannelDifference { channel, .. } => {
                 if let Some(ch) = self.channels.get_mut(&channel)
@@ -1023,6 +1042,7 @@ impl UpdateManager {
             ch.again = false;
             ch.retry_at = None;
             ch.backoff = Duration::ZERO;
+            ch.refused_until = None;
         }
         self.retrying.remove(&channel);
         let mut out = Out::new(self.empty_group());
@@ -1388,7 +1408,7 @@ impl UpdateManager {
         if p.common_epoch == Some(self.epoch) {
             self.epoch += 1;
             self.refusals = next_backoff(self.refusals);
-            self.retry_at = Some(later(self.retry_at, now + self.refusals));
+            self.refused_until = Some(later(self.refused_until, now + self.refusals));
             self.pts = self.committed.pts;
             self.qts = self.committed.qts;
             self.seq = self.committed.seq;
@@ -1417,7 +1437,7 @@ impl UpdateManager {
             ch.pts = self.committed_channels.get(&c).copied();
             ch.deadline = None;
             ch.refusals = next_backoff(ch.refusals);
-            ch.retry_at = Some(later(ch.retry_at, now + ch.refusals));
+            ch.refused_until = Some(later(ch.refused_until, now + ch.refusals));
             self.gapped.remove(&c);
             if ch.fetch == ChannelFetch::Idle && ch.pts.is_some() {
                 ch.fetch = ChannelFetch::Wanted;
@@ -1805,7 +1825,7 @@ impl UpdateManager {
             && self.channels.get(&c).is_none_or(|ch| {
                 ch.fetch == ChannelFetch::Idle
                     && ch.held.is_empty()
-                    && ch.retry_at.is_none()
+                    && ch.ready_at().is_none()
                     && ch.pts == self.committed_channels.get(&c).copied()
             })
     }
@@ -1990,6 +2010,14 @@ impl UpdateManager {
             error = %e,
             "update manager: undecodable {what} skipped"
         );
+    }
+}
+
+/// The later of two pending waits, if any.
+fn wait_for(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
 }
 
