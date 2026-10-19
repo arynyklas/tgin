@@ -404,11 +404,6 @@ impl Reloader {
             );
         }
         self.loaded = text.into_bytes();
-        // A login started for an account the reload removed or moved ends.
-        self.shared
-            .accounts
-            .reconcile(|name| crate::admin::target_of(&cfg, name))
-            .await;
 
         // Before the sources restart: their `getMe` records identities in
         // the gateway's new entries.
@@ -418,6 +413,12 @@ impl Reloader {
         );
         self.restart_sources(&cfg, &report).await;
         self.reload_tls(&cfg).await;
+        // Last, so a login that is slow to end never delays the rest: a
+        // login started for an account the reload removed or moved ends.
+        self.shared
+            .accounts
+            .reconcile(|name| crate::admin::target_of(&cfg, name))
+            .await;
         if !report.restart_required.is_empty() {
             tracing::warn!(
                 settings = ?report.restart_required,

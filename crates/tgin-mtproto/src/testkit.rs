@@ -252,6 +252,10 @@ pub enum Reply {
     NoAnswer,
     /// Never written ([`SenderError::NotSent`]).
     NotSent,
+    /// Written, and no answer ever comes.
+    Hang,
+    /// The reply, after a while (Tokio time).
+    Later(std::time::Duration, Box<Reply>),
     /// Transport −404 on a logged-in key.
     KeyRevoked,
 }
@@ -378,16 +382,24 @@ impl Link for ScriptedLink {
         lock(&self.inner.calls).push((self.dc, body.to_vec()));
         let next = lock(&self.inner.script).pop_front();
         match next {
-            Some((expected, reply)) if expected == id => match reply {
-                Reply::Ok(bytes) => Ok(RpcOutcome::Result(Bytes::from(bytes))),
-                Reply::Rpc(code, message) => Ok(RpcOutcome::Error {
-                    code,
-                    message: message.to_owned(),
-                }),
-                Reply::NoAnswer => Err(SenderError::NoAnswer),
-                Reply::NotSent => Err(SenderError::NotSent),
-                Reply::KeyRevoked => Err(SenderError::KeyRevoked),
-            },
+            Some((expected, mut reply)) if expected == id => {
+                while let Reply::Later(wait, inner) = reply {
+                    tokio::time::sleep(wait).await;
+                    reply = *inner;
+                }
+                match reply {
+                    Reply::Ok(bytes) => Ok(RpcOutcome::Result(Bytes::from(bytes))),
+                    Reply::Rpc(code, message) => Ok(RpcOutcome::Error {
+                        code,
+                        message: message.to_owned(),
+                    }),
+                    Reply::NoAnswer => Err(SenderError::NoAnswer),
+                    Reply::NotSent => Err(SenderError::NotSent),
+                    Reply::Hang => std::future::pending().await,
+                    Reply::KeyRevoked => Err(SenderError::KeyRevoked),
+                    Reply::Later(..) => Err(SenderError::NotSent),
+                }
+            }
             // Off script: the request "was never sent".
             _ => Err(SenderError::NotSent),
         }

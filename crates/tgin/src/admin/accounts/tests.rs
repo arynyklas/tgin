@@ -106,7 +106,14 @@ fn setup_with(token: bool, phone: Option<&str>, script: Vec<(u32, Reply)>) -> Se
     let handle: Arc<dyn AccountHandle> = fake.clone();
     let state = TestState {
         accounts: Arc::new(Accounts::new(handle)),
-        targets: Arc::new(HashMap::from([("main".to_owned(), target)])),
+        targets: Arc::new(HashMap::from([
+            ("second".to_owned(), {
+                let mut second = target.clone();
+                second.session_dir = dir.path().join("second");
+                second
+            }),
+            ("main".to_owned(), target),
+        ])),
         token,
     };
     Setup {
@@ -797,4 +804,136 @@ async fn reload_closes_logins_of_changed_accounts() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{change}: closed");
         SessionStore::open(&s.dir.path().join("main")).expect("released");
     }
+}
+
+/// A start that waits on Telegram about a leftover key holds no lock that
+/// other requests need: GET and DELETE for another account, a reload's
+/// reconcile, and a second start for the same account (409) all answer at
+/// once. Reconcile ends the waiting start: when it finishes, its login is
+/// not installed.
+#[tokio::test(start_paused = true)]
+async fn a_hanging_probe_blocks_nothing_else() {
+    let s = setup(Some(PHONE), vec![(ids::GET_USERS, Reply::Hang)]);
+    {
+        let store = SessionStore::open(&s.dir.path().join("main")).expect("open");
+        store
+            .set_home_key(2, &tgin_mtproto::AuthKey([1; 256]))
+            .expect("key");
+    }
+    let app = s.app.clone();
+    let probing = tokio::spawn(async move {
+        call(
+            &app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await
+    });
+    // Until the start reserved its name and waits on Telegram.
+    while s.fake.dial.calls().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let quick = Duration::from_millis(1);
+    for (method, path, body, want) in [
+        (
+            "GET",
+            "/v1/accounts/second/login",
+            "",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "DELETE",
+            "/v1/accounts/second/login",
+            "",
+            StatusCode::NOT_FOUND,
+        ),
+        ("GET", "/v1/accounts/main/login", "", StatusCode::OK),
+        (
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+            StatusCode::CONFLICT,
+        ),
+        ("POST", "/v1/accounts/main/logout", "", StatusCode::CONFLICT),
+    ] {
+        let (status, text) = timeout(quick, call(&s.app, method, path, body))
+            .await
+            .unwrap_or_else(|_| panic!("{method} {path} waited on the probe"));
+        assert_eq!(status, want, "{method} {path}: {text}");
+        if want == StatusCode::CONFLICT {
+            assert_eq!(text, r#"{"error":"login starting"}"#, "{method} {path}");
+        }
+    }
+    let (_, text) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(parse(&text), LoginStatus::Connecting);
+
+    // A reload that removes the account does not wait for the probe.
+    timeout(quick, s.state.accounts.reconcile(|_| None))
+        .await
+        .expect("reconcile waited on the probe");
+    let (status, _) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The probe gives up at its deadline; the session is unchanged.
+    let (status, text) = probing.await.expect("joined");
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("session unverified"), "{text}");
+    let store = reopen(&s.dir).await;
+    assert_eq!(store.home_dc().expect("home"), Some(2));
+}
+
+/// A start cancelled while it waits on Telegram (`DELETE …/login`) is not
+/// installed when Telegram answers: the new login ends at once, and the
+/// session is free.
+#[tokio::test(start_paused = true)]
+async fn a_start_cancelled_while_probing_is_not_installed() {
+    let s = setup(
+        Some(PHONE),
+        vec![
+            (
+                ids::GET_USERS,
+                Reply::Later(
+                    Duration::from_secs(5),
+                    Box::new(Reply::Rpc(401, "AUTH_KEY_UNREGISTERED")),
+                ),
+            ),
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token(b"t", later())),
+            ),
+        ],
+    );
+    {
+        let store = SessionStore::open(&s.dir.path().join("main")).expect("open");
+        store
+            .set_home_key(2, &tgin_mtproto::AuthKey([1; 256]))
+            .expect("key");
+    }
+    let app = s.app.clone();
+    let starting = tokio::spawn(async move {
+        call(
+            &app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await
+    });
+    while s.fake.dial.calls().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let (status, text) = call(&s.app, "DELETE", "/v1/accounts/main/login", "").await;
+    assert_eq!(
+        (status, text.as_str()),
+        (StatusCode::OK, r#"{"cancelled":true}"#)
+    );
+    let (status, text) = starting.await.expect("joined");
+    assert_eq!(
+        (status, text.as_str()),
+        (StatusCode::CONFLICT, r#"{"error":"login cancelled"}"#)
+    );
+    let (status, _) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    reopen(&s.dir).await;
 }

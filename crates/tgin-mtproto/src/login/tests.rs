@@ -500,7 +500,8 @@ async fn logged_in_session_refuses_a_login() {
 
 /// A home key left without a login marker may be logged in (its answer was
 /// lost): `start` asks Telegram before it resets anything [C: S3 F7].
-/// - logged in: the identity gate and the marker, no new key;
+/// - logged in, `phone` configured: the identity gate and the marker, no
+///   new key;
 /// - unknown to Telegram (401, −404): reset, and a fresh login;
 /// - no clear answer: refused, nothing changed.
 #[tokio::test]
@@ -508,8 +509,11 @@ async fn a_leftover_key_is_asked_before_the_reset() {
     // Logged in after all: recorded on the old key, no new connection.
     let (tmp, store) = self::store();
     store.set_home_key(4, &AuthKey([7; 256])).expect("key");
-    let dial = ScriptedDial::new(vec![(ids::GET_USERS, Reply::Ok(users(31, None)))]);
-    let h = start(store, dial.clone(), params(None), Method::Qr)
+    let dial = ScriptedDial::new(vec![(
+        ids::GET_USERS,
+        Reply::Ok(users(31, Some("88800000000"))),
+    )]);
+    let h = start(store, dial.clone(), params(Some(PHONE)), Method::Qr)
         .await
         .expect("start");
     assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 31 });
@@ -1175,4 +1179,19 @@ fn step_debug_hides_token_and_hash() {
         // Bytes would show as numbers.
         assert!(!shown.contains("83, 69, 67"), "{shown}");
     }
+}
+
+/// Telegram never answering about a leftover key ends the start at
+/// [`LEFTOVER_DEADLINE`], unverified, with the session unchanged.
+#[tokio::test(start_paused = true)]
+async fn a_hanging_leftover_probe_is_bounded() {
+    let (tmp, store) = self::store();
+    store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![(ids::GET_USERS, Reply::Hang)]);
+    let started = tokio::time::Instant::now();
+    let out = start(store, dial, params(Some(PHONE)), Method::Qr).await;
+    assert!(matches!(out, Err(StartError::Unverified(_))));
+    assert_eq!(started.elapsed(), LEFTOVER_DEADLINE);
+    let store = wait_reopen(&tmp).await;
+    assert_eq!(store.home_dc().expect("home"), Some(4));
 }

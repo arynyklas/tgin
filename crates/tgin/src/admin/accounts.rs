@@ -23,15 +23,16 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::future::BoxFuture;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tgin_core::config::Config;
 use tgin_mtproto::login::{
     self, LoginError, LoginHandle, LoginParams, LoginState, LogoutError, Method, StartError,
     TcpDial,
 };
 use tgin_mtproto::{InitParams, SessionError, SessionStore};
-use tokio::sync::Mutex;
 
 use super::{LoginStatus, LoginUrl};
 
@@ -159,9 +160,40 @@ pub(crate) fn logout_refusal(e: LogoutError) -> Refusal {
 /// The logins in progress or ended, by account.
 pub(crate) struct Accounts {
     handle: Arc<dyn AccountHandle>,
-    /// A `tokio` mutex: starting a login may ask Telegram about a leftover
-    /// key while it holds the account's entry.
-    logins: Mutex<HashMap<String, Login>>,
+    /// Never held across an await: starting a login may wait on Telegram,
+    /// so a start reserves its name with [`Entry::Starting`] and installs
+    /// the login after.
+    logins: Mutex<HashMap<String, Entry>>,
+    /// Tells one start's reservation from a later one's.
+    starts: AtomicU64,
+}
+
+/// An account's place in [`Accounts`].
+enum Entry {
+    /// A start is in progress: it may be asking Telegram about a leftover
+    /// key, for up to `login::LEFTOVER_DEADLINE`.
+    Starting {
+        id: u64,
+        target: Target,
+    },
+    Running(Login),
+}
+
+impl Entry {
+    fn target(&self) -> &Target {
+        match self {
+            Self::Starting { target, .. } => target,
+            Self::Running(login) => &login.target,
+        }
+    }
+
+    /// Ends it: a running login is closed (see [`Login::close`]); a start
+    /// in progress finds its reservation gone and closes what it started.
+    async fn close(self) {
+        if let Self::Running(login) = self {
+            login.close().await;
+        }
+    }
 }
 
 impl Accounts {
@@ -169,27 +201,28 @@ impl Accounts {
         Self {
             handle,
             logins: Mutex::new(HashMap::new()),
+            starts: AtomicU64::new(0),
         }
     }
 
-    async fn login(&self, name: &str) -> Option<Arc<LoginHandle>> {
-        self.logins
-            .lock()
-            .await
-            .get(name)
-            .map(|login| Arc::clone(&login.handle))
+    /// The account's login: `Ok(None)` while one is starting.
+    fn login(&self, name: &str) -> Option<Option<Arc<LoginHandle>>> {
+        self.logins.lock().get(name).map(|entry| match entry {
+            Entry::Starting { .. } => None,
+            Entry::Running(login) => Some(Arc::clone(&login.handle)),
+        })
     }
 
     /// After a reload: closes every login whose account is gone, or whose
     /// `session_dir` or `phone` changed (`target` gives the new config's).
     /// Closing waits until the login has released its session.
     pub(crate) async fn reconcile(&self, target: impl Fn(&str) -> Option<Target>) {
-        let stale: Vec<(String, Login)> = {
-            let mut logins = self.logins.lock().await;
+        let stale: Vec<(String, Entry)> = {
+            let mut logins = self.logins.lock();
             let names: Vec<String> = logins
                 .iter()
-                .filter(|(name, login)| {
-                    !target(name).is_some_and(|new| login.target.same_login(&new))
+                .filter(|(name, entry)| {
+                    !target(name).is_some_and(|new| entry.target().same_login(&new))
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
@@ -383,33 +416,74 @@ async fn start<S: AccountsState>(
     if accounts.handle.running(&name) {
         return running();
     }
-    let handle = {
-        let mut logins = accounts.logins.lock().await;
+    let id = accounts.starts.fetch_add(1, Ordering::Relaxed);
+    let running = {
+        let mut logins = accounts.logins.lock();
         match logins.get(&name) {
-            Some(login) if !login.handle.state().is_final() => {
+            Some(Entry::Starting { .. }) => {
+                return error(StatusCode::CONFLICT, "login starting");
+            }
+            Some(Entry::Running(login)) if !login.handle.state().is_final() => {
                 if login.method != method {
                     return error(StatusCode::CONFLICT, "login in progress");
                 }
-                Arc::clone(&login.handle)
+                Some(Arc::clone(&login.handle))
             }
             _ => {
                 // An ended login has released the session.
-                logins.remove(&name);
-                match accounts.handle.start_login(&target, method).await {
-                    Ok(h) => {
+                logins.insert(
+                    name.clone(),
+                    Entry::Starting {
+                        id,
+                        target: target.clone(),
+                    },
+                );
+                None
+            }
+        }
+    };
+    let handle = match running {
+        Some(handle) => handle,
+        None => {
+            let started = accounts.handle.start_login(&target, method).await;
+            // No await while the map is locked.
+            let installed = {
+                let mut logins = accounts.logins.lock();
+                let ours = matches!(
+                    logins.get(&name),
+                    Some(Entry::Starting { id: mine, .. }) if *mine == id
+                );
+                match started {
+                    Ok(h) if ours => {
                         let h = Arc::new(h);
                         logins.insert(
                             name.clone(),
-                            Login {
+                            Entry::Running(Login {
                                 method,
-                                target: target.clone(),
+                                target,
                                 handle: Arc::clone(&h),
-                            },
+                            }),
                         );
-                        h
+                        Ok(h)
                     }
-                    Err(refusal) => return refused(&name, &refusal),
+                    Ok(h) => Err(Err(h)),
+                    Err(refusal) => {
+                        if ours {
+                            logins.remove(&name);
+                        }
+                        Err(Ok(refusal))
+                    }
                 }
+            };
+            match installed {
+                Ok(h) => h,
+                // Cancelled meanwhile (DELETE, or a reload changed the
+                // account): the new login ends at once.
+                Err(Err(h)) => {
+                    h.close().await;
+                    return error(StatusCode::CONFLICT, "login cancelled");
+                }
+                Err(Ok(refusal)) => return refused(&name, &refusal),
             }
         }
     };
@@ -427,8 +501,9 @@ async fn current<S: AccountsState>(
     if state.target(&name).is_none() {
         return unknown_account();
     }
-    match state.accounts().login(&name).await {
-        Some(h) => login_status(&h.state()),
+    match state.accounts().login(&name) {
+        Some(Some(h)) => login_status(&h.state()),
+        Some(None) => login_status(&LoginState::Connecting),
         None => no_login(),
     }
 }
@@ -482,7 +557,7 @@ async fn submit<S: AccountsState>(
     if state.target(name).is_none() {
         return unknown_account();
     }
-    let Some(h) = state.accounts().login(name).await else {
+    let Some(Some(h)) = state.accounts().login(name) else {
         return no_login();
     };
     match hand(h).await {
@@ -513,7 +588,7 @@ async fn cancel<S: AccountsState>(
     if state.target(&name).is_none() {
         return unknown_account();
     }
-    let login = state.accounts().logins.lock().await.remove(&name);
+    let login = state.accounts().logins.lock().remove(&name);
     match login {
         Some(login) => {
             login.close().await;
@@ -536,8 +611,15 @@ async fn logout<S: AccountsState>(
     if accounts.handle.running(&name) {
         return running();
     }
-    // A login in progress ends first, releasing the session.
-    let login = accounts.logins.lock().await.remove(&name);
+    // A login in progress ends first, releasing the session; one still
+    // starting holds the session until it is installed.
+    let login = {
+        let mut logins = accounts.logins.lock();
+        if let Some(Entry::Starting { .. }) = logins.get(&name) {
+            return error(StatusCode::CONFLICT, "login starting");
+        }
+        logins.remove(&name)
+    };
     if let Some(login) = login {
         login.close().await;
     }

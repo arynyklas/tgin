@@ -62,6 +62,8 @@ mod tests;
 pub const FIRST_DC: i32 = 2;
 /// The longest a QR token is shown before it is exported again.
 const MAX_TOKEN_TTL: i64 = 30;
+/// The longest `start` asks Telegram about a key an unfinished login left.
+pub const LEFTOVER_DEADLINE: Duration = Duration::from_secs(20);
 /// Wrong passwords, or wrong codes, that end a login.
 pub const MAX_ATTEMPTS: u32 = 5;
 /// The longest a QR login runs unscanned; then it ends `Failed(expired)`.
@@ -986,10 +988,12 @@ impl LoginHandle {
 ///
 /// A recorded login is refused ([`StartError::LoggedIn`]). A home key left
 /// without one (a login whose answer was lost, say) may still be logged
-/// in, so it is asked first ([`whoami`]): logged in, it goes through the
-/// identity gate and is recorded; unknown to Telegram, the session is reset
-/// and the login starts on [`FIRST_DC`] with a new key; no clear answer
-/// refuses ([`StartError::Unverified`]) and changes nothing.
+/// in, so it is asked first ([`whoami`]), within [`LEFTOVER_DEADLINE`]:
+/// - logged in: it goes through the identity gate and is recorded;
+/// - unknown to Telegram: the session is reset and the login starts on
+///   [`FIRST_DC`] with a new key;
+/// - no clear answer in time, or an unconfirmed logout: refused
+///   ([`StartError::Unverified`]), the session unchanged.
 pub async fn start<D: Dial>(
     store: SessionStore,
     dial: D,
@@ -1001,18 +1005,22 @@ pub async fn start<D: Dial>(
     }
     let begin = match leftover(&store)? {
         None => Begin::Fresh(method),
-        Some((dc, key)) => match dial.dial(dc, Some(key), false).await {
-            Ok((link, pushes, _)) => {
-                let conn = Conn::new(link, pushes);
-                match whoami(&conn.link).await {
-                    Ok(Some(me)) => Begin::Recovered(conn, me),
-                    Ok(None) => Begin::Fresh(method),
-                    Err(f) => return Err(StartError::Unverified(LoginError::from(f).to_string())),
+        Some((dc, key)) => {
+            let asked = tokio::time::timeout(
+                LEFTOVER_DEADLINE,
+                ask_leftover(&dial, dc, key, &params, method),
+            )
+            .await;
+            match asked {
+                Ok(begin) => begin?,
+                Err(_) => {
+                    return Err(StartError::Unverified(format!(
+                        "Telegram did not answer within {} s",
+                        LEFTOVER_DEADLINE.as_secs()
+                    )));
                 }
             }
-            Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => Begin::Fresh(method),
-            Err(e) => return Err(StartError::Unverified(e.to_string())),
-        },
+        }
     };
     if matches!(begin, Begin::Fresh(_)) {
         store.reset_for_login()?;
@@ -1034,6 +1042,28 @@ pub async fn start<D: Dial>(
         commands: commands_tx,
         task: Some(task),
     })
+}
+
+/// What a leftover home key means for the login (see [`start`]).
+async fn ask_leftover<D: Dial>(
+    dial: &D,
+    dc: i32,
+    key: AuthKey,
+    _params: &LoginParams,
+    method: Method,
+) -> Result<Begin<D::Link>, StartError> {
+    let unverified = |e: String| StartError::Unverified(e);
+    let (link, pushes) = match dial.dial(dc, Some(key), false).await {
+        Ok((link, pushes, _)) => (link, pushes),
+        Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => return Ok(Begin::Fresh(method)),
+        Err(e) => return Err(unverified(e.to_string())),
+    };
+    let conn = Conn::new(link, pushes);
+    match whoami(&conn.link).await {
+        Ok(None) => Ok(Begin::Fresh(method)),
+        Ok(Some(me)) => Ok(Begin::Recovered(conn, me)),
+        Err(f) => Err(unverified(LoginError::from(f).to_string())),
+    }
 }
 
 /// The home DC and its key, when a key is stored.
