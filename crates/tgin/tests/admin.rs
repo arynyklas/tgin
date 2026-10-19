@@ -545,10 +545,12 @@ async fn status_requires_token() {
         let answer = answer(delete).await;
         assert_eq!(answer.status, 401, "DELETE {token:?}");
     }
-    assert!(
-        !session.exists(),
-        "an unauthorized request opened the session"
-    );
+    // The account itself opens its session (it is logged out); no
+    // unauthorized request started a login on it.
+    let login = tgin
+        .admin_get("/v1/accounts/main/login", Some(ADMIN_TOKEN))
+        .await;
+    assert_eq!(login.status, 404, "an unauthorized request started a login");
 
     let status = tgin.status().await;
     assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
