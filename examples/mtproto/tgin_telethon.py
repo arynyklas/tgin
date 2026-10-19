@@ -9,14 +9,18 @@ own layer, so use it only for objects that layer shares with the account's
 
 import base64
 import json
+import logging
 import struct
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from telethon.errors import TypeNotFoundError
 from telethon.extensions import BinaryReader
 
 RPC_ERROR = 0x2144CA19
+log = logging.getLogger("tgin_telethon")
 
 
 class TginError(Exception):
@@ -28,8 +32,9 @@ class TginError(Exception):
 
 
 class Tgin:
-    def __init__(self, base_url, account, token, layer):
+    def __init__(self, base_url, account, token, layer, attempts=3):
         self.base, self.account, self.token, self.layer = base_url.rstrip("/"), account, token, layer
+        self.attempts = attempts
 
     def invoke_url(self):
         return f"{self.base}/mtproto/v1/{urllib.parse.quote(self.account, safe='')}/invoke"
@@ -39,19 +44,28 @@ class Tgin:
         return f"{self.base}/c/{urllib.parse.quote(consumer, safe='')}/mtproto/v1/getUpdates?{query}"
 
     def invoke(self, request, timeout=90):
-        """Sends a Telethon request object; returns its parsed result."""
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "X-Tgin-Layer": str(self.layer),
-            "Content-Type": "application/octet-stream",
-        }
+        """Sends a Telethon request; returns its result. A 429, or a 503 with
+        Retry-After, was not executed: retried after Retry-After, `attempts`
+        times in all. A 502 no_answer may have run and is never retried."""
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return self._invoke_once(request, timeout)
+            except TginError as e:
+                if attempt == self.attempts or e.retry_after is None or e.status not in (429, 503):
+                    raise
+                time.sleep(e.retry_after)
+
+    def _invoke_once(self, request, timeout):
+        headers = {"Authorization": f"Bearer {self.token}", "X-Tgin-Layer": str(self.layer),
+                   "Content-Type": "application/octet-stream"}
         req = urllib.request.Request(self.invoke_url(), bytes(request), headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                status, body, ctype, retry = resp.status, resp.read(), resp.headers.get_content_type(), None
+                status, body, head = resp.status, resp.read(), resp.headers
         except urllib.error.HTTPError as e:
-            status, body, ctype, retry = e.code, e.read(), e.headers.get_content_type(), e.headers.get("Retry-After")
-        if ctype == "application/json":  # tgin's own error: 400, 401, 403, 409, 429, 502, 503...
+            status, body, head = e.code, e.read(), e.headers
+        retry = int(head["Retry-After"]) if (head.get("Retry-After") or "").isdigit() else None
+        if head.get_content_type() == "application/json":  # tgin's own error
             err = json.loads(body)
             raise TginError(status, err.get("error"), err.get("description", ""), retry)
         if body[:4] == struct.pack("<I", RPC_ERROR):  # Telegram's rpc_error (200, 403 or 429)
@@ -63,14 +77,13 @@ class Tgin:
 
 def parse_envelope(envelope):
     """(update, users, chats) of one envelope, as Telethon objects."""
-    tl = BinaryReader(base64.b64decode(envelope["tl"])).tgread_object()
-    users = BinaryReader(base64.b64decode(envelope["users"])).tgread_object()
-    chats = BinaryReader(base64.b64decode(envelope["chats"])).tgread_object()
-    return tl, users, chats
+    return tuple(BinaryReader(base64.b64decode(envelope[k])).tgread_object() for k in ("tl", "users", "chats"))
 
 
 def poll(tgin, consumer, consumer_token, instance, timeout=30):
-    """Yields (envelope, update, users, chats) forever, acknowledging each poll."""
+    """Yields (envelope, update, users, chats) forever, acknowledging each poll.
+    An envelope Telethon cannot parse (a constructor of another layer) is
+    logged by its constructor and skipped, so polling moves past it."""
     offset = 0
     headers = {"Authorization": f"Bearer {consumer_token}", "X-Tgin-Instance": instance}
     while True:
@@ -79,4 +92,10 @@ def poll(tgin, consumer, consumer_token, instance, timeout=30):
             answer = json.loads(resp.read())
         for envelope in answer["result"]:
             offset = envelope["update_id"] + 1  # acknowledges everything up to this id; ids skip
-            yield (envelope, *parse_envelope(envelope))
+            try:
+                parsed = parse_envelope(envelope)
+            except TypeNotFoundError:
+                log.warning("skipped update %s: %s is not in Telethon's layer",
+                            envelope["update_id"], envelope["constructor"])
+                continue
+            yield (envelope, *parsed)
