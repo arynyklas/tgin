@@ -234,18 +234,18 @@ async fn invoke(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
-    let Some(account) = endpoint.accounts.get(&account) else {
-        return tgin_error(StatusCode::NOT_FOUND, "unknown_account", "no such account");
-    };
     let bearer = headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "));
-    let Some(client) = bearer.and_then(|b| account.client(b)) else {
-        return tgin_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "a valid client bearer token is required",
-        );
+        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
+        .unwrap_or_default();
+    // An unknown account is answered as a wrong token, after a comparison
+    // of the same kind, so the answer does not tell which accounts exist.
+    let Some(account) = endpoint.accounts.get(&account) else {
+        let _ = secret_eq(bearer, UNKNOWN_ACCOUNT_TOKEN);
+        return unauthorized();
+    };
+    let Some(client) = account.client(bearer) else {
+        return unauthorized();
     };
     // The body is read only once the client is known, within
     // BODY_TIMEOUT, and up to the bound of its content type.
@@ -346,6 +346,17 @@ async fn invoke(
     let response = answer_response(answer, wants_json(&headers, header::ACCEPT), method);
     tracing::debug!(account = %account.name, method, status = response.status().as_u16(), "mtproto rpc");
     response
+}
+
+/// What an unknown account's bearer is compared with.
+const UNKNOWN_ACCOUNT_TOKEN: &[u8] = b"tgin-unknown-account-0000000000000000";
+
+fn unauthorized() -> Response {
+    tgin_error(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "a valid client bearer token is required",
+    )
 }
 
 fn too_large() -> Response {

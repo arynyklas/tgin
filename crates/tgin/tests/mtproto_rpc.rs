@@ -298,6 +298,31 @@ async fn allowlist_deny_by_default() {
 }
 
 #[tokio::test]
+async fn unknown_account_answers_as_a_wrong_token() {
+    let app = app(FakeAccount::new([]));
+    let mut answers = Vec::new();
+    for (path, token) in [("main", "wrong"), ("nobody", "wrong"), ("nobody", TOKEN)] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/mtproto/v1/{path}/invoke"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-tgin-layer", "230")
+                    .body(Body::from(tl(GET_CONFIG)))
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        answers.push((status, body));
+    }
+    assert_eq!(answers[0].0, StatusCode::UNAUTHORIZED);
+    assert_eq!(answers[1], answers[0]);
+    assert_eq!(answers[2], answers[0]);
+}
+
+#[tokio::test]
 async fn wrong_token_401() {
     let account = FakeAccount::new([]);
     let app = app(Arc::clone(&account));
