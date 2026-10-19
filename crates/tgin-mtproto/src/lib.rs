@@ -11,18 +11,30 @@
 //! schema; [`tl_json`] renders the same bytes as TL-JSON (design §10.5) and
 //! back. [`updates`] is tgin's own update-state handling and gap recovery
 //! over those bytes.
+//!
+//! A [`Sender`] holds one connection to one DC and gives every request an
+//! honest outcome: answered, [`SenderError::NotSent`] (never written, one
+//! resend allowed) or [`SenderError::NoAnswer`] (written, never resent).
 
+mod dc;
 pub mod decode;
 mod error;
 mod lock;
 pub mod schema;
+mod sender;
 mod session;
 #[cfg(test)]
 mod testgen;
 pub mod tl_json;
+mod transport;
 pub mod updates;
 
+pub use dc::DcOption;
 pub use error::SessionError;
 pub use schema::TlError;
+pub use sender::{Connected, InitParams, Pushes, RpcOutcome, Sender, SenderError};
 pub use session::{AuthKey, ChannelKind, DcAddr, Login, Peer, PeerKind, SessionStore, UpdateState};
+pub use transport::{
+    GeneratedKey, Opened, PacketReader, PacketWriter, TcpTransport, Transport, TransportError,
+};
 pub use updates::{Batch, Dropped, Fetch, StateDelta, StoredState, UpdateBytes, UpdateManager};

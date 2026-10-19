@@ -12,11 +12,19 @@ publish.workspace = true
 base64.workspace = true
 bytes.workspace = true
 fd-lock.workspace = true
+flate2.workspace = true
+# grammers 0.11 family, exact pins (Task 1's confinement check keeps them
+# in this crate). The sender uses the transport framing, the auth key
+# exchange and the MTProto 2.0 cipher; its message loop is tgin's own.
+grammers-crypto = { version = "=0.11.0", default-features = false }
+grammers-mtproto = { version = "=0.11.0", default-features = false }
+grammers-tl-types = { version = "=0.11.0", default-features = false, features = ["tl-api", "tl-mtproto"] }
+rand.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 # build.rs reads the vendored schemas (schema/*.tl) with grammers' own parser,
@@ -28,8 +36,9 @@ grammers-tl-parser = "=1.2.2"
 # The decoder and codec property tests compare with grammers' typed
 # (de)serializers, functions and mtproto.tl included.
 grammers-tl-types = { version = "=0.11.0", default-features = false, features = ["tl-api", "tl-mtproto", "deserializable-functions"] }
+parking_lot.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "test-util", "time"] }
 
 # The two-process ownership race: its own `main` is both the race driver and,
 # re-run with `TGIN_LOCK_CHILD_DIR`, the contender. A test target, so cargo
