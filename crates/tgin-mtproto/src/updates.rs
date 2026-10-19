@@ -565,6 +565,12 @@ pub struct UpdateManager {
     /// The common box's refetch after a refusal waits until then; apart
     /// from `retry_at`, which `updatesTooLong` cuts short.
     refused_until: Option<Instant>,
+    /// Telegram's `FLOOD_WAIT_X` on `updates.getState` or `getDifference`:
+    /// no common fetch before then, whatever signal comes.
+    common_flood: Option<Instant>,
+    /// The same for `updates.getChannelDifference`, for every channel:
+    /// Telegram's limit is per method.
+    channel_flood: Option<Instant>,
     known_users: HashSet<i64>,
     committed: UpdateState,
     committed_channels: HashMap<i64, i32>,
@@ -637,6 +643,8 @@ impl UpdateManager {
             backoff: Duration::ZERO,
             refusals: Duration::ZERO,
             refused_until: None,
+            common_flood: None,
+            channel_flood: None,
             ahead: startup.iter().copied().collect(),
             startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
@@ -795,7 +803,8 @@ impl UpdateManager {
         if self.idle_at <= now {
             self.idle_at = now + IDLE_DIFFERENCE;
         }
-        let retry_due = wait_for(self.retry_at, self.refused_until).is_none_or(|d| d <= now);
+        let retry_due = wait_for(self.retry_at, self.refused_until).is_none_or(|d| d <= now)
+            && self.common_flood.is_none_or(|d| d <= now);
         match self.fetch {
             CommonFetch::WantState if retry_due => {
                 self.fetch = CommonFetch::State { epoch: self.epoch };
@@ -864,6 +873,9 @@ impl UpdateManager {
                 }
             }
         }
+        if self.channel_flood.is_some_and(|d| d > now) {
+            return None;
+        }
         while self.in_flight < MAX_CHANNEL_FETCHES {
             let c = self.queue.pop_front()?;
             let Some(ch) = self.channels.get_mut(&c) else {
@@ -900,14 +912,16 @@ impl UpdateManager {
     #[must_use]
     pub fn deadline(&self) -> Instant {
         let now = Instant::now();
+        let channel_flood = self.channel_flood.filter(|&d| d > now);
         if !self.queue.is_empty() && self.in_flight < MAX_CHANNEL_FETCHES {
-            return now;
-        }
-        let mut at = self.idle_at;
-        match self.fetch {
-            CommonFetch::WantState | CommonFetch::WantDifference => {
-                at = at.min(wait_for(self.retry_at, self.refused_until).unwrap_or(now));
+            match channel_flood {
+                None => return now,
+                Some(d) => return self.idle_at.min(d).min(self.common_deadline(now)),
             }
+        }
+        let mut at = self.idle_at.min(self.common_deadline(now));
+        match self.fetch {
+            CommonFetch::WantState | CommonFetch::WantDifference => {}
             CommonFetch::Idle => {
                 if let Some(d) = self.gap_deadline {
                     at = at.min(d);
@@ -918,11 +932,46 @@ impl UpdateManager {
         for c in self.gapped.iter().chain(&self.retrying) {
             if let Some(ch) = self.channels.get(c) {
                 for d in [ch.deadline, ch.ready_at()].into_iter().flatten() {
-                    at = at.min(d);
+                    at = at.min(channel_flood.map_or(d, |f| d.max(f)));
                 }
             }
         }
         at
+    }
+
+    /// When a pending common fetch may run: after a failed fetch's retry,
+    /// a refusal's wait and Telegram's flood wait; far off when none is
+    /// pending.
+    fn common_deadline(&self, now: Instant) -> Instant {
+        match self.fetch {
+            CommonFetch::WantState | CommonFetch::WantDifference => {
+                let at = wait_for(self.retry_at, self.refused_until).unwrap_or(now);
+                self.common_flood.map_or(at, |f| at.max(f))
+            }
+            _ => self.idle_at,
+        }
+    }
+
+    /// Telegram answered `fetch` with `FLOOD_WAIT_X` (or `SLOWMODE_WAIT_X`):
+    /// it is asked again, not before `wait` from now. The wait is apart
+    /// from the failure backoff and a refusal's wait, and no signal cuts it
+    /// short. For `updates.getChannelDifference` it holds every channel's
+    /// fetch, since Telegram limits the method.
+    pub fn fetch_flood_wait(&mut self, fetch: Fetch, wait: Duration) {
+        let until = Instant::now() + wait;
+        let slot = match fetch {
+            Fetch::GetState | Fetch::GetDifference { .. } => &mut self.common_flood,
+            Fetch::GetChannelDifference { .. } => &mut self.channel_flood,
+        };
+        *slot = Some(slot.map_or(until, |d| d.max(until)));
+        self.fetch_failed(fetch);
+    }
+
+    /// Until when the common box waits out Telegram's flood wait, while it
+    /// does.
+    #[must_use]
+    pub fn flood_wait(&self) -> Option<Instant> {
+        self.common_flood.filter(|&d| d > Instant::now())
     }
 
     /// A fetch from [`next_action`](Self::next_action) got no answer (a

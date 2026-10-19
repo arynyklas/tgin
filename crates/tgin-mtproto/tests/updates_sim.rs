@@ -2966,3 +2966,53 @@ async fn stale_channel_answer_waits_for_the_refusal_backoff() {
         })
     );
 }
+
+/// Telegram's `FLOOD_WAIT_X` on getDifference holds the common box for X
+/// seconds: a later `updatesTooLong` asks nothing before then.
+#[tokio::test(start_paused = true)]
+async fn flood_wait_holds_the_difference_whatever_signal_comes() {
+    let mut m = started(stored(10, &[], &[]));
+    let batches = m.feed_push(too_long());
+    commit(&mut m, &batches);
+    let fetch = m.next_action().expect("a difference");
+    assert!(matches!(fetch, Fetch::GetDifference { .. }), "{fetch:?}");
+    let start = Instant::now();
+    m.fetch_flood_wait(fetch, Duration::from_secs(30));
+    assert_eq!(m.flood_wait(), Some(start + Duration::from_secs(30)));
+    advance(Duration::from_secs(5)).await;
+    let batches = m.feed_push(too_long());
+    commit(&mut m, &batches);
+    assert_eq!(
+        m.next_action(),
+        None,
+        "a signal does not cut the wait short"
+    );
+    assert_eq!(m.deadline(), start + Duration::from_secs(30));
+    advance(Duration::from_secs(25)).await;
+    assert!(matches!(m.next_action(), Some(Fetch::GetDifference { .. })));
+    assert_eq!(m.flood_wait(), None);
+}
+
+/// A flood wait on getChannelDifference holds every channel's fetch:
+/// Telegram limits the method.
+#[tokio::test(start_paused = true)]
+async fn channel_flood_wait_holds_every_channel() {
+    let mut m = started(stored(10, &[(1, 5), (2, 7)], &[]));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    let fetch = m.next_action().expect("a channel fetch");
+    let start = Instant::now();
+    m.fetch_flood_wait(fetch, Duration::from_secs(20));
+    assert_eq!(m.flood_wait(), None, "the common box is free");
+    let batches = m.feed_push(b(short(&channel_too_long(2, None))));
+    nothing(&mut m, &batches);
+    assert_eq!(m.next_action(), None, "another channel waits too");
+    assert_eq!(m.deadline(), start + Duration::from_secs(20));
+    advance(Duration::from_secs(20)).await;
+    let mut asked = Vec::new();
+    while let Some(Fetch::GetChannelDifference { channel, .. }) = m.next_action() {
+        asked.push(channel);
+    }
+    asked.sort_unstable();
+    assert_eq!(asked, [1, 2]);
+}

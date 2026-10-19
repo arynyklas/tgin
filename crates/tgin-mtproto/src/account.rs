@@ -937,6 +937,7 @@ async fn run(ctx: Arc<Ctx>) -> End {
             ids,
             fetches: JoinSet::new(),
             dropped: Dropped::default(),
+            flood: None,
         };
         ingest.run(conn.pushes, &mut affected).await
     };
@@ -1034,6 +1035,8 @@ struct Ingest<'a> {
     fetches: JoinSet<Fetched>,
     /// What [`UpdateManager::dropped`] said last.
     dropped: Dropped,
+    /// What [`UpdateManager::flood_wait`] said last.
+    flood: Option<Instant>,
 }
 
 impl Ingest<'_> {
@@ -1134,8 +1137,10 @@ impl Ingest<'_> {
                         self.ctx.shared.froze();
                         self.manager.fetch_failed(fetch);
                     }
-                    (ErrorClass::FloodWait(_) | ErrorClass::SlowMode(_), _) => {
-                        self.manager.fetch_failed(fetch);
+                    (ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x), _) => {
+                        tracing::warn!(account = %name, fetch = fetch_name(fetch), seconds = x, "Telegram asks the account to wait before it catches up again");
+                        self.manager
+                            .fetch_flood_wait(fetch, Duration::from_secs(u64::from(x)));
                     }
                     (_, Fetch::GetChannelDifference { channel, .. })
                         if CHANNEL_GONE.contains(&message.as_str()) =>
@@ -1221,6 +1226,18 @@ impl Ingest<'_> {
             Ordering::Relaxed,
         );
         self.dropped = dropped;
+        // The common box waits out Telegram's flood wait: the account shows
+        // it until then.
+        let flood = self.manager.flood_wait();
+        if flood != self.flood {
+            self.flood = flood;
+            match flood {
+                Some(until) => shared.set_state(AccountState::FloodWait {
+                    until: SystemTime::now() + until.saturating_duration_since(Instant::now()),
+                }),
+                None => shared.connected(),
+            }
+        }
     }
 }
 

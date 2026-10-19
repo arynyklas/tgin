@@ -566,3 +566,41 @@ async fn status_reports_layer_home_dc_and_counts() {
     assert_eq!(status.updates, 1);
     run.account.close().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn flood_wait_on_a_catch_up_is_waited_out() {
+    let net = FakeNetwork::new();
+    let mut first = true;
+    net.answer(move |call| {
+        if call.ctor() == ids::GET_DIFFERENCE && std::mem::take(&mut first) {
+            return Reply::Rpc(420, "FLOOD_WAIT_30");
+        }
+        one_message(call)
+    });
+    let registry = Arc::new(Registry::default());
+    let started = Instant::now();
+    let run = start(&net, &registry);
+    let state = until(&run.account, |s| {
+        matches!(s, AccountState::FloodWait { .. })
+    })
+    .await;
+    assert!(matches!(state, AccountState::FloodWait { until } if until > SystemTime::now()));
+    // A signal during the wait asks nothing.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(net.push(crate::testkit::updates_too_long()));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let differences = |net: &FakeNetwork| {
+        net.ctors()
+            .iter()
+            .filter(|&&c| c == ids::GET_DIFFERENCE)
+            .count()
+    };
+    assert_eq!(differences(&net), 1, "nothing asked during the wait");
+    until(&run.account, running).await;
+    assert_eq!(
+        Instant::now().duration_since(started),
+        Duration::from_secs(30)
+    );
+    assert_eq!(run.sink.updates(), 1);
+    run.account.close().await;
+}
