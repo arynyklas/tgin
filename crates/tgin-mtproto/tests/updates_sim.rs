@@ -803,6 +803,75 @@ async fn undecodable_is_counted_skipped_and_never_refetched() {
     assert_eq!(m.next_action(), None);
 }
 
+/// A failed common fetch is asked again after 1 s, doubling to 60 s, and
+/// `deadline` says when; an answer resets it. A permanent failure of a
+/// difference resyncs with getState.
+#[tokio::test(start_paused = true)]
+async fn failed_fetch_backs_off_and_escalates() {
+    let mut m = started(stored(10, &[], &[5]));
+    m.feed_push(too_long());
+    let mut f = m.next_action().expect("a difference");
+    for secs in [1, 2, 4, 8, 16, 32, 60, 60] {
+        m.fetch_failed(f);
+        assert_eq!(m.next_action(), None, "not at once after {secs} s");
+        let wait = Duration::from_secs(secs);
+        assert_eq!(m.deadline(), Instant::now() + wait);
+        advance(wait - Duration::from_millis(1)).await;
+        assert_eq!(m.next_action(), None);
+        advance(Duration::from_millis(1)).await;
+        f = m.next_action().expect("asked again");
+        assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
+    }
+    // An answer resets the backoff.
+    let batches = m.feed_difference(b(difference_empty(1, 3)));
+    commit(&mut m, &batches);
+    m.feed_push(too_long());
+    let f = m.next_action().expect("at once");
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
+
+    // PERSISTENT_TIMESTAMP_INVALID and the like: resync, at once.
+    advance(Duration::from_secs(1)).await;
+    let f = m.next_action().expect("asked again");
+    assert!(m.fetch_failed_permanently(f).is_empty());
+    assert_eq!(m.next_action(), Some(Fetch::GetState));
+}
+
+/// A failed channel fetch backs off per channel, its updates waiting, while
+/// other boxes go on; a permanent failure drops the channel's state so its
+/// next update starts it again, never fetching from the failed state.
+#[tokio::test(start_paused = true)]
+async fn failed_channel_fetch_backs_off_permanent_drops_state() {
+    let mut m = started(stored(10, &[(1, 5), (2, 5)], &[5]));
+    m.feed_push(b(short(&channel_too_long(1, None))));
+    let f = m.next_action().expect("channel 1");
+    assert_eq!(f, Fetch::GetChannelDifference { channel: 1, pts: 5 });
+    m.fetch_failed(f);
+    assert_eq!(m.next_action(), None);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
+    let held = new_channel_message(&message(1, PeerId::Channel(1), "h"), 9, 1);
+    assert!(
+        m.feed_push(b(updates(std::slice::from_ref(&held), NONE, NONE, 2, 0)))
+            .is_empty(),
+        "channel 1 is catching up: its update waits"
+    );
+    let other = new_channel_message(&message(2, PeerId::Channel(2), "o"), 6, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&other), NONE, NONE, 2, 0)));
+    assert_eq!(all_updates(&batches), vec![b(other)]);
+    commit(&mut m, &batches);
+    advance(Duration::from_secs(1)).await;
+    let f = m.next_action().expect("asked again");
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(2));
+    advance(Duration::from_secs(2)).await;
+    let f = m.next_action().expect("asked again");
+    // CHANNEL_INVALID: the held update starts the channel again.
+    let batches = m.fetch_failed_permanently(f);
+    assert_eq!(all_updates(&batches), vec![b(held)]);
+    assert_eq!(commit(&mut m, &batches).channels, vec![(1, 8), (1, 9)]);
+    assert_eq!(m.next_action(), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn affected_pts_advance_the_box() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));

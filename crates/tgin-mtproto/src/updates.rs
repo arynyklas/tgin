@@ -7,9 +7,11 @@
 //!   the `Updates` answers the sender copies into the push stream and the
 //!   synthetic `updatesTooLong` it adds when a connection ends;
 //! - runs each [`Fetch`] from [`next_action`](UpdateManager::next_action)
-//!   on the ingest session and feeds the answer back (or reports
-//!   [`fetch_failed`](UpdateManager::fetch_failed)); it calls
-//!   `next_action` again by [`deadline`](UpdateManager::deadline);
+//!   on the ingest session and feeds the answer back, or reports
+//!   [`fetch_failed`](UpdateManager::fetch_failed) (asked again after a
+//!   backoff) or
+//!   [`fetch_failed_permanently`](UpdateManager::fetch_failed_permanently);
+//!   it calls `next_action` again by [`deadline`](UpdateManager::deadline);
 //! - offers each [`Batch`] to admission, in id order, then reports
 //!   [`committed`](UpdateManager::committed) or
 //!   [`refused`](UpdateManager::refused), and persists the [`StateDelta`]
@@ -58,6 +60,10 @@ pub const GAP_HOLD: Duration = Duration::from_millis(500);
 pub const IDLE_DIFFERENCE: Duration = Duration::from_secs(15 * 60);
 /// At most this many `updates.getChannelDifference` calls in flight.
 pub const MAX_CHANNEL_FETCHES: usize = 4;
+/// A failed fetch is asked again after this long, doubling per failure up
+/// to [`RETRY_MAX`] (as TDLib backs off getDifference).
+pub const RETRY_MIN: Duration = Duration::from_secs(1);
+pub const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Held (out-of-order) updates per box. Beyond it, a sequenced update is
 /// dropped from memory; the box's state has not moved past it, so the
 /// difference brings it back.
@@ -334,6 +340,9 @@ struct Channel {
     /// An `updateChannelTooLong` came while a call was in flight: one more
     /// fetch follows it.
     again: bool,
+    /// A failed fetch is asked again then (with `fetch` Wanted).
+    retry_at: Option<Instant>,
+    backoff: Duration,
     /// Bumped when a refused batch rolls the channel back.
     epoch: u32,
 }
@@ -347,6 +356,8 @@ impl Channel {
             fetch: ChannelFetch::Idle,
             epoch: 0,
             again: false,
+            retry_at: None,
+            backoff: Duration::ZERO,
         }
     }
 }
@@ -455,6 +466,11 @@ pub struct UpdateManager {
     in_flight: usize,
     /// Channels with a gap deadline.
     gapped: HashSet<i64>,
+    /// Channels waiting for a failed fetch's retry.
+    retrying: HashSet<i64>,
+    /// The common box's failed fetch is asked again then.
+    retry_at: Option<Instant>,
+    backoff: Duration,
     known_users: HashSet<i64>,
     committed: UpdateState,
     committed_channels: HashMap<i64, i32>,
@@ -497,6 +513,9 @@ impl UpdateManager {
             queue: VecDeque::new(),
             in_flight: 0,
             gapped: HashSet::new(),
+            retrying: HashSet::new(),
+            retry_at: None,
+            backoff: Duration::ZERO,
             known_users: state.known_users.into_iter().collect(),
             committed: common,
             committed_channels: state.channels.into_iter().collect(),
@@ -629,16 +648,19 @@ impl UpdateManager {
         if self.idle_at <= now {
             self.idle_at = now + IDLE_DIFFERENCE;
         }
+        let retry_due = self.retry_at.is_none_or(|d| d <= now);
         match self.fetch {
-            CommonFetch::WantState => {
+            CommonFetch::WantState if retry_due => {
                 self.fetch = CommonFetch::State { epoch: self.epoch };
                 self.again = false;
+                self.retry_at = None;
                 return Some(Fetch::GetState);
             }
-            CommonFetch::WantDifference => {
+            CommonFetch::WantDifference if retry_due => {
                 self.fetch = CommonFetch::Difference { epoch: self.epoch };
                 // This call postdates every signal so far.
                 self.again = false;
+                self.retry_at = None;
                 return Some(Fetch::GetDifference {
                     pts: self.pts,
                     qts: self.qts,
@@ -646,6 +668,28 @@ impl UpdateManager {
                 });
             }
             _ => {}
+        }
+        if !self.retrying.is_empty() {
+            let due: Vec<i64> = self
+                .retrying
+                .iter()
+                .copied()
+                .filter(|c| {
+                    self.channels
+                        .get(c)
+                        .and_then(|ch| ch.retry_at)
+                        .is_none_or(|d| d <= now)
+                })
+                .collect();
+            for c in due {
+                self.retrying.remove(&c);
+                if let Some(ch) = self.channels.get_mut(&c) {
+                    ch.retry_at = None;
+                    if ch.fetch == ChannelFetch::Wanted {
+                        self.queue.push_back(c);
+                    }
+                }
+            }
         }
         if !self.gapped.is_empty() {
             let due: Vec<i64> = self
@@ -692,7 +736,8 @@ impl UpdateManager {
     }
 
     /// When [`next_action`](Self::next_action) may next have something
-    /// that is not due now: a gap's hold, or the idle difference.
+    /// that is not due now: a gap's hold, a failed fetch's retry, or the
+    /// idle difference.
     #[must_use]
     pub fn deadline(&self) -> Instant {
         let mut at = self.idle_at;
@@ -701,38 +746,79 @@ impl UpdateManager {
         {
             at = at.min(d);
         }
-        for c in &self.gapped {
-            if let Some(d) = self.channels.get(c).and_then(|ch| ch.deadline) {
-                at = at.min(d);
+        if let Some(d) = self.retry_at {
+            at = at.min(d);
+        }
+        for c in self.gapped.iter().chain(&self.retrying) {
+            if let Some(ch) = self.channels.get(c) {
+                for d in [ch.deadline, ch.retry_at].into_iter().flatten() {
+                    at = at.min(d);
+                }
             }
         }
         at
     }
 
     /// A fetch from [`next_action`](Self::next_action) got no answer (a
-    /// connection error or an RPC error). It is asked again.
+    /// connection error or an RPC error). It is asked again after a
+    /// backoff, per box: [`RETRY_MIN`], doubling up to [`RETRY_MAX`], reset
+    /// by the box's next answer. Its updates wait meanwhile.
     pub fn fetch_failed(&mut self, fetch: Fetch) {
+        let now = Instant::now();
         match fetch {
-            Fetch::GetState => {
-                if matches!(self.fetch, CommonFetch::State { .. }) {
-                    self.fetch = CommonFetch::WantState;
-                }
-            }
-            Fetch::GetDifference { .. } => {
-                if matches!(self.fetch, CommonFetch::Difference { .. }) {
-                    self.fetch = CommonFetch::WantDifference;
-                }
+            Fetch::GetState | Fetch::GetDifference { .. } => {
+                let want = match (fetch, self.fetch) {
+                    (Fetch::GetState, CommonFetch::State { .. }) => CommonFetch::WantState,
+                    (Fetch::GetDifference { .. }, CommonFetch::Difference { .. }) => {
+                        CommonFetch::WantDifference
+                    }
+                    _ => return,
+                };
+                self.fetch = want;
+                self.backoff = next_backoff(self.backoff);
+                self.retry_at = Some(now + self.backoff);
             }
             Fetch::GetChannelDifference { channel, .. } => {
                 if let Some(ch) = self.channels.get_mut(&channel)
                     && matches!(ch.fetch, ChannelFetch::InFlight { .. })
                 {
                     ch.fetch = ChannelFetch::Wanted;
-                    self.queue.push_back(channel);
+                    ch.backoff = next_backoff(ch.backoff);
+                    ch.retry_at = Some(now + ch.backoff);
+                    self.retrying.insert(channel);
                     self.in_flight = self.in_flight.saturating_sub(1);
                 }
             }
         }
+    }
+
+    /// A fetch failed in a way asking again cannot fix (for example
+    /// PERSISTENT_TIMESTAMP_INVALID, CHANNEL_INVALID, or a channel whose
+    /// access hash the caller lacks). A failed difference resyncs with
+    /// `updates.getState`; getState itself is asked again as by
+    /// [`fetch_failed`](Self::fetch_failed). A channel's state is dropped,
+    /// as for an undecodable answer: its next update starts it again, and
+    /// its held updates are delivered from there.
+    pub fn fetch_failed_permanently(&mut self, fetch: Fetch) -> Vec<Batch> {
+        match fetch {
+            Fetch::GetState => self.fetch_failed(fetch),
+            Fetch::GetDifference { .. } => {
+                if matches!(self.fetch, CommonFetch::Difference { .. }) {
+                    self.fetch = CommonFetch::WantState;
+                }
+            }
+            Fetch::GetChannelDifference { channel, .. } => {
+                if self
+                    .channels
+                    .get(&channel)
+                    .is_some_and(|ch| matches!(ch.fetch, ChannelFetch::InFlight { .. }))
+                {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    return self.abandon_channel(channel);
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Stops tracking a channel the account can no longer read (e.g.
@@ -744,7 +830,26 @@ impl UpdateManager {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
         self.gapped.remove(&channel);
+        self.retrying.remove(&channel);
         self.committed_channels.remove(&channel);
+    }
+
+    /// Drops a channel's state, so no difference is fetched from it again
+    /// (an undecodable or permanently failed fetch, its call no longer in
+    /// flight): its next update starts it again, and its held updates are
+    /// delivered from there.
+    fn abandon_channel(&mut self, channel: i64) -> Vec<Batch> {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.pts = None;
+            ch.fetch = ChannelFetch::Idle;
+            ch.again = false;
+            ch.retry_at = None;
+            ch.backoff = Duration::ZERO;
+        }
+        self.retrying.remove(&channel);
+        let mut out = Out::new(self.empty_group());
+        self.release_channel(channel, &mut out);
+        self.finish(out)
     }
 
     /// The answer to [`Fetch::GetState`]. Held common and qts updates are
@@ -753,6 +858,7 @@ impl UpdateManager {
         let CommonFetch::State { epoch } = self.fetch else {
             return Vec::new();
         };
+        self.backoff = Duration::ZERO;
         if epoch != self.epoch {
             self.fetch = self.resync();
             return Vec::new();
@@ -794,6 +900,7 @@ impl UpdateManager {
         let CommonFetch::Difference { epoch } = self.fetch else {
             return Vec::new();
         };
+        self.backoff = Duration::ZERO;
         if epoch != self.epoch {
             // Asked before a refused batch rolled the state back.
             self.fetch = self.resync();
@@ -896,6 +1003,7 @@ impl UpdateManager {
             return Vec::new();
         };
         self.in_flight = self.in_flight.saturating_sub(1);
+        ch.backoff = Duration::ZERO;
         if epoch != ch.epoch {
             ch.fetch = ChannelFetch::Wanted;
             self.queue.push_back(channel);
@@ -913,15 +1021,8 @@ impl UpdateManager {
         let d = match d {
             Ok(d) => d,
             Err(e) => {
-                // Skip past it: the channel's state is dropped and its next
-                // update starts it again, so this difference is never
-                // fetched again.
-                ch.pts = None;
-                ch.fetch = ChannelFetch::Idle;
                 self.undecodable("channel difference", &bytes, &e);
-                let mut out = Out::new(self.empty_group());
-                self.release_channel(channel, &mut out);
-                return self.finish(out);
+                return self.abandon_channel(channel);
             }
         };
         let home = self.group(&bytes, d.users, d.chats);
@@ -1567,6 +1668,16 @@ impl UpdateManager {
             error = %e,
             "update manager: undecodable {what} skipped"
         );
+    }
+}
+
+/// The next retry delay after `prev`: [`RETRY_MIN`], then doubling up to
+/// [`RETRY_MAX`].
+fn next_backoff(prev: Duration) -> Duration {
+    if prev.is_zero() {
+        RETRY_MIN
+    } else {
+        (prev * 2).min(RETRY_MAX)
     }
 }
 
