@@ -786,3 +786,48 @@ async fn final_state_is_published_after_the_session_is_released() {
         drop(h);
     }
 }
+
+/// The gate resets only after Telegram confirmed the logout (an answer, a
+/// 401, or a key it no longer knows). Without one, the key stays home with
+/// no login marker, for `tgin admin logout` to retry, and the end says so.
+#[tokio::test]
+async fn wrong_account_logout_must_be_confirmed_before_the_reset() {
+    for (reply, confirmed) in [
+        (Reply::Ok(logged_out()), true),
+        (Reply::Rpc(401, "AUTH_KEY_UNREGISTERED"), true),
+        (Reply::KeyRevoked, true),
+        (Reply::NoAnswer, false),
+        (Reply::Rpc(420, "FLOOD_WAIT_9"), false),
+    ] {
+        let (h, dial, tmp) = begin(
+            Method::Qr,
+            Some(PHONE),
+            vec![
+                (
+                    ids::EXPORT_LOGIN_TOKEN,
+                    Reply::Ok(login_token_success(66, Some("79990000000"))),
+                ),
+                (ids::LOG_OUT, reply.clone()),
+            ],
+        );
+        let want = if confirmed {
+            LoginError::WrongAccount
+        } else {
+            LoginError::WrongAccountNotLoggedOut
+        };
+        assert_eq!(end(&h).await, LoginState::Failed(want.clone()), "{reply:?}");
+        assert!(dial.done(), "{reply:?}");
+        drop(h);
+        let store = wait_reopen(&tmp).await;
+        assert_eq!(store.login().expect("login"), None, "{reply:?}");
+        assert_eq!(
+            store.home_dc().expect("home").is_some(),
+            !confirmed,
+            "{reply:?}"
+        );
+        if !confirmed {
+            assert!(want.to_string().contains("tgin admin logout"), "{want}");
+            assert_eq!(want.code(), "wrong_account_not_logged_out");
+        }
+    }
+}

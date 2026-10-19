@@ -6,8 +6,10 @@
 //! `code_login.rs`) with its R7 fixes:
 //! - **The identity gate.** With a `phone` in the config, the logged-in
 //!   user's phone must match it. On a mismatch the new key is logged out
-//!   (`auth.logOut`), the session is reset and the login ends
-//!   [`Failed`](LoginState::Failed)`(`[`LoginError::WrongAccount`]`)`.
+//!   (`auth.logOut`). Once Telegram confirms it, the session is reset and
+//!   the login ends [`Failed`](LoginState::Failed)`(`[`LoginError::WrongAccount`]`)`;
+//!   without a confirmation the key stays home, with no login, and the end
+//!   is [`LoginError::WrongAccountNotLoggedOut`].
 //! - **The login marker** (self user and `login_unix`) is written in one
 //!   transaction ([`SessionStore::record_login`]), and only after the gate.
 //! - **SRP** runs only once `p`/`g` pass grammers' safety check and `srp_B`
@@ -282,6 +284,13 @@ pub enum LoginError {
     /// config's. The new authorization was logged out again.
     #[error("the logged-in account is not the configured one; it was logged out again")]
     WrongAccount,
+    /// The identity gate found another account, and Telegram did not
+    /// confirm `auth.logOut` of it. The key stays in the session (home DC,
+    /// no login), so the logout can be retried.
+    #[error(
+        "the logged-in account is not the configured one, and Telegram did not confirm its logout: run `tgin admin logout <account> --yes`, or end the session in that account's Settings > Devices"
+    )]
+    WrongAccountNotLoggedOut,
     /// The code flow needs the account's `phone` in the config.
     #[error("the account has no `phone` in the config; the code login needs one")]
     NoPhone,
@@ -312,6 +321,7 @@ impl LoginError {
             Self::MigrateLoop { .. } => "migrate_loop",
             Self::PasswordParams(_) => "password_params",
             Self::WrongAccount => "wrong_account",
+            Self::WrongAccountNotLoggedOut => "wrong_account_not_logged_out",
             Self::NoPhone => "no_phone",
             Self::NotExpected => "not_expected",
             Self::Decode => "decode",
@@ -703,11 +713,18 @@ async fn check_password<L: Link>(link: &L, password: String) -> Result<Step, Log
     }
 }
 
-/// `auth.logOut` on `link`'s key.
+/// `auth.logOut` on `link`'s key: `Ok` once Telegram confirmed that the
+/// key is logged out, by answering it, or by no longer knowing the key
+/// (401, transport −404).
 async fn log_out_key<L: Link>(link: &L) -> Result<(), Fail> {
-    call(link, &tl::functions::auth::LogOut {})
-        .await
-        .map(|_| ())
+    match call(link, &tl::functions::auth::LogOut {}).await {
+        Ok(_)
+        | Err(
+            Fail::Rpc { code: 401, .. }
+            | Fail::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown),
+        ) => Ok(()),
+        Err(f) => Err(f),
+    }
 }
 
 /// Whether the configured `want` and Telegram's `got` are one number:
@@ -907,16 +924,8 @@ pub async fn log_out<D: Dial>(store: &SessionStore, dial: &D) -> Result<(), Logo
         match dial.dial(dc, Some(key), logged_in).await {
             Ok((link, pushes, _)) => {
                 drop(pushes);
-                match log_out_key(&link).await {
-                    // Telegram no longer knows the key: logged out already.
-                    Ok(())
-                    | Err(
-                        Fail::Rpc { code: 401, .. }
-                        | Fail::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown),
-                    ) => {}
-                    Err(f) => {
-                        return Err(LogoutError::Unconfirmed(LoginError::from(f).to_string()));
-                    }
+                if let Err(f) = log_out_key(&link).await {
+                    return Err(LogoutError::Unconfirmed(LoginError::from(f).to_string()));
                 }
             }
             Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => {}
@@ -1155,7 +1164,11 @@ impl<D: Dial> Flow<D> {
                 "login: the logged-in account is not the configured one; logging it out"
             );
             if log_out_key(link).await.is_err() {
-                tracing::warn!("login: auth.logOut of the wrong account got no confirmation");
+                // The key is the only way to retry the logout: keep it.
+                tracing::warn!(
+                    "login: auth.logOut of the wrong account got no confirmation; the key is kept for `tgin admin logout`"
+                );
+                return Err(LoginError::WrongAccountNotLoggedOut);
             }
             self.store.reset_for_login()?;
             return Err(LoginError::WrongAccount);
