@@ -570,8 +570,9 @@ pub struct Rpc {
     /// clients.
     #[schemars(range(min = 1))]
     pub max_rps: At<u32>,
-    /// A `FLOOD_WAIT` or `SLOWMODE_WAIT` up to this long is slept out and
-    /// the request retried; a longer one answers 429 with `Retry-After`.
+    /// A `FLOOD_WAIT` up to this long is slept out and the request
+    /// retried; a longer one, and any `SLOWMODE_WAIT`, answers 429 with
+    /// `Retry-After`. At most 60 s.
     pub flood_sleep_threshold: At<HumanDuration>,
     /// Who may call the account, by name.
     pub clients: IndexMap<Name, At<RpcClient>>,

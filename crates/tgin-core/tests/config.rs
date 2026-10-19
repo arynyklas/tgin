@@ -3949,6 +3949,21 @@ fn session_dir_case_follows_the_platform() {
 
 /// A literal `api_id` out of range names the range.
 #[test]
+fn flood_sleep_threshold_at_most_a_minute() {
+    let yaml = "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { flood_sleep_threshold: 61s } }\n";
+    let err = single_error(yaml);
+    assert_at(
+        &err,
+        "accounts.main.rpc.flood_sleep_threshold",
+        pos(yaml, "61s"),
+    );
+    assert_message(&err, "`61s` is longer than the maximum of 1m");
+    let ok = "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { flood_sleep_threshold: 60s } }\n";
+    let account = &loads(ok).accounts[0];
+    assert_eq!(account.rpc.flood_sleep_threshold, Duration::from_secs(60));
+}
+
+#[test]
 fn api_id_out_of_range() {
     for bad in ["0", "-3", "99999999999"] {
         let yaml = format!(

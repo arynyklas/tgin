@@ -20,6 +20,8 @@ use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
+use tokio::time::{Instant, sleep_until};
+
 use bytes::Bytes;
 
 use crate::decode::BoxKind;
@@ -397,7 +399,8 @@ impl fmt::Debug for Answer {
 /// - [`SenderError::NoAnswer`] and every other failure: returned, never
 ///   resent;
 /// - `FLOOD_WAIT_X` with X ≤ `flood_sleep_threshold`: slept once, then sent
-///   again on the same route;
+///   again on the same route; if `drain` completes during the sleep, the
+///   flood wait is answered with what is left of it;
 /// - `*_MIGRATE_X` from the main session: sent once to the media session
 ///   of DC X;
 /// - a `messages.affected*` answer: its pts go to `sink` in `context`.
@@ -407,7 +410,9 @@ pub async fn call(
     context: BoxKind,
     body: Bytes,
     flood_sleep_threshold: Duration,
+    drain: impl Future<Output = ()>,
 ) -> Answer {
+    let mut drain = std::pin::pin!(drain);
     let mut route = Route::Main;
     let mut resent = false;
     let mut slept = false;
@@ -428,7 +433,21 @@ pub async fn call(
                         if !slept && Duration::from_secs(u64::from(x)) <= flood_sleep_threshold =>
                     {
                         slept = true;
-                        tokio::time::sleep(Duration::from_secs(u64::from(x))).await;
+                        let until = Instant::now() + Duration::from_secs(u64::from(x));
+                        tokio::select! {
+                            () = sleep_until(until) => {}
+                            () = &mut drain => {
+                                // Not executed: the client retries after
+                                // what is left of the wait.
+                                let left = until.saturating_duration_since(Instant::now());
+                                let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+                                return Answer::Error {
+                                    code,
+                                    message,
+                                    class: ErrorClass::FloodWait(u32::try_from(secs).unwrap_or(x)),
+                                };
+                            }
+                        }
                     }
                     ErrorClass::Migrate(dc) if route == Route::Main => route = Route::Media(dc),
                     _ => {

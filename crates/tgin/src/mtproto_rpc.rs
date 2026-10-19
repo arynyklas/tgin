@@ -68,6 +68,7 @@ use tgin_mtproto::schema::{API, MTPROTO};
 use tgin_runtime::limit::{KeyedLimiter, Quota};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// The largest TL request: the sender's bound, 1 044 428 bytes (just under
 /// 1 MiB).
@@ -88,15 +89,20 @@ pub const LAYER_HEADER: &str = "x-tgin-layer";
 pub const RENDER_HEADER: &str = "x-tgin-render";
 
 /// Every account the endpoint serves, by name.
-#[derive(Default)]
 pub struct RpcEndpoint {
     accounts: HashMap<String, Arc<RpcAccount>>,
+    /// Cancelled when tgin drains: a flood sleep then ends at once, with
+    /// 429 and what is left of the wait.
+    drain: CancellationToken,
 }
 
 impl RpcEndpoint {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(drain: CancellationToken) -> Self {
+        Self {
+            accounts: HashMap::new(),
+            drain,
+        }
     }
 
     /// Serves `account` under its name.
@@ -343,6 +349,7 @@ async fn invoke(
         context,
         inner,
         account.flood_sleep_threshold,
+        endpoint.drain.cancelled(),
     )
     .await;
     let response = answer_response(answer, wants_json(&headers, header::ACCEPT), method);

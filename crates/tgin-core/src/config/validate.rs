@@ -174,6 +174,13 @@ fn account(raw: &RawConfig, diag: &mut Diagnostics, path: &str, account: &Accoun
         format!("{path}.rpc.flood_sleep_threshold"),
         &account.rpc.flood_sleep_threshold,
     );
+    at_most(
+        diag,
+        format!("{path}.rpc.flood_sleep_threshold"),
+        &account.rpc.flood_sleep_threshold,
+        MAX_FLOOD_SLEEP,
+        "a request waits this long on its HTTP connection; a longer flood wait answers 429 with Retry-After",
+    );
     for (client_name, client) in &account.rpc.clients {
         let path = format!("{path}.rpc.clients.{}", client_name.as_str());
         check_name(diag, &path, client_name.as_str(), client.location);
@@ -1070,6 +1077,10 @@ fn commands(diag: &mut Diagnostics, path: &str, commands: &[At<String>]) {
         }
     }
 }
+
+/// The longest `flood_sleep_threshold`: a request sleeping out a flood
+/// wait holds its client's HTTP connection.
+const MAX_FLOOD_SLEEP: Duration = Duration::from_secs(60);
 
 /// Rejects humantime's month and year units.
 fn duration(diag: &mut Diagnostics, path: impl Into<String>, value: &At<HumanDuration>) {

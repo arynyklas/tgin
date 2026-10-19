@@ -17,6 +17,7 @@ use tgin_mtproto::rpc::{AccountRpc, AffectedSink, BoxFuture, InvokeError, Route}
 use tgin_mtproto::schema::{API, MTPROTO};
 use tgin_mtproto::{AuthKey, RpcOutcome, SenderError, SessionError};
 use tgin_runtime::secret::Secret;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
 const TOKEN: &str = "client-token-0123456789";
@@ -120,7 +121,16 @@ fn allow_all() -> MethodAcl {
 }
 
 fn app_with(account: Arc<dyn AccountRpc>, sink: Arc<FakeSink>, rpc: &Rpc) -> Router {
-    let mut endpoint = RpcEndpoint::new();
+    app_draining(account, sink, rpc, CancellationToken::new())
+}
+
+fn app_draining(
+    account: Arc<dyn AccountRpc>,
+    sink: Arc<FakeSink>,
+    rpc: &Rpc,
+    drain: CancellationToken,
+) -> Router {
+    let mut endpoint = RpcEndpoint::new(drain);
     endpoint.insert(RpcAccount::new("main", rpc, account, sink));
     router(Arc::new(endpoint))
 }
@@ -361,6 +371,26 @@ async fn flood_below_threshold_slept_once() {
     assert_eq!(answer.retry_after(), Some("5"));
     assert_eq!(start.elapsed(), Duration::from_secs(5));
     assert_eq!(account.calls().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn flood_sleep_ends_on_drain() {
+    let account = FakeAccount::new([err(420, "FLOOD_WAIT_9"), ok(NEAREST)]);
+    let drain = CancellationToken::new();
+    let app = app_draining(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, allow_all()),
+        drain.clone(),
+    );
+    let pending = tokio::spawn(async move { send(&app, tl(GET_CONFIG)).await });
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    drain.cancel();
+    let answer = pending.await.expect("answered");
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.retry_after(), Some("6"));
+    assert_eq!(answer.body, Bytes::from(rpc_error_tl(420, "FLOOD_WAIT_9")));
+    assert_eq!(account.calls().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
