@@ -817,6 +817,20 @@ async fn minus_404_before_login_is_key_unknown() {
     assert_eq!(h.opens(), [true]);
 }
 
+/// A login on a sender made before it marks the key logged in: a later
+/// −404 is a revoked key, not an unknown one.
+#[tokio::test(start_paused = true)]
+async fn mark_logged_in_turns_minus_404_into_key_revoked() {
+    let (h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    first_call(&h, &mut srv).await;
+    h.sender.mark_logged_in();
+    let call = h.invoke(get_config());
+    srv.request().await;
+    srv.fail(TransportError::Status(404));
+    let result = outcome(call).await;
+    assert!(matches!(result, Err(SenderError::KeyRevoked)), "{result:?}");
+}
+
 /// Every connection opens with the sender's own `initConnection` call;
 /// callers' requests wait for its answer and are never wrapped (P5).
 #[tokio::test(start_paused = true)]

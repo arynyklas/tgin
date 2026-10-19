@@ -56,6 +56,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Read as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -123,7 +125,8 @@ pub struct InitParams {
     /// in `invokeWithoutUpdates`, and pushes are dropped.
     pub without_updates: bool,
     /// The key has a self user: a transport −404 is
-    /// [`SenderError::KeyRevoked`], else [`SenderError::KeyUnknown`].
+    /// [`SenderError::KeyRevoked`], else [`SenderError::KeyUnknown`]. A
+    /// login on the sender later calls [`Sender::mark_logged_in`].
     pub logged_in: bool,
     layer: i32,
 }
@@ -300,6 +303,7 @@ pub struct Sender {
     dc_id: i32,
     max_body: usize,
     commands: mpsc::Sender<Command>,
+    logged_in: Arc<AtomicBool>,
 }
 
 /// The update containers a main session's connection pushes, in arrival
@@ -378,6 +382,7 @@ impl Sender {
         } else {
             pushes_rx
         };
+        let logged_in = Arc::new(AtomicBool::new(init.logged_in));
         let actor = Actor {
             transport,
             dc,
@@ -388,7 +393,7 @@ impl Sender {
                 dc_id: dc.id,
                 init_call,
                 without_updates: init.without_updates,
-                logged_in: init.logged_in,
+                logged_in: Arc::clone(&logged_in),
                 tuning,
                 clock: Clock {
                     offset: time_offset,
@@ -405,6 +410,7 @@ impl Sender {
                 dc_id: dc.id,
                 max_body,
                 commands,
+                logged_in,
             },
             Pushes(pushes),
             new_key,
@@ -415,6 +421,12 @@ impl Sender {
     #[must_use]
     pub fn dc_id(&self) -> i32 {
         self.dc_id
+    }
+
+    /// The key now has a self user (a login completed on this sender):
+    /// from here on a transport −404 is [`SenderError::KeyRevoked`].
+    pub fn mark_logged_in(&self) {
+        self.logged_in.store(true, Ordering::Relaxed);
     }
 
     /// Sends one request (a serialized TL function) and waits for its
@@ -483,7 +495,7 @@ struct Shared {
     /// The connection's first call; see [`InitParams::init_call`].
     init_call: Bytes,
     without_updates: bool,
-    logged_in: bool,
+    logged_in: Arc<AtomicBool>,
     tuning: Tuning,
     clock: Clock,
     /// Per key, not per session, so a fresh connection keeps it.
@@ -723,11 +735,13 @@ impl<T: Transport> Actor<T> {
             }
         };
         let gone = match &cause {
-            Cause::Transport(TransportError::Status(404)) => Some(if st.logged_in {
-                KeyGone::Revoked
-            } else {
-                KeyGone::Unknown
-            }),
+            Cause::Transport(TransportError::Status(404)) => {
+                Some(if st.logged_in.load(Ordering::Relaxed) {
+                    KeyGone::Revoked
+                } else {
+                    KeyGone::Unknown
+                })
+            }
             _ => None,
         };
         match gone {
