@@ -39,7 +39,12 @@ fn config(token: &str, extra: &str) -> String {
 
 /// The account's session, logged in on DC 2.
 fn logged_in(dir: &Path) {
-    let store = SessionStore::open(&dir.join("sessions").join("main")).expect("store");
+    logged_in_as(dir, "main");
+}
+
+/// The account `name`'s session, logged in as user 42 on DC 2.
+fn logged_in_as(dir: &Path, name: &str) {
+    let store = SessionStore::open(&dir.join("sessions").join(name)).expect("store");
     store.set_home_key(2, &AuthKey([2; 256])).expect("key");
     store
         .record_login(Peer {
@@ -340,5 +345,114 @@ async fn unmatched_account_updates_are_counted() {
     })
     .await
     .unwrap_or_else(|_| panic!("{line} missing:\n{}", tgin.metrics.encode()));
+    tgin.stop().await;
+}
+
+/// Two accounts of one config, both logged in as one user: the first in
+/// config order runs, the second waits as a duplicate until the first is
+/// removed. The removed account's series go with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_runs_once_its_user_is_released() {
+    let net = FakeNetwork::new();
+    net.answer(|call| match call.ctor() {
+        ids::GET_DIFFERENCE => Reply::Ok(tgin_mtproto::testkit::difference(
+            &[tgin_mtproto::testkit::private_message(1, 100, "hi")],
+            11,
+            1,
+            1,
+        )),
+        _ => Reply::Ok(ANSWER.to_vec()),
+    });
+    let second = "  second:\n    api_id: 1\n    api_hash: other-api-hash-value-01\n    session_dir: sessions/second\n";
+    let yaml = format!("{}{second}", config(CLIENT_A, ""));
+    let dir = tempfile::tempdir().expect("tempdir");
+    logged_in_as(dir.path(), "main");
+    logged_in_as(dir.path(), "second");
+    let file = dir.path().join("tgin.yaml");
+    std::fs::write(&file, &yaml).expect("config");
+    let mut boot = Boot::load(&file, Arc::new(MapEnv::default())).expect("config loads");
+    boot.accounts_network = Arc::new(move |_| Arc::new(net.clone()));
+    let app = App::start(boot).await.expect("tgin starts");
+    let (signals, rx) = mpsc::channel(4);
+    let tgin = Tgin {
+        data: app.data_addrs()[0],
+        admin: app.admin_addrs()[0],
+        metrics: app.metrics(),
+        run: tokio::spawn(app.run(Signals::from_channel(rx))),
+        signals,
+        file,
+        dir,
+        http: reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client"),
+    };
+    let states = || async {
+        let (_, body) = tgin.accounts().await;
+        let json: Value = serde_json::from_str(&body).expect("json");
+        json["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .map(|a| {
+                (
+                    a["name"].as_str().unwrap_or_default().to_owned(),
+                    a["state"].as_str().unwrap_or_default().to_owned(),
+                    a["reason"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    timeout(PATIENCE, async {
+        loop {
+            let s = states().await;
+            if s.iter().any(|a| a.1 == "running") && s.iter().any(|a| a.1 == "failed") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("one runs, one fails");
+    let s = states().await;
+    assert!(
+        s.contains(&("main".into(), "running".into(), String::new())),
+        "{s:?}"
+    );
+    assert!(
+        s.contains(&("second".into(), "failed".into(), "duplicate_account".into())),
+        "{s:?}"
+    );
+    assert_eq!(tgin.call(CLIENT_A).await.status(), 200);
+    let unmatched = r#"tgin_routes_unmatched_total{source="main"} 1"#;
+    timeout(PATIENCE, async {
+        while !tgin.metrics.encode().lines().any(|l| l == unmatched) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("main's update is unmatched");
+
+    // Without main, second takes the user.
+    tgin.reload(
+        &yaml
+            .replace("  main:\n", "  first:\n")
+            .replace("sessions/main", "sessions/first"),
+    )
+    .await;
+    timeout(PATIENCE, async {
+        while !states()
+            .await
+            .contains(&("second".into(), "running".into(), String::new()))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("second runs");
+    let metrics = tgin.metrics.encode();
+    for gone in [r#"account="main""#, r#"source="main""#] {
+        assert!(!metrics.contains(gone), "{gone} still in:\n{metrics}");
+    }
     tgin.stop().await;
 }

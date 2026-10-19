@@ -129,24 +129,34 @@ impl RpcEndpoint {
         }
     }
 
-    /// Serves `account` under its name, in place of the one it had.
+    /// Serves `account` under its name, in place of the one it had; the
+    /// series of a client the new one no longer has are removed.
     pub fn insert(&self, mut account: RpcAccount) {
         self.metrics.attach(&mut account);
         let account = Arc::new(account);
+        let previous = self.accounts.load().get(&account.name).cloned();
         self.accounts.rcu(|accounts| {
             let mut accounts = HashMap::clone(accounts);
             accounts.insert(account.name.clone(), Arc::clone(&account));
             accounts
         });
+        if let Some(previous) = previous {
+            let kept = |name: &str| account.clients.iter().any(|c| c.name == name);
+            self.metrics.forget(&previous, &kept, false);
+        }
     }
 
-    /// Stops serving the account `name`.
+    /// Stops serving the account `name` and removes its series.
     pub fn remove(&self, name: &str) {
+        let previous = self.accounts.load().get(name).cloned();
         self.accounts.rcu(|accounts| {
             let mut accounts = HashMap::clone(accounts);
             accounts.remove(name);
             accounts
         });
+        if let Some(previous) = previous {
+            self.metrics.forget(&previous, &|_| false, true);
+        }
     }
 
     /// `now` while a call is on its way to Telegram, else when the last one
@@ -282,6 +292,25 @@ impl RpcMetrics {
                     outcome: outcome.as_str(),
                 })
             }));
+        }
+    }
+
+    /// Removes the series of `account`'s clients that `kept` does not
+    /// name, and with `whole` the account's own.
+    fn forget(&self, account: &RpcAccount, kept: &dyn Fn(&str) -> bool, whole: bool) {
+        for client in account.clients.iter().filter(|c| !kept(&c.name)) {
+            for outcome in Outcome::ALL {
+                self.calls.remove(&RpcLabels {
+                    account: account.name.clone(),
+                    client: client.name.clone(),
+                    outcome: outcome.as_str(),
+                });
+            }
+        }
+        if whole {
+            self.seconds.remove(&AccountLabel {
+                account: account.name.clone(),
+            });
         }
     }
 

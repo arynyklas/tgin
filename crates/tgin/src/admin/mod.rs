@@ -69,12 +69,15 @@
 //! The `tg://login` URL appears in these answers only; it, codes and
 //! passwords are never logged. `POST …/logout` calls `auth.logOut` and
 //! clears the session (keys, login, peers, update state; the directory
-//! stays, under its lock). The account routes need `admin.token`: without one they answer 403
+//! stays, under its lock). A running account is parked for it first: its
+//! ingest stops with everything admitted committed, its RPC calls get up
+//! to 10 s, and it releases the session; it then shows `logged_out`, or
+//! runs again on its key when Telegram did not confirm the logout. The account routes need `admin.token`: without one they answer 403
 //! `admin.token required for account login` (a token-less loopback listener
 //! is open to every local user and every web page), and every login
 //! answer carries `Cache-Control: no-store`. Failures: 400 `invalid body`, 404 `unknown
-//! account`, 404 `no login`, 409 `account running` (both refuse while the
-//! account runs), 409 `logged in` (log out first), 409 `session held` (by
+//! account`, 404 `no login`, 409 `account running` (a login while the
+//! account runs), 409 `logout in progress`, 409 `logged in` (log out first), 409 `session held` (by
 //! another process), 409 `session unverified` (a key left by an unfinished
 //! login, which Telegram gave no clear answer about: try again, or log
 //! out), 409 `login in progress` (with the other method), 422

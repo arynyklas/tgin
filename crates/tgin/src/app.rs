@@ -332,6 +332,7 @@ impl App {
         }));
         let account_sources = Arc::new(AccountSources::new(
             Arc::clone(&engine),
+            core.clone(),
             accounts_network,
             registry,
             Arc::clone(&endpoint),

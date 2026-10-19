@@ -11,6 +11,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use prometheus_client::collector::Collector;
@@ -20,6 +22,7 @@ use prometheus_client::metrics::counter::ConstCounter;
 use prometheus_client::metrics::gauge::ConstGauge;
 use tgin_core::config::{self, Config};
 use tgin_core::engine::Engine;
+use tgin_core::metrics::CoreMetrics;
 use tgin_mtproto::InitParams;
 use tgin_mtproto::account::{
     Account, AccountSpec, AccountState, AccountStatus, Network, Registry, TcpNetwork,
@@ -56,19 +59,30 @@ struct Running {
     limiter: Arc<AccountLimiter>,
 }
 
+/// How long a logout waits for a running account's RPC calls before it
+/// closes the account's session.
+pub(crate) const PARK_RPC_WAIT: Duration = Duration::from_secs(10);
+/// How long starting an account waits for it to read its session and
+/// claim its user, so accounts claim in config order.
+const CHECK_WAIT: Duration = Duration::from_secs(5);
+
 /// The accounts of the running config.
 pub(crate) struct AccountSources {
     engine: Arc<Engine>,
+    core: CoreMetrics,
     network: AccountNetwork,
     registry: Arc<Registry>,
     endpoint: Arc<RpcEndpoint>,
     board: Arc<Board>,
     running: Mutex<BTreeMap<String, Running>>,
+    /// The shutdown stopped the accounts: nothing starts any more.
+    stopped: AtomicBool,
 }
 
 impl AccountSources {
     pub(crate) fn new(
         engine: Arc<Engine>,
+        core: CoreMetrics,
         network: AccountNetwork,
         registry: Arc<Registry>,
         endpoint: Arc<RpcEndpoint>,
@@ -76,11 +90,13 @@ impl AccountSources {
     ) -> Self {
         Self {
             engine,
+            core,
             network,
             registry,
             endpoint,
             board,
             running: Mutex::new(BTreeMap::new()),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -89,8 +105,9 @@ impl AccountSources {
         &self.endpoint
     }
 
-    /// Makes the running accounts those of `cfg`: starts the new ones,
-    /// stops the removed ones, restarts those whose `api_id`, `api_hash` or
+    /// Makes the running accounts those of `cfg`: starts the new ones, in
+    /// config order (of two accounts of one user, the first wins), stops
+    /// the removed ones, restarts those whose `api_id`, `api_hash` or
     /// `session_dir` changed (the old one releases the session first), and
     /// applies `rpc` changes in place.
     pub(crate) async fn apply(&self, cfg: &Config) {
@@ -131,6 +148,7 @@ impl AccountSources {
                         if let Some(run) = running.remove(&name) {
                             self.endpoint.remove(&name);
                             self.board.0.write().remove(&name);
+                            self.core.remove_source(&name);
                             tracing::info!(account = %name, "the account was removed; it stops");
                             closing.push(run.account);
                         }
@@ -145,57 +163,86 @@ impl AccountSources {
                 }
             }
         }
+        starting.sort_by_key(|a| cfg.accounts.iter().position(|c| c.name == a.name));
+        // Closing releases their users: an account refused as a duplicate
+        // of one of them looks again.
         for account in closing {
             account.close().await;
         }
         for config in starting {
-            self.start(config);
+            self.start(config).await;
         }
     }
 
-    fn start(&self, config: config::Account) {
+    /// Starts the account of `config`, unless the shutdown stopped the
+    /// accounts, and waits (bounded) until it has claimed its user.
+    async fn start(&self, config: config::Account) {
         let limiter = Arc::new(AccountLimiter::new(config.rpc.max_rps));
-        let spec = AccountSpec {
-            name: config.name.clone(),
-            session_dir: config.session_dir.expose().clone(),
-            charge: Some(Arc::clone(&limiter) as Arc<dyn tgin_mtproto::rpc::Charge>),
+        let account = {
+            // Under the lock the shutdown stops the accounts with: an
+            // account started here is stopped by it, or not started.
+            let mut running = self.running.lock();
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let spec = AccountSpec {
+                name: config.name.clone(),
+                session_dir: config.session_dir.expose().clone(),
+                charge: Some(Arc::clone(&limiter) as Arc<dyn tgin_mtproto::rpc::Charge>),
+            };
+            let sink = Arc::new(AccountIngest::new(Arc::clone(&self.engine), &config.name));
+            let account = Account::start(
+                spec,
+                sink,
+                (self.network)(&config),
+                Arc::clone(&self.registry),
+            );
+            running.insert(
+                config.name.clone(),
+                Running {
+                    account: account.clone(),
+                    config: config.clone(),
+                    limiter: Arc::clone(&limiter),
+                },
+            );
+            account
         };
-        let sink = Arc::new(AccountIngest::new(Arc::clone(&self.engine), &config.name));
-        let account = Account::start(
-            spec,
-            sink,
-            (self.network)(&config),
-            Arc::clone(&self.registry),
-        );
         self.endpoint.insert(RpcAccount::new(
             &config.name,
             &config.rpc,
             account.rpc(),
             account.affected(),
-            Arc::clone(&limiter),
+            limiter,
         ));
         self.board
             .0
             .write()
             .insert(config.name.clone(), account.clone());
         tracing::info!(account = %config.name, "account started");
-        self.running.lock().insert(
-            config.name.clone(),
-            Running {
-                account,
-                config,
-                limiter,
-            },
-        );
+        let _ = tokio::time::timeout(CHECK_WAIT, account.checked()).await;
     }
 
     /// Whether the account `name` holds, or will take again on its own,
-    /// its session: logins and logouts wait.
+    /// its session.
     pub(crate) fn running(&self, name: &str) -> bool {
         self.running
             .lock()
             .get(name)
             .is_some_and(|run| run.account.state().active())
+    }
+
+    /// Parks the account `name` for a logout: its ingest stops (everything
+    /// admitted is committed), its RPC calls get [`PARK_RPC_WAIT`], and its
+    /// session is released. It starts again at once and waits, as
+    /// `logged_out`, while the logout holds the session.
+    pub(crate) async fn park(&self, name: &str) {
+        let run = self.running.lock().remove(name);
+        let Some(run) = run else {
+            return;
+        };
+        tracing::info!(account = %name, "the account is parked for a logout");
+        run.account.park(PARK_RPC_WAIT).await;
+        self.start(run.config).await;
     }
 
     /// The session of account `name` changed outside it (a login or a
@@ -210,20 +257,27 @@ impl AccountSources {
         self.board.statuses()
     }
 
-    /// Stops every account's ingest; their RPC goes on until
+    /// Stops every account's ingest, for good: no account starts after
+    /// this, a reload's included. Their RPC goes on until
     /// [`close`](Self::close).
     pub(crate) fn stop_ingest(&self) {
-        for run in self.running.lock().values() {
+        let running = self.running.lock();
+        self.stopped.store(true, Ordering::SeqCst);
+        for run in running.values() {
             run.account.stop_ingest();
         }
     }
 
     /// Closes every account, aborting those still running at `deadline`.
     pub(crate) async fn close(&self, deadline: Instant) {
-        let accounts: Vec<Account> = std::mem::take(&mut *self.running.lock())
-            .into_values()
-            .map(|run| run.account)
-            .collect();
+        let accounts: Vec<Account> = {
+            let mut running = self.running.lock();
+            self.stopped.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *running)
+                .into_values()
+                .map(|run| run.account)
+                .collect()
+        };
         for account in accounts {
             if tokio::time::timeout_at(deadline, account.close())
                 .await
@@ -231,6 +285,7 @@ impl AccountSources {
             {
                 tracing::warn!(account = %account.name(), "the account did not close in time");
                 account.abort();
+                account.close().await;
             }
         }
     }
@@ -303,5 +358,65 @@ impl Collector for AccountsCollector {
             }
         }
         self.rpc.encode(&mut encoder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tgin_core::engine::EngineRuntime;
+    use tgin_mtproto::testkit::FakeNetwork;
+    use tgin_runtime::config::MapEnv;
+    use tgin_runtime::obs::MetricsRegistry;
+    use tgin_runtime::supervisor::Supervisor;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    /// After the shutdown stopped the accounts, a reload still on its way
+    /// starts none.
+    #[tokio::test]
+    async fn nothing_starts_once_the_accounts_are_stopped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = format!(
+            "version: 1\naccounts:\n  main:\n    api_id: 1\n    api_hash: h\n    session_dir: '{}'\n",
+            dir.path().join("main").display()
+        );
+        let cfg = tgin_core::config::load(&yaml, Path::new("tgin.yaml"), &MapEnv::default())
+            .expect("valid config");
+        let mut registry = MetricsRegistry::new("test", "test");
+        let core = CoreMetrics::register(registry.registry_mut());
+        let engine = Engine::new(
+            &cfg,
+            core.clone(),
+            reqwest::Client::new(),
+            EngineRuntime {
+                supervisor: Arc::new(Supervisor::new()),
+                stop: CancellationToken::new(),
+                force: CancellationToken::new(),
+                via: tgin_runtime::http::Via::generate(),
+                reply: Default::default(),
+            },
+        )
+        .expect("engine");
+        let net = FakeNetwork::new();
+        let network: AccountNetwork = {
+            let net = net.clone();
+            Arc::new(move |_| Arc::new(net.clone()))
+        };
+        let sources = AccountSources::new(
+            Arc::new(engine),
+            core,
+            network,
+            Arc::new(Registry::default()),
+            Arc::new(RpcEndpoint::new(CancellationToken::new())),
+            Arc::new(Board::default()),
+        );
+        sources.stop_ingest();
+        sources.apply(&cfg).await;
+        assert!(sources.statuses().is_empty(), "no account started");
+        assert!(!dir.path().join("main").exists(), "no session opened");
+        assert!(net.dials().is_empty());
     }
 }

@@ -111,6 +111,10 @@ pub(crate) trait AccountHandle: Send + Sync + 'static {
     /// up: the account looks at its session again (a logged-out account
     /// that is now logged in starts).
     fn changed(&self, account: &str);
+    /// Parks a running account so a logout can use its session: its ingest
+    /// stops, its RPC calls get a bounded wait, and it releases the
+    /// session, waiting while a logout holds it.
+    fn park(&self, account: &str) -> BoxFuture<'static, ()>;
 }
 
 /// The production handle: Telegram's DCs over TCP, and the accounts'
@@ -150,6 +154,12 @@ impl AccountHandle for Sessions {
     fn changed(&self, account: &str) {
         self.0.wake(account);
     }
+
+    fn park(&self, account: &str) -> BoxFuture<'static, ()> {
+        let sources = Arc::clone(&self.0);
+        let account = account.to_owned();
+        Box::pin(async move { sources.park(&account).await })
+    }
 }
 
 pub(crate) fn start_refusal(e: StartError) -> Refusal {
@@ -187,12 +197,18 @@ enum Entry {
         target: Target,
     },
     Running(Login),
+    /// A logout holds the session: the account stays parked, and a login
+    /// waits.
+    LoggingOut {
+        id: u64,
+        target: Target,
+    },
 }
 
 impl Entry {
     fn target(&self) -> &Target {
         match self {
-            Self::Starting { target, .. } => target,
+            Self::Starting { target, .. } | Self::LoggingOut { target, .. } => target,
             Self::Running(login) => &login.target,
         }
     }
@@ -217,9 +233,10 @@ impl Accounts {
 
     /// The account's login: `Ok(None)` while one is starting.
     fn login(&self, name: &str) -> Option<Option<Arc<LoginHandle>>> {
-        self.logins.lock().get(name).map(|entry| match entry {
-            Entry::Starting { .. } => None,
-            Entry::Running(login) => Some(Arc::clone(&login.handle)),
+        self.logins.lock().get(name).and_then(|entry| match entry {
+            Entry::Starting { .. } => Some(None),
+            Entry::Running(login) => Some(Some(Arc::clone(&login.handle))),
+            Entry::LoggingOut { .. } => None,
         })
     }
 
@@ -255,7 +272,7 @@ impl Accounts {
             .lock()
             .get(name)
             .is_some_and(|entry| match entry {
-                Entry::Starting { .. } => true,
+                Entry::Starting { .. } | Entry::LoggingOut { .. } => true,
                 Entry::Running(login) => !login.handle.state().is_final(),
             })
     }
@@ -290,9 +307,10 @@ impl Login {
     }
 }
 
-/// A start's [`Entry::Starting`] reservation. Dropping it removes the
-/// entry if it is still this start's reservation; once the login is
-/// installed the entry is `Running`, so there is nothing to remove.
+/// A start's [`Entry::Starting`] or a logout's [`Entry::LoggingOut`]
+/// reservation. Dropping it removes the entry if it is still this
+/// reservation, and tells the account; once a login is installed the entry
+/// is `Running`, so there is nothing to remove.
 struct Reservation<'a> {
     accounts: &'a Accounts,
     name: &'a str,
@@ -305,7 +323,7 @@ impl Drop for Reservation<'_> {
             let mut logins = self.accounts.logins.lock();
             let ours = matches!(
                 logins.get(self.name),
-                Some(Entry::Starting { id, .. }) if *id == self.id
+                Some(Entry::Starting { id, .. } | Entry::LoggingOut { id, .. }) if *id == self.id
             );
             ours && logins.remove(self.name).is_some()
         };
@@ -482,6 +500,9 @@ async fn start<S: AccountsState>(
             Some(Entry::Starting { .. }) => {
                 return error(StatusCode::CONFLICT, "login starting");
             }
+            Some(Entry::LoggingOut { .. }) => {
+                return error(StatusCode::CONFLICT, "logout in progress");
+            }
             Some(Entry::Running(login)) if !login.handle.state().is_final() => {
                 if login.method != method {
                     return error(StatusCode::CONFLICT, "login in progress");
@@ -655,7 +676,13 @@ async fn cancel<S: AccountsState>(
     if state.target(&name).is_none() {
         return unknown_account();
     }
-    let login = state.accounts().logins.lock().remove(&name);
+    let login = {
+        let mut logins = state.accounts().logins.lock();
+        if let Some(Entry::LoggingOut { .. }) = logins.get(&name) {
+            return error(StatusCode::CONFLICT, "logout in progress");
+        }
+        logins.remove(&name)
+    };
     match login {
         Some(login) => {
             login.close().await;
@@ -667,6 +694,12 @@ async fn cancel<S: AccountsState>(
     }
 }
 
+/// `POST …/logout`. A running account is parked first: its ingest stops
+/// (everything admitted is committed), its RPC calls get a bounded wait,
+/// and it releases the session. Meanwhile the account waits as
+/// `logged_out` and a login gets 409. Once the logout ends the account
+/// looks again: logged out, or, when Telegram did not confirm the logout,
+/// running again on its key.
 async fn logout<S: AccountsState>(
     _: TokenConfigured,
     State(state): State<S>,
@@ -676,25 +709,43 @@ async fn logout<S: AccountsState>(
         return unknown_account();
     };
     let accounts = state.accounts();
-    if accounts.handle.running(&name) {
-        return running();
-    }
+    let id = accounts.starts.fetch_add(1, Ordering::Relaxed);
     // A login in progress ends first, releasing the session; one still
     // starting holds the session until it is installed.
     let login = {
         let mut logins = accounts.logins.lock();
-        if let Some(Entry::Starting { .. }) = logins.get(&name) {
-            return error(StatusCode::CONFLICT, "login starting");
+        match logins.get(&name) {
+            Some(Entry::Starting { .. }) => {
+                return error(StatusCode::CONFLICT, "login starting");
+            }
+            Some(Entry::LoggingOut { .. }) => {
+                return error(StatusCode::CONFLICT, "logout in progress");
+            }
+            _ => {}
         }
-        logins.remove(&name)
+        logins.insert(
+            name.clone(),
+            Entry::LoggingOut {
+                id,
+                target: target.clone(),
+            },
+        )
+    };
+    // Removes the reservation and wakes the account on every way out.
+    let _reservation = Reservation {
+        accounts,
+        name: &name,
+        id,
     };
     if let Some(login) = login {
         login.close().await;
     }
+    if accounts.handle.running(&name) {
+        accounts.handle.park(&name).await;
+    }
     match accounts.handle.log_out(&target).await {
         Ok(()) => {
             tracing::info!(account = %name, "account logged out");
-            accounts.handle.changed(&name);
             axum::Json(json!({ "logged_out": true })).into_response()
         }
         Err(refusal) => refused(&name, &refusal),

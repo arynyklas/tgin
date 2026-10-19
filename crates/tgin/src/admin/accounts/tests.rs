@@ -26,6 +26,11 @@ struct Fake {
     dial: ScriptedDial,
     /// The accounts `changed` was called for, in order.
     changed: std::sync::Mutex<Vec<String>>,
+    /// The accounts `park` was called for, in order.
+    parked: std::sync::Mutex<Vec<String>>,
+    /// While set, `park` waits for `release`.
+    hold: AtomicBool,
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl AccountHandle for Fake {
@@ -63,6 +68,18 @@ impl AccountHandle for Fake {
             .lock()
             .expect("changed")
             .push(account.to_owned());
+    }
+
+    fn park(&self, account: &str) -> BoxFuture<'static, ()> {
+        self.parked.lock().expect("parked").push(account.to_owned());
+        self.running.store(false, Ordering::SeqCst);
+        let hold = self.hold.load(Ordering::SeqCst);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if hold {
+                release.notified().await;
+            }
+        })
     }
 }
 
@@ -104,6 +121,9 @@ fn setup_with(token: bool, phone: Option<&str>, script: Vec<(u32, Reply)>) -> Se
         running: AtomicBool::new(false),
         dial: ScriptedDial::new(script),
         changed: std::sync::Mutex::new(Vec::new()),
+        parked: std::sync::Mutex::new(Vec::new()),
+        hold: AtomicBool::new(false),
+        release: Arc::new(tokio::sync::Notify::new()),
     });
     let target = Target {
         session_dir: dir.path().join("main"),
@@ -503,10 +523,7 @@ async fn wrong_account_logged_out() {
 async fn login_refused_while_running() {
     let s = setup(None, vec![]);
     s.fake.running.store(true, Ordering::SeqCst);
-    for (path, body) in [
-        ("/v1/accounts/main/login", r#"{"method":"qr"}"#),
-        ("/v1/accounts/main/logout", ""),
-    ] {
+    for (path, body) in [("/v1/accounts/main/login", r#"{"method":"qr"}"#)] {
         let (status, text) = call(&s.app, "POST", path, body).await;
         assert_eq!(status, StatusCode::CONFLICT, "{path}");
         assert_eq!(text, r#"{"error":"account running"}"#, "{path}");
@@ -1043,4 +1060,78 @@ async fn a_finished_login_wakes_its_account() {
     .expect("the account is told");
     assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
     assert!(!s.state.accounts.login_in_progress("main"));
+}
+
+/// A logged-in session on DC 2 for `main`.
+fn home_key(s: &Setup) {
+    let store = SessionStore::open(&s.dir.path().join("main")).expect("open");
+    store
+        .set_home_key(2, &tgin_mtproto::AuthKey([1; 256]))
+        .expect("key");
+}
+
+/// A logout of a running account parks it first, then tells it the
+/// session changed, whether Telegram confirmed the logout or not.
+#[tokio::test]
+async fn logout_parks_a_running_account() {
+    for (reply, status) in [
+        (Reply::Ok(logged_out()), StatusCode::OK),
+        (Reply::NoAnswer, StatusCode::BAD_GATEWAY),
+    ] {
+        let s = setup(None, vec![(ids::LOG_OUT, reply)]);
+        home_key(&s);
+        s.fake.running.store(true, Ordering::SeqCst);
+        let (got, body) = call(&s.app, "POST", "/v1/accounts/main/logout", "").await;
+        assert_eq!(got, status, "{body}");
+        assert_eq!(*s.fake.parked.lock().expect("parked"), ["main"]);
+        assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
+        assert!(s.fake.dial.done(), "auth.logOut was sent");
+        assert!(!s.state.accounts.login_in_progress("main"));
+    }
+}
+
+/// While a logout holds the session, the account stays parked and a
+/// login gets 409.
+#[tokio::test]
+async fn a_login_waits_for_a_logout() {
+    let s = setup(None, vec![(ids::LOG_OUT, Reply::Ok(logged_out()))]);
+    home_key(&s);
+    s.fake.running.store(true, Ordering::SeqCst);
+    s.fake.hold.store(true, Ordering::SeqCst);
+    let logout = {
+        let app = s.app.clone();
+        tokio::spawn(async move { call(&app, "POST", "/v1/accounts/main/logout", "").await })
+    };
+    timeout(WAIT, async {
+        while s.fake.parked.lock().expect("parked").is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the account is parked");
+    assert!(
+        s.state.accounts.login_in_progress("main"),
+        "the account stays parked"
+    );
+    let (status, body) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::CONFLICT, r#"{"error":"logout in progress"}"#)
+    );
+    let (status, _) = call(&s.app, "POST", "/v1/accounts/main/logout", "").await;
+    assert_eq!(status, StatusCode::CONFLICT, "one logout at a time");
+    assert!(s.fake.changed.lock().expect("changed").is_empty());
+    s.fake.release.notify_one();
+    let (status, body) = timeout(WAIT, logout)
+        .await
+        .expect("ends")
+        .expect("no panic");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
 }
