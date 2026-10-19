@@ -498,7 +498,15 @@ async fn probes_unauthenticated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_requires_token() {
     let telegram = telegram().await;
-    let tgin = start("status_requires_token", &hooked(&telegram, "")).await;
+    // An account, so its routes are mounted: they too sit behind the token,
+    // and an unauthorized request never reaches the session or Telegram.
+    let session = scratch("status_requires_token").join("session-main");
+    let _ = std::fs::remove_dir_all(&session);
+    let account = format!(
+        "accounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: '{}' }}\n",
+        session.display()
+    );
+    let tgin = start("status_requires_token", &hooked(&telegram, &account)).await;
     tgin.deliver("/hook", &[1, 2]).await;
 
     let unauthorized = json!({ "error": "unauthorized" });
@@ -507,7 +515,12 @@ async fn status_requires_token() {
         Some("wrong"),
         Some(&ADMIN_TOKEN[..ADMIN_TOKEN.len() - 1]),
     ] {
-        for path in ["/v1/status", "/v1/config"] {
+        for path in [
+            "/v1/status",
+            "/v1/config",
+            "/v1/accounts/main/login",
+            "/v1/accounts/other/login",
+        ] {
             let answer = tgin.admin_get(path, token).await;
             assert_eq!(answer.status, 401, "{path} {token:?}");
             assert_eq!(answer.json(), unauthorized);
@@ -516,11 +529,26 @@ async fn status_requires_token() {
             "/v1/reload",
             "/v1/consumers/workers/pause",
             "/v1/consumers/workers/purge",
+            "/v1/accounts/main/login",
+            "/v1/accounts/main/login/code",
+            "/v1/accounts/main/login/password",
+            "/v1/accounts/main/logout",
         ] {
             let answer = tgin.admin_post(path, token).await;
             assert_eq!(answer.status, 401, "{path} {token:?}");
+            assert_eq!(answer.json(), unauthorized, "{path}");
         }
+        let mut delete = tgin.http.delete(tgin.admin_url("/v1/accounts/main/login"));
+        if let Some(token) = token {
+            delete = delete.bearer_auth(token);
+        }
+        let answer = answer(delete).await;
+        assert_eq!(answer.status, 401, "DELETE {token:?}");
     }
+    assert!(
+        !session.exists(),
+        "an unauthorized request opened the session"
+    );
 
     let status = tgin.status().await;
     assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
