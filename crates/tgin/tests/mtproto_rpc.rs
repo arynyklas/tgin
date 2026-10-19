@@ -599,6 +599,69 @@ async fn max_rps_limits() {
     assert_eq!(account.calls().len(), 3);
 }
 
+/// A request whose body never arrives.
+fn stalled(auth: Option<&str>) -> Request<Body> {
+    let mut req = Request::post("/mtproto/v1/main/invoke")
+        .header("x-tgin-layer", "230")
+        .header("content-length", "4096");
+    if let Some(token) = auth {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let never = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+    req.body(Body::from_stream(never)).expect("request")
+}
+
+#[tokio::test(start_paused = true)]
+async fn body_read_only_after_auth_and_bounded_in_time() {
+    let account = FakeAccount::new([]);
+    let app = app(Arc::clone(&account));
+    // Refused from the headers, without waiting for the body.
+    let start = tokio::time::Instant::now();
+    let guard = Duration::from_secs(3600);
+    let refused = tokio::time::timeout(guard, app.clone().oneshot(stalled(None)))
+        .await
+        .expect("answered from the headers")
+        .expect("infallible");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    // Authenticated: the body must arrive within BODY_TIMEOUT.
+    let slow = tokio::time::timeout(guard, app.oneshot(stalled(Some(TOKEN))))
+        .await
+        .expect("bounded")
+        .expect("infallible");
+    assert_eq!(slow.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(start.elapsed(), tgin::mtproto_rpc::BODY_TIMEOUT);
+    assert!(account.calls().is_empty());
+}
+
+#[tokio::test]
+async fn body_bound_follows_content_type() {
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    // TL-JSON may be larger than a TL request: 1.5 MiB of it is read.
+    let mut json = GET_NEAREST.to_owned();
+    json.push_str(&" ".repeat(1_500_000));
+    let answer = send_with(
+        &app,
+        "230",
+        json.into_bytes(),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    let mut huge = GET_NEAREST.to_owned();
+    huge.push_str(&" ".repeat(tgin::mtproto_rpc::MAX_JSON_BODY));
+    let answer = send_with(
+        &app,
+        "230",
+        huge.into_bytes(),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(account.calls().len(), 1);
+}
+
 #[tokio::test]
 async fn body_bound_413() {
     let account = FakeAccount::new([]);

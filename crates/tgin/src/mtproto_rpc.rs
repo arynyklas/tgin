@@ -31,6 +31,10 @@
 //!   the call was written and may have been executed; tgin never resends
 //!   it. 503 with `Retry-After`: not executed, safe to retry.
 //!
+//! **Order.** The account and the bearer token are checked from the
+//! headers before the body is read; the body must then arrive within
+//! [`BODY_TIMEOUT`] (else 408).
+//!
 //! **Bounds.** A TL request is at most [`MAX_TL_BODY`] (the sender's
 //! bound, just under 1 MiB); a TL-JSON request body at most
 //! [`MAX_JSON_BODY`]. Upload files with `upload.saveFilePart` /
@@ -43,12 +47,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use futures_util::StreamExt as _;
 use serde::Serialize;
 use tgin_core::config::{self, MethodAcl};
 use tgin_mtproto::SenderError;
@@ -68,6 +73,11 @@ pub const MAX_TL_BODY: usize = tgin_mtproto::MAX_REQUEST;
 /// The largest TL-JSON request body: 2 MiB (base64 makes a 512 KiB file
 /// part about 700 KiB).
 pub const MAX_JSON_BODY: usize = 2 << 20;
+
+/// How long a request body may take to arrive once the client is
+/// authenticated, so a client that trickles its body cannot hold a
+/// connection (the webhook routes' bound).
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The header naming the request's layer.
 pub const LAYER_HEADER: &str = "x-tgin-layer";
@@ -154,11 +164,12 @@ impl RpcAccount {
     }
 }
 
-/// The endpoint's routes, with the body bound.
+/// The endpoint's routes. The handler reads the body itself, after
+/// authentication, so axum's default body limit is off.
 pub fn router(endpoint: Arc<RpcEndpoint>) -> Router {
     Router::new()
         .route("/mtproto/v1/{account}/invoke", post(invoke))
-        .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
+        .layer(DefaultBodyLimit::disable())
         .with_state(endpoint)
 }
 
@@ -186,12 +197,43 @@ fn wants_json(headers: &HeaderMap, name: header::HeaderName) -> bool {
         .is_some_and(|v| v.contains("application/json"))
 }
 
+/// Why a request body could not be read.
+enum BodyError {
+    TooLarge,
+    Broken,
+}
+
+/// Reads `body`, refusing it once it passes `limit` bytes. A body of one
+/// chunk is not copied.
+async fn read_body(body: Body, limit: usize) -> Result<Bytes, BodyError> {
+    let mut stream = body.into_data_stream();
+    let mut first: Option<Bytes> = None;
+    let mut rest: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| BodyError::Broken)?;
+        let held = first.as_ref().map_or(0, Bytes::len) + rest.len();
+        if held.saturating_add(chunk.len()) > limit {
+            return Err(BodyError::TooLarge);
+        }
+        match first.take() {
+            None if rest.is_empty() => first = Some(chunk),
+            None => rest.extend_from_slice(&chunk),
+            Some(head) => {
+                rest.extend_from_slice(&head);
+                rest.extend_from_slice(&chunk);
+            }
+        }
+    }
+    Ok(first.unwrap_or_else(|| Bytes::from(rest)))
+}
+
 async fn invoke(
     State(endpoint): State<Arc<RpcEndpoint>>,
     Path(account): Path<String>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let Some(account) = endpoint.accounts.get(&account) else {
         return tgin_error(StatusCode::NOT_FOUND, "unknown_account", "no such account");
     };
@@ -205,16 +247,29 @@ async fn invoke(
             "a valid client bearer token is required",
         );
     };
-    let body = match body {
-        Ok(body) => body,
-        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            return too_large();
-        }
-        Err(_) => {
+    // The body is read only once the client is known, within
+    // BODY_TIMEOUT, and up to the bound of its content type.
+    let json_body = wants_json(&headers, header::CONTENT_TYPE);
+    let limit = if json_body {
+        MAX_JSON_BODY
+    } else {
+        MAX_TL_BODY
+    };
+    let body = match tokio::time::timeout(BODY_TIMEOUT, read_body(body, limit)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(BodyError::TooLarge)) => return too_large(),
+        Ok(Err(BodyError::Broken)) => {
             return tgin_error(
                 StatusCode::BAD_REQUEST,
                 "bad_request",
                 "the body could not be read",
+            );
+        }
+        Err(_) => {
+            return tgin_error(
+                StatusCode::REQUEST_TIMEOUT,
+                "body_timeout",
+                "the request body did not arrive in time",
             );
         }
     };
@@ -233,7 +288,7 @@ async fn invoke(
         Some(got) if got != layer => return layer_mismatch(layer),
         Some(_) => {}
     }
-    let tl: Bytes = if wants_json(&headers, header::CONTENT_TYPE) {
+    let tl: Bytes = if json_body {
         let Ok(text) = std::str::from_utf8(&body) else {
             return tgin_error(
                 StatusCode::BAD_REQUEST,
