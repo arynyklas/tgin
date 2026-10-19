@@ -964,3 +964,74 @@ async fn wrong_account_logout_must_be_confirmed_before_the_reset() {
         }
     }
 }
+
+/// SRP's secret `a` is tgin's own (the OS CSPRNG, with Telegram's
+/// `secure_random` mixed in), not Telegram's `secure_random`: two proofs
+/// for the same `account.password` and password differ.
+#[tokio::test]
+async fn srp_secret_is_drawn_per_proof() {
+    let mut proofs = Vec::new();
+    for _ in 0..2 {
+        let (h, dial, _tmp) = begin(
+            Method::Qr,
+            None,
+            two_fa(vec![
+                (ids::GET_PASSWORD, Reply::Ok(account_password_srp())),
+                (ids::CHECK_PASSWORD, Reply::Ok(authorization(3, None))),
+            ]),
+        )
+        .await;
+        settled(&h).await;
+        assert_eq!(
+            h.submit_password("same".into()).await,
+            Ok(LoginState::LoggedIn { user_id: 3 })
+        );
+        let bodies = dial.bodies();
+        let check = bodies
+            .iter()
+            .find(|b| b.starts_with(&ids::CHECK_PASSWORD.to_le_bytes()))
+            .expect("checkPassword sent")
+            .clone();
+        proofs.push(check);
+    }
+    assert_ne!(proofs[0], proofs[1], "the same `a` twice");
+}
+
+/// `srp_B` must lie strictly between 1 and p − 1: 0, 1, p − 1 and p are
+/// refused before any proof is made.
+#[tokio::test]
+async fn srp_b_outside_the_group_is_refused() {
+    let p = crate::testkit::srp_prime();
+    let mut p_minus_1 = p.clone();
+    *p_minus_1.last_mut().expect("p") -= 1;
+    for (name, g_b) in [
+        ("0", vec![0u8; 256]),
+        ("1", vec![1u8]),
+        ("p - 1", p_minus_1),
+        ("p", p.clone()),
+    ] {
+        let (h, dial, _tmp) = begin(
+            Method::Qr,
+            None,
+            two_fa(vec![(
+                ids::GET_PASSWORD,
+                Reply::Ok(account_password_sized(&g_b, &[6; 32])),
+            )]),
+        )
+        .await;
+        settled(&h).await;
+        h.submit_password("x".into()).await.expect("handed over");
+        assert_eq!(
+            end(&h).await,
+            LoginState::Failed(LoginError::PasswordParams("srp_B outside 1 < g_b < p - 1")),
+            "{name}"
+        );
+        assert!(
+            !dial
+                .calls()
+                .iter()
+                .any(|(_, id)| *id == ids::CHECK_PASSWORD),
+            "{name}"
+        );
+    }
+}

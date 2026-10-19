@@ -12,9 +12,10 @@
 //!   is [`LoginError::WrongAccountNotLoggedOut`].
 //! - **The login marker** (self user and `login_unix`) is written in one
 //!   transaction ([`SessionStore::record_login`]), and only after the gate.
-//! - **SRP** runs only once `p`/`g` pass grammers' safety check and `srp_B`
+//! - **SRP** runs only once `p`/`g` pass grammers' safety check, `srp_B`
 //!   and `secure_random` are at most 256 bytes (grammers pads them to 256
-//!   and would panic on more).
+//!   and would panic on more) and `1 < g_b < p − 1`. Its secret `a` comes
+//!   from the OS CSPRNG, `secure_random` only mixed in.
 //! - **A probe after an I/O failure.** When `auth.checkPassword`,
 //!   `auth.importLoginToken` or `auth.signIn` was written and no answer came,
 //!   the login may have happened: the flow asks `users.getUsers([inputUserSelf])`
@@ -280,6 +281,9 @@ pub enum LoginError {
     /// `account.password` without what SRP needs, or with unsafe values.
     #[error("unusable 2FA parameters from Telegram: {0}")]
     PasswordParams(&'static str),
+    /// The operating system's random source failed: no SRP secret.
+    #[error("the operating system's random source failed")]
+    NoRandomness,
     /// The identity gate: the logged-in account's phone is not the
     /// config's. The new authorization was logged out again.
     #[error("the logged-in account is not the configured one; it was logged out again")]
@@ -320,6 +324,7 @@ impl LoginError {
             Self::SignUpRequired => "sign_up_required",
             Self::MigrateLoop { .. } => "migrate_loop",
             Self::PasswordParams(_) => "password_params",
+            Self::NoRandomness => "no_randomness",
             Self::WrongAccount => "wrong_account",
             Self::WrongAccountNotLoggedOut => "wrong_account_not_logged_out",
             Self::NoPhone => "no_phone",
@@ -673,6 +678,10 @@ fn srp_inputs(info: tl::types::account::Password) -> Result<Srp, LoginError> {
     if !(2..=7).contains(&algo.g) {
         return Err(LoginError::PasswordParams("g outside 2..=7"));
     }
+    // A g_b of 0, 1 or p − 1 (or beyond p) pins the shared secret.
+    if !in_group(&srp_b, &algo.p) {
+        return Err(LoginError::PasswordParams("srp_B outside 1 < g_b < p - 1"));
+    }
     Ok(Srp {
         salt1: algo.salt1,
         salt2: algo.salt2,
@@ -684,12 +693,52 @@ fn srp_inputs(info: tl::types::account::Password) -> Result<Srp, LoginError> {
     })
 }
 
+/// Whether `1 < g_b < p − 1`, both big-endian.
+fn in_group(g_b: &[u8], p: &[u8]) -> bool {
+    fn strip(n: &[u8]) -> &[u8] {
+        let zeros = n.iter().take_while(|&&b| b == 0).count();
+        &n[zeros..]
+    }
+    // `p − 1`; p is odd once it passes the safe-prime check, and a p that
+    // is not fails that check anyway.
+    let mut p_minus_1 = strip(p).to_vec();
+    for byte in p_minus_1.iter_mut().rev() {
+        let (v, borrow) = byte.overflowing_sub(1);
+        *byte = v;
+        if !borrow {
+            break;
+        }
+    }
+    let less = |a: &[u8], b: &[u8]| {
+        let (a, b) = (strip(a), strip(b));
+        a.len() < b.len() || (a.len() == b.len() && a < b)
+    };
+    less(&[1], g_b) && less(g_b, &p_minus_1)
+}
+
+/// SRP's secret exponent `a`: 256 bytes from the OS CSPRNG, with
+/// Telegram's `secure_random` XORed in as extra entropy. Never Telegram's
+/// value alone: whoever knew `a` could test password guesses offline
+/// against a decrypted login.
+fn srp_secret(secure_random: &[u8]) -> Result<Vec<u8>, LoginError> {
+    use rand::TryRng as _;
+    let mut a = vec![0u8; SRP_MAX];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut a)
+        .map_err(|_| LoginError::NoRandomness)?;
+    for (byte, extra) in a.iter_mut().zip(secure_random) {
+        *byte ^= extra;
+    }
+    Ok(a)
+}
+
 /// SRP over a fresh `account.getPassword`, then `auth.checkPassword`. The
 /// password is used for the proof only.
 async fn check_password<L: Link>(link: &L, password: String) -> Result<Step, LoginError> {
     let tl::enums::account::Password::Password(info) =
         call(link, &tl::functions::account::GetPassword {}).await?;
     let srp = srp_inputs(info)?;
+    let a = srp_secret(&srp.secure_random)?;
     let srp_id = srp.srp_id;
     // The safe-prime check and PBKDF2 (100 000 rounds) take a while.
     let proof = tokio::task::spawn_blocking(move || {
@@ -697,13 +746,7 @@ async fn check_password<L: Link>(link: &L, password: String) -> Result<Step, Log
             return None;
         }
         Some(calculate_2fa(
-            &srp.salt1,
-            &srp.salt2,
-            &srp.p,
-            &srp.g,
-            srp.srp_b,
-            srp.secure_random,
-            password,
+            &srp.salt1, &srp.salt2, &srp.p, &srp.g, srp.srp_b, a, password,
         ))
     })
     .await

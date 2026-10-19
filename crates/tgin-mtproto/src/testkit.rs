@@ -165,7 +165,9 @@ const SRP_P: &str = "c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563
     e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f\
     0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b";
 
-fn srp_p() -> Vec<u8> {
+/// Telegram's 2048-bit SRP prime, big-endian.
+#[must_use]
+pub fn srp_prime() -> Vec<u8> {
     let hex: Vec<u8> = SRP_P.bytes().filter(u8::is_ascii_hexdigit).collect();
     hex.chunks(2)
         .map(|pair| {
@@ -183,13 +185,13 @@ fn srp_p() -> Vec<u8> {
 /// end to end.
 #[must_use]
 pub fn account_password_srp() -> Vec<u8> {
-    account_password_with(&srp_p(), &[5; 256], &[6; 32])
+    account_password_with(&srp_prime(), &[5; 256], &[6; 32])
 }
 
 /// As [`account_password_srp`], with the given `srp_B` and `secure_random`.
 #[must_use]
 pub fn account_password_sized(srp_b: &[u8], secure_random: &[u8]) -> Vec<u8> {
-    account_password_with(&srp_p(), srp_b, secure_random)
+    account_password_with(&srp_prime(), srp_b, secure_random)
 }
 
 fn account_password_with(p: &[u8], srp_b: &[u8], secure_random: &[u8]) -> Vec<u8> {
