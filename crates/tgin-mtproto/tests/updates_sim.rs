@@ -7,11 +7,24 @@
 //! after the commit of each batch) and checks that every sequenced update
 //! of the server's log reached admission at least once.
 //!
-//! The server's rules the model relies on, no more: half its answers are
-//! computed when asked and fed after later pushes; its getDifference
-//! signals (`updateChannelTooLong`) only channels with an update the
-//! client never got and that is not on the way; two channels are quiet
-//! (nothing after the main phase reveals what they missed).
+//! The server follows Telegram's rules, and the model relies on no more:
+//! - half its answers are computed when asked and fed after later pushes;
+//! - its getDifference signals (`updateChannelTooLong`) only channels with
+//!   an update the client never got and that is not on the way;
+//! - it pushes `updates` (some channel posts unordered, seq 0),
+//!   `updatesCombined` with `seq_start < seq`, and short forms;
+//! - it answers some getDifference with `differenceTooLong` (only where
+//!   that skips nothing the client could still deliver);
+//! - a quarter of the scripts start a fresh account (no state: getState,
+//!   every channel unknown);
+//! - any batch may be refused, one with no updates included;
+//! - two channels are quiet (nothing after the main phase reveals what
+//!   they missed).
+//!
+//! What Telegram cannot bring back is not owed: what a `differenceTooLong`
+//! skips the client never got, what precedes a fresh account's first
+//! state, and a channel's updates before the first one admitted when it
+//! was not known at start.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -27,6 +40,7 @@ use tokio::time::{Duration, Instant, advance};
 
 const VECTOR: u32 = 0x1cb5_c415;
 const UPDATES: u32 = 0x74ae_4240;
+const UPDATES_COMBINED: u32 = 0x725b_04c3;
 const UPDATE_SHORT: u32 = 0x78d4_dec1;
 const UPDATES_TOO_LONG: u32 = 0xe317_af7e;
 const UPDATE_NEW_MESSAGE: u32 = 0x1f2b_0afd;
@@ -166,6 +180,23 @@ fn delete_messages(ids: &[i32], pts: i32, count: i32) -> Vec<u8> {
 
 fn short(update: &[u8]) -> Vec<u8> {
     T::new(UPDATE_SHORT).raw(update).int(1).done()
+}
+
+fn updates_combined(
+    us: &[Vec<u8>],
+    users: &[Vec<u8>],
+    date: i32,
+    seq_start: i32,
+    seq: i32,
+) -> Vec<u8> {
+    T::new(UPDATES_COMBINED)
+        .vec(us)
+        .vec(users)
+        .vec(NONE)
+        .int(date)
+        .int(seq_start)
+        .int(seq)
+        .done()
 }
 
 fn updates(us: &[Vec<u8>], users: &[Vec<u8>], chats: &[Vec<u8>], date: i32, seq: i32) -> Vec<u8> {
@@ -1302,27 +1333,35 @@ struct Script {
     chats: HashMap<i64, Vec<u8>>,
     /// Message bytes (and short message pushes) → event index.
     by_bytes: HashMap<Vec<u8>, usize>,
+    /// What the manager starts from: a fresh account (common pts 0, no
+    /// channel known) or a stored state.
     initial: StoredState,
+    /// The server's state before the first event.
+    base: UpdateState,
 }
 
 fn script(seed: u64) -> Script {
     let mut rng = Rng(seed);
+    let base = UpdateState {
+        pts: 10,
+        qts: 5,
+        seq: 3,
+        date: 1,
+    };
+    // A quarter of the scripts start a fresh account: no state, so
+    // getState first, and every channel unknown.
+    let fresh = rng.chance(25);
     let initial = StoredState {
-        common: UpdateState {
-            pts: 10,
-            qts: 5,
-            seq: 3,
-            date: 1,
-        },
+        common: if fresh { UpdateState::default() } else { base },
         channels: CHANNELS
             .iter()
-            .filter(|&&c| c != UNKNOWN_CHANNEL)
+            .filter(|&&c| c != UNKNOWN_CHANNEL && !fresh)
             .map(|&c| (c, 5))
             .collect(),
         known_users: KNOWN_USERS.to_vec(),
         behind: Vec::new(),
     };
-    let (mut pts, mut qts, mut seq) = (10, 5, 3);
+    let (mut pts, mut qts, mut seq) = (base.pts, base.qts, base.seq);
     let mut chan: BTreeMap<i64, i32> = CHANNELS.iter().map(|&c| (c, 5)).collect();
     let users: HashMap<i64, Vec<u8>> = USERS.iter().map(|&u| (u, user(u))).collect();
     let chats: HashMap<i64, Vec<u8>> = CHANNELS.iter().map(|&c| (c, channel(c))).collect();
@@ -1364,6 +1403,16 @@ fn script(seed: u64) -> Script {
                     let s = short_message(tag, user, pts, 1);
                     by_bytes.insert(s.clone(), i);
                     s
+                } else if rng.chance(30) {
+                    // seq_start < seq: two updates in one combined push.
+                    seq += 2;
+                    updates_combined(
+                        &[new_message(&m, pts, 1), user_status(user)],
+                        &[users[&user].clone()],
+                        date,
+                        seq - 1,
+                        seq,
+                    )
                 } else {
                     seq += 1;
                     updates(
@@ -1400,13 +1449,17 @@ fn script(seed: u64) -> Script {
                 let push = if !reliable && rng.chance(10) {
                     short(&channel_too_long(c, rng.chance(50).then_some(chan_pts)))
                 } else {
-                    seq += 1;
+                    // Some channel pushes are unordered (seq 0).
+                    let unordered = rng.chance(30);
+                    if !unordered {
+                        seq += 1;
+                    }
                     updates(
                         &[new_channel_message(&m, chan_pts, 1)],
                         NONE,
                         &[chats[&c].clone()],
                         date,
-                        seq,
+                        if unordered { 0 } else { seq },
                     )
                 };
                 (Some(push), m)
@@ -1440,6 +1493,7 @@ fn script(seed: u64) -> Script {
         chats,
         by_bytes,
         initial,
+        base,
     }
 }
 
@@ -1483,6 +1537,10 @@ struct Answer {
     bytes: Vec<u8>,
     /// A channel difference's pts: the client is told of everything up to it.
     to: i32,
+    /// Events Telegram cannot bring back once this answer is taken: a
+    /// `differenceTooLong` skips the ones the client never got; a getState
+    /// (a fresh account's) skips everything before it.
+    skips: Vec<usize>,
 }
 
 struct Sim<'a> {
@@ -1505,8 +1563,15 @@ struct Sim<'a> {
     /// Events that have happened on the server.
     done: usize,
     admitted: HashSet<usize>,
-    /// The first admitted update of the unknown channel: its pts before.
-    first_unknown: Option<i32>,
+    /// Per channel not known at start: its first admitted update's pts
+    /// before it. Only what follows is owed.
+    first_admitted: HashMap<i64, i32>,
+    /// Events the server can no longer send (see [`Answer::skips`]).
+    skipped: HashSet<usize>,
+    /// Pushes fed to the manager since its last start.
+    fed_run: HashSet<usize>,
+    /// A batch was refused since the manager's last start.
+    refused_run: bool,
     point: u64,
     kill_at: Option<u64>,
     killable: bool,
@@ -1531,7 +1596,10 @@ impl<'a> Sim<'a> {
             received: HashSet::new(),
             done: 0,
             admitted: HashSet::new(),
-            first_unknown: None,
+            first_admitted: HashMap::new(),
+            skipped: HashSet::new(),
+            fed_run: HashSet::new(),
+            refused_run: false,
             point: 0,
             kill_at,
             killable: true,
@@ -1554,6 +1622,8 @@ impl<'a> Sim<'a> {
         self.m = UpdateManager::new(self.persisted.stored());
         self.net.clear();
         self.in_flight.clear();
+        self.fed_run.clear();
+        self.refused_run = false;
         true
     }
 
@@ -1565,8 +1635,9 @@ impl<'a> Sim<'a> {
             if self.tick() {
                 return; // before admission
             }
-            // Admission may be full; a batch with no updates always fits.
-            if !batch.updates.is_empty() && self.rng.chance(4) {
+            // Admission may be full, for any batch.
+            if self.rng.chance(4) {
+                self.refused_run |= !batch.updates.is_empty();
                 if let Some(d) = self.m.refused(batch.id) {
                     self.persisted.apply(&d);
                 }
@@ -1590,8 +1661,10 @@ impl<'a> Sim<'a> {
             if let Some(i) = self.identify(u.bytes()) {
                 self.admitted.insert(i);
                 let e = &self.s.events[i];
-                if e.kind == Kind::Chan(UNKNOWN_CHANNEL) && self.first_unknown.is_none() {
-                    self.first_unknown = Some(e.chan_pts - 1);
+                if let Kind::Chan(c) = e.kind
+                    && !self.s.initial.channels.iter().any(|&(k, _)| k == c)
+                {
+                    self.first_admitted.entry(c).or_insert(e.chan_pts - 1);
                 }
             }
         }
@@ -1626,19 +1699,35 @@ impl<'a> Sim<'a> {
     fn compute(&self, f: Fetch) -> Answer {
         match f {
             Fetch::GetState => {
+                assert_eq!(
+                    self.persisted.common.pts, 0,
+                    "getState only while no state was committed"
+                );
                 let (pts, qts, seq, date) = self.current();
                 Answer {
                     bytes: state(pts, qts, date, seq),
                     to: 0,
+                    // The state is taken whole: nothing before it is owed
+                    // to an account that never committed one.
+                    skips: (0..self.done).collect(),
                 }
             }
-            Fetch::GetDifference { pts, qts, .. } => Answer {
-                bytes: self.difference(pts, qts),
-                to: 0,
-            },
+            Fetch::GetDifference { pts, qts, .. } => {
+                assert_ne!(pts, 0, "getDifference from pts 0");
+                let (bytes, skips) = self.difference(pts, qts);
+                Answer {
+                    bytes,
+                    to: 0,
+                    skips,
+                }
+            }
             Fetch::GetChannelDifference { channel, pts } => {
                 let (bytes, to) = self.channel_difference(channel, pts);
-                Answer { bytes, to }
+                Answer {
+                    bytes,
+                    to,
+                    skips: Vec::new(),
+                }
             }
         }
     }
@@ -1669,12 +1758,14 @@ impl<'a> Sim<'a> {
             self.net.push_front((i, p.clone()));
         }
         self.received.insert(i);
+        self.fed_run.insert(i);
         let batches = self.m.feed_push(p);
         self.take(batches);
     }
 
     fn answer(&mut self, f: Fetch, early: Option<Answer>) {
         let a = early.unwrap_or_else(|| self.compute(f));
+        self.skipped.extend(a.skips.iter().copied());
         let batches = match f {
             Fetch::GetState => self.m.feed_state(b(a.bytes)),
             Fetch::GetDifference { .. } => self.m.feed_difference(b(a.bytes)),
@@ -1697,7 +1788,7 @@ impl<'a> Sim<'a> {
         match self.done.checked_sub(1).map(|i| &self.s.events[i]) {
             Some(e) => (e.pts, e.qts, e.seq, e.date),
             None => {
-                let c = self.s.initial.common;
+                let c = self.s.base;
                 (c.pts, c.qts, c.seq, c.date)
             }
         }
@@ -1711,7 +1802,47 @@ impl<'a> Sim<'a> {
             .map_or(5, |e| e.chan_pts)
     }
 
-    fn difference(&self, pts: i32, qts: i32) -> Vec<u8> {
+    /// `updates.differenceTooLong`, as Telegram answers a pts too far
+    /// behind: the box jumps to the pts of a pending event. Only where that
+    /// loses nothing the client could still deliver: every event it skips
+    /// was never sent to the client (those are what Telegram cannot bring
+    /// back), is admitted, or was fed to this run of the manager with no
+    /// batch refused since (so it is held or delivered).
+    fn too_long(&self, pts: i32) -> Option<(Vec<u8>, Vec<usize>)> {
+        let log = &self.s.events[..self.done];
+        let pending: Vec<(usize, &Event)> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(e.kind, Kind::Msg { .. } | Kind::Affected { .. }) && e.pts > pts
+            })
+            .collect();
+        let roll = (self.s.seed ^ u64::try_from(pts).ok()? ^ (self.done as u64))
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> 62;
+        if pending.len() < 4 || roll != 0 {
+            return None;
+        }
+        let to = pending[pending.len() / 2].1.pts;
+        let on_the_way: HashSet<usize> = self.net.iter().map(|&(i, _)| i).collect();
+        let mut skips = Vec::new();
+        for &(i, e) in pending.iter().filter(|(_, e)| e.pts <= to) {
+            if !self.received.contains(&i) && !on_the_way.contains(&i) {
+                skips.push(i);
+            } else if !(self.admitted.contains(&i)
+                || (self.fed_run.contains(&i) && !self.refused_run)
+                || matches!(e.kind, Kind::Affected { .. }))
+            {
+                return None;
+            }
+        }
+        Some((T::new(DIFFERENCE_TOO_LONG).int(to).done(), skips))
+    }
+
+    fn difference(&self, pts: i32, qts: i32) -> (Vec<u8>, Vec<usize>) {
+        if let Some(too_long) = self.too_long(pts) {
+            return too_long;
+        }
         let log = &self.s.events[..self.done];
         let pending: Vec<&Event> = log
             .iter()
@@ -1744,7 +1875,10 @@ impl<'a> Sim<'a> {
                 chats: &chats,
                 users: &users,
             };
-            return difference(&d, &state(last.pts, last.qts, last.date, last.seq), true);
+            return (
+                difference(&d, &state(last.pts, last.qts, last.date, last.seq), true),
+                Vec::new(),
+            );
         }
         // Channels with an update the client was never told of are
         // signalled. A push on the way counts as told: the server sent
@@ -1765,7 +1899,7 @@ impl<'a> Sim<'a> {
         }
         let (cp, cq, cs, cd) = self.current();
         if msgs.is_empty() && enc.is_empty() && other.is_empty() && (cp, cq) == (pts, qts) {
-            return difference_empty(cd, cs);
+            return (difference_empty(cd, cs), Vec::new());
         }
         let d = Diff {
             msgs: &msgs,
@@ -1774,7 +1908,7 @@ impl<'a> Sim<'a> {
             chats: &chats,
             users: &users,
         };
-        difference(&d, &state(cp, cq, cd, cs), false)
+        (difference(&d, &state(cp, cq, cd, cs), false), Vec::new())
     }
 
     /// The answer, and the channel pts it brings the client to.
@@ -1848,6 +1982,7 @@ impl<'a> Sim<'a> {
                 self.pump();
                 if let Some((i, p)) = self.net.pop_front() {
                     self.received.insert(i);
+                    self.fed_run.insert(i);
                     let batches = self.m.feed_push(p);
                     self.take(batches);
                 } else if let Some((f, early)) = self.in_flight.pop_front() {
@@ -1898,11 +2033,12 @@ impl<'a> Sim<'a> {
     fn check(&self) -> Result<(), String> {
         for (i, e) in self.s.events.iter().enumerate() {
             let required = match e.kind {
-                Kind::Msg { .. } | Kind::Enc => true,
-                Kind::Chan(UNKNOWN_CHANNEL) => {
-                    self.first_unknown.is_some_and(|base| e.chan_pts > base)
-                }
-                Kind::Chan(_) => true,
+                Kind::Msg { .. } | Kind::Enc => !self.skipped.contains(&i),
+                Kind::Chan(c) if self.s.initial.channels.iter().any(|&(k, _)| k == c) => true,
+                Kind::Chan(c) => self
+                    .first_admitted
+                    .get(&c)
+                    .is_some_and(|&base| e.chan_pts > base),
                 Kind::Affected { .. } | Kind::Status => false,
             };
             if required && !self.admitted.contains(&i) {
