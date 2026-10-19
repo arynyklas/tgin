@@ -9,22 +9,32 @@
 //!
 //! The server follows Telegram's rules, and the model relies on no more:
 //! - half its answers are computed when asked and fed after later pushes;
-//! - its getDifference signals (`updateChannelTooLong`) only channels with
-//!   an update the client never got and that is not on the way;
+//! - its getDifference tells of channels with an update the client never
+//!   got and that is not on the way: by `updateChannelTooLong`, or (one in
+//!   four) by their posts as `updateNewChannelMessage` in `other_updates`;
 //! - it pushes `updates` (some channel posts unordered, seq 0),
-//!   `updatesCombined` with `seq_start < seq`, and short forms;
-//! - it answers some getDifference with `differenceTooLong` (only where
-//!   that skips nothing the client could still deliver);
+//!   `updatesCombined` with `seq_start < seq`, short forms, and bare
+//!   `updateChannelTooLong` signals;
+//! - it answers some getDifference with `differenceTooLong`, and some
+//!   getChannelDifference with `channelDifferenceTooLong` (only where that
+//!   skips nothing the client could still deliver);
 //! - a quarter of the scripts start a fresh account (no state: getState,
 //!   every channel unknown);
-//! - any batch may be refused, one with no updates included;
+//! - any batch may be refused, one with no updates included, and about a
+//!   third are reported later than they are decided, in order, while
+//!   pushes and answers go on;
 //! - two channels are quiet (nothing after the main phase reveals what
 //!   they missed).
 //!
-//! What Telegram cannot bring back is not owed: what a `differenceTooLong`
-//! skips the client never got, what precedes a fresh account's first
-//! state, and a channel's updates before the first one admitted when it
-//! was not known at start.
+//! The caller writes the marks of all batches a call returned in one write,
+//! then admits them. A kill point sits before that write, too.
+//!
+//! What is not owed: what Telegram cannot bring back (what a too-long
+//! answer skips that the client never got, what precedes a fresh account's
+//! first state, a channel's updates before the first one admitted when it
+//! was not known at start), counted only once the manager took the answer;
+//! and the stated exception (a kill before a call's marks are durable: what
+//! those channels missed so far).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -1462,7 +1472,7 @@ async fn difference_message_composed_bytes_equal_typed() {
     assert!(matches!(m.next_action(), Some(Fetch::GetDifference { .. })));
     let msgs = [
         message(1, PeerId::User(5), "plain"),
-        message(2, PeerId::Chat(6), "Ã¼nÃ¯cÃ¸dÃ© âœ“ æ—¥æœ¬èªž ðŸŽ‰"),
+        message(2, PeerId::Chat(6), "ünïcødé ✓ 日本語 🎉"),
     ];
     let enc = [encrypted(3)];
     let batches = m.feed_difference(b(difference(
@@ -1497,7 +1507,7 @@ async fn difference_message_composed_bytes_equal_typed() {
     assert_eq!(got.iter().map(|g| g.to_vec()).collect::<Vec<_>>(), want);
     commit(&mut m, &batches);
 
-    let post = message(4, PeerId::Channel(9), "ÎºÎ±Î½Î¬Î»Î¹");
+    let post = message(4, PeerId::Channel(9), "κανάλι");
     let batches = m.feed_push(b(short(&channel_too_long(9, None))));
     nothing(&mut m, &batches);
     assert!(matches!(
@@ -1531,7 +1541,7 @@ const MAIN_EVENTS: usize = 24;
 const SEED: u64 = 0x7467_696e_5f6d_3335;
 const USERS: [i64; 5] = [100, 101, 102, 103, 104];
 const KNOWN_USERS: [i64; 2] = [100, 101];
-/// Channels 1â€“3, 5 and 6 start known; channel 4 is unknown until its
+/// Channels 1–3, 5 and 6 start known; channel 4 is unknown until its
 /// first update.
 const CHANNELS: [i64; 6] = [1, 2, 3, 4, 5, 6];
 const UNKNOWN_CHANNEL: i64 = 4;
@@ -1579,6 +1589,9 @@ struct Event {
     tag: u32,
     /// What the socket carries for it, if anything.
     push: Option<Bytes>,
+    /// The push is only a catch-up signal (`updateChannelTooLong`): the
+    /// client that gets it still lacks the update.
+    signal: bool,
     /// The message (or encrypted message) for differences; for `Affected`,
     /// its `updateDeleteMessages`.
     body: Vec<u8>,
@@ -1597,7 +1610,7 @@ struct Script {
     phases: [usize; 3],
     users: HashMap<i64, Vec<u8>>,
     chats: HashMap<i64, Vec<u8>>,
-    /// Message bytes (and short message pushes) â†’ event index.
+    /// Message bytes (and short message pushes) → event index.
     by_bytes: HashMap<Vec<u8>, usize>,
     /// What the manager starts from: a fresh account (common pts 0, no
     /// channel known) or a stored state.
@@ -1660,6 +1673,7 @@ fn script(seed: u64) -> Script {
         };
         let lost = !reliable && rng.chance(15);
         let mut chan_pts = 0;
+        let mut signal = false;
         let (push, body) = match kind {
             Kind::Msg { user } => {
                 pts += 1;
@@ -1713,6 +1727,7 @@ fn script(seed: u64) -> Script {
                 let m = message(tag, PeerId::Channel(c), &format!("e{tag}"));
                 by_bytes.insert(m.clone(), i);
                 let push = if !reliable && rng.chance(10) {
+                    signal = true;
                     short(&channel_too_long(c, rng.chance(50).then_some(chan_pts)))
                 } else {
                     // Some channel pushes are unordered (seq 0).
@@ -1736,6 +1751,7 @@ fn script(seed: u64) -> Script {
             kind,
             tag,
             push: push.filter(|_| !lost).map(Bytes::from),
+            signal,
             body,
             pts,
             qts,
@@ -1800,23 +1816,40 @@ impl Persisted {
         }
     }
 
-    fn mark(&mut self, channels: &[i64], mark: u64) {
-        for &c in channels {
-            let row = self.behind.entry(c).or_insert(mark);
-            *row = (*row).max(mark);
+    /// As `SessionStore::mark_channels_behind`: the marks, and the
+    /// baseline of a channel with no stored pts.
+    fn mark(&mut self, batch: &Batch) {
+        for &c in &batch.ahead {
+            let row = self.behind.entry(c).or_insert(batch.id);
+            *row = (*row).max(batch.id);
+            if let Some(&(_, p)) = batch.commit.channels.iter().find(|(k, _)| *k == c) {
+                self.channels.entry(c).or_insert(p);
+            }
         }
     }
+}
+
+/// A batch admitted or refused, not yet reported.
+struct Decided {
+    id: u64,
+    admitted: bool,
+    /// Refusing it rolls the common box back (when still current).
+    rolls_back: bool,
+    /// The mirrored epoch it was returned in.
+    epoch: u32,
 }
 
 /// An answer computed when its call was asked.
 struct Answer {
     bytes: Vec<u8>,
-    /// A channel difference's pts: the client is told of everything up to it.
-    to: i32,
     /// Events Telegram cannot bring back once this answer is taken: a
-    /// `differenceTooLong` skips the ones the client never got; a getState
-    /// (a fresh account's) skips everything before it.
+    /// `differenceTooLong` or `channelDifferenceTooLong` skips the ones the
+    /// client never got; a getState (a fresh account's) skips everything
+    /// before it.
     skips: Vec<usize>,
+    /// Events the answer carries or covers: the client got them once the
+    /// answer is taken.
+    covers: Vec<usize>,
 }
 
 struct Sim<'a> {
@@ -1829,9 +1862,9 @@ struct Sim<'a> {
     /// Calls on the way. Some answers are computed when asked, as a server
     /// does, and fed after pushes that came later: an answer may predate
     /// the pushes fed before it.
-    in_flight: VecDeque<(Fetch, Option<Answer>)>,
-    /// Events the client got: their push was fed, or a fed channel
-    /// difference covered them. The server signals the channels of the
+    in_flight: VecDeque<(Fetch, Option<Answer>, u32)>,
+    /// Events the client got: their push was fed, or an accepted answer
+    /// covered them. The server signals the channels of the
     /// others not on the way (`updateChannelTooLong` in getDifference):
     /// what a client never got, the server tells it to fetch; what it got,
     /// or is getting, the client must keep.
@@ -1842,12 +1875,28 @@ struct Sim<'a> {
     /// Per channel not known at start: its first admitted update's pts
     /// before it. Only what follows is owed.
     first_admitted: HashMap<i64, i32>,
+    /// Channels whose state the manager dropped (a fetch failed for good):
+    /// unknown from then on, as if not known at start.
+    reset: HashSet<i64>,
     /// Events the server can no longer send (see [`Answer::skips`]).
     skipped: HashSet<usize>,
     /// Pushes fed to the manager since its last start.
     fed_run: HashSet<usize>,
     /// A batch was refused since the manager's last start.
     refused_run: bool,
+    /// Batches decided (admitted or refused) and not yet reported: `(id,
+    /// admitted, has updates)`, reported later, in order.
+    open: VecDeque<Decided>,
+    /// The manager's common-box epoch, mirrored: it moves when a refused
+    /// batch that moved the common box in the current epoch is reported. A
+    /// call asked in an older epoch is stale.
+    epoch: u32,
+    /// A getDifference failed for good: a getState resync may follow, and
+    /// what it skips is not owed (Telegram cannot serve that pts).
+    resync_due: bool,
+    /// Channel events lost in the one stated window: a kill after the feed
+    /// that returned their batch, before its mark was durable.
+    exempt: HashSet<usize>,
     point: u64,
     kill_at: Option<u64>,
     killable: bool,
@@ -1873,9 +1922,14 @@ impl<'a> Sim<'a> {
             done: 0,
             admitted: HashSet::new(),
             first_admitted: HashMap::new(),
+            reset: HashSet::new(),
             skipped: HashSet::new(),
             fed_run: HashSet::new(),
             refused_run: false,
+            open: VecDeque::new(),
+            epoch: 0,
+            resync_due: false,
+            exempt: HashSet::new(),
             point: 0,
             kill_at,
             killable: true,
@@ -1900,36 +1954,117 @@ impl<'a> Sim<'a> {
         self.in_flight.clear();
         self.fed_run.clear();
         self.refused_run = false;
+        self.open.clear();
+        self.epoch = 0;
         true
     }
 
     fn take(&mut self, batches: Vec<Batch>) {
+        // The caller persists the marks of every batch a call returned, in
+        // one write, before it admits the first.
+        let ahead: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| b.ahead.iter().copied())
+            .collect();
+        if !ahead.is_empty() && self.tick() {
+            // Killed before the marks were durable: the stated exception.
+            // What those channels missed so far is not owed.
+            self.exempt.extend(
+                self.s.events[..self.done]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e.kind, Kind::Chan(c) if ahead.contains(&c)))
+                    .map(|(i, _)| i),
+            );
+            return;
+        }
+        for batch in &batches {
+            self.persisted.mark(batch);
+        }
         for batch in batches {
-            // The caller persists the channels a batch moves ahead before
-            // it offers the batch to admission.
-            self.persisted.mark(&batch.ahead, batch.id);
             if self.tick() {
                 return; // before admission
             }
             // Admission may be full, for any batch.
-            if self.rng.chance(4) {
+            let admitted = !self.rng.chance(4);
+            if admitted {
+                self.admit(&batch);
+            } else {
                 self.refused_run |= !batch.updates.is_empty();
-                if let Some(d) = self.m.refused(batch.id) {
-                    self.persisted.apply(&d);
-                }
-                continue;
             }
-            self.admit(&batch);
+            // Whether it moved the common box: a common field in its delta,
+            // or a sequenced common or qts update.
+            let common = batch.commit.pts.is_some()
+                || batch.commit.qts.is_some()
+                || batch.commit.seq.is_some()
+                || batch.commit.date.is_some()
+                || batch.updates.iter().any(|u| {
+                    let f = u.facts();
+                    match f.box_kind {
+                        BoxKind::Common => f.pts.is_some_and(|p| p != 0),
+                        BoxKind::Qts => f.qts.is_some_and(|q| q != 0),
+                        _ => false,
+                    }
+                });
+            self.open.push_back(Decided {
+                id: batch.id,
+                admitted,
+                rolls_back: !admitted && !batch.updates.is_empty() && common,
+                epoch: self.epoch,
+            });
             if self.tick() {
-                return; // admitted, not committed
+                return; // decided, not reported
             }
-            if let Some(d) = self.m.committed(batch.id) {
+            // Most are reported at once; the rest later, in order.
+            if self.rng.chance(70) && self.report() {
+                return;
+            }
+        }
+    }
+
+    /// Push `i` is fed. Only a push that carries its update gives it to
+    /// the client; a signal only asks for a fetch.
+    fn got(&mut self, i: usize) {
+        if !self.s.events[i].signal {
+            self.received.insert(i);
+            self.fed_run.insert(i);
+        }
+    }
+
+    /// Reports every decided batch, in order. True when killed meanwhile.
+    fn report(&mut self) -> bool {
+        while let Some(b) = self.open.pop_front() {
+            let d = if b.admitted {
+                self.m.committed(b.id)
+            } else {
+                self.m.refused(b.id)
+            };
+            if b.rolls_back && b.epoch == self.epoch {
+                self.epoch += 1;
+                // Calls asked before the rollback are stale now; a stale
+                // call may fail as well as answer, for good or not.
+                let mut kept = VecDeque::new();
+                for (f, early, asked) in std::mem::take(&mut self.in_flight) {
+                    let common = !matches!(f, Fetch::GetChannelDifference { .. });
+                    match self.rng.below(4) {
+                        0 if common => self.m.fetch_failed(f),
+                        1 if common => {
+                            let batches = self.m.fetch_failed_permanently(f);
+                            assert!(batches.is_empty(), "a common failure returns nothing");
+                        }
+                        _ => kept.push_back((f, early, asked)),
+                    }
+                }
+                self.in_flight = kept;
+            }
+            if let Some(d) = d {
                 self.persisted.apply(&d);
             }
             if self.tick() {
-                return; // committed
+                return true; // reported
             }
         }
+        false
     }
 
     fn admit(&mut self, batch: &Batch) {
@@ -1938,7 +2073,8 @@ impl<'a> Sim<'a> {
                 self.admitted.insert(i);
                 let e = &self.s.events[i];
                 if let Kind::Chan(c) = e.kind
-                    && !self.s.initial.channels.iter().any(|&(k, _)| k == c)
+                    && (self.reset.contains(&c)
+                        || !self.s.initial.channels.iter().any(|&(k, _)| k == c))
                 {
                     self.first_admitted.entry(c).or_insert(e.chan_pts - 1);
                 }
@@ -1968,41 +2104,51 @@ impl<'a> Sim<'a> {
     fn pump(&mut self) {
         while let Some(f) = self.m.next_action() {
             let early = self.rng.chance(50).then(|| self.compute(f));
-            self.in_flight.push_back((f, early));
+            self.in_flight.push_back((f, early, self.epoch));
         }
     }
 
     fn compute(&self, f: Fetch) -> Answer {
         match f {
             Fetch::GetState => {
-                assert_eq!(
-                    self.persisted.common.pts, 0,
-                    "getState only while no state was committed"
+                assert!(
+                    self.persisted.common.pts == 0 || self.resync_due,
+                    "getState only with no committed state, or after a \
+                     difference failed for good"
                 );
                 let (pts, qts, seq, date) = self.current();
                 Answer {
                     bytes: state(pts, qts, date, seq),
-                    to: 0,
-                    // The state is taken whole: nothing before it is owed
-                    // to an account that never committed one.
-                    skips: (0..self.done).collect(),
+                    // The state is taken whole: no common or qts update
+                    // before it is owed (an account that never committed
+                    // a state, or a resync past a pts Telegram refused).
+                    skips: (0..self.done)
+                        .filter(|&i| matches!(self.s.events[i].kind, Kind::Msg { .. } | Kind::Enc))
+                        .collect(),
+                    covers: Vec::new(),
                 }
             }
             Fetch::GetDifference { pts, qts, .. } => {
                 assert_ne!(pts, 0, "getDifference from pts 0");
-                let (bytes, skips) = self.difference(pts, qts);
+                let (bytes, skips, covers) = self.difference(pts, qts);
                 Answer {
                     bytes,
-                    to: 0,
                     skips,
+                    covers,
                 }
             }
             Fetch::GetChannelDifference { channel, pts } => {
-                let (bytes, to) = self.channel_difference(channel, pts);
+                let (bytes, to, skips) = self.channel_difference(channel, pts);
+                let covers = self.s.events[..self.done]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.kind == Kind::Chan(channel) && e.chan_pts <= to)
+                    .map(|(i, _)| i)
+                    .collect();
                 Answer {
                     bytes,
-                    to,
-                    skips: Vec::new(),
+                    skips,
+                    covers,
                 }
             }
         }
@@ -2033,30 +2179,27 @@ impl<'a> Sim<'a> {
         if self.rng.chance(5) {
             self.net.push_front((i, p.clone()));
         }
-        self.received.insert(i);
-        self.fed_run.insert(i);
+        self.got(i);
         let batches = self.m.feed_push(p);
         self.take(batches);
     }
 
     fn answer(&mut self, f: Fetch, early: Option<Answer>) {
         let a = early.unwrap_or_else(|| self.compute(f));
-        self.skipped.extend(a.skips.iter().copied());
         let batches = match f {
             Fetch::GetState => self.m.feed_state(b(a.bytes)),
             Fetch::GetDifference { .. } => self.m.feed_difference(b(a.bytes)),
             Fetch::GetChannelDifference { channel, .. } => {
-                let to = a.to;
-                self.received.extend(
-                    self.s.events[..self.done]
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| e.kind == Kind::Chan(channel) && e.chan_pts <= to)
-                        .map(|(i, _)| i),
-                );
                 self.m.feed_channel_difference(channel, b(a.bytes))
             }
         };
+        // Only an answer the manager took counts: a taken answer always
+        // returns its state's batch, a discarded (stale) one none.
+        if !batches.is_empty() {
+            self.resync_due &= !matches!(f, Fetch::GetState);
+            self.skipped.extend(a.skips.iter().copied());
+            self.received.extend(a.covers.iter().copied());
+        }
         self.take(batches);
     }
 
@@ -2084,7 +2227,7 @@ impl<'a> Sim<'a> {
     /// was never sent to the client (those are what Telegram cannot bring
     /// back), is admitted, or was fed to this run of the manager with no
     /// batch refused since (so it is held or delivered).
-    fn too_long(&self, pts: i32) -> Option<(Vec<u8>, Vec<usize>)> {
+    fn too_long(&self, pts: i32) -> Option<(Vec<u8>, Vec<usize>, Vec<usize>)> {
         let log = &self.s.events[..self.done];
         let pending: Vec<(usize, &Event)> = log
             .iter()
@@ -2093,16 +2236,37 @@ impl<'a> Sim<'a> {
                 matches!(e.kind, Kind::Msg { .. } | Kind::Affected { .. }) && e.pts > pts
             })
             .collect();
-        let roll = (self.s.seed ^ u64::try_from(pts).ok()? ^ (self.done as u64))
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            >> 62;
-        if pending.len() < 4 || roll != 0 {
+        if pending.len() < 4 || self.roll(u64::try_from(pts).ok()?) != 0 {
             return None;
         }
         let to = pending[pending.len() / 2].1.pts;
+        let skips = self.skippable(pending.iter().filter(|(_, e)| e.pts <= to).copied())?;
+        Some((
+            T::new(DIFFERENCE_TOO_LONG).int(to).done(),
+            skips,
+            Vec::new(),
+        ))
+    }
+
+    /// One in four, by the script, the call and the log.
+    fn roll(&self, key: u64) -> u64 {
+        (self.s.seed ^ key.wrapping_mul(0x5851_f42d_4c95_7f2d) ^ (self.done as u64))
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> 62
+    }
+
+    /// The events a too-long answer would skip, if skipping loses nothing
+    /// the client could still deliver: each was never sent to the client
+    /// (Telegram cannot bring those back), is admitted, or was fed to this
+    /// run of the manager with no batch refused since (so it is held or
+    /// delivered).
+    fn skippable<'e>(
+        &self,
+        events: impl Iterator<Item = (usize, &'e Event)>,
+    ) -> Option<Vec<usize>> {
         let on_the_way: HashSet<usize> = self.net.iter().map(|&(i, _)| i).collect();
         let mut skips = Vec::new();
-        for &(i, e) in pending.iter().filter(|(_, e)| e.pts <= to) {
+        for (i, e) in events {
             if !self.received.contains(&i) && !on_the_way.contains(&i) {
                 skips.push(i);
             } else if !(self.admitted.contains(&i)
@@ -2112,10 +2276,10 @@ impl<'a> Sim<'a> {
                 return None;
             }
         }
-        Some((T::new(DIFFERENCE_TOO_LONG).int(to).done(), skips))
+        Some(skips)
     }
 
-    fn difference(&self, pts: i32, qts: i32) -> (Vec<u8>, Vec<usize>) {
+    fn difference(&self, pts: i32, qts: i32) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
         if let Some(too_long) = self.too_long(pts) {
             return too_long;
         }
@@ -2154,28 +2318,41 @@ impl<'a> Sim<'a> {
             return (
                 difference(&d, &state(last.pts, last.qts, last.date, last.seq), true),
                 Vec::new(),
+                Vec::new(),
             );
         }
         // Channels with an update the client was never told of are
-        // signalled. A push on the way counts as told: the server sent
-        // it, and learns otherwise only when the connection drops with it
-        // unacknowledged.
+        // signalled, or (one in four) their posts since the first such
+        // update come as `updateNewChannelMessage`. A push on the way
+        // counts as told: the server sent it, and learns otherwise only
+        // when the connection drops with it unacknowledged.
         let on_the_way: HashSet<usize> = self.net.iter().map(|&(i, _)| i).collect();
-        let since: BTreeSet<i64> = log
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| match e.kind {
-                Kind::Chan(c) if !self.received.contains(&i) && !on_the_way.contains(&i) => Some(c),
-                _ => None,
-            })
-            .collect();
-        for c in since {
-            other.push(channel_too_long(c, Some(self.channel_pts(c))));
+        let mut since: BTreeMap<i64, usize> = BTreeMap::new();
+        for (i, e) in log.iter().enumerate() {
+            if let Kind::Chan(c) = e.kind
+                && !self.received.contains(&i)
+                && !on_the_way.contains(&i)
+            {
+                since.entry(c).or_insert(i);
+            }
+        }
+        let mut covers = Vec::new();
+        for (c, first) in since {
+            if self.roll(c.unsigned_abs() ^ 0xc4a7) == 0 {
+                for (i, e) in log.iter().enumerate().skip(first) {
+                    if e.kind == Kind::Chan(c) {
+                        other.push(new_channel_message(&e.body, e.chan_pts, 1));
+                        covers.push(i);
+                    }
+                }
+            } else {
+                other.push(channel_too_long(c, Some(self.channel_pts(c))));
+            }
             chats.push(self.s.chats[&c].clone());
         }
         let (cp, cq, cs, cd) = self.current();
         if msgs.is_empty() && enc.is_empty() && other.is_empty() && (cp, cq) == (pts, qts) {
-            return (difference_empty(cd, cs), Vec::new());
+            return (difference_empty(cd, cs), Vec::new(), Vec::new());
         }
         let d = Diff {
             msgs: &msgs,
@@ -2184,19 +2361,36 @@ impl<'a> Sim<'a> {
             chats: &chats,
             users: &users,
         };
-        (difference(&d, &state(cp, cq, cd, cs), false), Vec::new())
+        (
+            difference(&d, &state(cp, cq, cd, cs), false),
+            Vec::new(),
+            covers,
+        )
     }
 
-    /// The answer, and the channel pts it brings the client to.
-    fn channel_difference(&self, c: i64, pts: i32) -> (Vec<u8>, i32) {
-        let pending: Vec<&Event> = self.s.events[..self.done]
+    /// The answer, the channel pts it brings the client to, and what it
+    /// skips.
+    fn channel_difference(&self, c: i64, pts: i32) -> (Vec<u8>, i32, Vec<usize>) {
+        let pending: Vec<(usize, &Event)> = self.s.events[..self.done]
             .iter()
-            .filter(|e| e.kind == Kind::Chan(c) && e.chan_pts > pts)
+            .enumerate()
+            .filter(|(_, e)| e.kind == Kind::Chan(c) && e.chan_pts > pts)
             .collect();
         if pending.is_empty() {
             let to = self.channel_pts(c);
-            return (channel_difference_empty(true, to), to);
+            return (channel_difference_empty(true, to), to, Vec::new());
         }
+        // Too far behind (one in four with 3 or more pending): the
+        // channel's dialog pts and its latest post only.
+        if pending.len() >= 3
+            && self.roll(c.unsigned_abs() ^ u64::try_from(pts).unwrap_or(0) ^ 0x7f) == 0
+            && let Some(skips) = self.skippable(pending[..pending.len() - 1].iter().copied())
+        {
+            let to = self.channel_pts(c);
+            let latest = [pending[pending.len() - 1].1.body.clone()];
+            return (channel_difference_too_long(c, to, &latest), to, skips);
+        }
+        let pending: Vec<&Event> = pending.into_iter().map(|(_, e)| e).collect();
         let fin = pending.len() <= CHANNEL_DIFF_LIMIT;
         let taken = &pending[..pending.len().min(CHANNEL_DIFF_LIMIT)];
         let msgs: Vec<Vec<u8>> = taken.iter().map(|e| e.body.clone()).collect();
@@ -2211,7 +2405,7 @@ impl<'a> Sim<'a> {
             chats: &chats,
             ..EMPTY_DIFF
         };
-        (channel_difference(fin, to, &d), to)
+        (channel_difference(fin, to, &d), to, Vec::new())
     }
 
     async fn step(&mut self) {
@@ -2223,11 +2417,36 @@ impl<'a> Sim<'a> {
             }
             30..58 => self.deliver(),
             58..76 => {
-                if let Some((f, early)) = self.in_flight.pop_front() {
-                    if self.rng.chance(5) {
-                        self.m.fetch_failed(f);
-                    } else {
-                        self.answer(f, early);
+                if let Some((f, early, asked)) = self.in_flight.pop_front() {
+                    match self.rng.below(100) {
+                        0..5 => self.m.fetch_failed(f),
+                        // An error asking again cannot fix (for example
+                        // PERSISTENT_TIMESTAMP_INVALID, CHANNEL_INVALID).
+                        5..8 => {
+                            // Only a current call's failure resyncs with
+                            // getState; a stale one's catches up from the
+                            // committed state.
+                            self.resync_due |=
+                                matches!(f, Fetch::GetDifference { .. }) && asked == self.epoch;
+                            if let Fetch::GetChannelDifference { channel, .. } = f {
+                                // The channel's state is dropped by design:
+                                // what it missed so far is not owed, and it
+                                // is unknown again (owed from its next
+                                // admitted update on).
+                                self.reset.insert(channel);
+                                self.first_admitted.remove(&channel);
+                                self.exempt.extend(
+                                    self.s.events[..self.done]
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, e)| e.kind == Kind::Chan(channel))
+                                        .map(|(i, _)| i),
+                                );
+                            }
+                            let batches = self.m.fetch_failed_permanently(f);
+                            self.take(batches);
+                        }
+                        _ => self.answer(f, early),
                     }
                 }
             }
@@ -2236,11 +2455,15 @@ impl<'a> Sim<'a> {
                 // The connection ends: its pushes and calls are lost, and
                 // the sender adds `updatesTooLong`.
                 self.net.clear();
-                for (f, _) in std::mem::take(&mut self.in_flight) {
+                for (f, _, _) in std::mem::take(&mut self.in_flight) {
                     self.m.fetch_failed(f);
                 }
                 let batches = self.m.feed_push(b(T::new(UPDATES_TOO_LONG).done()));
                 self.take(batches);
+            }
+            93..97 => {
+                // Admission reports the batches it held open.
+                self.report();
             }
             _ => {}
         }
@@ -2257,12 +2480,13 @@ impl<'a> Sim<'a> {
             loop {
                 self.pump();
                 if let Some((i, p)) = self.net.pop_front() {
-                    self.received.insert(i);
-                    self.fed_run.insert(i);
+                    self.got(i);
                     let batches = self.m.feed_push(p);
                     self.take(batches);
-                } else if let Some((f, early)) = self.in_flight.pop_front() {
+                } else if let Some((f, early, _)) = self.in_flight.pop_front() {
                     self.answer(f, early);
+                } else if !self.open.is_empty() {
+                    self.report();
                 } else {
                     break;
                 }
@@ -2310,7 +2534,13 @@ impl<'a> Sim<'a> {
         for (i, e) in self.s.events.iter().enumerate() {
             let required = match e.kind {
                 Kind::Msg { .. } | Kind::Enc => !self.skipped.contains(&i),
-                Kind::Chan(c) if self.s.initial.channels.iter().any(|&(k, _)| k == c) => true,
+                Kind::Chan(_) if self.exempt.contains(&i) || self.skipped.contains(&i) => false,
+                Kind::Chan(c)
+                    if !self.reset.contains(&c)
+                        && self.s.initial.channels.iter().any(|&(k, _)| k == c) =>
+                {
+                    true
+                }
                 Kind::Chan(c) => self
                     .first_admitted
                     .get(&c)
