@@ -835,3 +835,48 @@ async fn peers_are_persisted_before_admission() {
     );
     run.account.close().await;
 }
+
+/// A short message from a user whose access hash the session has cached
+/// is delivered at once: the account asks the session, holding no set of
+/// known users.
+#[tokio::test(start_paused = true)]
+async fn a_cached_user_is_looked_up_in_the_session() {
+    let net = FakeNetwork::new();
+    let registry = Arc::new(Registry::default());
+    let dir = tempfile::tempdir().expect("tempdir");
+    logged_in(dir.path(), USER);
+    {
+        let store = SessionStore::open(dir.path()).expect("store");
+        store
+            .put_peers(&[Peer {
+                id: 100,
+                kind: PeerKind::User {
+                    bot: Some(false),
+                    is_self: Some(false),
+                },
+                access_hash: Some(7),
+            }])
+            .expect("peer");
+    }
+    let run = start_in("main", dir, &net, &registry);
+    until(&run.account, running).await;
+    let differences = || {
+        net.ctors()
+            .iter()
+            .filter(|&&c| c == ids::GET_DIFFERENCE)
+            .count()
+    };
+    let asked = differences();
+    assert!(net.push(tl_bytes(
+        r#"{"_":"updateShortMessage","id":1,"user_id":"100","message":"hi","pts":11,"pts_count":1,"date":1}"#
+    )));
+    timeout(WAIT, async {
+        while run.sink.updates() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("delivered");
+    assert_eq!(differences(), asked, "no difference asked for a known user");
+    run.account.close().await;
+}

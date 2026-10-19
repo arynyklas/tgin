@@ -355,20 +355,9 @@ impl SessionStore {
     }
 
     /// What the update manager starts from: the common state, every
-    /// channel's pts, the users whose access hash is cached, and the
-    /// channels that may be behind their stored pts.
+    /// channel's pts and the channels that may be behind their stored pts.
+    /// Known users are not loaded: ask [`user_known`](Self::user_known).
     pub fn stored_state(&self) -> Result<StoredState, SessionError> {
-        let mut known_users = Vec::new();
-        {
-            let txn = self.db.begin_read()?;
-            for row in txn.open_table(PEERS)?.iter()? {
-                let (_, v) = row?;
-                let peer = decode_peer(v.value()).ok_or(SessionError::Corrupt("peer"))?;
-                if matches!(peer.kind, PeerKind::User { .. }) && peer.access_hash.is_some() {
-                    known_users.push(peer.id);
-                }
-            }
-        }
         let mut behind = Vec::new();
         {
             let txn = self.db.begin_read()?;
@@ -380,9 +369,16 @@ impl SessionStore {
         Ok(StoredState {
             common: self.update_state()?,
             channels: self.channel_pts()?,
-            known_users,
+            known_users: Vec::new(),
             behind,
         })
+    }
+
+    /// Whether the user `id`'s access hash is cached.
+    pub fn user_known(&self, id: i64) -> Result<bool, SessionError> {
+        Ok(self
+            .peer(id)?
+            .is_some_and(|p| matches!(p.kind, PeerKind::User { .. }) && p.access_hash.is_some()))
     }
 
     /// Persists what [`UpdateManager::committed`](crate::UpdateManager::committed)
@@ -1067,8 +1063,13 @@ mod tests {
             s.peer(7).expect("user"),
             Some(user(Some(false), Some(false), Some(12)))
         );
-        let st = s.stored_state().expect("stored");
-        assert_eq!(st.known_users, vec![7]);
+        assert!(s.user_known(7).expect("user"), "a user with a hash");
+        assert!(!s.user_known(8).expect("unknown"), "a user never seen");
+        assert!(
+            !s.user_known(-99).expect("not a user"),
+            "a channel row is no user"
+        );
+        assert!(s.stored_state().expect("stored").known_users.is_empty());
     }
 
     /// `commit_state` writes only the fields a delta names, plus its
@@ -1110,7 +1111,10 @@ mod tests {
         );
         assert_eq!(st.channels, vec![(5, 50), (6, 60)]);
         assert_eq!(st.behind, vec![(6, 2)]);
-        assert!(st.known_users.is_empty());
+        assert!(
+            st.known_users.is_empty(),
+            "users are looked up, never loaded"
+        );
     }
 
     /// A commit reporting a channel caught up and a newer mark of that

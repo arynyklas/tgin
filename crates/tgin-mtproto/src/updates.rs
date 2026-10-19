@@ -117,7 +117,9 @@ pub struct StoredState {
     pub common: UpdateState,
     /// Each channel's pts, by bare channel id.
     pub channels: Vec<(i64, i32)>,
-    /// The users whose access hash is cached.
+    /// Users whose access hash is cached, known up front. Leave it empty and
+    /// give a [`with_user_lookup`](UpdateManager::with_user_lookup) instead
+    /// to keep no set in memory.
     pub known_users: Vec<i64>,
     /// Channels a batch moved ahead of their stored pts that have not
     /// caught up since ([`Batch::ahead`]), each with the id of the batch
@@ -530,6 +532,10 @@ enum Common {
     Qts,
 }
 
+/// Whether a user's access hash is cached: see
+/// [`UpdateManager::with_user_lookup`].
+type UserLookup = Box<dyn Fn(i64) -> bool + Send + Sync>;
+
 /// One account's update state and gap recovery. See the module docs.
 pub struct UpdateManager {
     pts: i32,
@@ -572,7 +578,13 @@ pub struct UpdateManager {
     /// The same for `updates.getChannelDifference`, for every channel:
     /// Telegram's limit is per method.
     channel_flood: Option<Instant>,
+    /// Users known to have a cached access hash: those of the stored state
+    /// and, without a [`user_lookup`](Self::with_user_lookup), those seen
+    /// since.
     known_users: HashSet<i64>,
+    /// Asks the session's cache whether a user's access hash is known; then
+    /// nothing is held in memory per user.
+    user_lookup: Option<UserLookup>,
     committed: UpdateState,
     committed_channels: HashMap<i64, i32>,
     pending: VecDeque<Pending>,
@@ -651,6 +663,7 @@ impl UpdateManager {
             ahead_new: Vec::new(),
             caught_up,
             known_users: state.known_users.into_iter().collect(),
+            user_lookup: None,
             committed: common,
             committed_channels: state.channels.into_iter().collect(),
             pending: VecDeque::new(),
@@ -658,6 +671,15 @@ impl UpdateManager {
             next_origin: 0,
             dropped: Dropped::default(),
         }
+    }
+
+    /// Asks `known` whether a user's access hash is cached (the session's
+    /// `peers` table), when a short update needs to know, instead of holding
+    /// a set of every known user in memory.
+    #[must_use]
+    pub fn with_user_lookup(mut self, known: impl Fn(i64) -> bool + Send + Sync + 'static) -> Self {
+        self.user_lookup = Some(Box::new(known));
+        self
     }
 
     /// What was dropped so far.
@@ -1563,10 +1585,10 @@ impl UpdateManager {
             Some(PeerId::User(u)) => Some(u),
             _ => None,
         };
-        [f.sender, peer]
-            .into_iter()
-            .flatten()
-            .any(|u| !self.known_users.contains(&u))
+        [f.sender, peer].into_iter().flatten().any(|u| {
+            !self.known_users.contains(&u)
+                && !self.user_lookup.as_ref().is_some_and(|known| known(u))
+        })
     }
 
     fn offer_common(&mut self, which: Common, h: Held, out: &mut Out) {
@@ -2023,7 +2045,7 @@ impl UpdateManager {
         };
         let (users, chats) = (slice(users), slice(chats));
         let mut peers = Vec::new();
-        if decode::peers(&users, &mut peers).is_ok() {
+        if self.user_lookup.is_none() && decode::peers(&users, &mut peers).is_ok() {
             for p in peers {
                 if matches!(p.kind, PeerKind::User { .. }) && p.access_hash.is_some() {
                     self.known_users.insert(p.id);

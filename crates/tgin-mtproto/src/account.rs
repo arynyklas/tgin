@@ -1031,7 +1031,17 @@ async fn run(ctx: Arc<Ctx>) -> End {
             ctx: &ctx,
             store: &store,
             session: conn.session,
-            manager: UpdateManager::new(state),
+            manager: UpdateManager::new(state).with_user_lookup({
+                // Weak: a manager that outlives the run never holds the
+                // session. A failed lookup counts as unknown, which only
+                // asks one difference more.
+                let store = Arc::downgrade(&store);
+                move |user| {
+                    store
+                        .upgrade()
+                        .is_some_and(|store| store.user_known(user).unwrap_or(false))
+                }
+            }),
             ids,
             fetches: JoinSet::new(),
             dropped: Dropped::default(),
