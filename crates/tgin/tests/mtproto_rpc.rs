@@ -311,6 +311,7 @@ async fn authorization_methods_refused_even_when_listed() {
             MethodGlob::Any,
             MethodGlob::Exact("auth.exportAuthorization".to_owned()),
             MethodGlob::Exact("auth.acceptLoginToken".to_owned()),
+            MethodGlob::Exact("bots.exportBotToken".to_owned()),
         ],
         deny: Vec::new(),
     };
@@ -322,6 +323,8 @@ async fn authorization_methods_refused_even_when_listed() {
     for body in [
         r#"{"_":"auth.exportAuthorization","dc_id":4}"#,
         r#"{"_":"auth.acceptLoginToken","token":"AQID"}"#,
+        // Returns, or with `revoke` rotates, a managed bot's token.
+        r#"{"_":"bots.exportBotToken","bot":{"_":"inputUserSelf"},"revoke":false}"#,
     ] {
         let answer = send(&app, tl(body)).await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN);

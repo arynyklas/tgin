@@ -158,8 +158,10 @@ pub enum Refused {
 
 /// Refused whatever a client's allowlist says (the owner may
 /// overrule it): each mints or moves an authorization of the account, and
-/// tgin owns the account's authorizations.
-pub const AUTHORIZATION_METHODS: [&str; 8] = [
+/// tgin owns the account's authorizations. `bots.exportBotToken` hands
+/// out, or with `revoke` rotates, the token of a bot the account manages:
+/// a credential export of the same kind.
+pub const AUTHORIZATION_METHODS: [&str; 9] = [
     "auth.exportAuthorization",
     "auth.importAuthorization",
     "auth.acceptLoginToken",
@@ -168,6 +170,7 @@ pub const AUTHORIZATION_METHODS: [&str; 8] = [
     "auth.bindTempAuthKey",
     "auth.importBotAuthorization",
     "auth.importWebTokenAuthorization",
+    "bots.exportBotToken",
 ];
 
 const UPDATES_METHODS: [&str; 3] = [
