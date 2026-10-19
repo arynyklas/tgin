@@ -20,12 +20,14 @@
 
 mod dc;
 pub mod decode;
+pub mod envelope;
 mod error;
 mod lock;
 pub mod login;
 pub mod schema;
 mod sender;
 mod session;
+mod sink;
 #[cfg(test)]
 mod testgen;
 #[cfg(any(test, feature = "testkit"))]
@@ -39,6 +41,7 @@ pub use error::SessionError;
 pub use schema::TlError;
 pub use sender::{Connected, InitParams, Pushes, RpcOutcome, Sender, SenderError};
 pub use session::{AuthKey, ChannelKind, DcAddr, Login, Peer, PeerKind, SessionStore, UpdateState};
+pub use sink::{Admission, BatchSink, ID_BLOCK, IdsError, UpdateIds};
 pub use transport::{
     GeneratedKey, Opened, PacketReader, PacketWriter, TcpTransport, Transport, TransportError,
 };

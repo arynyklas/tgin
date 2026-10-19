@@ -12,11 +12,13 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 use tgin_core::config::{self, Config};
 use tgin_core::consumer::{PollRequest, PullConsumer};
-use tgin_core::engine::{Consumer, Engine, EngineRuntime, TokenChanged, WebhookChange};
+use tgin_core::engine::{
+    BuildError, Consumer, Engine, EngineRuntime, Feed, TokenChanged, WebhookChange,
+};
 use tgin_core::facts::Facts;
 use tgin_core::ids::SourceId;
 use tgin_core::metrics::CoreMetrics;
-use tgin_core::sink::{Admit, Sink};
+use tgin_core::sink::{Admit, BatchUpdate, Sink};
 use tgin_runtime::breaker::BreakerState;
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::queue::{HolderId, QueueStats};
@@ -1709,5 +1711,224 @@ async fn bot_scoped_changes_refuse_a_rotated_token() {
     assert_eq!(
         h.engine.drop_pending(a, &tok("9:zzz"), "hooks"),
         Ok(Some(1))
+    );
+}
+
+// ------------------------------------------------------------- accounts
+
+/// One account, `acct`: new messages go to `raw`, channel posts to the
+/// `tl_json` consumers `r1` and `r2`.
+const ACCOUNT: &str = r#"version: 1
+server: {}
+accounts:
+  acct:
+    api_id: 1
+    api_hash: h
+    session_dir: sessions/acct
+    routes:
+      - match: { constructors: [updateNewMessage] }
+        to: [raw]
+      - match: { constructors: [updateNewChannelMessage] }
+        to: [{ all: [r1, r2] }]
+consumers:
+  raw: { pull: { auth_token: t0, capacity: 3 } }
+  r1: { pull: { auth_token: t1, render: tl_json } }
+  r2: { pull: { auth_token: t2, render: tl_json } }
+"#;
+
+/// A batch update that counts how often each payload is built.
+struct Counted {
+    update_type: &'static str,
+    id: i64,
+    payloads: usize,
+    rendered: usize,
+}
+
+impl Counted {
+    fn new(update_type: &'static str, id: i64) -> Self {
+        Self {
+            update_type,
+            id,
+            payloads: 0,
+            rendered: 0,
+        }
+    }
+}
+
+impl BatchUpdate for Counted {
+    fn facts(&self) -> Facts<'_> {
+        Facts {
+            update_type: self.update_type,
+            chat_id: Some(7),
+            ..Facts::default()
+        }
+    }
+
+    fn update_id(&self) -> i64 {
+        self.id
+    }
+
+    fn update_type(&self) -> &'static str {
+        self.update_type
+    }
+
+    fn payload(&mut self) -> Bytes {
+        self.payloads += 1;
+        Bytes::from(format!(r#"{{"update_id":{},"form":"raw"}}"#, self.id))
+    }
+
+    fn rendered(&mut self) -> Bytes {
+        self.rendered += 1;
+        Bytes::from(format!(r#"{{"update_id":{},"form":"tl_json"}}"#, self.id))
+    }
+}
+
+async fn payloads(c: &PullConsumer) -> Vec<String> {
+    let resp = c
+        .poll(req("x", 0, Duration::ZERO), &CancellationToken::new())
+        .await;
+    resp.items
+        .iter()
+        .map(|b| String::from_utf8(b.to_vec()).expect("UTF-8"))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn rendered_built_once_and_only_for_tl_json_targets() {
+    let h = Harness::new(ACCOUNT);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let mut batch = [
+        Counted::new("updateNewMessage", 1),
+        Counted::new("updateNewChannelMessage", 2),
+        Counted::new("updateUserStatus", 3),
+    ];
+    assert_eq!(h.engine.admit_batch(acct, &mut batch), Admit::Admitted);
+    assert_eq!((batch[0].payloads, batch[0].rendered), (1, 0), "raw only");
+    assert_eq!(
+        (batch[1].payloads, batch[1].rendered),
+        (1, 1),
+        "rendered once for two tl_json consumers"
+    );
+    assert_eq!((batch[2].payloads, batch[2].rendered), (0, 0), "unrouted");
+    assert_eq!(
+        payloads(&h.pull("raw")).await,
+        [r#"{"update_id":1,"form":"raw"}"#]
+    );
+    for c in ["r1", "r2"] {
+        assert_eq!(
+            payloads(&h.pull(c)).await,
+            [r#"{"update_id":2,"form":"tl_json"}"#]
+        );
+    }
+    let mut none = [Counted::new("updateUserStatus", 4)];
+    assert_eq!(h.engine.admit_batch(acct, &mut none), Admit::Unroutable);
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_is_admitted_whole_or_not_at_all() {
+    let h = Harness::new(ACCOUNT);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let mut first = [
+        Counted::new("updateNewMessage", 1),
+        Counted::new("updateNewMessage", 2),
+    ];
+    assert_eq!(h.engine.admit_batch(acct, &mut first), Admit::Admitted);
+    // Room for one more, and the batch has two: neither is queued.
+    let mut second = [
+        Counted::new("updateNewMessage", 3),
+        Counted::new("updateNewMessage", 4),
+    ];
+    assert_eq!(h.engine.admit_batch(acct, &mut second), Admit::Backpressure);
+    assert_eq!(h.stats("raw").available, 2);
+    assert_eq!(h.stats("raw").reserved, 0, "every reservation released");
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [1, 2]);
+    assert_eq!(poll(&h.pull("raw"), "x", 3).await, Vec::<i64>::new());
+    assert_eq!(h.engine.admit_batch(acct, &mut second), Admit::Admitted);
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [3, 4], "in batch order");
+}
+
+/// A bot source, or a source no rule names, cannot purge an account's
+/// queue: `honor_drop_pending` applies to bots' own updates only.
+#[tokio::test(start_paused = true)]
+async fn account_ids_survive_reloads_and_bots_cannot_purge_them() {
+    let with_bot = ACCOUNT.replace(
+        "accounts:",
+        "bots:\n  - { name: b, token: \"1:aaa\", routes: [{ to: [other] }] }\naccounts:",
+    ) + "  other: { pull: { honor_drop_pending: true } }\n";
+    let h = Harness::new(&with_bot);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let bot = h.engine.source_id("b").expect("a bot source");
+    assert_ne!(acct, bot);
+    assert_eq!(h.engine.source_id("acct"), None, "an account is no bot");
+    h.engine.apply(&load(&with_bot)).expect("apply");
+    assert_eq!(h.engine.account_source("acct"), Some(acct));
+    let mut batch = [Counted::new("updateNewMessage", 1)];
+    assert_eq!(h.engine.admit_batch(acct, &mut batch), Admit::Admitted);
+    assert_eq!(h.engine.drop_pending(bot, &tok("1:aaa"), "raw"), Ok(None));
+    assert_eq!(h.stats("raw").available, 1);
+}
+
+/// A reload never gives a consumer the other kind of updates while it
+/// still holds, or is still given, the kind it had: it is refused, and
+/// the consumer keeps its queue. Once nothing feeds it and it is empty,
+/// it may change.
+#[tokio::test(start_paused = true)]
+async fn reload_refuses_turning_a_bot_queue_into_an_account_queue() {
+    const BOT_FED: &str = r#"version: 1
+server: {}
+bots:
+  - { name: b, token: "1:aaa", routes: [{ to: [q] }] }
+accounts:
+  acct: { api_id: 1, api_hash: h, session_dir: sessions/acct }
+consumers:
+  q: { pull: { auth_token: t } }
+"#;
+    let unfed = BOT_FED.replace("routes: [{ to: [q] }]", "routes: []");
+    let account_fed = unfed.replace(
+        "session_dir: sessions/acct }",
+        "session_dir: sessions/acct, routes: [{ to: [q] }] }",
+    );
+    let h = Harness::new(BOT_FED);
+    let bot = h.engine.source_id("b").expect("bot");
+    assert_eq!(admit_to(&h.engine, bot, "message", 1), Admit::Admitted);
+
+    let err = h.engine.apply(&load(&account_fed)).expect_err("refused");
+    assert!(
+        matches!(&err, BuildError::FeedChanged { consumer, from: Feed::Bots, to: Feed::Account } if consumer == "q"),
+        "{err}"
+    );
+    assert_eq!(h.stats("q").available, 1, "the queue is kept");
+    assert_eq!(
+        h.engine.pull_consumer_fed("q").map(|(_, f)| f),
+        Some(Some(Feed::Bots))
+    );
+
+    // Unfed, it still holds a bot update: still refused.
+    h.engine.apply(&load(&unfed)).expect("unfed");
+    assert!(h.engine.apply(&load(&account_fed)).is_err());
+    // Drained, it may change.
+    assert_eq!(poll(&h.pull("q"), "x", 0).await, [1]);
+    assert_eq!(poll(&h.pull("q"), "x", -1).await, Vec::<i64>::new());
+    h.engine.apply(&load(&account_fed)).expect("drained");
+    assert_eq!(
+        h.engine.pull_consumer_fed("q").map(|(_, f)| f),
+        Some(Some(Feed::Account))
+    );
+
+    // And back: refused while the account still feeds it.
+    let acct = h.engine.account_source("acct").expect("account");
+    let mut batch = [Counted::new("updateNewMessage", 1)];
+    assert_eq!(h.engine.admit_batch(acct, &mut batch), Admit::Admitted);
+    let err = h.engine.apply(&load(BOT_FED)).expect_err("refused");
+    assert!(
+        matches!(
+            err,
+            BuildError::FeedChanged {
+                from: Feed::Account,
+                to: Feed::Bots,
+                ..
+            }
+        ),
+        "{err}"
     );
 }

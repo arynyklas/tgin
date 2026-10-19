@@ -2780,6 +2780,8 @@ version = "1.0.0-dev"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64 0.23.1",
+ "bytes",
  "clap",
  "futures-util",
  "http-body",

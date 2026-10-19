@@ -39,7 +39,7 @@ use crate::ids::{ConsumerId, SourceId};
 use crate::metrics::{ConsumerDropReason, ConsumerMetrics, CoreMetrics, SourceMetrics};
 use crate::reload::{self, Plan};
 use crate::reply::{Binding, ReplyHandle};
-use crate::rules::{MatchScratch, RouteTable, RuleError, TargetSpec};
+use crate::rules::{MatchScratch, RouteTable, RuleError, RuleSpec, TargetSpec};
 
 /// What the engine's background tasks run under.
 #[derive(Clone)]
@@ -81,6 +81,34 @@ pub enum BuildError {
          tgin started; restart tgin to apply this config"
     )]
     SourceIdsExhausted,
+    #[error(
+        "consumer `{consumer}` holds {from} updates and would now get {to} updates; a \
+         consumer never mixes the two"
+    )]
+    FeedChanged {
+        consumer: String,
+        from: Feed,
+        to: Feed,
+    },
+}
+
+/// What a consumer instance is given: bot updates (Bot API JSON) or account
+/// updates (envelope v1). Config validation keeps one consumer to one kind;
+/// an instance keeps the kind it was first given (see
+/// [`BuildError::FeedChanged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feed {
+    Bots,
+    Account,
+}
+
+impl fmt::Display for Feed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bots => "bot",
+            Self::Account => "account",
+        })
+    }
 }
 
 /// One consumer instance. Cloning shares it.
@@ -240,6 +268,9 @@ pub struct EngineState {
     /// The name of every source id ever given out, by id; push consumers
     /// name the source of queued updates with it.
     pub(crate) source_names: Arc<[Arc<str>]>,
+    /// The accounts of this generation with their source ids, which the
+    /// route table knows their rules by. An account keeps its id by name.
+    pub(crate) accounts: Vec<(Arc<str>, SourceId)>,
     /// The config this state was built from, for the next reload's diff.
     pub(crate) config: Arc<Config>,
 }
@@ -287,9 +318,34 @@ impl EngineState {
             .map(|info| info.id)
             .find(|&id| self.feeds(id, consumer))
     }
+
+    /// The account `name`'s source id.
+    pub(crate) fn account_named(&self, name: &str) -> Option<SourceId> {
+        self.accounts
+            .iter()
+            .find(|(n, _)| **n == *name)
+            .map(|&(_, id)| id)
+    }
+}
+
+/// What the rules of `cfg` give the consumer `consumer`, if anything:
+/// account updates when an account's rules reach it, else bot updates when
+/// a bot's do.
+pub(crate) fn feed_of(cfg: &Config, consumer: ConsumerId) -> Option<Feed> {
+    if cfg.accounts.iter().any(|a| targets(&a.rules, consumer)) {
+        Some(Feed::Account)
+    } else if cfg.bots.iter().any(|b| targets(&b.rules, consumer)) {
+        Some(Feed::Bots)
+    } else {
+        None
+    }
 }
 
 fn bot_targets(bot: &config::Bot, consumer: ConsumerId) -> bool {
+    targets(&bot.rules, consumer)
+}
+
+fn targets(rules: &[RuleSpec], consumer: ConsumerId) -> bool {
     fn reaches(spec: &TargetSpec, consumer: ConsumerId) -> bool {
         match spec {
             TargetSpec::Consumer(id) => *id == consumer,
@@ -298,7 +354,7 @@ fn bot_targets(bot: &config::Bot, consumer: ConsumerId) -> bool {
             }
         }
     }
-    bot.rules
+    rules
         .iter()
         .any(|rule| rule.targets.iter().any(|spec| reaches(spec, consumer)))
 }
@@ -309,6 +365,8 @@ pub(crate) struct Target {
     pub(crate) slot: Arc<Slot>,
     pub(crate) on_full: OnFull,
     pub(crate) capacity_bytes: usize,
+    /// `render: tl_json`: account updates go with their TL-JSON.
+    pub(crate) tl_json: bool,
 }
 
 /// One consumer instance with what the engine keeps for it. It lives as long
@@ -338,6 +396,8 @@ pub(crate) struct Slot {
     /// The bot that fed a pull instance when a reload retired it, so that
     /// [`Engine::routes_to`] keeps answering for it while it drains.
     pub(crate) fed_by: Mutex<Option<SourceId>>,
+    /// The kind of updates the instance has been given, once known.
+    pub(crate) feed: Mutex<Option<Feed>>,
 }
 
 impl Slot {
@@ -359,6 +419,7 @@ impl Slot {
             kill: rt.force.child_token(),
             drain: Mutex::new(None),
             fed_by: Mutex::new(None),
+            feed: Mutex::new(None),
         }
     }
 
@@ -684,18 +745,38 @@ impl Engine {
     /// instance a reload removed or replaced that still drains, so that its
     /// clients can fetch and ack what it holds.
     pub fn pull_consumer(&self, name: &str) -> Option<Arc<PullConsumer>> {
-        if let Some(Consumer::Pull(c)) = self.consumer(name) {
-            return Some(c);
+        self.pull_consumer_fed(name).map(|(c, _)| c)
+    }
+
+    /// [`Engine::pull_consumer`], with the kind of updates the instance
+    /// holds, once it was given any: a Bot API poll must never get account
+    /// envelopes, nor an account poll bot updates.
+    pub fn pull_consumer_fed(&self, name: &str) -> Option<(Arc<PullConsumer>, Option<Feed>)> {
+        let pull = |slot: &Slot| match &slot.consumer {
+            Consumer::Pull(c) => Some((Arc::clone(c), *slot.feed.lock())),
+            Consumer::Push(_) => None,
+        };
+        if let Some(found) = self
+            .shared
+            .state
+            .load()
+            .target(name)
+            .and_then(|t| pull(&t.slot))
+        {
+            return Some(found);
         }
         self.shared
             .retired
             .lock()
             .iter()
             .filter(|s| &*s.name == name)
-            .find_map(|s| match &s.consumer {
-                Consumer::Pull(c) => Some(Arc::clone(c)),
-                Consumer::Push(_) => None,
-            })
+            .find_map(|s| pull(s))
+    }
+
+    /// The engine's id of the account `name`, which its ingest admits with.
+    /// It stays the same across reloads that keep the account.
+    pub fn account_source(&self, name: &str) -> Option<SourceId> {
+        self.shared.state.load().account_named(name)
     }
 
     /// Whether the bot `source` routes to the consumer `consumer`: a rule of
@@ -892,7 +973,7 @@ impl Engine {
         if let Some(Some(info)) = sources.get_mut(usize::from(source.0)) {
             info.username = username;
         }
-        let table = match reload::compile(&old.config, &sources) {
+        let table = match reload::compile(&old.config, &sources, &old.accounts) {
             Ok(table) => table,
             Err(err) => {
                 tracing::error!(error = %err, "recompiling the routes for a bot username failed");
@@ -906,6 +987,7 @@ impl Engine {
             sources,
             targets: old.targets.clone(),
             source_names: Arc::clone(&old.source_names),
+            accounts: old.accounts.clone(),
             config: Arc::clone(&old.config),
         }));
     }

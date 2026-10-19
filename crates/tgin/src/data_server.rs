@@ -1,5 +1,6 @@
 //! The data plane's routes: webhook ingress, the Bot-API-shaped pull
-//! endpoints (`/c/{consumer}/getUpdates` and each alias, served by
+//! endpoints (`/c/{consumer}/getUpdates`, `/c/{consumer}/mtproto/v1/getUpdates`
+//! for account-fed consumers, and each alias, served by
 //! [`tgin_botapi::pull`]), and the Bot API gateway as the fallback for every
 //! other path.
 //!
@@ -22,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use parking_lot::Mutex;
 use tgin_botapi::gateway::{Gateway, errors};
-use tgin_botapi::pull::{PullAuth, PullRoutes};
+use tgin_botapi::pull::{PollPath, PullAuth, PullRoutes};
 use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
 use tgin_core::engine::Engine;
@@ -225,6 +226,12 @@ fn router(
         "/c/{consumer}/getUpdates",
         get(by_path).post(by_path).with_state(Arc::clone(&pull)),
     );
+    router = router.route(
+        "/c/{consumer}/mtproto/v1/getUpdates",
+        get(account_path)
+            .post(account_path)
+            .with_state(Arc::clone(&pull)),
+    );
     for (path, name) in aliases {
         router = router.route(&path, alias(&pull, name));
     }
@@ -275,13 +282,21 @@ async fn by_path(
     Path(consumer): Path<String>,
     req: Request,
 ) -> Response {
-    pull.get_updates(&consumer, req).await
+    pull.get_updates(&consumer, PollPath::Bot, req).await
+}
+
+async fn account_path(
+    State(pull): State<Arc<PullRoutes>>,
+    Path(consumer): Path<String>,
+    req: Request,
+) -> Response {
+    pull.get_updates(&consumer, PollPath::Account, req).await
 }
 
 fn alias(pull: &Arc<PullRoutes>, name: Arc<str>) -> MethodRouter {
     let handler = move |State(pull): State<Arc<PullRoutes>>, req: Request| {
         let name = Arc::clone(&name);
-        async move { pull.get_updates(&name, req).await }
+        async move { pull.get_updates(&name, PollPath::Alias, req).await }
     };
     get(handler.clone())
         .post(handler)

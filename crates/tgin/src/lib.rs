@@ -1,6 +1,7 @@
 //! The tgin binary: command line, process assembly, the data and admin
 //! planes, and hot reload.
 
+pub mod account_ingest;
 pub mod admin;
 pub mod app;
 pub mod cli;

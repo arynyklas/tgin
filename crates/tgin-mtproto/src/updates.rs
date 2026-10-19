@@ -208,7 +208,7 @@ pub struct UpdateBytes {
 }
 
 impl UpdateBytes {
-    fn new(bytes: Bytes) -> Result<Self, TlError> {
+    pub(crate) fn new(bytes: Bytes) -> Result<Self, TlError> {
         let f = decode::facts(&bytes)?;
         let base = bytes.as_ptr().addr();
         let range = |s: &str| {
