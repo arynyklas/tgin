@@ -1414,3 +1414,127 @@ async fn init_deadline_waits_while_reads_are_paused() {
     fresh.answer(packet.requests()[0].msg_id, &ANSWER);
     assert_eq!(outcome(call).await.unwrap(), answered());
 }
+
+/// An `rpc_error` answer to the connection's init call.
+fn refuse_init(srv: &mut Server, init_msg_id: i64, code: i32, message: &str) {
+    let error = tl::enums::RpcError::Error(tl::types::RpcError {
+        error_code: code,
+        error_message: message.into(),
+    });
+    srv.answer(init_msg_id, &error.to_bytes());
+}
+
+/// Stands in for the update manager: answers every push with a request,
+/// as Task 5 answers `updatesTooLong` with `getDifference`.
+fn eager_consumer(h: &mut Harness) -> JoinHandle<()> {
+    let mut pushes = h.pushes.take().unwrap();
+    let sender = Arc::clone(&h.sender);
+    tokio::spawn(async move {
+        while pushes.recv().await.is_some() {
+            let _ = sender.invoke(get_config()).await;
+        }
+    })
+}
+
+/// A permanent init refusal (a mistyped api_id) costs one connection: it
+/// starts no catch-up, and later requests fail without connecting (P7).
+#[tokio::test(start_paused = true)]
+async fn refused_init_latches_without_a_reconnect_loop() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let consumer = eager_consumer(&mut h);
+    let call = h.invoke(get_config());
+    let init_msg = srv.init_packet().await;
+    refuse_init(&mut srv, init_msg.msg_id, 400, "API_ID_INVALID");
+    let result = outcome(call).await;
+    assert!(
+        matches!(&result, Err(SenderError::InitRefused { code: 400, .. })),
+        "{result:?}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    let result = outcome(h.invoke(get_config())).await;
+    assert!(
+        matches!(&result, Err(SenderError::InitRefused { code: 400, message }) if message == "API_ID_INVALID"),
+        "{result:?}"
+    );
+    assert!(h.conns.try_recv().is_err(), "no reconnect");
+    assert_eq!(h.opens(), [true], "one connection in all");
+    consumer.abort();
+}
+
+/// A 420 `FLOOD_WAIT_X` answer to the init call holds for X seconds, then
+/// the next request connects again.
+#[tokio::test(start_paused = true)]
+async fn flood_wait_on_init_latches_for_its_seconds() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let init_msg = srv.init_packet().await;
+    refuse_init(&mut srv, init_msg.msg_id, 420, "FLOOD_WAIT_30");
+    assert!(matches!(
+        outcome(call).await,
+        Err(SenderError::InitRefused { code: 420, .. })
+    ));
+
+    tokio::time::sleep(Duration::from_secs(29)).await;
+    assert!(matches!(
+        outcome(h.invoke(get_config())).await,
+        Err(SenderError::InitRefused { code: 420, .. })
+    ));
+    assert!(h.conns.try_recv().is_err(), "no connection while it holds");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let call = h.invoke(get_config());
+    let mut fresh = h.ready_conn().await;
+    let packet = fresh.request().await;
+    fresh.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+/// Transport −429 (too many connections from this address) delays each
+/// next connection: 1 s, doubling, capped at 60 s; a completed init resets
+/// it. No catch-up push is made for a connection that never initialized.
+#[tokio::test(start_paused = true)]
+async fn minus_429_backs_off_reconnects() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    // Each request opens the next connection, which the next round fails.
+    let mut call = h.invoke(get_config());
+    for expected in [1, 2, 4, 8, 16, 32, 60, 60] {
+        srv.init_packet().await;
+        // The request now waits behind the init call on this connection.
+        srv.no_request().await;
+        srv.fail(TransportError::Status(429));
+        assert!(matches!(outcome(call).await, Err(SenderError::NotSent)));
+        let failed_at = tokio::time::Instant::now();
+        call = h.invoke(get_config());
+        srv = timeout(Duration::from_secs(120), h.conns.recv())
+            .await
+            .expect("the sender reconnects")
+            .unwrap();
+        assert_eq!(
+            failed_at.elapsed().as_secs(),
+            expected,
+            "the delay before the next connection"
+        );
+        assert!(pushes.try_recv().is_err(), "no catch-up before init");
+    }
+    // A completed init resets the backoff: the next −429 waits 1 s again.
+    srv.handshake().await;
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+    srv.close();
+    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+    let started = tokio::time::Instant::now();
+    let call = h.invoke(get_config());
+    let mut srv = h.next_conn().await;
+    assert_eq!(started.elapsed().as_secs(), 0, "no delay after a good init");
+    srv.init_packet().await;
+    srv.no_request().await;
+    srv.fail(TransportError::Status(429));
+    assert!(matches!(outcome(call).await, Err(SenderError::NotSent)));
+    let failed_at = tokio::time::Instant::now();
+    let _call = h.invoke(get_config());
+    h.next_conn().await;
+    assert_eq!(failed_at.elapsed().as_secs(), 1, "the backoff starts over");
+}

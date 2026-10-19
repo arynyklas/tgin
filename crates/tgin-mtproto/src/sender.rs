@@ -29,10 +29,10 @@
 //! `session_id`, seqno from 0). When one ends, the sender stays without a
 //! connection until the next `invoke`, which opens a fresh one. Pushes
 //! therefore stop until then. So on a main session, whenever a connection
-//! ends (except on −404 and when the sender is dropped) and whenever
-//! Telegram reports `new_session_created`, the sender pushes a synthetic
-//! `updatesTooLong`: the update manager then calls `getDifference`, which
-//! reconnects and re-subscribes the session.
+//! that completed its init call ends (except on −404 and when the sender
+//! is dropped) and whenever Telegram reports `new_session_created`, the
+//! sender pushes a synthetic `updatesTooLong`: the update manager then
+//! calls `getDifference`, which reconnects and re-subscribes the session.
 //!
 //! Every connection opens with the sender's own init call,
 //! `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`; no
@@ -40,6 +40,13 @@
 //! it. If no answer comes within the init timeout the connection is
 //! dropped and the waiting requests get [`SenderError::NotSent`]; if
 //! Telegram refuses it they get [`SenderError::InitRefused`].
+//!
+//! Failures before init do not turn into a reconnect loop (ruling P7):
+//! - a 4xx refusal of the init call latches: every later request gets
+//!   [`SenderError::InitRefused`] without connecting, until the sender is
+//!   rebuilt; a 420 `FLOOD_WAIT_X` latches for X seconds;
+//! - a transport −429 (too many connections) delays the next connection by
+//!   1 s, doubling to 60 s; a completed init resets it.
 //!
 //! # Pushes
 //!
@@ -421,6 +428,9 @@ impl Sender {
                 salt,
                 backlog: VecDeque::new(),
                 dead: None,
+                refused: None,
+                backoff: Duration::ZERO,
+                retry_at: None,
             },
         };
         tokio::spawn(actor.run(opened.reader, opened.writer));
@@ -522,6 +532,13 @@ struct Shared {
     /// Received pushes the channel has not taken yet.
     backlog: VecDeque<Bytes>,
     dead: Option<KeyGone>,
+    /// Telegram refused the init call with a 4xx: `(code, message, until)`;
+    /// `until: None` holds until the sender is rebuilt.
+    refused: Option<(i32, String, Option<Instant>)>,
+    /// The delay after the last transport −429, and when the next
+    /// connection may open.
+    backoff: Duration,
+    retry_at: Option<Instant>,
 }
 
 impl Shared {
@@ -546,6 +563,61 @@ impl Shared {
             0
         }
     }
+
+    /// The latched init refusal, while it holds.
+    fn refusal(&mut self, now: Instant) -> Option<SenderError> {
+        match &self.refused {
+            Some((code, message, until)) if until.is_none_or(|until| now < until) => {
+                Some(SenderError::InitRefused {
+                    code: *code,
+                    message: message.clone(),
+                })
+            }
+            Some(_) => {
+                self.refused = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// What a connection's end teaches about the next one (ruling P7).
+    fn learn(&mut self, cause: &Cause, init_done: bool, now: Instant) {
+        if init_done {
+            self.backoff = Duration::ZERO;
+            self.retry_at = None;
+        }
+        match cause {
+            // A 4xx refusal of initConnection holds: retrying cannot help
+            // until the sender is rebuilt, except FLOOD_WAIT_X, which holds
+            // for X seconds.
+            Cause::InitRefused { code, message } if (400..500).contains(code) => {
+                let until = (*code == 420).then(|| now + flood_wait(message));
+                self.refused = Some((*code, message.clone(), until));
+            }
+            // Too many connections from this address: back off, 1 s
+            // doubling to 60 s.
+            Cause::Transport(TransportError::Status(429)) => {
+                self.backoff = (self.backoff * 2).clamp(MIN_BACKOFF, MAX_BACKOFF);
+                self.retry_at = Some(now + self.backoff);
+            }
+            _ => {}
+        }
+    }
+}
+
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A 420 without a number in its message.
+const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
+
+/// The X of a 420 `…_X` message (`FLOOD_WAIT_30`).
+fn flood_wait(message: &str) -> Duration {
+    message
+        .rsplit('_')
+        .next()
+        .and_then(|secs| secs.parse().ok())
+        .map_or(DEFAULT_FLOOD_WAIT, Duration::from_secs)
 }
 
 /// Why a connection ended.
@@ -698,9 +770,24 @@ impl<T: Transport> Actor<T> {
             tokio::select! {
                 command = self.commands.recv() => {
                     let command = command?;
+                    if let Some(error) = self.st.refusal(Instant::now()) {
+                        let _ = command.reply.send(Err(error));
+                        continue;
+                    }
                     if let Some(gone) = self.st.dead {
                         let _ = command.reply.send(Err(gone.error()));
                         continue;
+                    }
+                    if let Some(at) = self.st.retry_at.filter(|at| *at > Instant::now()) {
+                        // Backing off after a −429: pushes still go out.
+                        loop {
+                            tokio::select! {
+                                () = sleep_until(at) => break,
+                                permit = self.pushes.reserve(), if !self.st.backlog.is_empty() => {
+                                    hand_out(permit, &mut self.st.backlog);
+                                }
+                            }
+                        }
                     }
                     if command.reply.is_closed() {
                         continue;
@@ -792,7 +879,11 @@ impl<T: Transport> Actor<T> {
             None => tracing::debug!(dc = st.dc_id, cause = %cause, "mtproto connection ended"),
         }
         st.dead = st.dead.or(gone);
-        if gone.is_none() && !matches!(cause, Cause::Shutdown) {
+        let init_done = conn.init == Init::Done;
+        st.learn(&cause, init_done, Instant::now());
+        // A connection that never finished its init call never had pushes
+        // to lose; a new session's own `new_session_created` signals it.
+        if gone.is_none() && init_done && !matches!(cause, Cause::Shutdown) {
             st.session_lost();
         }
         conn.end(writer.is_flushed(), gone, &cause);
