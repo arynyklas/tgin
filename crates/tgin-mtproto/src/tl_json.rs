@@ -302,7 +302,10 @@ impl Schema {
             }
             Ty::Long => {
                 let n = match number(v) {
-                    Some(t) => t.parse::<i64>().ok().filter(|n| n.abs() <= MAX_SAFE),
+                    Some(t) => t
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|n| (-MAX_SAFE..=MAX_SAFE).contains(n)),
                     None => string(v, at)
                         .ok()
                         .filter(|s| !s.starts_with('+'))

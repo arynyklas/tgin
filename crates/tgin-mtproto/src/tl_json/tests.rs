@@ -112,6 +112,46 @@ fn rendering_follows_design_10_5() {
     assert_eq!(tl(&text), Ok(b));
 }
 
+/// A long given as a JSON number must be a safe integer: ±(2^53 − 1) is
+/// accepted, ±2^53 and `i64::MIN` are refused, and nothing panics.
+#[test]
+fn long_number_is_a_safe_integer() {
+    let req = |n: &str| {
+        tl(&format!(
+            r#"{{"_":"inputPeerUser","user_id":{n},"access_hash":"0"}}"#
+        ))
+    };
+    for n in [(1i64 << 53) - 1, -((1i64 << 53) - 1), 0] {
+        let enc = req(&n.to_string());
+        assert_eq!(
+            enc.map(|e| e[4..12].to_vec()),
+            Ok(n.to_le_bytes().to_vec()),
+            "{n}"
+        );
+    }
+    for n in [1i64 << 53, -(1i64 << 53), i64::MAX, i64::MIN] {
+        assert!(
+            matches!(
+                req(&n.to_string()),
+                Err(TlError::Json {
+                    field: "user_id",
+                    ..
+                })
+            ),
+            "{n}"
+        );
+    }
+    // As a string, every long is accepted.
+    let enc = tl(&format!(
+        r#"{{"_":"inputPeerUser","user_id":"{}","access_hash":"0"}}"#,
+        i64::MIN
+    ));
+    assert_eq!(
+        enc.map(|e| e[4..12].to_vec()),
+        Ok(i64::MIN.to_le_bytes().to_vec())
+    );
+}
+
 #[test]
 fn requests_may_use_null_false_and_whitespace() {
     // A request may write absent flagged fields as null and unset `true`
