@@ -34,6 +34,9 @@ const PEERS: TableDefinition<i64, &[u8]> = TableDefinition::new("peers");
 const UPDATE_STATE: TableDefinition<&str, i32> = TableDefinition::new("update_state");
 /// Bare channel id → channel pts.
 const CHANNEL_PTS: TableDefinition<i64, i32> = TableDefinition::new("channel_pts");
+/// Bare channel id → nothing: a batch moved the channel ahead of its
+/// stored pts and it has not caught up since, so it catches up at start.
+const CHANNELS_BEHIND: TableDefinition<i64, ()> = TableDefinition::new("channels_behind");
 /// `schema`, `created_unix`, `self_user_id`, `login_unix`, `update_id`;
 /// integers are little-endian `i64`.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -155,6 +158,7 @@ impl SessionStore {
             txn.open_table(PEERS)?;
             txn.open_table(UPDATE_STATE)?;
             txn.open_table(CHANNEL_PTS)?;
+            txn.open_table(CHANNELS_BEHIND)?;
             let mut meta = txn.open_table(META)?;
             if meta.get("schema")?.is_none() {
                 meta.insert("schema", SCHEMA_VERSION)?;
@@ -314,11 +318,13 @@ impl SessionStore {
             txn.delete_table(PEERS)?;
             txn.delete_table(UPDATE_STATE)?;
             txn.delete_table(CHANNEL_PTS)?;
+            txn.delete_table(CHANNELS_BEHIND)?;
             txn.open_table(AUTH_KEYS)?;
             txn.open_table(HOME_DC)?;
             txn.open_table(PEERS)?;
             txn.open_table(UPDATE_STATE)?;
             txn.open_table(CHANNEL_PTS)?;
+            txn.open_table(CHANNELS_BEHIND)?;
             let mut meta = txn.open_table(META)?;
             meta.remove(SELF_USER_ID)?;
             meta.remove(LOGIN_UNIX)?;
@@ -357,7 +363,8 @@ impl SessionStore {
     }
 
     /// What the update manager starts from: the common state, every
-    /// channel's pts, and the users whose access hash is cached.
+    /// channel's pts, the users whose access hash is cached, and the
+    /// channels that may be behind their stored pts.
     pub fn stored_state(&self) -> Result<StoredState, SessionError> {
         let mut known_users = Vec::new();
         {
@@ -370,10 +377,18 @@ impl SessionStore {
                 }
             }
         }
+        let mut behind = Vec::new();
+        {
+            let txn = self.db.begin_read()?;
+            for row in txn.open_table(CHANNELS_BEHIND)?.iter()? {
+                behind.push(row?.0.value());
+            }
+        }
         Ok(StoredState {
             common: self.update_state()?,
             channels: self.channel_pts()?,
             known_users,
+            behind,
         })
     }
 
@@ -395,6 +410,25 @@ impl SessionStore {
             let mut channels = txn.open_table(CHANNEL_PTS)?;
             for &(channel, pts) in &delta.channels {
                 channels.insert(channel, pts)?;
+            }
+            let mut behind = txn.open_table(CHANNELS_BEHIND)?;
+            for channel in &delta.caught_up {
+                behind.remove(channel)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Records a batch's [`ahead`](crate::Batch::ahead) channels, before
+    /// the batch is admitted: after a crash, they catch up at start.
+    pub fn mark_channels_behind(&self, channels: &[i64]) -> Result<(), SessionError> {
+        if channels.is_empty() {
+            return Ok(());
+        }
+        self.write(|txn| {
+            let mut behind = txn.open_table(CHANNELS_BEHIND)?;
+            for &channel in channels {
+                behind.insert(channel, ())?;
             }
             Ok(())
         })
@@ -750,6 +784,7 @@ mod tests {
         })
         .expect("state");
         s.set_channel_pts(9, 10).expect("channel");
+        s.mark_channels_behind(&[9]).expect("behind");
         s.set_update_id(77).expect("update_id");
 
         s.reset_for_login().expect("reset");
@@ -764,6 +799,7 @@ mod tests {
         assert_eq!(s.peer(42).expect("peer"), None);
         assert_eq!(s.update_state().expect("state"), UpdateState::default());
         assert!(s.channel_pts().expect("channels").is_empty());
+        assert!(s.stored_state().expect("stored").behind.is_empty());
         assert_eq!(s.dc_options().expect("dcs"), vec![(2, addr)]);
         assert_eq!(s.update_id().expect("update_id"), Some(77));
         // A new key may now be stored: the marker is gone.
@@ -903,7 +939,8 @@ mod tests {
     }
 
     /// `commit_state` writes only the fields a delta names, plus its
-    /// channel rows, and `stored_state` reads them back.
+    /// channel rows, and clears the behind rows it reports caught up;
+    /// `stored_state` reads them back.
     #[test]
     fn commit_state_applies_delta() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -915,13 +952,18 @@ mod tests {
             date: 4,
         })
         .expect("state");
+        s.mark_channels_behind(&[5, 6, 7]).expect("behind");
+        s.mark_channels_behind(&[]).expect("none");
         s.commit_state(&StateDelta {
             pts: Some(10),
             seq: Some(30),
             channels: vec![(5, 50), (6, 60)],
+            caught_up: vec![5, 7],
             ..StateDelta::default()
         })
         .expect("commit");
+        drop(s);
+        let s = SessionStore::open(tmp.path()).expect("reopen");
         let st = s.stored_state().expect("stored");
         assert_eq!(
             st.common,
@@ -933,6 +975,7 @@ mod tests {
             }
         );
         assert_eq!(st.channels, vec![(5, 50), (6, 60)]);
+        assert_eq!(st.behind, vec![6]);
         assert!(st.known_users.is_empty());
     }
 

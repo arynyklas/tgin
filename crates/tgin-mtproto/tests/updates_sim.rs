@@ -246,6 +246,7 @@ fn stored(pts: i32, channels: &[(i64, i32)], known: &[i64]) -> StoredState {
         },
         channels: channels.to_vec(),
         known_users: known.to_vec(),
+        behind: Vec::new(),
     }
 }
 
@@ -259,6 +260,7 @@ fn commit(m: &mut UpdateManager, batches: &[Batch]) -> StateDelta {
             out.seq = d.seq.or(out.seq);
             out.date = d.date.or(out.date);
             out.channels.extend(d.channels);
+            out.caught_up.extend(d.caught_up);
         }
     }
     out
@@ -286,6 +288,17 @@ fn all_updates(batches: &[Batch]) -> Vec<Bytes> {
     batches
         .iter()
         .flat_map(|b| b.updates.iter().map(|u| u.bytes().clone()))
+        .collect()
+}
+
+/// Commits what carries no update yet (a held update, a catch-up signal):
+/// at most a batch naming the channels it moves ahead. Returns them.
+fn nothing(m: &mut UpdateManager, batches: &[Batch]) -> Vec<i64> {
+    assert!(all_updates(batches).is_empty(), "no update yet");
+    commit(m, batches);
+    batches
+        .iter()
+        .flat_map(|b| b.ahead.iter().copied())
         .collect()
 }
 
@@ -534,12 +547,83 @@ async fn live_push_not_blocked_by_1000_channel_catchup() {
     assert!(fetched.values().all(|&n| n == 1));
 }
 
+/// A batch names the channels it is first to move ahead of their committed
+/// pts; the caller persists them before admission. After a crash, those
+/// channels (quiet ones too) catch up once the start-up difference ends,
+/// and a committed delta reports each caught up.
+#[tokio::test(start_paused = true)]
+async fn channels_left_behind_catch_up_after_restart() {
+    let mut m = started(stored(10, &[(1, 5), (2, 5)], &[]));
+    let post = |id: u32, pts: i32| {
+        new_channel_message(&message(id, PeerId::Channel(1), &format!("p{id}")), pts, 1)
+    };
+    let first = m.feed_push(b(updates(&[post(1, 6)], NONE, NONE, 2, 0)));
+    assert_eq!(
+        first
+            .iter()
+            .flat_map(|b| b.ahead.clone())
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    let second = m.feed_push(b(updates(&[post(2, 7)], NONE, NONE, 2, 0)));
+    assert!(second.iter().all(|b| b.ahead.is_empty()), "named once");
+
+    // Killed before either batch was committed.
+    let mut st = stored(10, &[(1, 5), (2, 5)], &[]);
+    st.behind = vec![1, 9]; // 9: never committed a state
+    let mut m = UpdateManager::new(st);
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+    assert_eq!(
+        m.next_action(),
+        None,
+        "channels wait for the start-up difference"
+    );
+    // A commit while the start-up difference runs does not count channel
+    // 1 caught up: it has not been fetched yet.
+    let live = new_channel_message(&message(3, PeerId::Channel(2), "l"), 6, 1);
+    let batches = m.feed_push(b(updates(&[live], NONE, NONE, 2, 0)));
+    let d = commit(&mut m, &batches);
+    assert!(!d.caught_up.contains(&1), "{:?}", d.caught_up);
+    assert!(d.caught_up.contains(&9), "nothing to catch up from");
+    let batches = m.feed_difference(b(difference_empty(1, 3)));
+    let d = commit(&mut m, &batches);
+    assert!(!d.caught_up.contains(&1), "{:?}", d.caught_up);
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
+    );
+    assert_eq!(m.next_action(), None, "channel 2 was not behind");
+    let msgs = [
+        message(1, PeerId::Channel(1), "p1"),
+        message(2, PeerId::Channel(1), "p2"),
+    ];
+    let batches = m.feed_channel_difference(
+        1,
+        b(channel_difference(
+            true,
+            7,
+            &Diff {
+                msgs: &msgs,
+                ..EMPTY_DIFF
+            },
+        )),
+    );
+    assert_eq!(all_updates(&batches).len(), 2);
+    let d = commit(&mut m, &batches);
+    assert_eq!(d.channels, vec![(1, 7)]);
+    assert!(d.caught_up.contains(&1), "{:?}", d.caught_up);
+}
+
 #[tokio::test(start_paused = true)]
 async fn channel_gap_fetches_only_that_channel() {
     let mut m = started(stored(10, &[(1, 5), (2, 7)], &[]));
     let post = |id: u32, c: i64| message(id, PeerId::Channel(c), &format!("p{id}"));
     let a7 = new_channel_message(&post(7, 1), 7, 1);
-    assert!(m.feed_push(b(updates(&[a7], NONE, NONE, 2, 0))).is_empty());
+    let batches = m.feed_push(b(updates(&[a7], NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
     advance(GAP_HOLD).await;
     assert_eq!(
         m.next_action(),
@@ -583,10 +667,8 @@ async fn channel_gap_fetches_only_that_channel() {
 async fn channel_too_long_fetches_once() {
     let mut m = started(stored(10, &[(1, 5), (2, 9)], &[]));
     for _ in 0..2 {
-        assert!(
-            m.feed_push(b(short(&channel_too_long(1, Some(9)))))
-                .is_empty()
-        );
+        let batches = m.feed_push(b(short(&channel_too_long(1, Some(9)))));
+        nothing(&mut m, &batches);
     }
     assert_eq!(
         m.next_action(),
@@ -598,7 +680,8 @@ async fn channel_too_long_fetches_once() {
     assert_eq!(m.next_action(), None, "final: fetched once");
 
     // Without a pts, the signal still fetches.
-    assert!(m.feed_push(b(short(&channel_too_long(2, None)))).is_empty());
+    let batches = m.feed_push(b(short(&channel_too_long(2, None))));
+    nothing(&mut m, &batches);
     assert_eq!(
         m.next_action(),
         Some(Fetch::GetChannelDifference { channel: 2, pts: 9 })
@@ -616,13 +699,15 @@ async fn channel_too_long_fetches_once() {
 #[tokio::test(start_paused = true)]
 async fn channel_too_long_mid_fetch_fetches_once_more() {
     let mut m = started(stored(10, &[(1, 5)], &[]));
-    assert!(m.feed_push(b(short(&channel_too_long(1, None)))).is_empty());
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
     assert_eq!(
         m.next_action(),
         Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
     );
     for _ in 0..2 {
-        assert!(m.feed_push(b(short(&channel_too_long(1, None)))).is_empty());
+        let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+        nothing(&mut m, &batches);
         assert_eq!(m.next_action(), None, "no parallel fetch");
     }
     let batches = m.feed_channel_difference(1, b(channel_difference_empty(true, 7)));
@@ -843,18 +928,16 @@ async fn failed_fetch_backs_off_and_escalates() {
 #[tokio::test(start_paused = true)]
 async fn failed_channel_fetch_backs_off_permanent_drops_state() {
     let mut m = started(stored(10, &[(1, 5), (2, 5)], &[5]));
-    m.feed_push(b(short(&channel_too_long(1, None))));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
     let f = m.next_action().expect("channel 1");
     assert_eq!(f, Fetch::GetChannelDifference { channel: 1, pts: 5 });
     m.fetch_failed(f);
     assert_eq!(m.next_action(), None);
     assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
     let held = new_channel_message(&message(1, PeerId::Channel(1), "h"), 9, 1);
-    assert!(
-        m.feed_push(b(updates(std::slice::from_ref(&held), NONE, NONE, 2, 0)))
-            .is_empty(),
-        "channel 1 is catching up: its update waits"
-    );
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&held), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
     let other = new_channel_message(&message(2, PeerId::Channel(2), "o"), 6, 1);
     let batches = m.feed_push(b(updates(std::slice::from_ref(&other), NONE, NONE, 2, 0)));
     assert_eq!(all_updates(&batches), vec![b(other)]);
@@ -1023,7 +1106,8 @@ async fn difference_message_composed_bytes_equal_typed() {
     commit(&mut m, &batches);
 
     let post = message(4, PeerId::Channel(9), "κανάλι");
-    m.feed_push(b(short(&channel_too_long(9, None))));
+    let batches = m.feed_push(b(short(&channel_too_long(9, None))));
+    nothing(&mut m, &batches);
     assert!(matches!(
         m.next_action(),
         Some(Fetch::GetChannelDifference { channel: 9, .. })
@@ -1055,9 +1139,14 @@ const MAIN_EVENTS: usize = 24;
 const SEED: u64 = 0x7467_696e_5f6d_3335;
 const USERS: [i64; 5] = [100, 101, 102, 103, 104];
 const KNOWN_USERS: [i64; 2] = [100, 101];
-/// Channels 1–3 start known; channel 4 is unknown until its first update.
-const CHANNELS: [i64; 4] = [1, 2, 3, 4];
+/// Channels 1–3, 5 and 6 start known; channel 4 is unknown until its
+/// first update.
+const CHANNELS: [i64; 6] = [1, 2, 3, 4, 5, 6];
 const UNKNOWN_CHANNEL: i64 = 4;
+/// Channels that post after the main phase. 5 and 6 are quiet: nothing
+/// after the main phase reveals a gap in them, so what they miss comes back
+/// only through the manager's own catch-up or the server's signal.
+const FLUSHED: [i64; 4] = [1, 2, 3, 4];
 const DIFF_LIMIT: usize = 3;
 const CHANNEL_DIFF_LIMIT: usize = 2;
 
@@ -1107,8 +1196,6 @@ struct Event {
     date: i32,
     /// The channel's pts after it (`Chan`).
     chan_pts: i32,
-    /// The common pts when it happened (`Chan`).
-    mark: i32,
 }
 
 struct Script {
@@ -1138,6 +1225,7 @@ fn script(seed: u64) -> Script {
             .map(|&c| (c, 5))
             .collect(),
         known_users: KNOWN_USERS.to_vec(),
+        behind: Vec::new(),
     };
     let (mut pts, mut qts, mut seq) = (10, 5, 3);
     let mut chan: BTreeMap<i64, i32> = CHANNELS.iter().map(|&c| (c, 5)).collect();
@@ -1145,18 +1233,18 @@ fn script(seed: u64) -> Script {
     let chats: HashMap<i64, Vec<u8>> = CHANNELS.iter().map(|&c| (c, channel(c))).collect();
     let mut events = Vec::new();
     let mut by_bytes = HashMap::new();
-    // Two flush rounds of one post per channel: the lazy channels catch up
-    // on their next activity. The common box gets none; after a restart
-    // it relies on the start-up difference alone.
-    let total = MAIN_EVENTS + 2 * CHANNELS.len();
+    // Two flush rounds of one post per flushed channel: the lazy channels
+    // catch up on their next activity. The common box and the quiet
+    // channels get none.
+    let total = MAIN_EVENTS + 2 * FLUSHED.len();
     let mut phases = [0; 3];
     for i in 0..total {
         let reliable = i >= MAIN_EVENTS;
-        let flush = (i - MAIN_EVENTS.min(i)) % CHANNELS.len();
+        let flush = (i - MAIN_EVENTS.min(i)) % FLUSHED.len();
         let tag = u32::try_from(i).expect("tag") + 1;
         let date = i32::try_from(i).expect("date") + 2;
         let kind = if reliable {
-            Kind::Chan(CHANNELS[flush])
+            Kind::Chan(FLUSHED[flush])
         } else {
             match rng.below(100) {
                 0..30 => Kind::Msg {
@@ -1172,7 +1260,6 @@ fn script(seed: u64) -> Script {
         };
         let lost = !reliable && rng.chance(15);
         let mut chan_pts = 0;
-        let mut mark = 0;
         let (push, body) = match kind {
             Kind::Msg { user } => {
                 pts += 1;
@@ -1213,7 +1300,6 @@ fn script(seed: u64) -> Script {
                 let p = chan.entry(c).or_insert(5);
                 *p += 1;
                 chan_pts = *p;
-                mark = pts;
                 let m = message(tag, PeerId::Channel(c), &format!("e{tag}"));
                 by_bytes.insert(m.clone(), i);
                 let push = if !reliable && rng.chance(10) {
@@ -1242,12 +1328,11 @@ fn script(seed: u64) -> Script {
             seq,
             date,
             chan_pts,
-            mark,
         });
         if i + 1 == MAIN_EVENTS {
             phases[0] = i + 1;
         }
-        if i + 1 == MAIN_EVENTS + CHANNELS.len() {
+        if i + 1 == MAIN_EVENTS + FLUSHED.len() {
             phases[1] = i + 1;
         }
     }
@@ -1270,6 +1355,8 @@ struct Persisted {
     common: UpdateState,
     channels: BTreeMap<i64, i32>,
     known: BTreeSet<i64>,
+    /// The batches' `ahead` channels, until a delta says caught up.
+    behind: BTreeSet<i64>,
 }
 
 impl Persisted {
@@ -1278,6 +1365,7 @@ impl Persisted {
             common: self.common,
             channels: self.channels.iter().map(|(&c, &p)| (c, p)).collect(),
             known_users: self.known.iter().copied().collect(),
+            behind: self.behind.iter().copied().collect(),
         }
     }
 
@@ -1289,6 +1377,9 @@ impl Persisted {
         for &(c, p) in &d.channels {
             self.channels.insert(c, p);
         }
+        for c in &d.caught_up {
+            self.behind.remove(c);
+        }
     }
 }
 
@@ -1297,8 +1388,14 @@ struct Sim<'a> {
     rng: Rng,
     m: UpdateManager,
     persisted: Persisted,
-    net: VecDeque<Bytes>,
+    /// Pushes on the way, with their event.
+    net: VecDeque<(usize, Bytes)>,
     in_flight: VecDeque<Fetch>,
+    /// Events the server told the client of: their push was fed, or a fed
+    /// channel difference covered them. It signals the others' channels
+    /// (`updateChannelTooLong` in getDifference): what a client never got,
+    /// the server tells it to fetch; what it got, the client must keep.
+    received: HashSet<usize>,
     /// Events that have happened on the server.
     done: usize,
     admitted: HashSet<usize>,
@@ -1316,6 +1413,7 @@ impl<'a> Sim<'a> {
             common: s.initial.common,
             channels: s.initial.channels.iter().copied().collect(),
             known: s.initial.known_users.iter().copied().collect(),
+            behind: BTreeSet::new(),
         };
         Self {
             s,
@@ -1324,6 +1422,7 @@ impl<'a> Sim<'a> {
             persisted,
             net: VecDeque::new(),
             in_flight: VecDeque::new(),
+            received: HashSet::new(),
             done: 0,
             admitted: HashSet::new(),
             first_unknown: None,
@@ -1354,6 +1453,9 @@ impl<'a> Sim<'a> {
 
     fn take(&mut self, batches: Vec<Batch>) {
         for batch in batches {
+            // The caller persists the channels a batch moves ahead before
+            // it offers the batch to admission.
+            self.persisted.behind.extend(batch.ahead.iter().copied());
             if self.tick() {
                 return; // before admission
             }
@@ -1415,10 +1517,11 @@ impl<'a> Sim<'a> {
     }
 
     fn occur(&mut self, reliable: bool) {
-        let e = &self.s.events[self.done];
+        let i = self.done;
+        let e = &self.s.events[i];
         self.done += 1;
         if let Some(p) = &e.push {
-            self.net.push_back(p.clone());
+            self.net.push_back((i, p.clone()));
         }
         if let Kind::Affected { fed: true } = e.kind
             && !reliable
@@ -1432,12 +1535,13 @@ impl<'a> Sim<'a> {
         if self.net.len() >= 2 && self.rng.chance(8) {
             self.net.swap(0, 1);
         }
-        let Some(p) = self.net.pop_front() else {
+        let Some((i, p)) = self.net.pop_front() else {
             return;
         };
         if self.rng.chance(5) {
-            self.net.push_front(p.clone());
+            self.net.push_front((i, p.clone()));
         }
+        self.received.insert(i);
         let batches = self.m.feed_push(p);
         self.take(batches);
     }
@@ -1453,7 +1557,14 @@ impl<'a> Sim<'a> {
                 self.m.feed_difference(b(d))
             }
             Fetch::GetChannelDifference { channel, pts } => {
-                let d = self.channel_difference(channel, pts);
+                let (d, to) = self.channel_difference(channel, pts);
+                self.received.extend(
+                    self.s.events[..self.done]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.kind == Kind::Chan(channel) && e.chan_pts <= to)
+                        .map(|(i, _)| i),
+                );
                 self.m.feed_channel_difference(channel, b(d))
             }
         };
@@ -1513,11 +1624,13 @@ impl<'a> Sim<'a> {
             };
             return difference(&d, &state(last.pts, last.qts, last.date, last.seq), true);
         }
-        // Channels with updates since that state are signalled.
+        // Channels with an update the client was never told of are
+        // signalled.
         let since: BTreeSet<i64> = log
             .iter()
-            .filter_map(|e| match e.kind {
-                Kind::Chan(c) if e.mark >= pts => Some(c),
+            .enumerate()
+            .filter_map(|(i, e)| match e.kind {
+                Kind::Chan(c) if !self.received.contains(&i) => Some(c),
                 _ => None,
             })
             .collect();
@@ -1539,13 +1652,15 @@ impl<'a> Sim<'a> {
         difference(&d, &state(cp, cq, cd, cs), false)
     }
 
-    fn channel_difference(&self, c: i64, pts: i32) -> Vec<u8> {
+    /// The answer, and the channel pts it brings the client to.
+    fn channel_difference(&self, c: i64, pts: i32) -> (Vec<u8>, i32) {
         let pending: Vec<&Event> = self.s.events[..self.done]
             .iter()
             .filter(|e| e.kind == Kind::Chan(c) && e.chan_pts > pts)
             .collect();
         if pending.is_empty() {
-            return channel_difference_empty(true, self.channel_pts(c));
+            let to = self.channel_pts(c);
+            return (channel_difference_empty(true, to), to);
         }
         let fin = pending.len() <= CHANNEL_DIFF_LIMIT;
         let taken = &pending[..pending.len().min(CHANNEL_DIFF_LIMIT)];
@@ -1561,7 +1676,7 @@ impl<'a> Sim<'a> {
             chats: &chats,
             ..EMPTY_DIFF
         };
-        channel_difference(fin, to, &d)
+        (channel_difference(fin, to, &d), to)
     }
 
     async fn step(&mut self) {
@@ -1606,7 +1721,8 @@ impl<'a> Sim<'a> {
             let mut moves = 0;
             loop {
                 self.pump();
-                if let Some(p) = self.net.pop_front() {
+                if let Some((i, p)) = self.net.pop_front() {
+                    self.received.insert(i);
                     let batches = self.m.feed_push(p);
                     self.take(batches);
                 } else if let Some(f) = self.in_flight.pop_front() {

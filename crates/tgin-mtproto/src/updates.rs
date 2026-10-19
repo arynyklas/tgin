@@ -12,7 +12,9 @@
 //!   backoff) or
 //!   [`fetch_failed_permanently`](UpdateManager::fetch_failed_permanently);
 //!   it calls `next_action` again by [`deadline`](UpdateManager::deadline);
-//! - offers each [`Batch`] to admission, in id order, then reports
+//! - persists each [`Batch`]'s [`ahead`](Batch::ahead) channels
+//!   ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind)),
+//!   offers the batch to admission, in id order, then reports
 //!   [`committed`](UpdateManager::committed) or
 //!   [`refused`](UpdateManager::refused), and persists the [`StateDelta`]
 //!   either returns ([`SessionStore::commit_state`](crate::SessionStore::commit_state)).
@@ -30,9 +32,11 @@
 //!
 //! The common box (with `qts` and `seq`) catches up with
 //! `updates.getDifference`, at start and on a gap still open after
-//! [`GAP_HOLD`]. A channel catches up only on a gap in that channel or on
-//! `updateChannelTooLong`, never at start. Pushes for any box that is not
-//! catching up are delivered as they come.
+//! [`GAP_HOLD`]. A channel catches up on a gap in that channel, on
+//! `updateChannelTooLong`, or at start when the last run left it behind
+//! ([`StoredState::behind`]: a batch moved it past its committed pts, and
+//! it never caught up); no other channel catches up at start. Pushes for
+//! any box that is not catching up are delivered as they come.
 //!
 //! # Bytes (plan decision 7)
 //!
@@ -86,6 +90,11 @@ pub struct StoredState {
     pub channels: Vec<(i64, i32)>,
     /// The users whose access hash is cached.
     pub known_users: Vec<i64>,
+    /// Channels a batch moved ahead of their stored pts that have not
+    /// caught up since ([`Batch::ahead`]): each fetches its difference
+    /// after the start-up difference, so a crash before their batches were
+    /// committed loses none of a quiet channel's updates.
+    pub behind: Vec<i64>,
 }
 
 /// State to persist: each `Some` field and each channel row replaces the
@@ -98,6 +107,8 @@ pub struct StateDelta {
     pub date: Option<i32>,
     /// `(bare channel id, pts)`, one row per channel.
     pub channels: Vec<(i64, i32)>,
+    /// Channels caught up with their committed pts: no longer behind.
+    pub caught_up: Vec<i64>,
 }
 
 impl StateDelta {
@@ -108,6 +119,7 @@ impl StateDelta {
             && self.seq.is_none()
             && self.date.is_none()
             && self.channels.is_empty()
+            && self.caught_up.is_empty()
     }
 
     fn set_channel(&mut self, channel: i64, pts: i32) {
@@ -125,6 +137,11 @@ impl StateDelta {
         self.date = later.date.or(self.date);
         for (c, p) in later.channels {
             self.set_channel(c, p);
+        }
+        for c in later.caught_up {
+            if !self.caught_up.contains(&c) {
+                self.caught_up.push(c);
+            }
         }
     }
 }
@@ -269,6 +286,13 @@ pub struct Batch {
     /// [`committed`](UpdateManager::committed) returns, not this: a batch
     /// after a refused one must not persist past the refused updates.
     pub commit: StateDelta,
+    /// The channels this batch is the first to move ahead of their
+    /// committed state. Persist them
+    /// ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind))
+    /// before admitting the batch, admitted or not: after a crash they
+    /// catch up at start, so a quiet channel loses nothing. A batch may
+    /// carry only this (an update held for a gap, a catch-up signal).
+    pub ahead: Vec<i64>,
 }
 
 /// Leaves out the bytes: they are account content.
@@ -279,6 +303,7 @@ impl fmt::Debug for Batch {
             .field("updates", &self.updates)
             .field("peers", &self.peers.len())
             .field("commit", &self.commit)
+            .field("ahead", &self.ahead)
             .finish()
     }
 }
@@ -478,12 +503,21 @@ pub struct UpdateManager {
     next_id: u64,
     next_origin: u64,
     dropped: Dropped,
+    /// Channels persisted as behind ([`Batch::ahead`]), not yet caught up.
+    ahead: HashSet<i64>,
+    /// Newly ahead, for the next batch's `ahead`.
+    ahead_new: Vec<i64>,
+    /// Channels behind at start, queued once the start-up difference ends.
+    startup: Vec<i64>,
+    /// Channels caught up, for the next committed delta.
+    caught_up: Vec<i64>,
 }
 
 impl UpdateManager {
     /// Starts from the persisted state: with a common state, the first
     /// action is `updates.getDifference`; without one, `updates.getState`.
-    /// No channel catches up at start.
+    /// The channels in [`StoredState::behind`] catch up after that; no
+    /// other channel catches up at start.
     #[must_use]
     pub fn new(state: StoredState) -> Self {
         let common = state.common;
@@ -492,6 +526,17 @@ impl UpdateManager {
         } else {
             CommonFetch::WantDifference
         };
+        let channels: HashMap<i64, Channel> = state
+            .channels
+            .iter()
+            .map(|&(c, p)| (c, Channel::new(Some(p))))
+            .collect();
+        // A channel behind without a stored pts has nothing to catch up
+        // from (its first state was never committed).
+        let (startup, caught_up): (Vec<i64>, Vec<i64>) = state
+            .behind
+            .into_iter()
+            .partition(|c| channels.contains_key(c));
         Self {
             pts: common.pts,
             qts: common.qts,
@@ -505,17 +550,17 @@ impl UpdateManager {
             fetch,
             epoch: 0,
             again: false,
-            channels: state
-                .channels
-                .iter()
-                .map(|&(c, p)| (c, Channel::new(Some(p))))
-                .collect(),
+            channels,
             queue: VecDeque::new(),
             in_flight: 0,
             gapped: HashSet::new(),
             retrying: HashSet::new(),
             retry_at: None,
             backoff: Duration::ZERO,
+            ahead: startup.iter().copied().collect(),
+            ahead_new: Vec::new(),
+            startup,
+            caught_up,
             known_users: state.known_users.into_iter().collect(),
             committed: common,
             committed_channels: state.channels.into_iter().collect(),
@@ -832,6 +877,10 @@ impl UpdateManager {
         self.gapped.remove(&channel);
         self.retrying.remove(&channel);
         self.committed_channels.remove(&channel);
+        self.startup.retain(|&c| c != channel);
+        if self.ahead.remove(&channel) {
+            self.caught_up.push(channel);
+        }
     }
 
     /// Drops a channel's state, so no difference is fetched from it again
@@ -1052,6 +1101,7 @@ impl UpdateManager {
                 ch.fetch = ChannelFetch::Idle;
             }
         }
+        self.mark_ahead(channel);
         self.release_channel(channel, &mut out);
         self.finish(out)
     }
@@ -1100,6 +1150,19 @@ impl UpdateManager {
                 self.roll_back(&p);
             }
         }
+        // Channels back where their committed state says are no longer
+        // behind.
+        let mut caught_up = std::mem::take(&mut self.caught_up);
+        caught_up.extend(
+            self.ahead
+                .iter()
+                .copied()
+                .filter(|&c| self.caught_up_with_commit(c)),
+        );
+        for c in &caught_up {
+            self.ahead.remove(c);
+        }
+        delta.caught_up = caught_up;
         (!delta.is_empty()).then_some(delta)
     }
 
@@ -1339,6 +1402,7 @@ impl UpdateManager {
             if ch.held.len() < MAX_HELD {
                 ch.held.push(h);
             }
+            self.mark_ahead(c);
             return;
         }
         let Some(local) = ch.pts else {
@@ -1359,6 +1423,7 @@ impl UpdateManager {
                 }
                 ch.deadline.get_or_insert_with(|| Instant::now() + GAP_HOLD);
                 self.gapped.insert(c);
+                self.mark_ahead(c);
             }
         }
     }
@@ -1374,6 +1439,7 @@ impl UpdateManager {
     fn set_baseline(&mut self, c: i64, pts: i32, out: &mut Out) {
         let group = out.open.group.clone();
         self.flush(out);
+        self.mark_ahead(c);
         if let Some(ch) = self.channels.get_mut(&c) {
             ch.pts = Some(pts);
         }
@@ -1390,6 +1456,7 @@ impl UpdateManager {
             ch.pts = Some(h.pts);
         }
         out.open.touch_channel(c, h.pts);
+        self.mark_ahead(c);
     }
 
     fn release_channel(&mut self, c: i64, out: &mut Out) {
@@ -1461,6 +1528,9 @@ impl UpdateManager {
                 ChannelFetch::Wanted => {}
             },
         }
+        if self.channels.get(&c).is_some_and(|ch| ch.pts.is_some()) {
+            self.mark_ahead(c);
+        }
     }
 
     /// The catch-up after a rollback: a difference from the committed
@@ -1494,6 +1564,41 @@ impl UpdateManager {
         if self.fetch == CommonFetch::Idle && std::mem::take(&mut self.again) {
             self.fetch = CommonFetch::WantDifference;
         }
+        if self.fetch == CommonFetch::Idle {
+            // The start-up difference is over: the channels left behind by
+            // the last run catch up now, through the fetch queue.
+            for c in std::mem::take(&mut self.startup) {
+                if let Some(ch) = self.channels.get_mut(&c)
+                    && ch.fetch == ChannelFetch::Idle
+                    && ch.pts.is_some()
+                {
+                    ch.fetch = ChannelFetch::Wanted;
+                    self.queue.push_back(c);
+                }
+            }
+        }
+    }
+
+    /// `c` is ahead of its committed state: the next batch names it, unless
+    /// it is already persisted as behind.
+    fn mark_ahead(&mut self, c: i64) {
+        if self.ahead.insert(c) {
+            self.ahead_new.push(c);
+        }
+    }
+
+    /// Whether `c` is where its committed state says: nothing held,
+    /// nothing to fetch, its pts committed.
+    fn caught_up_with_commit(&self, c: i64) -> bool {
+        // A start-up channel has not caught up yet: its fetch comes after
+        // the start-up difference.
+        !self.startup.contains(&c)
+            && self.channels.get(&c).is_none_or(|ch| {
+                ch.fetch == ChannelFetch::Idle
+                    && ch.held.is_empty()
+                    && ch.retry_at.is_none()
+                    && ch.pts == self.committed_channels.get(&c).copied()
+            })
     }
 
     fn arm_gap(&mut self) {
@@ -1590,7 +1695,7 @@ impl UpdateManager {
     fn flush(&mut self, out: &mut Out) {
         let group = out.open.group.clone();
         let open = std::mem::replace(&mut out.open, Open::new(group));
-        if open.updates.is_empty() && open.delta.is_empty() {
+        if open.updates.is_empty() && open.delta.is_empty() && self.ahead_new.is_empty() {
             return;
         }
         let mut peers = Vec::new();
@@ -1620,6 +1725,7 @@ impl UpdateManager {
             chats: open.group.chats,
             peers,
             commit: open.delta,
+            ahead: std::mem::take(&mut self.ahead_new),
         });
     }
 
