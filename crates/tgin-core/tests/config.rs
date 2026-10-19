@@ -3804,3 +3804,23 @@ consumers:
         "feed: { push: { endpoints: [{ url: \"http://x\" }] } }",
     ));
 }
+
+/// `accept_set_webhook` takes its endpoint from a bot's `setWebhook`, so a
+/// push consumer that only accounts feed may not have it.
+#[test]
+fn accept_set_webhook_needs_a_bot_source() {
+    let yaml = r#"version: 1
+accounts:
+  a: { api_id: 1, api_hash: h, session_dir: sa, routes: [{ to: [hooks] }] }
+consumers:
+  hooks: { push: { accept_set_webhook: true } }
+"#;
+    let err = single_error(yaml);
+    assert_at(
+        &err,
+        "consumers.hooks.push.accept_set_webhook",
+        pos(yaml, "{ push: { accept"),
+    );
+    assert_message(&err, "account `a`");
+    assert!(err.hint.is_some(), "{err}");
+}

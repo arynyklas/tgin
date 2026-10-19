@@ -375,6 +375,21 @@ fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
     for (index, (name, consumer)) in raw.consumers.iter().enumerate() {
         let path = format!("consumers.{}", name.as_str());
         let Some(bot) = bot_of[index] else {
+            if let (Some(account), Consumer::Push(push)) = (account_of[index], &consumer.value)
+                && push.accept_set_webhook
+            {
+                diag.errors.push(
+                    ConfigError::new(format!(
+                        "push consumer `{}` has `accept_set_webhook: true`, but only account `{account}` feeds it, and no bot to call `setWebhook`",
+                        name.as_str()
+                    ))
+                    .at(located(
+                        format!("{path}.push.accept_set_webhook"),
+                        consumer.location,
+                    ))
+                    .hint("give an account's push consumer its `endpoints`, and remove `accept_set_webhook`"),
+                );
+            }
             continue;
         };
         if let Some(account) = account_of[index] {
