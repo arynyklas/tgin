@@ -515,6 +515,52 @@ impl SessionStore {
     }
 }
 
+/// DC id → the 256-byte auth key of the account's media session to that
+/// DC. A row is written only once `auth.importAuthorization` succeeded on
+/// the key, so only these keys count as authorized for the account; the
+/// `auth_keys` table may hold other keys (a login's first DC). Created on
+/// first write.
+const MEDIA_KEYS: TableDefinition<i32, &[u8]> = TableDefinition::new("media_keys");
+
+/// Media session keys (plan decision 2).
+impl SessionStore {
+    /// The authorized media key for `dc`, if one is stored.
+    pub fn media_key(&self, dc: i32) -> Result<Option<AuthKey>, SessionError> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(MEDIA_KEYS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(dc)? {
+            Some(k) => Ok(Some(AuthKey(
+                <[u8; 256]>::try_from(k.value()).map_err(|_| SessionError::Corrupt("media key"))?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Stores `key` as the authorized media key for `dc`: call it only once
+    /// `auth.importAuthorization` succeeded on it. Refuses the home DC.
+    pub fn set_media_key(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError> {
+        self.write(|txn| {
+            if txn.open_table(HOME_DC)?.get(HOME_KEY)?.map(|v| v.value()) == Some(dc) {
+                return Err(SessionError::HomeDc { dc });
+            }
+            txn.open_table(MEDIA_KEYS)?.insert(dc, key.0.as_slice())?;
+            Ok(())
+        })
+    }
+
+    /// Forgets the media key for `dc` (Telegram no longer knows it).
+    pub fn remove_media_key(&self, dc: i32) -> Result<(), SessionError> {
+        self.write(|txn| {
+            txn.open_table(MEDIA_KEYS)?.remove(dc)?;
+            Ok(())
+        })
+    }
+}
+
 fn read_i64(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &'static str,
@@ -1088,5 +1134,27 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("session.redb")), 0o600);
         assert_eq!(mode(&dir.join("lock")), 0o600);
+    }
+
+    #[test]
+    fn media_keys_are_apart_from_auth_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        s.set_home_key(2, &AuthKey([1; 256])).expect("first DC");
+        s.set_home_key(4, &AuthKey([2; 256])).expect("home");
+        // DC 2's login key is no media key.
+        assert_eq!(s.media_key(2).expect("read"), None);
+        s.set_media_key(2, &AuthKey([5; 256])).expect("media");
+        assert!(matches!(
+            s.set_media_key(4, &AuthKey([5; 256])),
+            Err(SessionError::HomeDc { dc: 4 })
+        ));
+        drop(s);
+        let s = SessionStore::open(tmp.path()).expect("reopen");
+        assert_eq!(s.media_key(2).expect("read"), Some(AuthKey([5; 256])));
+        assert_eq!(s.auth_key(2).expect("read"), Some(AuthKey([1; 256])));
+        s.remove_media_key(2).expect("remove");
+        assert_eq!(s.media_key(2).expect("read"), None);
+        assert_eq!(s.auth_key(2).expect("read"), Some(AuthKey([1; 256])));
     }
 }

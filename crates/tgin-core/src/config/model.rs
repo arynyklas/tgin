@@ -566,12 +566,14 @@ pub struct Account {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Rpc {
-    /// Most requests per second the account sends Telegram, over all
-    /// clients.
+    /// Most requests per second the account sends Telegram for its RPC
+    /// clients, over all of them: each call, each resend, each `*_MIGRATE`
+    /// hop and a media session's export and import count.
     #[schemars(range(min = 1))]
     pub max_rps: At<u32>,
-    /// A `FLOOD_WAIT` or `SLOWMODE_WAIT` up to this long is slept out and
-    /// the request retried; a longer one answers 429 with `Retry-After`.
+    /// A `FLOOD_WAIT` up to this long is slept out and the request
+    /// retried; a longer one, and any `SLOWMODE_WAIT`, answers 429 with
+    /// `Retry-After`. At most 60 s.
     pub flood_sleep_threshold: At<HumanDuration>,
     /// Who may call the account, by name.
     pub clients: IndexMap<Name, At<RpcClient>>,

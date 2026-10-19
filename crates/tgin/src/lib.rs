@@ -6,5 +6,6 @@ pub mod app;
 pub mod cli;
 mod data_server;
 pub mod exit;
+pub mod mtproto_rpc;
 mod reload;
 mod sources;

@@ -92,6 +92,8 @@ pub(crate) struct Ctor {
     pub name: &'static str,
     /// The boxed type (index into `Schema::types`); `None` for a function.
     pub ty: Option<u16>,
+    /// A function's result type; `None` for a constructor.
+    pub result: Option<Ty>,
     /// The update box an `Update` or `Updates` constructor belongs to.
     pub seq: Seq,
     pub params: &'static [Param],

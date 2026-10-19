@@ -18,7 +18,9 @@
 //! - [`SenderError::NoAnswer`]: the request was written and the connection
 //!   ended before an answer. It may have been executed. Never resend it.
 //! - [`SenderError::KeyRevoked`] / [`SenderError::KeyUnknown`]: transport
-//!   −404, Telegram does not know the auth key [C: S4 F8].
+//!   −404, Telegram does not know the auth key [C: S4 F8]. A server that
+//!   cannot find the key cannot decrypt, and so cannot execute, any request
+//!   on that connection: the request was not executed (ruling P13).
 //! - [`SenderError::BadMessage`]: Telegram ignored the request
 //!   (`bad_msg_notification`), after at most one resend for the codes that
 //!   allow one (16, 17, 48).
@@ -262,10 +264,13 @@ pub enum SenderError {
     #[error("the request was sent but no answer came; it may have been executed")]
     NoAnswer,
     /// Transport −404 on a logged-in key: the authorization is gone. The
-    /// sender makes no new key; the account needs a new login.
+    /// sender makes no new key; the account needs a new login. The request
+    /// was not executed: without the key Telegram cannot decrypt it
+    /// (ruling P13).
     #[error("Telegram no longer knows the account's auth key (transport -404)")]
     KeyRevoked,
-    /// Transport −404 on a key without a self user.
+    /// Transport −404 on a key without a self user. Not executed, as for
+    /// [`SenderError::KeyRevoked`].
     #[error("Telegram does not know this auth key (transport -404)")]
     KeyUnknown,
     /// Telegram ignored the request (`bad_msg_notification`); it was not
@@ -409,7 +414,7 @@ impl Sender {
             }
         };
         let init_call = Bytes::from(init.init_call());
-        let max_body = MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - WITHOUT_UPDATES.len();
+        let max_body = MAX_REQUEST;
         let (commands, commands_rx) = mpsc::channel(COMMANDS);
         let (pushes_tx, pushes_rx) = mpsc::channel(tuning.pushes.max(1));
         // A media session's pushes go nowhere: its caller gets a closed
@@ -484,6 +489,10 @@ impl Sender {
         answer.await.unwrap_or(Err(SenderError::NoAnswer))
     }
 }
+
+/// The largest request [`Sender::invoke`] takes: one message's payload,
+/// less the `invokeWithoutUpdates` prefix a media session adds.
+pub const MAX_REQUEST: usize = MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - WITHOUT_UPDATES.len();
 
 /// `invokeWithoutUpdates#bfa9e4b7`, the prefix of every media request.
 const WITHOUT_UPDATES: [u8; 4] =

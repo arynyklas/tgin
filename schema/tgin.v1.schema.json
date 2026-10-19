@@ -1141,11 +1141,11 @@
         "flood_sleep_threshold": {
           "$ref": "#/$defs/Duration",
           "default": "10s",
-          "description": "A `FLOOD_WAIT` or `SLOWMODE_WAIT` up to this long is slept out and\nthe request retried; a longer one answers 429 with `Retry-After`."
+          "description": "A `FLOOD_WAIT` up to this long is slept out and the request\nretried; a longer one, and any `SLOWMODE_WAIT`, answers 429 with\n`Retry-After`. At most 60 s."
         },
         "max_rps": {
           "default": 20,
-          "description": "Most requests per second the account sends Telegram, over all\nclients.",
+          "description": "Most requests per second the account sends Telegram for its RPC\nclients, over all of them: each call, each resend, each `*_MIGRATE`\nhop and a media session's export and import count.",
           "format": "uint32",
           "minimum": 1,
           "type": "integer"

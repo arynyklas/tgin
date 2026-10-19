@@ -68,6 +68,34 @@ impl Schema {
         res
     }
 
+    /// TL-JSON of the result of a call to `function` (a full name such as
+    /// `users.getUsers`), read by the function's result type, so a
+    /// `Vector<T>` result renders as an array and a `Bool` as a boolean.
+    /// On error `out` is left as it was.
+    pub fn result_to_json(
+        &self,
+        function: &str,
+        bytes: &[u8],
+        out: &mut String,
+    ) -> Result<(), TlError> {
+        let Some(Some(ty)) = self.ctor_by_name(function).map(|c| c.result.as_ref()) else {
+            return Err(TlError::Json {
+                ctor: "",
+                field: "",
+                what: "not a function of the schema",
+            });
+        };
+        let start = out.len();
+        let mut r = Reader::new(bytes);
+        let res = self
+            .json_value(&mut r, out, ty, 0)
+            .and_then(|()| r.finish());
+        if res.is_err() {
+            out.truncate(start);
+        }
+        res
+    }
+
     /// [`from_json`] for this schema.
     pub fn from_json(&self, json: &str, out: &mut Vec<u8>) -> Result<(), TlError> {
         let start = out.len();
