@@ -25,6 +25,7 @@ use axum::routing::post;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
+use tgin_core::config::Config;
 use tgin_mtproto::login::{
     self, LoginError, LoginHandle, LoginParams, LoginState, LogoutError, Method, StartError,
     TcpDial,
@@ -43,6 +44,27 @@ const SETTLE: Duration = Duration::from_secs(30);
 pub(crate) struct Target {
     pub(crate) session_dir: PathBuf,
     pub(crate) params: LoginParams,
+}
+
+impl Target {
+    /// Whether a login started for `self` still fits `other`: the same
+    /// session, and the same phone for the identity gate.
+    fn same_login(&self, other: &Self) -> bool {
+        self.session_dir == other.session_dir && self.params.phone == other.params.phone
+    }
+}
+
+/// The account `name` of `cfg`, as a login needs it.
+pub(crate) fn target_of(cfg: &Config, name: &str) -> Option<Target> {
+    let account = cfg.accounts.iter().find(|a| a.name == name)?;
+    Some(Target {
+        session_dir: account.session_dir.expose().clone(),
+        params: LoginParams {
+            api_id: account.api_id,
+            api_hash: account.api_hash.expose().clone(),
+            phone: account.phone.as_ref().map(|p| p.expose().clone()),
+        },
+    })
 }
 
 /// Why an account refused a login or logout.
@@ -139,7 +161,7 @@ pub(crate) struct Accounts {
     handle: Arc<dyn AccountHandle>,
     /// A `tokio` mutex: starting a login may ask Telegram about a leftover
     /// key while it holds the account's entry.
-    logins: Mutex<HashMap<String, (Method, Arc<LoginHandle>)>>,
+    logins: Mutex<HashMap<String, Login>>,
 }
 
 impl Accounts {
@@ -155,7 +177,49 @@ impl Accounts {
             .lock()
             .await
             .get(name)
-            .map(|(_, h)| Arc::clone(h))
+            .map(|login| Arc::clone(&login.handle))
+    }
+
+    /// After a reload: closes every login whose account is gone, or whose
+    /// `session_dir` or `phone` changed (`target` gives the new config's).
+    /// Closing waits until the login has released its session.
+    pub(crate) async fn reconcile(&self, target: impl Fn(&str) -> Option<Target>) {
+        let stale: Vec<(String, Login)> = {
+            let mut logins = self.logins.lock().await;
+            let names: Vec<String> = logins
+                .iter()
+                .filter(|(name, login)| {
+                    !target(name).is_some_and(|new| login.target.same_login(&new))
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            names
+                .into_iter()
+                .filter_map(|name| logins.remove(&name).map(|login| (name, login)))
+                .collect()
+        };
+        for (name, login) in stale {
+            tracing::info!(account = %name, "account login closed: the account changed in the config");
+            login.close().await;
+        }
+    }
+}
+
+/// A login of the map, with the config it was started for.
+struct Login {
+    method: Method,
+    target: Target,
+    handle: Arc<LoginHandle>,
+}
+
+impl Login {
+    /// Ends it and waits for its task when this is the last handle; other
+    /// holders (a request in flight) see it end.
+    async fn close(self) {
+        match Arc::try_unwrap(self.handle) {
+            Ok(handle) => handle.close().await,
+            Err(shared) => shared.abort(),
+        }
     }
 }
 
@@ -200,6 +264,10 @@ pub(crate) fn routes<S: AccountsState>() -> Router<S> {
         .route("/v1/accounts/{name}/login/code", post(code::<S>))
         .route("/v1/accounts/{name}/login/password", post(password::<S>))
         .route("/v1/accounts/{name}/logout", post(logout::<S>))
+        .route(
+            "/v1/accounts/{name}/login",
+            axum::routing::delete(cancel::<S>),
+        )
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -318,11 +386,11 @@ async fn start<S: AccountsState>(
     let handle = {
         let mut logins = accounts.logins.lock().await;
         match logins.get(&name) {
-            Some((m, h)) if !h.state().is_final() => {
-                if *m != method {
+            Some(login) if !login.handle.state().is_final() => {
+                if login.method != method {
                     return error(StatusCode::CONFLICT, "login in progress");
                 }
-                Arc::clone(h)
+                Arc::clone(&login.handle)
             }
             _ => {
                 // An ended login has released the session.
@@ -330,7 +398,14 @@ async fn start<S: AccountsState>(
                 match accounts.handle.start_login(&target, method).await {
                     Ok(h) => {
                         let h = Arc::new(h);
-                        logins.insert(name.clone(), (method, Arc::clone(&h)));
+                        logins.insert(
+                            name.clone(),
+                            Login {
+                                method,
+                                target: target.clone(),
+                                handle: Arc::clone(&h),
+                            },
+                        );
                         h
                     }
                     Err(refusal) => return refused(&name, &refusal),
@@ -427,6 +502,27 @@ async fn submit<S: AccountsState>(
     }
 }
 
+/// `DELETE …/login`: ends the account's login (`tgin admin login` sends it
+/// on Ctrl+C) and waits until it has released the session.
+async fn cancel<S: AccountsState>(
+    _: TokenConfigured,
+    State(state): State<S>,
+    Path(name): Path<String>,
+) -> Response {
+    if state.target(&name).is_none() {
+        return unknown_account();
+    }
+    let login = state.accounts().logins.lock().await.remove(&name);
+    match login {
+        Some(login) => {
+            login.close().await;
+            tracing::info!(account = %name, "account login cancelled");
+            axum::Json(json!({ "cancelled": true })).into_response()
+        }
+        None => no_login(),
+    }
+}
+
 async fn logout<S: AccountsState>(
     _: TokenConfigured,
     State(state): State<S>,
@@ -441,10 +537,8 @@ async fn logout<S: AccountsState>(
     }
     // A login in progress ends first, releasing the session.
     let login = accounts.logins.lock().await.remove(&name);
-    if let Some((_, h)) = login
-        && let Ok(h) = Arc::try_unwrap(h)
-    {
-        h.close().await;
+    if let Some(login) = login {
+        login.close().await;
     }
     match accounts.handle.log_out(&target).await {
         Ok(()) => {

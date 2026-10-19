@@ -16,6 +16,7 @@
 //! | `POST /v1/accounts/{name}/login` `{"method":"qr"\|"code"}` | token | 200 [`LoginStatus`] |
 //! | `GET /v1/accounts/{name}/login` | token | 200 [`LoginStatus`] |
 //! | `POST /v1/accounts/{name}/login/code` `{"code"}`, `/login/password` `{"password"}` | token | 200 [`LoginStatus`] |
+//! | `DELETE /v1/accounts/{name}/login` | token | 200 `{"cancelled":true}` |
 //! | `POST /v1/accounts/{name}/logout` | token | 200 `{"logged_out":true}` |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
@@ -57,6 +58,11 @@
 //! end is `logged_in` or `failed` with a `reason` (`wrong_account` when
 //! the account's phone is not the config's `phone`: that login is logged
 //! out again). A repeated `POST …/login` while one runs answers its state.
+//! A QR login ends `failed` (`expired`) after 5 minutes unscanned, and any
+//! login after 5 minutes without the code or password it waits for;
+//! `DELETE …/login` ends one at once (`tgin admin login` sends it on
+//! Ctrl+C), and a reload ends one whose account it removed or whose
+//! `session_dir` or `phone` it changed.
 //! The `tg://login` URL appears in these answers only; it, codes and
 //! passwords are never logged. `POST …/logout` calls `auth.logOut` and
 //! clears the session (keys, login, peers, update state; the directory
@@ -81,7 +87,7 @@ mod accounts;
 mod api;
 pub mod client;
 
-pub(crate) use accounts::{Accounts, Sessions};
+pub(crate) use accounts::{Accounts, Sessions, target_of};
 pub(crate) use api::{loop_detected, router};
 use std::time::Duration;
 

@@ -1035,3 +1035,52 @@ async fn srp_b_outside_the_group_is_refused() {
         );
     }
 }
+
+/// A QR login lives at most [`QR_LIFETIME`]: unscanned, it ends
+/// `Failed(expired)` and stops exporting tokens.
+#[tokio::test(start_paused = true)]
+async fn unscanned_qr_expires() {
+    let script = (0..20)
+        .map(|n| {
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token(&[n], later())),
+            )
+        })
+        .collect();
+    let (h, dial, _tmp) = begin(Method::Qr, None, script).await;
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        timeout(QR_LIFETIME * 2, h.finished()).await.expect("ends"),
+        LoginState::Failed(LoginError::Expired)
+    );
+    assert_eq!(started.elapsed(), QR_LIFETIME);
+    // One export per 30 s renewal until the deadline, none after it.
+    let exports = dial.calls().len();
+    assert_eq!(exports, 10, "{exports}");
+    tokio::time::sleep(QR_LIFETIME).await;
+    assert_eq!(dial.calls().len(), exports);
+}
+
+/// A login waits [`INPUT_WAIT`] for a code or password, then ends
+/// `Failed(expired)`.
+#[tokio::test(start_paused = true)]
+async fn code_and_password_waits_are_bounded() {
+    let (h, _dial, _tmp) = code_state(Reply::Ok(sent_code(&sms()))).await;
+    assert!(matches!(settled(&h).await, LoginState::CodeSent { .. }));
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        timeout(INPUT_WAIT * 2, h.finished()).await.expect("ends"),
+        LoginState::Failed(LoginError::Expired)
+    );
+    assert_eq!(started.elapsed(), INPUT_WAIT);
+
+    let (h, _dial, _tmp) = begin(Method::Qr, None, two_fa(vec![])).await;
+    assert!(matches!(settled(&h).await, LoginState::NeedPassword { .. }));
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        timeout(INPUT_WAIT * 2, h.finished()).await.expect("ends"),
+        LoginState::Failed(LoginError::Expired)
+    );
+    assert_eq!(started.elapsed(), INPUT_WAIT);
+}

@@ -47,6 +47,7 @@ use grammers_crypto::two_factor_auth::{calculate_2fa, check_p_and_g};
 use grammers_tl_types::{self as tl, Deserializable, Identifiable as _, RemoteCall};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::{
     AuthKey, DcOption, InitParams, Peer, PeerKind, Pushes, RpcOutcome, Sender, SenderError,
@@ -61,6 +62,11 @@ mod tests;
 pub const FIRST_DC: i32 = 2;
 /// The longest a QR token is shown before it is exported again.
 const MAX_TOKEN_TTL: i64 = 30;
+/// The longest a QR login runs unscanned; then it ends `Failed(expired)`.
+pub const QR_LIFETIME: Duration = Duration::from_secs(300);
+/// The longest a login waits for a code or a password; then it ends
+/// `Failed(expired)`.
+pub const INPUT_WAIT: Duration = Duration::from_secs(300);
 /// SRP's numbers are 2048 bits; grammers pads each to 256 bytes.
 const SRP_MAX: usize = 256;
 
@@ -281,6 +287,10 @@ pub enum LoginError {
     /// `account.password` without what SRP needs, or with unsafe values.
     #[error("unusable 2FA parameters from Telegram: {0}")]
     PasswordParams(&'static str),
+    /// The QR was not scanned within [`QR_LIFETIME`], or no code or
+    /// password came within [`INPUT_WAIT`].
+    #[error("the login expired; start it again")]
+    Expired,
     /// The operating system's random source failed: no SRP secret.
     #[error("the operating system's random source failed")]
     NoRandomness,
@@ -324,6 +334,7 @@ impl LoginError {
             Self::SignUpRequired => "sign_up_required",
             Self::MigrateLoop { .. } => "migrate_loop",
             Self::PasswordParams(_) => "password_params",
+            Self::Expired => "expired",
             Self::NoRandomness => "no_randomness",
             Self::WrongAccount => "wrong_account",
             Self::WrongAccountNotLoggedOut => "wrong_account_not_logged_out",
@@ -899,6 +910,13 @@ impl LoginHandle {
         self.state()
     }
 
+    /// Ends the login without waiting for it.
+    pub fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
     /// Ends the login and waits until it has released the session.
     pub async fn close(mut self) {
         if let Some(task) = self.task.take() {
@@ -1144,6 +1162,7 @@ impl<D: Dial> Flow<D> {
     }
 
     async fn drive(&mut self, method: Method) -> Result<LoginState, LoginError> {
+        let qr_deadline = Instant::now() + QR_LIFETIME;
         let mut conn = self.connect(FIRST_DC).await?;
         let (api_id, api_hash) = (self.params.api_id, self.params.api_hash.clone());
         let mut step = match method {
@@ -1162,8 +1181,11 @@ impl<D: Dial> Flow<D> {
                         expires,
                     });
                     let ttl = (i64::from(expires) - now_unix()).clamp(1, MAX_TOKEN_TTL);
-                    let ttl = Duration::from_secs(ttl.unsigned_abs());
-                    self.wait_scan(&conn.scanned, ttl).await;
+                    let renew = Instant::now() + Duration::from_secs(ttl.unsigned_abs());
+                    let scanned = self.wait_scan(&conn.scanned, renew.min(qr_deadline)).await;
+                    if !scanned && Instant::now() >= qr_deadline {
+                        return Err(LoginError::Expired);
+                    }
                     step = export(&conn.link, api_id, &api_hash).await;
                 }
                 Step::Migrate { dc, token } => {
@@ -1200,13 +1222,14 @@ impl<D: Dial> Flow<D> {
 
     /// Until the QR is scanned or `ttl` passes. A code or password meanwhile
     /// is refused.
-    async fn wait_scan(&mut self, scanned: &Notify, ttl: Duration) {
-        let deadline = tokio::time::sleep(ttl);
+    /// Whether it was scanned.
+    async fn wait_scan(&mut self, scanned: &Notify, until: Instant) -> bool {
+        let deadline = tokio::time::sleep_until(until);
         tokio::pin!(deadline);
         loop {
             tokio::select! {
-                () = &mut deadline => return,
-                () = scanned.notified() => return,
+                () = &mut deadline => return false,
+                () = scanned.notified() => return true,
                 Some(command) = self.commands.recv() => {
                     let _ = command.reply.send(Err(LoginError::NotExpected));
                 }
@@ -1222,8 +1245,12 @@ impl<D: Dial> Flow<D> {
         wanted: &Wanted,
         hash: Option<&str>,
     ) -> Result<Step, LoginError> {
+        let deadline = Instant::now() + INPUT_WAIT;
         loop {
-            let Some(command) = self.commands.recv().await else {
+            let Ok(command) = tokio::time::timeout_at(deadline, self.commands.recv()).await else {
+                return Err(LoginError::Expired);
+            };
+            let Some(command) = command else {
                 // Every handle is gone: nobody can answer.
                 return Err(LoginError::NotExpected);
             };

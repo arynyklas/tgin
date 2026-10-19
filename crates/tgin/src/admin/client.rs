@@ -175,7 +175,11 @@ pub fn run(command: &Command) -> u8 {
             return exit::FAILURE;
         }
     };
-    runtime.block_on(execute(command, token.as_deref()))
+    let code = runtime.block_on(execute(command, token.as_deref()));
+    // A password prompt cancelled by Ctrl+C still blocks its thread on the
+    // terminal: do not wait for it.
+    runtime.shutdown_background();
+    code
 }
 
 /// The token in `path`, without its line ending.
@@ -218,6 +222,12 @@ async fn execute(command: &Command, token: Option<&str>) -> u8 {
             &mut std::io::stderr(),
             method,
             LOGIN_POLL,
+            async {
+                // Without a signal handler, never interrupt.
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            },
         )
         .await;
     }
@@ -607,6 +617,8 @@ trait LoginApi {
     /// `POST …/login/code` or `…/login/password`: the next state, or why to
     /// try again.
     async fn submit(&mut self, field: Secret, value: String) -> Result<Submitted, String>;
+    /// `DELETE …/login`.
+    async fn cancel(&mut self) -> Result<(), String>;
 }
 
 /// Which secret `submit` hands over.
@@ -625,15 +637,19 @@ enum Submitted {
 /// Asks the operator for a code or the 2FA password; [`Tty`] in
 /// production.
 trait Prompt {
-    fn ask(&mut self, prompt: &str) -> std::io::Result<String>;
+    async fn ask(&mut self, prompt: &str) -> std::io::Result<String>;
 }
 
-/// The terminal, without echo.
+/// The terminal, without echo. The read runs on a blocking thread, so a
+/// Ctrl+C during it still cancels the login.
 struct Tty;
 
 impl Prompt for Tty {
-    fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
-        rpassword::prompt_password(prompt)
+    async fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
+        let prompt = prompt.to_owned();
+        tokio::task::spawn_blocking(move || rpassword::prompt_password(prompt))
+            .await
+            .map_err(std::io::Error::other)?
     }
 }
 
@@ -709,6 +725,16 @@ impl LoginApi for HttpLogin {
         }
         Self::state(&answer).map(Submitted::Next)
     }
+
+    async fn cancel(&mut self) -> Result<(), String> {
+        let answer = self.call(Method::DELETE, &[], None).await?;
+        // 404: the login had already ended.
+        if answer.status.is_success() || answer.status == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(format!("{}: {}", answer.status, failure(&answer.body)))
+        }
+    }
 }
 
 /// The QR of `url` in Unicode half blocks, light on dark, with its quiet
@@ -729,6 +755,8 @@ fn qr_text(url: &str) -> Option<String> {
 /// The QR goes to `out` (a fresh one each time the server renews the
 /// token); prompts and messages go to `err`. The URL itself is printed
 /// nowhere: only its QR.
+/// `interrupt` (Ctrl+C in production) ends the login on the server too
+/// (`DELETE …/login`), so it neither renews tokens nor holds the session.
 async fn login(
     api: &mut impl LoginApi,
     prompt: &mut impl Prompt,
@@ -736,11 +764,29 @@ async fn login(
     err: &mut impl std::io::Write,
     method: &str,
     poll: Duration,
+    interrupt: impl Future<Output = ()>,
 ) -> u8 {
-    match drive_login(api, prompt, out, err, method, poll).await {
-        Ok(code) => code,
-        Err(message) => {
+    let outcome = {
+        let drive = drive_login(&mut *api, prompt, out, &mut *err, method, poll);
+        tokio::pin!(drive);
+        tokio::pin!(interrupt);
+        tokio::select! {
+            biased;
+            outcome = &mut drive => Some(outcome),
+            () = &mut interrupt => None,
+        }
+    };
+    match outcome {
+        Some(Ok(code)) => code,
+        Some(Err(message)) => {
             let _ = writeln!(err, "tgin: {message}");
+            exit::FAILURE
+        }
+        None => {
+            let _ = match api.cancel().await {
+                Ok(()) => writeln!(err, "\ntgin: login cancelled"),
+                Err(message) => writeln!(err, "\ntgin: cancelling the login: {message}"),
+            };
             exit::FAILURE
         }
     }
@@ -783,7 +829,7 @@ async fn drive_login(
             }
             LoginStatus::CodeSent { kind, .. } => {
                 writeln!(err, "Telegram sent a login code ({kind}).").map_err(io)?;
-                let code = prompt.ask("Login code: ").map_err(io)?;
+                let code = prompt.ask("Login code: ").await.map_err(io)?;
                 submitted(api, err, Secret::Code, code).await?
             }
             LoginStatus::NeedPassword { hint } => {
@@ -791,7 +837,7 @@ async fn drive_login(
                     Some(hint) => format!("2FA password (hint: {hint}): "),
                     None => "2FA password: ".to_owned(),
                 };
-                let password = prompt.ask(&ask).map_err(io)?;
+                let password = prompt.ask(&ask).await.map_err(io)?;
                 submitted(api, err, Secret::Password, password).await?
             }
             LoginStatus::LoggedIn { user_id } => {
@@ -1032,6 +1078,7 @@ mod tests {
         submitted: Vec<(&'static str, String)>,
         /// What each submit answers.
         submits: std::collections::VecDeque<Submitted>,
+        cancelled: bool,
     }
 
     impl LoginApi for FakeApi {
@@ -1056,12 +1103,17 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| "script ended".to_owned())
         }
+
+        async fn cancel(&mut self) -> Result<(), String> {
+            self.cancelled = true;
+            Ok(())
+        }
     }
 
     struct Answers(Vec<String>, Vec<String>);
 
     impl Prompt for Answers {
-        fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
+        async fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
             self.1.push(prompt.to_owned());
             Ok(self.0.remove(0))
         }
@@ -1100,6 +1152,7 @@ mod tests {
                 Submitted::Next(LoginStatus::LoggedIn { user_id: 7 }),
             ]
             .into(),
+            cancelled: false,
         };
         let mut prompt = Answers(vec!["wrong-pw".into(), "right-pw".into()], Vec::new());
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1110,6 +1163,7 @@ mod tests {
             &mut err,
             "qr",
             Duration::ZERO,
+            std::future::pending(),
         )
         .await;
         let (out, err) = (
@@ -1163,6 +1217,7 @@ mod tests {
                 states: [state].into(),
                 submitted: Vec::new(),
                 submits: [].into(),
+                cancelled: false,
             };
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = login(
@@ -1172,6 +1227,7 @@ mod tests {
                 &mut err,
                 "qr",
                 Duration::ZERO,
+                std::future::pending(),
             )
             .await;
             assert_eq!(code, exit::FAILURE);
@@ -1185,5 +1241,34 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(qr, LoginStatus::Qr { expires: 5, .. }));
+    }
+
+    /// Ctrl+C at the QR ends the login on the server (`DELETE …/login`) and
+    /// exits non-zero; nothing else is called after it.
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_cancels_the_login_on_the_server() {
+        let mut api = FakeApi {
+            states: std::iter::repeat_with(|| qr("tok")).take(100).collect(),
+            submitted: Vec::new(),
+            submits: [].into(),
+            cancelled: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = login(
+            &mut api,
+            &mut Answers(Vec::new(), Vec::new()),
+            &mut out,
+            &mut err,
+            "qr",
+            Duration::from_secs(1),
+            tokio::time::sleep(Duration::from_millis(2500)),
+        )
+        .await;
+        assert_eq!(code, exit::FAILURE);
+        assert!(api.cancelled, "DELETE sent");
+        // start + two polls before the interrupt.
+        assert_eq!(api.states.len(), 97);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("login cancelled"), "{err}");
     }
 }

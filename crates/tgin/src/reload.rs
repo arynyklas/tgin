@@ -404,6 +404,11 @@ impl Reloader {
             );
         }
         self.loaded = text.into_bytes();
+        // A login started for an account the reload removed or moved ends.
+        self.shared
+            .accounts
+            .reconcile(|name| crate::admin::target_of(&cfg, name))
+            .await;
 
         // Before the sources restart: their `getMe` records identities in
         // the gateway's new entries.

@@ -82,6 +82,7 @@ struct Setup {
     app: Router,
     fake: Arc<Fake>,
     dir: TempDir,
+    state: TestState,
 }
 
 fn setup(phone: Option<&str>, script: Vec<(u32, Reply)>) -> Setup {
@@ -109,9 +110,10 @@ fn setup_with(token: bool, phone: Option<&str>, script: Vec<(u32, Reply)>) -> Se
         token,
     };
     Setup {
-        app: routes().with_state(state),
+        app: routes().with_state(state.clone()),
         fake,
         dir,
+        state,
     }
 }
 
@@ -689,4 +691,110 @@ async fn unverified_leftover_key_is_refused() {
     assert_eq!(json["error"], "session unverified");
     let store = reopen(&s.dir).await;
     assert_eq!(store.home_dc().expect("home"), Some(2));
+}
+
+/// `DELETE …/login` ends the login and releases the session at once; then
+/// there is no login.
+#[tokio::test]
+async fn delete_cancels_the_login() {
+    let s = setup(
+        None,
+        vec![(
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"t", later())),
+        )],
+    );
+    let (status, body) = call(&s.app, "DELETE", "/v1/accounts/main/login", "").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::NOT_FOUND, r#"{"error":"no login"}"#)
+    );
+    let (status, body) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert!(
+        matches!(parse(&body), LoginStatus::Qr { .. }),
+        "{status} {body}"
+    );
+    let (status, body) = call(&s.app, "DELETE", "/v1/accounts/main/login", "").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, r#"{"cancelled":true}"#)
+    );
+    // Released before the answer.
+    SessionStore::open(&s.dir.path().join("main")).expect("the session is free");
+    let (status, _) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&s.app, "DELETE", "/v1/accounts/other/login", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A reload closes a login whose account is gone or whose `session_dir`
+/// or `phone` changed, and keeps one whose account is unchanged.
+#[tokio::test]
+async fn reload_closes_logins_of_changed_accounts() {
+    let s = setup(
+        Some(PHONE),
+        vec![(
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"t", later())),
+        )],
+    );
+    let (_, body) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert!(matches!(parse(&body), LoginStatus::Qr { .. }), "{body}");
+    let state = s.state.clone();
+    let same = state.targets["main"].clone();
+
+    // Unchanged (api_hash may change: it is not the login's identity).
+    let mut hash = same.clone();
+    hash.params.api_hash = "rotated".into();
+    state.accounts.reconcile(|_| Some(hash.clone())).await;
+    let (status, _) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(status, StatusCode::OK, "kept");
+
+    for change in ["phone", "session_dir", "removed"] {
+        let mut changed = same.clone();
+        match change {
+            "phone" => changed.params.phone = Some("+1 555 0199".into()),
+            "session_dir" => changed.session_dir = s.dir.path().join("other"),
+            _ => {}
+        }
+        if change != "phone" {
+            // Start a fresh login for each case (the previous one closed).
+            // The closed login left its key: asked, unknown, reset.
+            s.fake.dial.extend(vec![
+                (ids::GET_USERS, Reply::Rpc(401, "AUTH_KEY_UNREGISTERED")),
+                (
+                    ids::EXPORT_LOGIN_TOKEN,
+                    Reply::Ok(login_token(b"u", later())),
+                ),
+            ]);
+            let (_, body) = call(
+                &s.app,
+                "POST",
+                "/v1/accounts/main/login",
+                r#"{"method":"qr"}"#,
+            )
+            .await;
+            assert!(
+                matches!(parse(&body), LoginStatus::Qr { .. }),
+                "{change}: {body}"
+            );
+        }
+        let target = (change != "removed").then_some(changed);
+        state.accounts.reconcile(|_| target.clone()).await;
+        let (status, _) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{change}: closed");
+        SessionStore::open(&s.dir.path().join("main")).expect("released");
+    }
 }

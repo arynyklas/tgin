@@ -66,16 +66,7 @@ impl AccountsState for Arc<Shared> {
     }
 
     fn target(&self, name: &str) -> Option<Target> {
-        let cfg = self.config.load();
-        let account = cfg.accounts.iter().find(|a| a.name == name)?;
-        Some(Target {
-            session_dir: account.session_dir.expose().clone(),
-            params: tgin_mtproto::login::LoginParams {
-                api_id: account.api_id,
-                api_hash: account.api_hash.expose().clone(),
-                phone: account.phone.as_ref().map(|p| p.expose().clone()),
-            },
-        })
+        accounts::target_of(&self.config.load(), name)
     }
 }
 

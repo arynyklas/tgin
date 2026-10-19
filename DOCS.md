@@ -696,7 +696,7 @@ $ tgin admin login <account>          # --code: a login code to the config's pho
 $ tgin admin logout <account> --yes
 ```
 
-`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns), both refuse while the account runs, and the QR's URL, codes and passwords are never logged.
+`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. An unscanned QR expires after 5 minutes, as does a wait for a code or password; Ctrl+C ends the login on tgin too. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns), both refuse while the account runs, and the QR's URL, codes and passwords are never logged.
 
 | Option | Environment | Meaning |
 |---|---|---|
