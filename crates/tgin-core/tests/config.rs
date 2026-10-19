@@ -3717,3 +3717,45 @@ fn render_requires_account_sources() {
     assert_message(&err, "bot `b`");
     assert_message(&err, "account `main`");
 }
+
+/// Contacts that change the address book are protected; the read-only
+/// `account.get*` methods of `ACCOUNT_READ_ONLY` are not, and the
+/// credential and Passport getters stay protected.
+#[test]
+fn account_changing_list() {
+    for method in [
+        "contacts.deleteContacts",
+        "contacts.importContacts",
+        "contacts.addContact",
+        "account.getTmpPassword",
+        "account.getPassword",
+        "account.getPasswordSettings",
+        "account.getAllSecureValues",
+        "account.getSecureValue",
+        "account.getAuthorizationForm",
+        "account.getPasskeys",
+        "account.getSomethingNew",
+        "account.updateProfile",
+    ] {
+        assert!(config::account_changing(method), "{method}");
+    }
+    for method in config::ACCOUNT_READ_ONLY {
+        assert!(method.starts_with("account.get"), "{method}");
+        assert!(!config::account_changing(method), "{method}");
+    }
+    for method in [
+        "account.getPrivacy",
+        "account.getNotifySettings",
+        "contacts.getContacts",
+    ] {
+        assert!(!config::account_changing(method), "{method}");
+    }
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"account.*\", \"contacts.*\"] } } } }\n",
+    );
+    let acl = &cfg.accounts[0].rpc.clients[0].acl;
+    assert!(acl.allows("account.getPrivacy"));
+    assert!(acl.allows("contacts.getContacts"));
+    assert!(!acl.allows("contacts.addContact"));
+    assert!(!acl.allows("account.getTmpPassword"));
+}

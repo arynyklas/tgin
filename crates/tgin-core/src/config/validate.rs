@@ -227,7 +227,8 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             }
         }
     }
-    // Globs that name a protected namespace, which allow none of it.
+    // Globs that name a protected namespace, which allow none of its
+    // protected methods.
     let mut useless: Vec<(usize, &At<String>)> = Vec::new();
     // Protected methods listed exactly, which are allowed.
     let mut exact: Vec<(usize, &At<String>)> = Vec::new();
@@ -260,7 +261,7 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
     if let Some((k, first)) = useless.first() {
         diag.warnings.push(
             ConfigError::warning(format!(
-                "{} allow no method of client `{name}`: auth and account-changing methods are allowed only by exact name",
+                "{} in client `{name}`'s `allow` grant none of its auth and account-changing methods: only an exact name allows one",
                 list(&useless, true)
             ))
             .at(located(format!("{path}.allow[{k}]"), first.location))

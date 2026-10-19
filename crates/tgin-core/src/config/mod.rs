@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
-pub use self::acl::{ACCOUNT_CHANGING, MethodAcl, MethodGlob, account_changing};
+pub use self::acl::{ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, MethodAcl, MethodGlob, account_changing};
 pub use self::model::RawConfig;
 pub use self::resolve::{
     Account, Admin, Balance, Bot, Config, Consumer, ConsumerKind, Endpoint, Files, Gateway,
