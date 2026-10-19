@@ -13,10 +13,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable as _, Serializable as _};
 use tokio::sync::Mutex;
+use tokio::time::{Instant, timeout};
 
 use crate::rpc::{AccountRpc, BoxFuture, ErrorClass, InvokeError, MediaFailure, Route, classify};
 use crate::{
@@ -179,12 +181,42 @@ fn setup_error(dc: i32, what: &'static str, e: &SenderError) -> InvokeError {
     }
 }
 
-/// One DC's media session: made and authorized, or connected with a new
-/// key whose authorization has not succeeded yet. The latter is kept so a
-/// retry repeats only the export and import, never the key exchange.
-enum Slot<S> {
-    Ready(Arc<S>),
-    Unauthorized(Arc<S>, Box<AuthKey>),
+/// The longest a media session's setup may take: connecting (10 s), the
+/// key exchange (30 s), the export and the import.
+pub const SETUP_DEADLINE: Duration = Duration::from_secs(60);
+/// The first and the longest wait after a failed setup before a DC is
+/// tried again; it doubles in between.
+const BACKOFF_FIRST: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// One DC's media session. `ready` is read without waiting on a setup
+/// in progress; `setup` serializes the setup of this DC only.
+struct Dc<S> {
+    ready: parking_lot::Mutex<Option<Arc<S>>>,
+    setup: Mutex<Setup<S>>,
+}
+
+struct Setup<S> {
+    /// Connected with a new key whose authorization has not succeeded yet:
+    /// kept so a retry repeats only the export and import, never the key
+    /// exchange.
+    unauthorized: Option<(Arc<S>, AuthKey)>,
+    /// After a failure: no setup before `until`; answered with `failure`.
+    failed: Option<(Instant, MediaFailure)>,
+    backoff: Duration,
+}
+
+impl<S> Default for Dc<S> {
+    fn default() -> Self {
+        Self {
+            ready: parking_lot::Mutex::new(None),
+            setup: Mutex::new(Setup {
+                unauthorized: None,
+                failed: None,
+                backoff: BACKOFF_FIRST,
+            }),
+        }
+    }
 }
 
 /// An account's sessions: the main one on the home DC and one media
@@ -196,7 +228,7 @@ pub struct AccountSessions<M, C: Connect, K> {
     layer: i32,
     connect: C,
     keys: K,
-    media: Mutex<HashMap<i32, Slot<C::Session>>>,
+    dcs: parking_lot::Mutex<HashMap<i32, Arc<Dc<C::Session>>>>,
 }
 
 impl<M, C: Connect, K> AccountSessions<M, C, K> {
@@ -207,19 +239,71 @@ impl<M, C: Connect, K> AccountSessions<M, C, K> {
             layer,
             connect,
             keys,
-            media: Mutex::new(HashMap::new()),
+            dcs: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn dc(&self, dc: i32) -> Arc<Dc<C::Session>> {
+        Arc::clone(self.dcs.lock().entry(dc).or_default())
     }
 }
 
 impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
-    /// The media session to `dc`, made and authorized on first use. Made
-    /// under the cache's lock, so two calls never authorize one DC twice.
+    /// The media session to `dc`, made and authorized on first use. A ready
+    /// session is returned at once; a setup waits only for another setup of
+    /// the same DC, is bounded by [`SETUP_DEADLINE`], and after a failure
+    /// the DC is not tried again for a backoff (1 s doubling to 60 s, or
+    /// Telegram's flood wait).
     async fn media(&self, dc: i32) -> Result<Arc<C::Session>, InvokeError> {
-        let mut cache = self.media.lock().await;
-        let (session, key) = match cache.get(&dc) {
-            Some(Slot::Ready(session)) => return Ok(Arc::clone(session)),
-            Some(Slot::Unauthorized(session, key)) => (Arc::clone(session), AuthKey::clone(key)),
+        let slot = self.dc(dc);
+        if let Some(session) = slot.ready.lock().clone() {
+            return Ok(session);
+        }
+        let mut setup = slot.setup.lock().await;
+        if let Some(session) = slot.ready.lock().clone() {
+            return Ok(session);
+        }
+        if let Some((until, failure)) = setup.failed
+            && Instant::now() < until
+        {
+            return Err(InvokeError::Media { dc, failure });
+        }
+        let made = match timeout(SETUP_DEADLINE, self.set_up(dc, &mut setup)).await {
+            Ok(made) => made,
+            Err(_) => Err(failed(dc, "the setup timed out")),
+        };
+        match made {
+            Ok(session) => {
+                setup.failed = None;
+                setup.backoff = BACKOFF_FIRST;
+                *slot.ready.lock() = Some(Arc::clone(&session));
+                Ok(session)
+            }
+            Err(e) => {
+                if let InvokeError::Media { failure, .. } = e {
+                    let wait = match failure {
+                        MediaFailure::FloodWait { seconds, .. } => {
+                            Duration::from_secs(u64::from(seconds)).max(setup.backoff)
+                        }
+                        MediaFailure::Failed { .. } => setup.backoff,
+                    };
+                    setup.failed = Some((Instant::now() + wait, failure));
+                    setup.backoff = (setup.backoff * 2).min(BACKOFF_MAX);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Connects (unless a connected, unauthorized session is kept) and
+    /// authorizes a new key.
+    async fn set_up(
+        &self,
+        dc: i32,
+        setup: &mut Setup<C::Session>,
+    ) -> Result<Arc<C::Session>, InvokeError> {
+        let (session, key) = match setup.unauthorized.take() {
+            Some(kept) => kept,
             None => {
                 let stored = self
                     .keys
@@ -232,27 +316,25 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
                     .map_err(|e| setup_error(dc, "connecting", &e))?;
                 let session = Arc::new(session);
                 let Some(key) = new_key else {
-                    cache.insert(dc, Slot::Ready(Arc::clone(&session)));
                     return Ok(session);
                 };
-                cache.insert(
-                    dc,
-                    Slot::Unauthorized(Arc::clone(&session), Box::new(key.clone())),
-                );
                 (session, key)
             }
         };
+        setup.unauthorized = Some((Arc::clone(&session), key.clone()));
         self.authorize(dc, session.as_ref()).await?;
         self.keys
             .save(dc, &key)
             .map_err(|_| failed(dc, "the session store failed"))?;
-        cache.insert(dc, Slot::Ready(Arc::clone(&session)));
+        setup.unauthorized = None;
         Ok(session)
     }
 
     /// Drops the media session to `dc` and its stored key.
     async fn evict(&self, dc: i32) -> Result<(), InvokeError> {
-        self.media.lock().await.remove(&dc);
+        let slot = self.dc(dc);
+        *slot.ready.lock() = None;
+        slot.setup.lock().await.unauthorized = None;
         self.keys
             .remove(dc)
             .map_err(|_| failed(dc, "the session store failed"))

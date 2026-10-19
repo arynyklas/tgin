@@ -741,6 +741,8 @@ impl Session for FakeSession {
 struct FakeConnect {
     media: Arc<FakeSession>,
     connects: Arc<Mutex<Vec<(i32, bool)>>>,
+    /// DCs whose connect never completes.
+    unreachable: Vec<i32>,
 }
 
 impl Connect for FakeConnect {
@@ -754,7 +756,13 @@ impl Connect for FakeConnect {
         self.connects.lock().push((dc, key.is_some()));
         let made = key.is_none().then_some(AuthKey([7; 256]));
         let media = Arc::clone(&self.media);
-        Box::pin(async move { Ok((media, made)) })
+        let hang = self.unreachable.contains(&dc);
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            Ok((media, made))
+        })
     }
 }
 
@@ -812,12 +820,23 @@ fn media_app<K: KeyStore + 'static>(
     home_dc: i32,
     keys: K,
 ) -> Media {
+    media_app_with(main, media, home_dc, keys, Vec::new())
+}
+
+fn media_app_with<K: KeyStore + 'static>(
+    main: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>,
+    media: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>,
+    home_dc: i32,
+    keys: K,
+    unreachable: Vec<i32>,
+) -> Media {
     let main = FakeSession::new(main);
     let media = FakeSession::new(media);
     let connects = Arc::new(Mutex::new(Vec::new()));
     let connect = FakeConnect {
         media: Arc::clone(&media),
         connects: Arc::clone(&connects),
+        unreachable,
     };
     let sessions = AccountSessions::new(Arc::clone(&main), home_dc, LAYER, connect, keys);
     let app = app_with(
@@ -914,7 +933,7 @@ async fn media_export_refused_is_503_not_executed() {
     assert!(m.media.methods().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn media_import_refused_is_503_and_retry_repeats_only_export_import() {
     let keys = Arc::new(FakeKeys::default());
     let m = media_app(
@@ -936,6 +955,8 @@ async fn media_import_refused_is_503_and_retry_repeats_only_export_import() {
     assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(first.error(), "media_session");
     assert!(keys.0.lock().is_empty());
+    // After the setup backoff.
+    tokio::time::advance(Duration::from_secs(1)).await;
     let second = send(&m.app, tl(GET_FILE)).await;
     assert_eq!(second.status, StatusCode::OK);
     // One key exchange for both attempts.
@@ -978,6 +999,56 @@ async fn media_flood_wait_during_setup_is_429() {
         assert_eq!(answer.error(), "media_flood_wait");
         assert_eq!(answer.retry_after(), Some("30"));
     }
+}
+
+fn migrate_to(dc: i32) -> Vec<Result<RpcOutcome, SenderError>> {
+    (0..8).map(|_| migrate(dc)).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn ready_media_session_never_waits_for_another_dc() {
+    let keys = Arc::new(FakeKeys::default());
+    keys.save(4, &AuthKey([3; 256])).expect("stored");
+    let main = vec![migrate(4), migrate(5), migrate(4)];
+    let m = media_app_with(main, [sender_ok(FILE), sender_ok(FILE)], 2, keys, vec![5]);
+    assert_eq!(send(&m.app, tl(GET_FILE)).await.status, StatusCode::OK);
+    // DC 5's setup hangs in its connect.
+    let app = m.app.clone();
+    let stuck = tokio::spawn(async move { send(&app, tl(GET_FILE)).await });
+    for _ in 0..1000 {
+        if m.connects.lock().len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(m.connects.lock().len(), 2, "DC 5's setup started");
+    let ready = tokio::time::timeout(Duration::from_millis(1), send(&m.app, tl(GET_FILE)))
+        .await
+        .expect("DC 4's ready session does not wait for DC 5's setup");
+    assert_eq!(ready.status, StatusCode::OK);
+    stuck.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn media_setup_has_a_deadline_and_a_backoff() {
+    let m = media_app_with(migrate_to(5), [], 2, Arc::new(FakeKeys::default()), vec![5]);
+    let start = tokio::time::Instant::now();
+    let bound = tgin_mtproto::media::SETUP_DEADLINE * 2;
+    let first = tokio::time::timeout(bound, send(&m.app, tl(GET_FILE)))
+        .await
+        .expect("the setup is bounded");
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first.error(), "media_session");
+    assert_eq!(start.elapsed(), tgin_mtproto::media::SETUP_DEADLINE);
+    // Within the backoff the DC is not tried again.
+    let second = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(m.connects.lock().len(), 1);
+    assert_eq!(start.elapsed(), tgin_mtproto::media::SETUP_DEADLINE);
+    // After it, it is.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let _ = tokio::time::timeout(Duration::from_millis(1), send(&m.app, tl(GET_FILE))).await;
+    assert_eq!(m.connects.lock().len(), 2);
 }
 
 #[tokio::test]
@@ -1029,6 +1100,7 @@ async fn file_migrate_uses_media_session_with_exported_auth() {
     let connect = FakeConnect {
         media: Arc::clone(&media),
         connects: Arc::clone(&connects),
+        unreachable: Vec::new(),
     };
     let keys = Arc::new(FakeKeys::default());
     let sessions = Arc::new(AccountSessions::new(
