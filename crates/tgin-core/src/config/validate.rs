@@ -230,8 +230,14 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
     // Globs that name a protected namespace, which allow none of its
     // protected methods.
     let mut useless: Vec<(usize, &At<String>)> = Vec::new();
-    // Protected methods listed exactly, which are allowed.
+    // Protected methods listed exactly that no `deny` glob blocks, which
+    // the client may call.
     let mut exact: Vec<(usize, &At<String>)> = Vec::new();
+    let deny: Vec<MethodGlob> = client
+        .deny
+        .iter()
+        .filter_map(|glob| MethodGlob::parse(&glob.value))
+        .collect();
     for (k, glob) in client.allow.iter().enumerate() {
         match MethodGlob::parse(&glob.value) {
             Some(MethodGlob::Namespace(_))
@@ -239,7 +245,9 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             {
                 useless.push((k, glob));
             }
-            Some(MethodGlob::Exact(method)) if acl::account_changing(&method) => {
+            Some(MethodGlob::Exact(method))
+                if acl::account_changing(&method) && !deny.iter().any(|d| d.matches(&method)) =>
+            {
                 exact.push((k, glob));
             }
             _ => {}

@@ -3759,3 +3759,20 @@ fn account_changing_list() {
     assert!(!acl.allows("contacts.addContact"));
     assert!(!acl.allows("account.getTmpPassword"));
 }
+
+/// An exactly listed account-changing method that `deny` blocks is not
+/// named in the warning: the client cannot call it.
+#[test]
+fn account_changing_warning_skips_denied() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [auth.logOut, account.updateProfile], deny: [\"auth.*\"] }, d: { token: u, allow: [auth.logOut], deny: [\"*\"] } } } }\n",
+    );
+    let text = render(&cfg.warnings);
+    assert_eq!(cfg.warnings.len(), 1, "{text}");
+    assert_message(&cfg.warnings[0], "account.updateProfile");
+    assert!(!text.contains("auth.logOut"), "{text}");
+    assert_eq!(
+        cfg.warnings[0].at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[1]"
+    );
+}
