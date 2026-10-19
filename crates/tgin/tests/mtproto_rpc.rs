@@ -1084,6 +1084,23 @@ async fn refused_media_key_is_dropped_and_authorized_again() {
             code: 401,
             message: "SESSION_REVOKED".to_owned(),
         }),
+        // Every lost authorization, not only the two above.
+        Ok(RpcOutcome::Error {
+            code: 401,
+            message: "AUTH_KEY_INVALID".to_owned(),
+        }),
+        Ok(RpcOutcome::Error {
+            code: 401,
+            message: "SESSION_EXPIRED".to_owned(),
+        }),
+        Ok(RpcOutcome::Error {
+            code: 406,
+            message: "AUTH_KEY_DUPLICATED".to_owned(),
+        }),
+        Err(SenderError::InitRefused {
+            code: 406,
+            message: "AUTH_KEY_DUPLICATED".to_owned(),
+        }),
         Err(SenderError::KeyUnknown),
     ] {
         let keys = Arc::new(FakeKeys::default());

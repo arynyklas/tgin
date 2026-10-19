@@ -48,6 +48,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::authorization;
 use crate::{
     AuthKey, DcOption, InitParams, Peer, PeerKind, Pushes, RpcOutcome, Sender, SenderError,
     SessionError, SessionStore,
@@ -542,8 +543,9 @@ async fn need_password<L: Link>(link: &L) -> Result<Step, LoginError> {
 }
 
 /// Who the link's key is logged in as: `users.getUsers([inputUserSelf])`.
-/// `Ok(None)` when Telegram says the key has no login (401, or a key it no
-/// longer knows); a request that was never written is sent once more.
+/// `Ok(None)` when Telegram says the key holds no login
+/// ([`authorization::no_login`], [`authorization::sender_gone`]); a request
+/// that was never written is sent once more.
 async fn whoami<L: Link>(link: &L) -> Result<Option<Me>, Fail> {
     let request = tl::functions::users::GetUsers {
         id: vec![tl::enums::InputUser::UserSelf],
@@ -554,11 +556,18 @@ async fn whoami<L: Link>(link: &L) -> Result<Option<Me>, Fail> {
     }
     match answer {
         Ok(users) => Ok(users.into_iter().next().and_then(Me::from_user)),
-        Err(
-            Fail::Rpc { code: 401, .. }
-            | Fail::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown),
-        ) => Ok(None),
+        Err(f) if holds_no_login(&f) => Ok(None),
         Err(f) => Err(f),
+    }
+}
+
+/// Telegram says the key holds no login: its authorization is gone, or a
+/// login on it never got past the 2FA step.
+fn holds_no_login(f: &Fail) -> bool {
+    match f {
+        Fail::Rpc { code, message } => authorization::no_login(*code, message),
+        Fail::Sender(e) => authorization::sender_gone(e),
+        Fail::NoAnswer | Fail::Decode => false,
     }
 }
 
@@ -840,15 +849,12 @@ async fn check_password<L: Link>(link: &L, password: String) -> Result<Step, Log
 }
 
 /// `auth.logOut` on `link`'s key: `Ok` once Telegram confirmed that the
-/// key is logged out, by answering it, or by no longer knowing the key
-/// (401, transport −404).
+/// key is logged out, by answering it, or by saying the key holds no login
+/// (a lost authorization, a duplicated key, transport −404).
 async fn log_out_key<L: Link>(link: &L) -> Result<(), Fail> {
     match call(link, &tl::functions::auth::LogOut {}).await {
-        Ok(_)
-        | Err(
-            Fail::Rpc { code: 401, .. }
-            | Fail::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown),
-        ) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(f) if holds_no_login(&f) => Ok(()),
         Err(f) => Err(f),
     }
 }
@@ -1094,7 +1100,7 @@ async fn ask_leftover<D: Dial>(
     let unverified = |e: String| StartError::Unverified(e);
     let (link, pushes) = match dial.dial(dc, Some(key), false).await {
         Ok((link, pushes, _)) => (link, pushes),
-        Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => return Ok(Begin::Fresh(method)),
+        Err(e) if authorization::sender_gone(&e) => return Ok(Begin::Fresh(method)),
         Err(e) => return Err(unverified(e.to_string())),
     };
     let conn = Conn::new(link, pushes);
@@ -1155,7 +1161,7 @@ pub async fn log_out<D: Dial>(store: &SessionStore, dial: &D) -> Result<(), Logo
                     return Err(LogoutError::Unconfirmed(LoginError::from(f).to_string()));
                 }
             }
-            Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => {}
+            Err(e) if authorization::sender_gone(&e) => {}
             Err(e) => return Err(LogoutError::Unconfirmed(e.to_string())),
         }
     }

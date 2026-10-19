@@ -672,6 +672,36 @@ fn an_unauthorized_main_answer_reports_a_gone_key() {
     assert!(shared.key_gone.load(Ordering::SeqCst), "duplicated on home");
 }
 
+/// An init call refused with a lost authorization (a copied session's
+/// `AUTH_KEY_DUPLICATED`) refuses every request on the main session the
+/// same way: the key is gone. A flood wait on it is not.
+#[test]
+fn an_init_refusal_of_a_lost_authorization_reports_a_gone_key() {
+    let shared = Shared::new(Arc::from("main"));
+    let refused = |code, message: &str| {
+        Err(InvokeError::Sender(SenderError::InitRefused {
+            code,
+            message: message.to_owned(),
+        }))
+    };
+    observe(&shared, Route::Main, 2, &refused(420, "FLOOD_WAIT_9"));
+    assert!(!shared.key_gone.load(Ordering::SeqCst), "a flood wait");
+    observe(
+        &shared,
+        Route::Media(4),
+        2,
+        &refused(406, "AUTH_KEY_DUPLICATED"),
+    );
+    assert!(!shared.key_gone.load(Ordering::SeqCst), "a media route");
+    observe(
+        &shared,
+        Route::Main,
+        2,
+        &refused(406, "AUTH_KEY_DUPLICATED"),
+    );
+    assert!(shared.key_gone.load(Ordering::SeqCst), "duplicated at init");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_cut_short_close_leaves_the_task_to_abort() {
     let net = FakeNetwork::new();

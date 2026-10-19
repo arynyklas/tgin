@@ -1374,3 +1374,93 @@ async fn sign_in_moved_after_send_code_moved_is_a_loop() {
     );
     assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)]);
 }
+
+/// A copied session directory: Telegram drops the key and answers 406
+/// `AUTH_KEY_DUPLICATED`, to `auth.logOut` or to the connection's init
+/// call. The authorization is gone, so the logout is confirmed and clears
+/// the session, and a new login can start; before, logout answered
+/// "unconfirmed" and login "logged in" for good.
+#[tokio::test]
+async fn log_out_accepts_a_duplicated_key() {
+    for reply in [
+        Reply::Rpc(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(401, "AUTH_KEY_UNREGISTERED"),
+        Reply::KeyUnknown,
+    ] {
+        let (_tmp, store) = store();
+        store.set_home_key(2, &AuthKey([1; 256])).expect("key");
+        store
+            .record_login(Peer {
+                id: 7,
+                kind: PeerKind::User {
+                    bot: Some(false),
+                    is_self: None,
+                },
+                access_hash: None,
+            })
+            .expect("login");
+        let dial = ScriptedDial::new(vec![(ids::LOG_OUT, reply.clone())]);
+        log_out(&store, &dial)
+            .await
+            .unwrap_or_else(|e| panic!("{reply:?}: {e}"));
+        assert_eq!(store.login().expect("login"), None, "{reply:?}");
+        assert_eq!(store.auth_key(2).expect("key"), None, "{reply:?}");
+        let dial = ScriptedDial::new(vec![(
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"t", later())),
+        )]);
+        let h = start(store, dial, params(None), Method::Qr)
+            .await
+            .unwrap_or_else(|e| panic!("{reply:?}: {e}"));
+        assert!(
+            matches!(settled(&h).await, LoginState::Qr { .. }),
+            "{reply:?}"
+        );
+    }
+    // A flood wait on the init call is not a lost authorization.
+    let (_tmp, store) = store();
+    store.set_home_key(2, &AuthKey([1; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![(
+        ids::LOG_OUT,
+        Reply::InitRefused(420, "FLOOD_WAIT_9"),
+    )]);
+    assert!(log_out(&store, &dial).await.is_err());
+    assert!(store.auth_key(2).expect("key").is_some());
+}
+
+/// A leftover key Telegram answers with `AUTH_KEY_DUPLICATED` holds no
+/// login: the session is reset and a fresh login starts.
+#[tokio::test]
+async fn a_duplicated_leftover_key_starts_fresh() {
+    for gone in [
+        Reply::Rpc(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(406, "AUTH_KEY_DUPLICATED"),
+        Reply::Rpc(401, "SESSION_PASSWORD_NEEDED"),
+    ] {
+        let (tmp, store) = self::store();
+        store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+        let dial = ScriptedDial::new(vec![
+            (ids::GET_USERS, gone.clone()),
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_success(8, None)),
+            ),
+        ]);
+        let h = start(store, dial.clone(), params(None), Method::Qr)
+            .await
+            .unwrap_or_else(|e| panic!("{gone:?}: {e}"));
+        assert_eq!(
+            end(&h).await,
+            LoginState::LoggedIn { user_id: 8 },
+            "{gone:?}"
+        );
+        assert_eq!(dial.dials(), vec![(4, true), (FIRST_DC, false)], "{gone:?}");
+        drop(h);
+        assert_eq!(
+            wait_reopen(&tmp).await.auth_key(4).expect("old key"),
+            None,
+            "{gone:?}"
+        );
+    }
+}

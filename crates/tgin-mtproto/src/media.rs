@@ -7,9 +7,9 @@
 //! with `auth.exportAuthorization` on the main session and
 //! `auth.importAuthorization` on the new one, and stored only once the
 //! import succeeded, so a stored media key is always an authorized one.
-//! A key Telegram stops accepting (`AUTH_KEY_UNREGISTERED`,
-//! `SESSION_REVOKED`, transport −404) is dropped, and the session is made
-//! and authorized again once.
+//! A key Telegram stops accepting (a lost authorization: any 401 but
+//! `SESSION_PASSWORD_NEEDED`, `AUTH_KEY_DUPLICATED`, transport −404) is
+//! dropped, and the session is made and authorized again once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use grammers_tl_types::{self as tl, Deserializable as _, Serializable as _};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 
+use crate::authorization;
 use crate::rpc::{
     AccountRpc, BoxFuture, Charge, ErrorClass, InvokeError, MediaFailure, Route, charged, classify,
 };
@@ -99,15 +100,10 @@ impl<K: KeyStore + ?Sized> KeyStore for Arc<K> {
 }
 
 /// Telegram does not know the media session's key, or no longer accepts
-/// its authorization: the call was not executed.
+/// its authorization ([`authorization::outcome_gone`]): the call was not
+/// executed.
 fn key_gone(outcome: &Result<RpcOutcome, SenderError>) -> bool {
-    match outcome {
-        Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => true,
-        Ok(RpcOutcome::Error { code: 401, message }) => {
-            message == "AUTH_KEY_UNREGISTERED" || message == "SESSION_REVOKED"
-        }
-        _ => false,
-    }
+    authorization::outcome_gone(outcome)
 }
 
 /// A failed media setup step.
@@ -368,9 +364,8 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         self.evict(dc, &media).await?;
         let media = self.media(dc).await?;
         charged(self.charge.as_ref())?;
-        // Safe to resend: a 401 AUTH_KEY_UNREGISTERED / SESSION_REVOKED is
-        // a refusal, and a −404 means Telegram could not decrypt the
-        // request.
+        // Safe to resend: a lost authorization is a refusal, and a −404
+        // means Telegram could not decrypt the request.
         let outcome = media.invoke(body).await;
         if key_gone(&outcome) {
             return Err(failed(dc, "the DC does not accept the media session's key"));
