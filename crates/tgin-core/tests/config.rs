@@ -3879,3 +3879,43 @@ consumers:
     assert_message(&err, "account `a`");
     assert!(err.hint.is_some(), "{err}");
 }
+
+fn two_sessions(a: &str, b: &str) -> String {
+    format!(
+        "version: 1\naccounts:\n  a: {{ api_id: 1, api_hash: h, session_dir: \"{a}\" }}\n  b: {{ api_id: 1, api_hash: h, session_dir: \"{b}\" }}\n"
+    )
+}
+
+/// `..` names the directory it leads to, whether or not it exists yet.
+#[test]
+fn session_dir_dot_dot_collides() {
+    let err = single_error(&two_sessions("sessions/a", "sessions/x/../a"));
+    assert_message(&err, "account `a` already uses this session directory");
+    let err = single_error(&two_sessions("sessions/a", "other/../sessions/./a"));
+    assert_eq!(err.at.as_ref().unwrap().path, "accounts.b.session_dir");
+
+    // An existing directory, reached through `..` from inside it.
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("session-dir-dot-dot");
+    std::fs::create_dir_all(root.join("a/inner")).unwrap();
+    let a = root.join("a");
+    let b = root.join("a/inner/..");
+    let yaml = two_sessions(
+        &a.display().to_string().replace('\\', "/"),
+        &b.display().to_string().replace('\\', "/"),
+    );
+    let err = single_error(&yaml);
+    assert_message(&err, "already uses this session directory");
+}
+
+/// Windows and macOS volumes ignore case, so `Sessions/A` is `sessions/a`
+/// there; Linux keeps them apart.
+#[test]
+fn session_dir_case_follows_the_platform() {
+    let yaml = two_sessions("sessions/a", "Sessions/A");
+    if cfg!(any(windows, target_os = "macos")) {
+        let err = single_error(&yaml);
+        assert_message(&err, "already uses this session directory");
+    } else {
+        loads(&yaml);
+    }
+}

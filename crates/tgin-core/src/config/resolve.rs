@@ -1204,8 +1204,8 @@ impl Resolver<'_> {
     /// is left out; the error rejects the config.
     fn accounts(&mut self, raw: &RawConfig) -> Vec<Account> {
         let mut out = Vec::with_capacity(raw.accounts.len());
-        // Each session directory, absolute, with the first account that has
-        // it.
+        // Each session directory, by its [`session_key`], with the first
+        // account that has it.
         let mut dirs: HashMap<PathBuf, &str> = HashMap::new();
         for (name, account) in &raw.accounts {
             let path = format!("accounts.{}", name.as_str());
@@ -1217,7 +1217,7 @@ impl Resolver<'_> {
                 .map(|phone| self.secret(format!("{path}.phone"), phone));
             let session_dir = self.session_dir(&path, &a.session_dir);
             if let Some(dir) = &session_dir {
-                match dirs.entry(dir.expose().clone()) {
+                match dirs.entry(session_key(dir.expose())) {
                     Entry::Vacant(entry) => {
                         entry.insert(name.as_str());
                     }
@@ -1391,6 +1391,31 @@ impl Resolver<'_> {
             },
         );
         self.diag.error(path, location, message);
+    }
+}
+
+/// The key two spellings of one session directory share: the canonical
+/// path of a directory that exists, which resolves symlinks, `..` and case.
+/// Otherwise the absolute path with `.` and `..` removed lexically and, on
+/// Windows and macOS, whose volumes ignore case by default, lowercased.
+fn session_key(dir: &Path) -> PathBuf {
+    let path = std::fs::canonicalize(dir).unwrap_or_else(|_| {
+        let mut path = PathBuf::new();
+        for component in dir.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    path.pop();
+                }
+                other => path.push(other),
+            }
+        }
+        path
+    });
+    if cfg!(any(windows, target_os = "macos")) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path
     }
 }
 
