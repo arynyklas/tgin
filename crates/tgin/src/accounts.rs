@@ -57,6 +57,8 @@ struct Running {
     account: Account,
     config: config::Account,
     limiter: Arc<AccountLimiter>,
+    /// Parked for a logout: its session is released.
+    parked: bool,
 }
 
 /// How long a logout waits for a running account's RPC calls before it
@@ -174,12 +176,25 @@ impl AccountSources {
     /// Starts the account of `config`, unless the shutdown stopped the
     /// accounts.
     fn start(&self, config: config::Account) {
+        self.start_as(config, None);
+    }
+
+    /// [`start`](Self::start); with `replacing`, only while that account is
+    /// still the one listed under the name.
+    fn start_as(&self, config: config::Account, replacing: Option<&Account>) {
         let limiter = Arc::new(AccountLimiter::new(config.rpc.max_rps));
         let account = {
             // Under the lock the shutdown stops the accounts with: an
             // account started here is stopped by it, or not started.
             let mut running = self.running.lock();
             if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(old) = replacing
+                && !running
+                    .get(&config.name)
+                    .is_some_and(|run| run.account.same(old))
+            {
                 return;
             }
             let spec = AccountSpec {
@@ -200,6 +215,7 @@ impl AccountSources {
                     account: account.clone(),
                     config: config.clone(),
                     limiter: Arc::clone(&limiter),
+                    parked: false,
                 },
             );
             account
@@ -219,26 +235,38 @@ impl AccountSources {
     }
 
     /// Whether the account `name` holds, or will take again on its own,
-    /// its session.
+    /// its session (a parked account does not).
     pub(crate) fn running(&self, name: &str) -> bool {
         self.running
             .lock()
             .get(name)
-            .is_some_and(|run| run.account.state().active())
+            .is_some_and(|run| !run.parked && run.account.state().active())
     }
 
     /// Parks the account `name` for a logout: its ingest stops (everything
     /// admitted is committed), its RPC calls get [`PARK_RPC_WAIT`], and its
-    /// session is released. It starts again at once and waits, as
-    /// `logged_out`, while the logout holds the session.
+    /// session is released. It stays listed, marked parked, so a reload
+    /// meanwhile closes or replaces it as usual. Then, unless a reload
+    /// replaced or removed it or the shutdown stopped the accounts, it
+    /// starts again and waits, as `logged_out`, while the logout holds the
+    /// session.
     pub(crate) async fn park(&self, name: &str) {
-        let run = self.running.lock().remove(name);
-        let Some(run) = run else {
-            return;
+        let account = {
+            let mut running = self.running.lock();
+            let Some(run) = running.get_mut(name) else {
+                return;
+            };
+            run.parked = true;
+            run.account.clone()
         };
         tracing::info!(account = %name, "the account is parked for a logout");
-        run.account.park(PARK_RPC_WAIT).await;
-        self.start(run.config);
+        account.park(PARK_RPC_WAIT).await;
+        // Started again only while it is still the account listed: a
+        // reload meanwhile removed or replaced it otherwise.
+        let config = self.running.lock().get(name).map(|run| run.config.clone());
+        if let Some(config) = config {
+            self.start_as(config, Some(&account));
+        }
     }
 
     /// The session of account `name` changed outside it (a login or a
@@ -362,29 +390,62 @@ mod tests {
     use std::path::Path;
 
     use tgin_core::engine::EngineRuntime;
-    use tgin_mtproto::testkit::FakeNetwork;
+    use tgin_mtproto::account::AccountState;
+    use tgin_mtproto::rpc::Route;
+    use tgin_mtproto::testkit::{FakeNetwork, Reply, difference_empty, ids};
+    use tgin_mtproto::{AuthKey, Peer, PeerKind, SessionStore, UpdateState};
     use tgin_runtime::config::MapEnv;
     use tgin_runtime::obs::MetricsRegistry;
     use tgin_runtime::supervisor::Supervisor;
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
 
-    /// After the shutdown stopped the accounts, a reload still on its way
-    /// starts none.
-    #[tokio::test]
-    async fn nothing_starts_once_the_accounts_are_stopped() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let yaml = format!(
-            "version: 1\naccounts:\n  main:\n    api_id: 1\n    api_hash: h\n    session_dir: '{}'\n",
-            dir.path().join("main").display()
-        );
-        let cfg = tgin_core::config::load(&yaml, Path::new("tgin.yaml"), &MapEnv::default())
-            .expect("valid config");
+    const WAIT: Duration = Duration::from_secs(600);
+
+    fn config(dir: &Path, api_hash: &str, accounts: bool) -> Config {
+        let yaml = if accounts {
+            format!(
+                "version: 1\naccounts:\n  main:\n    api_id: 1\n    api_hash: {api_hash}\n    session_dir: '{}'\n",
+                dir.join("main").display()
+            )
+        } else {
+            "version: 1\n".to_owned()
+        };
+        tgin_core::config::load(&yaml, Path::new("tgin.yaml"), &MapEnv::default())
+            .expect("valid config")
+    }
+
+    fn logged_in(dir: &Path) {
+        let store = SessionStore::open(&dir.join("main")).expect("store");
+        store.set_home_key(2, &AuthKey([2; 256])).expect("key");
+        store
+            .record_login(Peer {
+                id: 42,
+                kind: PeerKind::User {
+                    bot: Some(false),
+                    is_self: Some(true),
+                },
+                access_hash: Some(1),
+            })
+            .expect("login");
+        store
+            .set_update_state(UpdateState {
+                pts: 10,
+                qts: 0,
+                seq: 1,
+                date: 1,
+            })
+            .expect("state");
+    }
+
+    /// Account sources over an engine of `cfg`, on `net`.
+    fn sources(cfg: &Config, net: &FakeNetwork) -> Arc<AccountSources> {
         let mut registry = MetricsRegistry::new("test", "test");
         let core = CoreMetrics::register(registry.registry_mut());
         let engine = Engine::new(
-            &cfg,
+            cfg,
             core.clone(),
             reqwest::Client::new(),
             EngineRuntime {
@@ -396,23 +457,126 @@ mod tests {
             },
         )
         .expect("engine");
-        let net = FakeNetwork::new();
         let network: AccountNetwork = {
             let net = net.clone();
             Arc::new(move |_| Arc::new(net.clone()))
         };
-        let sources = AccountSources::new(
+        Arc::new(AccountSources::new(
             Arc::new(engine),
             core,
             network,
             Arc::new(Registry::default()),
             Arc::new(RpcEndpoint::new(CancellationToken::new())),
             Arc::new(Board::default()),
-        );
+        ))
+    }
+
+    /// Telegram answers a call after 3 s.
+    fn slow_telegram() -> FakeNetwork {
+        let net = FakeNetwork::new();
+        net.answer(|call| match call.ctor() {
+            ids::GET_DIFFERENCE => Reply::Ok(difference_empty(1, 1)),
+            _ => Reply::Later(Duration::from_secs(3), Box::new(Reply::Ok(Vec::new()))),
+        });
+        net
+    }
+
+    fn account(sources: &AccountSources) -> Option<(Account, config::Account, bool)> {
+        sources
+            .running
+            .lock()
+            .get("main")
+            .map(|run| (run.account.clone(), run.config.clone(), run.parked))
+    }
+
+    async fn until_running(account: &Account) {
+        let mut rx = account.watch();
+        timeout(WAIT, rx.wait_for(|s| *s == AccountState::Running))
+            .await
+            .expect("running")
+            .expect("alive");
+    }
+
+    /// The account running, with an RPC call on its way to Telegram.
+    async fn busy(sources: &AccountSources, net: &FakeNetwork) -> Account {
+        let (old, _, _) = account(sources).expect("started");
+        until_running(&old).await;
+        let rpc = old.rpc();
+        tokio::spawn(async move {
+            rpc.invoke(Route::Main, bytes::Bytes::from_static(&[0; 4]))
+                .await
+        });
+        timeout(WAIT, async {
+            while net.ctors().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the call reaches Telegram");
+        old
+    }
+
+    /// After the shutdown stopped the accounts, a reload still on its way
+    /// starts none.
+    #[tokio::test]
+    async fn nothing_starts_once_the_accounts_are_stopped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = config(dir.path(), "h", true);
+        let net = FakeNetwork::new();
+        let sources = sources(&cfg, &net);
         sources.stop_ingest();
         sources.apply(&cfg).await;
         assert!(sources.statuses().is_empty(), "no account started");
         assert!(!dir.path().join("main").exists(), "no session opened");
         assert!(net.dials().is_empty());
+    }
+
+    /// A reload that removes the account while it is parked leaves it
+    /// removed.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_during_a_park_removes_the_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        logged_in(dir.path());
+        let cfg = config(dir.path(), "h", true);
+        let net = slow_telegram();
+        let sources = sources(&cfg, &net);
+        sources.apply(&cfg).await;
+        busy(&sources, &net).await;
+        let park = tokio::spawn({
+            let sources = Arc::clone(&sources);
+            async move { sources.park("main").await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(matches!(account(&sources), Some((_, _, true))), "parked");
+        sources.apply(&config(dir.path(), "h", false)).await;
+        timeout(WAIT, park).await.expect("ends").expect("no panic");
+        assert!(account(&sources).is_none(), "removed for good");
+        drop(SessionStore::open(&dir.path().join("main")).expect("the session is free"));
+    }
+
+    /// A reload that changes the account while it is parked ends with the
+    /// new config running.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_during_a_park_runs_the_new_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        logged_in(dir.path());
+        let cfg = config(dir.path(), "h", true);
+        let net = slow_telegram();
+        let sources = sources(&cfg, &net);
+        sources.apply(&cfg).await;
+        busy(&sources, &net).await;
+        let park = tokio::spawn({
+            let sources = Arc::clone(&sources);
+            async move { sources.park("main").await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        sources.apply(&config(dir.path(), "h2", true)).await;
+        let (replaced, _, _) = account(&sources).expect("listed");
+        timeout(WAIT, park).await.expect("ends").expect("no panic");
+        let (now, cfg, parked) = account(&sources).expect("listed");
+        assert!(now.same(&replaced), "the park did not restart over it");
+        assert!(!parked);
+        assert_eq!(cfg.api_hash.expose(), "h2");
+        until_running(&now).await;
     }
 }

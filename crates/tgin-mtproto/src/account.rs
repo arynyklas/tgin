@@ -454,6 +454,13 @@ impl Account {
         &self.0.shared.name
     }
 
+    /// Whether `other` is a handle of this same account (not another start
+    /// of the same name).
+    #[must_use]
+    pub fn same(&self, other: &Account) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     #[must_use]
     pub fn state(&self) -> AccountState {
         self.0.shared.state.borrow().clone()
