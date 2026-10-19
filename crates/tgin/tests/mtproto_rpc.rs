@@ -160,9 +160,10 @@ impl Answer {
 }
 
 async fn send_with(app: &Router, layer: &str, body: Vec<u8>, extra: &[(&str, &str)]) -> Answer {
-    let mut req = Request::post("/mtproto/v1/main/invoke")
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .header("x-tgin-layer", layer);
+    let mut req = Request::post("/mtproto/v1/main/invoke").header("x-tgin-layer", layer);
+    if !extra.iter().any(|(k, _)| *k == "authorization") {
+        req = req.header("authorization", format!("Bearer {TOKEN}"));
+    }
     if !extra.iter().any(|(k, _)| *k == "content-type") {
         req = req.header("content-type", "application/octet-stream");
     }
@@ -403,6 +404,29 @@ async fn wrong_token_401() {
         .expect("infallible");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(account.calls().is_empty());
+}
+
+#[tokio::test]
+async fn auth_scheme_and_media_types_ignore_case() {
+    let account = FakeAccount::new([ok(NEAREST), ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    let lower = format!("bearer {TOKEN}");
+    let raw = send_with(&app, "230", tl(GET_NEAREST), &[("authorization", &lower)]).await;
+    assert_eq!(raw.status, StatusCode::OK);
+    let json = send_with(
+        &app,
+        "230",
+        GET_NEAREST.as_bytes().to_vec(),
+        &[
+            ("authorization", &format!("BEARER {TOKEN}")),
+            ("content-type", "Application/JSON; charset=utf-8"),
+            ("accept", "APPLICATION/json"),
+        ],
+    )
+    .await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert_eq!(json.body, Bytes::from_static(NEAREST.as_bytes()));
+    assert_eq!(account.calls().len(), 2);
 }
 
 #[tokio::test(start_paused = true)]

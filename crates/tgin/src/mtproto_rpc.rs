@@ -485,11 +485,26 @@ fn with_retry_after(mut response: Response, secs: u64) -> Response {
     response
 }
 
+/// Whether the header lists the `application/json` media type; media types
+/// are case-insensitive (RFC 9110 §8.3.1).
 fn wants_json(headers: &HeaderMap, name: header::HeaderName) -> bool {
+    const JSON: &[u8] = b"application/json";
+    headers.get(name).is_some_and(|v| {
+        v.as_bytes()
+            .windows(JSON.len())
+            .any(|w| w.eq_ignore_ascii_case(JSON))
+    })
+}
+
+/// The token after an `Authorization` scheme of `Bearer` in any case
+/// (RFC 9110 §11.1), as the other planes accept it; empty without one.
+fn bearer_token(headers: &HeaderMap) -> &[u8] {
+    const SCHEME: &[u8] = b"bearer ";
     headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("application/json"))
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.as_bytes().split_at_checked(SCHEME.len()))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
+        .map_or(&b""[..], |(_, token)| token)
 }
 
 /// Why a request body could not be read.
@@ -529,10 +544,7 @@ async fn invoke(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
-        .unwrap_or_default();
+    let bearer = bearer_token(&headers);
     // An unknown account is answered as a wrong token, after a comparison
     // of the same kind, so the answer does not tell which accounts exist.
     let Some(account) = endpoint.accounts.load().get(&account).cloned() else {
