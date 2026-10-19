@@ -1,0 +1,27 @@
+[package]
+name = "tgin-mtproto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "tgin's user-account engine: MTProto session store, sender and codec. The only crate that may depend on grammers."
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+fd-lock.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The two-process ownership race: its own `main` is both the race driver and,
+# re-run with `TGIN_LOCK_CHILD_DIR`, the contender. A test target, so cargo
+# builds it only for `cargo test` and never into a release artifact.
+[[test]]
+name = "lock_race"
+harness = false
+
+[lints]
+workspace = true

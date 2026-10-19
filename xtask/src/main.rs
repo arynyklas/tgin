@@ -1,6 +1,7 @@
 //! Repository automation for tgin, run with `cargo xtask <command>`.
 
 mod config_docs;
+mod confinement;
 mod e2e;
 
 use std::path::{Path, PathBuf};
@@ -15,7 +16,9 @@ commands:
   config-docs --check   fail if docs/config-reference.md is out of date
   e2e                   run the end-to-end suite (Docker): real bot frameworks
                         against tgin and the fake Telegram; tears it down after
-  e2e --keep            the same, leaving the stack up";
+  e2e --keep            the same, leaving the stack up
+  grammers-confinement  fail if a workspace crate other than tgin-mtproto
+                        depends on a grammers crate, directly or transitively";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,6 +34,7 @@ fn main() -> ExitCode {
         ["config-docs", "--check"] => config_reference(true),
         ["e2e"] => e2e::run(false),
         ["e2e", "--keep"] => e2e::run(true),
+        ["grammers-confinement"] => confinement::run(),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE

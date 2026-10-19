@@ -52,6 +52,8 @@ jobs:
         run: cargo xtask schema --check
       - name: Check the config reference is up to date
         run: cargo xtask config-docs --check
+      - name: Check grammers stays inside tgin-mtproto
+        run: cargo xtask grammers-confinement
 
   test:
     strategy:
