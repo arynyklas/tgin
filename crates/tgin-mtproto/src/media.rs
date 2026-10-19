@@ -20,7 +20,9 @@ use grammers_tl_types::{self as tl, Deserializable as _, Serializable as _};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 
-use crate::rpc::{AccountRpc, BoxFuture, ErrorClass, InvokeError, MediaFailure, Route, classify};
+use crate::rpc::{
+    AccountRpc, BoxFuture, Charge, ErrorClass, InvokeError, MediaFailure, Route, charged, classify,
+};
 use crate::{
     AuthKey, DcOption, InitParams, RpcOutcome, Sender, SenderError, SessionError, SessionStore,
 };
@@ -228,17 +230,28 @@ pub struct AccountSessions<M, C: Connect, K> {
     layer: i32,
     connect: C,
     keys: K,
+    charge: Arc<dyn Charge>,
     dcs: parking_lot::Mutex<HashMap<i32, Arc<Dc<C::Session>>>>,
 }
 
 impl<M, C: Connect, K> AccountSessions<M, C, K> {
-    pub fn new(main: M, home_dc: i32, layer: i32, connect: C, keys: K) -> Self {
+    /// `charge` is the account's request budget: a media setup's export and
+    /// import, and the resend after a refused media key, are charged to it.
+    pub fn new(
+        main: M,
+        home_dc: i32,
+        layer: i32,
+        connect: C,
+        keys: K,
+        charge: Arc<dyn Charge>,
+    ) -> Self {
         Self {
             main,
             home_dc,
             layer,
             connect,
             keys,
+            charge,
             dcs: parking_lot::Mutex::new(HashMap::new()),
         }
     }
@@ -322,6 +335,9 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
             }
         };
         setup.unauthorized = Some((Arc::clone(&session), key.clone()));
+        // The export and the import.
+        charged(self.charge.as_ref())?;
+        charged(self.charge.as_ref())?;
         self.authorize(dc, session.as_ref()).await?;
         self.keys
             .save(dc, &key)
@@ -353,6 +369,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         }
         self.evict(dc).await?;
         let media = self.media(dc).await?;
+        charged(self.charge.as_ref())?;
         let outcome = media.invoke(body).await;
         if key_gone(&outcome) {
             return Err(failed(dc, "the DC does not accept the media session's key"));

@@ -9,11 +9,11 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use parking_lot::Mutex;
-use tgin::mtproto_rpc::{RpcAccount, RpcEndpoint, router};
+use tgin::mtproto_rpc::{AccountLimiter, RpcAccount, RpcEndpoint, router};
 use tgin_core::config::{MethodAcl, MethodGlob, Rpc, RpcClient};
 use tgin_mtproto::decode::BoxKind;
 use tgin_mtproto::media::{AccountSessions, Connect, KeyStore, MediaConnected, Session};
-use tgin_mtproto::rpc::{AccountRpc, AffectedSink, BoxFuture, InvokeError, Route};
+use tgin_mtproto::rpc::{AccountRpc, AffectedSink, BoxFuture, Charge, InvokeError, Route};
 use tgin_mtproto::schema::{API, MTPROTO};
 use tgin_mtproto::{AuthKey, RpcOutcome, SenderError, SessionError};
 use tgin_runtime::secret::Secret;
@@ -130,8 +130,9 @@ fn app_draining(
     rpc: &Rpc,
     drain: CancellationToken,
 ) -> Router {
+    let limiter = Arc::new(AccountLimiter::new(rpc.max_rps));
     let mut endpoint = RpcEndpoint::new(drain);
-    endpoint.insert(RpcAccount::new("main", rpc, account, sink));
+    endpoint.insert(RpcAccount::new("main", rpc, account, sink, limiter));
     router(Arc::new(endpoint))
 }
 
@@ -635,6 +636,87 @@ async fn affected_on_a_channel_peer_goes_to_the_channel_box() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn max_rps_counts_resends() {
+    // max_rps 1: the resend after NotSent needs a second request.
+    let account = FakeAccount::new([Err(InvokeError::Sender(SenderError::NotSent)), ok(NEAREST)]);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(1, allow_all()),
+    );
+    let answer = send(&app, tl(GET_CONFIG)).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.error(), "rate_limited");
+    assert_eq!(answer.retry_after(), Some("1"));
+    assert_eq!(account.calls().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn max_rps_counts_migrate_hop_and_media_setup() {
+    // max_rps 3: the call, the hop, then the export and import need 4.
+    let m = media_app_with(
+        [migrate(4), sender_ok(EXPORTED)],
+        [sender_ok(IMPORTED), sender_ok(FILE)],
+        2,
+        Arc::new(FakeKeys::default()),
+        Vec::new(),
+        3,
+    );
+    let answer = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.error(), "rate_limited");
+    assert_eq!(m.main.methods(), vec![tl_json(GET_FILE)]);
+    assert!(m.media.methods().is_empty());
+}
+
+/// An account that never answers.
+struct Silent(Mutex<usize>);
+
+impl AccountRpc for Silent {
+    fn layer(&self) -> i32 {
+        LAYER
+    }
+
+    fn invoke(&self, _: Route, _: Bytes) -> BoxFuture<'_, Result<RpcOutcome, InvokeError>> {
+        *self.0.lock() += 1;
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn client_requests_in_flight_are_bounded() {
+    let account = Arc::new(Silent(Mutex::new(0)));
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, allow_all()),
+    );
+    let max = tgin::mtproto_rpc::MAX_CLIENT_IN_FLIGHT;
+    let waiting: Vec<_> = (0..max)
+        .map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move { send(&app, tl(GET_CONFIG)).await })
+        })
+        .collect();
+    for _ in 0..1000 {
+        if *account.0.lock() == max {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*account.0.lock(), max);
+    let refused = tokio::time::timeout(Duration::from_secs(5), send(&app, tl(GET_CONFIG)))
+        .await
+        .expect("refused at once");
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.error(), "too_many_in_flight");
+    assert_eq!(*account.0.lock(), max);
+    for task in waiting {
+        task.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn max_rps_limits() {
     let account = FakeAccount::new((0..4).map(|_| ok(NEAREST)));
     let app = app_with(
@@ -850,7 +932,7 @@ fn media_app<K: KeyStore + 'static>(
     home_dc: i32,
     keys: K,
 ) -> Media {
-    media_app_with(main, media, home_dc, keys, Vec::new())
+    media_app_with(main, media, home_dc, keys, Vec::new(), 100)
 }
 
 fn media_app_with<K: KeyStore + 'static>(
@@ -859,6 +941,7 @@ fn media_app_with<K: KeyStore + 'static>(
     home_dc: i32,
     keys: K,
     unreachable: Vec<i32>,
+    max_rps: u32,
 ) -> Media {
     let main = FakeSession::new(main);
     let media = FakeSession::new(media);
@@ -868,12 +951,25 @@ fn media_app_with<K: KeyStore + 'static>(
         connects: Arc::clone(&connects),
         unreachable,
     };
-    let sessions = AccountSessions::new(Arc::clone(&main), home_dc, LAYER, connect, keys);
-    let app = app_with(
-        Arc::new(sessions),
-        Arc::default(),
-        &rpc_config(100, allow_all()),
+    let rpc = rpc_config(max_rps, allow_all());
+    let limiter = Arc::new(AccountLimiter::new(rpc.max_rps));
+    let sessions = AccountSessions::new(
+        Arc::clone(&main),
+        home_dc,
+        LAYER,
+        connect,
+        keys,
+        Arc::clone(&limiter) as Arc<dyn Charge>,
     );
+    let mut endpoint = RpcEndpoint::new(CancellationToken::new());
+    endpoint.insert(RpcAccount::new(
+        "main",
+        &rpc,
+        Arc::new(sessions),
+        Arc::<FakeSink>::default(),
+        limiter,
+    ));
+    let app = router(Arc::new(endpoint));
     Media {
         main,
         media,
@@ -1040,7 +1136,14 @@ async fn ready_media_session_never_waits_for_another_dc() {
     let keys = Arc::new(FakeKeys::default());
     keys.save(4, &AuthKey([3; 256])).expect("stored");
     let main = vec![migrate(4), migrate(5), migrate(4)];
-    let m = media_app_with(main, [sender_ok(FILE), sender_ok(FILE)], 2, keys, vec![5]);
+    let m = media_app_with(
+        main,
+        [sender_ok(FILE), sender_ok(FILE)],
+        2,
+        keys,
+        vec![5],
+        100,
+    );
     assert_eq!(send(&m.app, tl(GET_FILE)).await.status, StatusCode::OK);
     // DC 5's setup hangs in its connect.
     let app = m.app.clone();
@@ -1061,7 +1164,14 @@ async fn ready_media_session_never_waits_for_another_dc() {
 
 #[tokio::test(start_paused = true)]
 async fn media_setup_has_a_deadline_and_a_backoff() {
-    let m = media_app_with(migrate_to(5), [], 2, Arc::new(FakeKeys::default()), vec![5]);
+    let m = media_app_with(
+        migrate_to(5),
+        [],
+        2,
+        Arc::new(FakeKeys::default()),
+        vec![5],
+        100,
+    );
     let start = tokio::time::Instant::now();
     let bound = tgin_mtproto::media::SETUP_DEADLINE * 2;
     let first = tokio::time::timeout(bound, send(&m.app, tl(GET_FILE)))
@@ -1139,6 +1249,7 @@ async fn file_migrate_uses_media_session_with_exported_auth() {
         LAYER,
         connect,
         Arc::clone(&keys),
+        Arc::new(AccountLimiter::new(NonZeroU32::new(100).expect("positive"))),
     ));
     let app = app_with(
         Arc::clone(&sessions) as Arc<dyn AccountRpc>,

@@ -49,6 +49,31 @@ pub enum InvokeError {
     /// was not executed.
     #[error("media session to DC {dc}: {failure}")]
     Media { dc: i32, failure: MediaFailure },
+    /// The account's request budget (`max_rps`) refused a further request
+    /// to Telegram: a resend, a migrate hop or a media setup. Not executed.
+    #[error("the account's request budget is spent for now")]
+    RateLimited { retry_after: Duration },
+}
+
+/// The account's request budget: one [`Charge::charge`] per request
+/// written to Telegram.
+pub trait Charge: Send + Sync {
+    /// Takes one request from the budget, or says how long until one is
+    /// free.
+    fn charge(&self) -> Result<(), Duration>;
+}
+
+impl<C: Charge + ?Sized> Charge for std::sync::Arc<C> {
+    fn charge(&self) -> Result<(), Duration> {
+        C::charge(self)
+    }
+}
+
+/// Charges `charge` for one more request.
+pub(crate) fn charged(charge: &dyn Charge) -> Result<(), InvokeError> {
+    charge
+        .charge()
+        .map_err(|retry_after| InvokeError::RateLimited { retry_after })
 }
 
 /// Why a media session could not take a request. Either way the request
@@ -403,20 +428,30 @@ impl fmt::Debug for Answer {
 ///   flood wait is answered with what is left of it;
 /// - `*_MIGRATE_X` from the main session: sent once to the media session
 ///   of DC X;
-/// - a `messages.affected*` answer: its pts go to `sink` in `context`.
+/// - a `messages.affected*` answer: its pts go to `sink` in `context`;
+/// - each send after the first is charged to `charge`; a refusal ends the
+///   call with [`InvokeError::RateLimited`].
 pub async fn call(
     account: &dyn AccountRpc,
     sink: &dyn AffectedSink,
     context: BoxKind,
     body: Bytes,
     flood_sleep_threshold: Duration,
+    charge: &dyn Charge,
     drain: impl Future<Output = ()>,
 ) -> Answer {
     let mut drain = std::pin::pin!(drain);
     let mut route = Route::Main;
     let mut resent = false;
     let mut slept = false;
+    let mut first = true;
     loop {
+        // The first send is the caller's to charge; every further one is
+        // charged here.
+        if !first && let Err(e) = charged(charge) {
+            return Answer::Failed(e);
+        }
+        first = false;
         match account.invoke(route, body.clone()).await {
             Err(InvokeError::Sender(SenderError::NotSent)) if !resent => resent = true,
             Err(e) => return Answer::Failed(e),

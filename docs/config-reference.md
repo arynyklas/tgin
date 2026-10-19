@@ -118,7 +118,7 @@ The MTProto RPC endpoint of one account.
 |---|---|---|---|
 | `clients` | map of names matching `^[a-z0-9][a-z0-9-]{0,62}$` to [RpcClient](#rpcclient) | `{}` | Who may call the account, by name. |
 | `flood_sleep_threshold` | [Duration](#duration) | `10s` | A `FLOOD_WAIT` up to this long is slept out and the request retried; a longer one, and any `SLOWMODE_WAIT`, answers 429 with `Retry-After`. At most 60 s. |
-| `max_rps` | integer (at least 1) | `20` | Most requests per second the account sends Telegram, over all clients. |
+| `max_rps` | integer (at least 1) | `20` | Most requests per second the account sends Telegram for its RPC clients, over all of them: each call, each resend, each `*_MIGRATE` hop and a media session's export and import count. |
 
 ## `RpcClient`
 

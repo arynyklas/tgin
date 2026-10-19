@@ -17,6 +17,12 @@
 //! account's authorizations (plan decision 2). The second refusal is
 //! ruling P10; the owner may overrule it.
 //!
+//! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
+//! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]
+//! (`max_rps`) counts every request tgin writes to Telegram for it: the
+//! call, each resend, each `*_MIGRATE` hop and a media session's export and
+//! import.
+//!
 //! The pipeline: unwrap the call ([`tgin_mtproto::rpc::unwrap_request`]),
 //! the client's allowlist (deny wins; empty denies), the account's
 //! `max_rps` limiter, then [`tgin_mtproto::rpc::call`] on the account.
@@ -45,6 +51,7 @@
 //! Request and answer bodies are never logged.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,12 +68,13 @@ use tgin_core::config::{self, MethodAcl};
 use tgin_mtproto::SenderError;
 use tgin_mtproto::decode::BoxKind;
 use tgin_mtproto::rpc::{
-    AccountRpc, AffectedSink, Answer, ErrorClass, InvokeError, MediaFailure, Refused, classify,
-    rpc_error_bytes, unwrap_request,
+    AccountRpc, AffectedSink, Answer, Charge, ErrorClass, InvokeError, MediaFailure, Refused,
+    classify, rpc_error_bytes, unwrap_request,
 };
 use tgin_mtproto::schema::{API, MTPROTO};
 use tgin_runtime::limit::{KeyedLimiter, Quota};
 use tgin_runtime::secret::{Secret, secret_eq};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -112,12 +120,42 @@ impl RpcEndpoint {
     }
 }
 
+/// How many requests one client may have in flight at once, body reading
+/// and decoding included.
+pub const MAX_CLIENT_IN_FLIGHT: usize = 8;
+
+/// An account's `max_rps` limiter. It counts every request tgin writes to
+/// Telegram for the account's RPC clients: the call, each resend (after a
+/// connection that never sent it, or a flood sleep), each `*_MIGRATE` hop,
+/// and the export and import that set up a media session. Share one
+/// between [`RpcAccount::new`] and the account's
+/// [`AccountSessions`](tgin_mtproto::media::AccountSessions).
+#[derive(Debug)]
+pub struct AccountLimiter(KeyedLimiter<()>);
+
+impl AccountLimiter {
+    /// `max_rps` per second, bursting to one second's worth.
+    #[must_use]
+    pub fn new(max_rps: NonZeroU32) -> Self {
+        Self(KeyedLimiter::new(Quota::per_second(max_rps, max_rps)))
+    }
+}
+
+impl Charge for AccountLimiter {
+    fn charge(&self) -> Result<(), Duration> {
+        self.0
+            .acquire(&(), Instant::now(), Duration::ZERO)
+            .map(drop)
+            .map_err(|denied| denied.retry_after)
+    }
+}
+
 /// One account's RPC side: its clients, its limiter and the running
 /// account.
 pub struct RpcAccount {
     name: String,
     clients: Vec<Client>,
-    limiter: KeyedLimiter<()>,
+    limiter: Arc<AccountLimiter>,
     flood_sleep_threshold: Duration,
     rpc: Arc<dyn AccountRpc>,
     sink: Arc<dyn AffectedSink>,
@@ -126,22 +164,21 @@ pub struct RpcAccount {
 struct Client {
     token: Secret<String>,
     acl: MethodAcl,
+    in_flight: Arc<Semaphore>,
 }
 
 impl RpcAccount {
     /// The RPC side of account `name`, configured by `spec`
-    /// (`accounts.<name>.rpc`), calling `rpc` and feeding affected pts to
-    /// `sink`.
+    /// (`accounts.<name>.rpc`), calling `rpc`, feeding affected pts to
+    /// `sink` and charging `limiter`.
     #[must_use]
     pub fn new(
         name: &str,
         spec: &config::Rpc,
         rpc: Arc<dyn AccountRpc>,
         sink: Arc<dyn AffectedSink>,
+        limiter: Arc<AccountLimiter>,
     ) -> Self {
-        let max_rps = spec.max_rps;
-        // `max_rps` per second, bursting to one second's worth.
-        let quota = Quota::per_second(max_rps, max_rps);
         Self {
             name: name.to_owned(),
             clients: spec
@@ -150,9 +187,10 @@ impl RpcAccount {
                 .map(|c| Client {
                     token: c.token.clone(),
                     acl: c.acl.clone(),
+                    in_flight: Arc::new(Semaphore::new(MAX_CLIENT_IN_FLIGHT)),
                 })
                 .collect(),
-            limiter: KeyedLimiter::new(quota),
+            limiter,
             flood_sleep_threshold: spec.flood_sleep_threshold,
             rpc,
             sink,
@@ -255,6 +293,18 @@ async fn invoke(
     let Some(client) = account.client(bearer) else {
         return unauthorized();
     };
+    // Held until the answer: bounds what one client makes tgin read,
+    // decode and wait on.
+    let Ok(_in_flight) = Arc::clone(&client.in_flight).try_acquire_owned() else {
+        return with_retry_after(
+            tgin_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_in_flight",
+                "the client has too many requests in flight",
+            ),
+            1,
+        );
+    };
     // The body is read only once the client is known, within
     // BODY_TIMEOUT, and up to the bound of its content type.
     let json_body = wants_json(&headers, header::CONTENT_TYPE);
@@ -327,19 +377,8 @@ async fn invoke(
             "the client's allowlist does not allow this method",
         );
     }
-    if let Err(denied) = account.limiter.acquire(&(), Instant::now(), Duration::ZERO) {
-        let secs = denied
-            .retry_after
-            .as_secs()
-            .saturating_add(u64::from(denied.retry_after.subsec_nanos() > 0));
-        return with_retry_after(
-            tgin_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "the account's max_rps is reached",
-            ),
-            secs,
-        );
+    if let Err(retry_after) = account.limiter.charge() {
+        return rate_limited(retry_after);
     }
     let context: BoxKind = call.context;
     let inner = tl.slice_ref(call.body);
@@ -349,6 +388,7 @@ async fn invoke(
         context,
         inner,
         account.flood_sleep_threshold,
+        account.limiter.as_ref(),
         endpoint.drain.cancelled(),
     )
     .await;
@@ -472,6 +512,22 @@ fn answer_response(answer: Answer, json: bool, method: &'static str) -> Response
     }
 }
 
+/// 429 for the account's `max_rps`: the call, or its next step, was not
+/// sent.
+fn rate_limited(retry_after: Duration) -> Response {
+    let secs = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0));
+    with_retry_after(
+        tgin_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "the account's max_rps is reached; the call was not executed",
+        ),
+        secs,
+    )
+}
+
 fn unavailable(error: &str, description: &str) -> Response {
     with_retry_after(
         tgin_error(StatusCode::SERVICE_UNAVAILABLE, error, description),
@@ -482,6 +538,7 @@ fn unavailable(error: &str, description: &str) -> Response {
 fn failure(e: &InvokeError) -> Response {
     let e = match e {
         InvokeError::Sender(e) => e,
+        InvokeError::RateLimited { retry_after } => return rate_limited(*retry_after),
         InvokeError::Media {
             failure: MediaFailure::FloodWait { seconds, .. },
             ..
