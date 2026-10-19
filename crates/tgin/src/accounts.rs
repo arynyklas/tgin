@@ -250,7 +250,15 @@ impl AccountSources {
     /// replaced or removed it or the shutdown stopped the accounts, it
     /// starts again and waits, as `logged_out`, while the logout holds the
     /// session.
-    pub(crate) async fn park(&self, name: &str) {
+    ///
+    /// The park runs on a task of its own: a caller that goes away (a
+    /// client disconnecting from a logout) cannot leave it half done.
+    pub(crate) async fn park(self: Arc<Self>, name: String) {
+        let park = tokio::spawn(async move { self.park_now(&name).await });
+        let _ = park.await;
+    }
+
+    async fn park_now(&self, name: &str) {
         let account = {
             let mut running = self.running.lock();
             let Some(run) = running.get_mut(name) else {
@@ -531,6 +539,44 @@ mod tests {
         assert!(net.dials().is_empty());
     }
 
+    /// A logout whose client goes away during the park: the park goes on,
+    /// and the account runs again, its old self having released the
+    /// session.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_outlives_its_caller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        logged_in(dir.path());
+        let cfg = config(dir.path(), "h", true);
+        let net = slow_telegram();
+        let sources = sources(&cfg, &net);
+        sources.apply(&cfg).await;
+        let old = busy(&sources, &net).await;
+        let park = Arc::clone(&sources).park("main".to_owned());
+        assert!(
+            timeout(Duration::from_secs(1), park).await.is_err(),
+            "dropped during the RPC wait"
+        );
+        timeout(WAIT, async {
+            loop {
+                if let Some((new, _, false)) = account(&sources)
+                    && !new.same(&old)
+                {
+                    return new;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map(|new| async move { until_running(&new).await })
+        .expect("restarted")
+        .await;
+        assert_eq!(
+            old.state(),
+            AccountState::Running,
+            "the old one ran until parked"
+        );
+    }
+
     /// A reload that removes the account while it is parked leaves it
     /// removed.
     #[tokio::test(start_paused = true)]
@@ -542,10 +588,7 @@ mod tests {
         let sources = sources(&cfg, &net);
         sources.apply(&cfg).await;
         busy(&sources, &net).await;
-        let park = tokio::spawn({
-            let sources = Arc::clone(&sources);
-            async move { sources.park("main").await }
-        });
+        let park = tokio::spawn(Arc::clone(&sources).park("main".to_owned()));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(matches!(account(&sources), Some((_, _, true))), "parked");
         sources.apply(&config(dir.path(), "h", false)).await;
@@ -565,10 +608,7 @@ mod tests {
         let sources = sources(&cfg, &net);
         sources.apply(&cfg).await;
         busy(&sources, &net).await;
-        let park = tokio::spawn({
-            let sources = Arc::clone(&sources);
-            async move { sources.park("main").await }
-        });
+        let park = tokio::spawn(Arc::clone(&sources).park("main".to_owned()));
         tokio::time::sleep(Duration::from_secs(1)).await;
         sources.apply(&config(dir.path(), "h2", true)).await;
         let (replaced, _, _) = account(&sources).expect("listed");

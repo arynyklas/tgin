@@ -156,9 +156,7 @@ impl AccountHandle for Sessions {
     }
 
     fn park(&self, account: &str) -> BoxFuture<'static, ()> {
-        let sources = Arc::clone(&self.0);
-        let account = account.to_owned();
-        Box::pin(async move { sources.park(&account).await })
+        Box::pin(Arc::clone(&self.0).park(account.to_owned()))
     }
 }
 
