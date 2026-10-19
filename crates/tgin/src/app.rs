@@ -185,6 +185,8 @@ pub(crate) struct Shared {
     /// listeners are bound once, from the start-up config: a reload that
     /// changes `admin.listen` takes effect only after a restart.
     pub(crate) admin_exposed: bool,
+    /// The accounts' logins (`/v1/accounts/{name}/login`).
+    pub(crate) accounts: crate::admin::Accounts,
 }
 
 /// What a starting app shares with whoever stops it, so that a start cut
@@ -315,6 +317,7 @@ impl App {
             ),
             reloads: handles.reloads.clone(),
             admin_exposed: cfg.admin.listen.iter().any(|addr| !addr.ip().is_loopback()),
+            accounts: crate::admin::Accounts::new(Arc::new(crate::admin::Sessions)),
         });
 
         // Before any source starts, so the probes answer during a slow

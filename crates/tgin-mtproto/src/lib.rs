@@ -12,6 +12,8 @@
 //! back. [`updates`] is tgin's own update-state handling and gap recovery
 //! over those bytes.
 //!
+//! [`login`] logs the account in over raw TL (QR, code, 2FA) and out.
+//!
 //! A [`Sender`] holds one connection to one DC and gives every request an
 //! honest outcome: answered, [`SenderError::NotSent`] (never written, one
 //! resend allowed) or [`SenderError::NoAnswer`] (written, never resent).
@@ -20,11 +22,14 @@ mod dc;
 pub mod decode;
 mod error;
 mod lock;
+pub mod login;
 pub mod schema;
 mod sender;
 mod session;
 #[cfg(test)]
 mod testgen;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod tl_json;
 mod transport;
 pub mod updates;

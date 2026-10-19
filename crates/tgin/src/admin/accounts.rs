@@ -1,0 +1,381 @@
+//! `/v1/accounts/{name}/login|logout`: logging a Telegram account in and
+//! out through the admin API (see the [module table](super)).
+//!
+//! A login runs on its own task, on the account's session, which it holds
+//! (under the session's lock) until the login ends. The routes reach the
+//! account through an [`AccountHandle`]: whether it runs, and the session
+//! and Telegram behind it, so the tests put a scripted Telegram there.
+//!
+//! The `tg://login` URL leaves tgin only in a `qr` answer. Codes and
+//! passwords are parsed from the body and handed to the login; no log
+//! line, error or status carries any of them.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use futures_util::future::BoxFuture;
+use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::json;
+use tgin_mtproto::login::{
+    self, LoginError, LoginHandle, LoginParams, LoginState, LogoutError, Method, StartError,
+    TcpDial,
+};
+use tgin_mtproto::{InitParams, SessionError, SessionStore};
+
+use super::{LoginStatus, LoginUrl};
+
+/// How long `POST …/login` waits for Telegram's first answer before it
+/// answers `connecting`.
+const SETTLE: Duration = Duration::from_secs(30);
+
+/// What a login needs of an account's config.
+#[derive(Clone, Debug)]
+pub(crate) struct Target {
+    pub(crate) session_dir: PathBuf,
+    pub(crate) params: LoginParams,
+}
+
+/// Why an account refused a login or logout.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// A login is recorded: log out first.
+    LoggedIn,
+    /// Another process holds the session.
+    Held,
+    /// Telegram did not confirm the logout; nothing was cleared.
+    Unconfirmed,
+    /// The session store failed.
+    Store(SessionError),
+}
+
+impl From<SessionError> for Refusal {
+    fn from(e: SessionError) -> Self {
+        match e {
+            SessionError::Held { .. } => Self::Held,
+            e => Self::Store(e),
+        }
+    }
+}
+
+/// The account behind the routes.
+pub(crate) trait AccountHandle: Send + Sync + 'static {
+    /// Whether the account runs. Login and logout refuse while it does.
+    fn running(&self, account: &str) -> bool;
+    /// Opens the account's session and starts a login on it.
+    fn start_login(&self, target: &Target, method: Method) -> Result<LoginHandle, Refusal>;
+    /// `auth.logOut`, then the session cleared.
+    fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>>;
+}
+
+/// The production handle: Telegram's DCs over TCP. No account runs yet:
+/// the supervisor that runs them (M3 Part 2, Task 7) answers `running`.
+pub(crate) struct Sessions;
+
+impl AccountHandle for Sessions {
+    fn running(&self, _account: &str) -> bool {
+        false
+    }
+
+    fn start_login(&self, target: &Target, method: Method) -> Result<LoginHandle, Refusal> {
+        let store = SessionStore::open(&target.session_dir)?;
+        let dial = TcpDial::new(InitParams::new(target.params.api_id));
+        login::start(store, dial, target.params.clone(), method).map_err(start_refusal)
+    }
+
+    fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>> {
+        let dir = target.session_dir.clone();
+        let dial = TcpDial::new(InitParams::new(target.params.api_id));
+        Box::pin(async move {
+            let store = SessionStore::open(&dir)?;
+            login::log_out(&store, &dial).await.map_err(logout_refusal)
+        })
+    }
+}
+
+pub(crate) fn start_refusal(e: StartError) -> Refusal {
+    match e {
+        StartError::LoggedIn => Refusal::LoggedIn,
+        StartError::Storage(e) => e.into(),
+    }
+}
+
+pub(crate) fn logout_refusal(e: LogoutError) -> Refusal {
+    match e {
+        LogoutError::Unconfirmed(_) => Refusal::Unconfirmed,
+        LogoutError::Storage(e) => e.into(),
+    }
+}
+
+/// The logins in progress or ended, by account.
+pub(crate) struct Accounts {
+    handle: Arc<dyn AccountHandle>,
+    logins: Mutex<HashMap<String, (Method, Arc<LoginHandle>)>>,
+}
+
+impl Accounts {
+    pub(crate) fn new(handle: Arc<dyn AccountHandle>) -> Self {
+        Self {
+            handle,
+            logins: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn login(&self, name: &str) -> Option<Arc<LoginHandle>> {
+        self.logins.lock().get(name).map(|(_, h)| Arc::clone(h))
+    }
+}
+
+/// What the routes need of their state.
+pub(crate) trait AccountsState: Clone + Send + Sync + 'static {
+    fn accounts(&self) -> &Accounts;
+    /// The account `name` of the running config.
+    fn target(&self, name: &str) -> Option<Target>;
+}
+
+/// The account routes, to be mounted behind the admin token.
+pub(crate) fn routes<S: AccountsState>() -> Router<S> {
+    Router::new()
+        .route(
+            "/v1/accounts/{name}/login",
+            post(start::<S>).get(current::<S>),
+        )
+        .route("/v1/accounts/{name}/login/code", post(code::<S>))
+        .route("/v1/accounts/{name}/login/password", post(password::<S>))
+        .route("/v1/accounts/{name}/logout", post(logout::<S>))
+}
+
+fn error(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(json!({ "error": message }))).into_response()
+}
+
+fn unknown_account() -> Response {
+    error(StatusCode::NOT_FOUND, "unknown account")
+}
+
+fn no_login() -> Response {
+    error(StatusCode::NOT_FOUND, "no login")
+}
+
+fn running() -> Response {
+    error(StatusCode::CONFLICT, "account running")
+}
+
+/// A body that is not the expected JSON. The text is never echoed: it may
+/// hold a password.
+fn invalid_body() -> Response {
+    error(StatusCode::BAD_REQUEST, "invalid body")
+}
+
+fn refused(account: &str, refusal: &Refusal) -> Response {
+    match refusal {
+        Refusal::LoggedIn => error(StatusCode::CONFLICT, "logged in"),
+        Refusal::Held => error(StatusCode::CONFLICT, "session held"),
+        Refusal::Unconfirmed => error(StatusCode::BAD_GATEWAY, "logout unconfirmed"),
+        Refusal::Store(e) => {
+            tracing::warn!(account, error = %e, "account session store failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "session store failed")
+        }
+    }
+}
+
+/// The admin API's view of `state`.
+pub(crate) fn status(state: &LoginState) -> LoginStatus {
+    match state {
+        LoginState::Connecting => LoginStatus::Connecting,
+        LoginState::Qr { url, expires } => LoginStatus::Qr {
+            url: LoginUrl(url.expose().to_owned()),
+            expires: i64::from(*expires),
+        },
+        LoginState::CodeSent { kind, timeout } => LoginStatus::CodeSent {
+            kind: kind.as_str().to_owned(),
+            timeout: *timeout,
+        },
+        LoginState::NeedPassword { hint } => LoginStatus::NeedPassword { hint: hint.clone() },
+        LoginState::NeedEmailSetup => LoginStatus::NeedEmailSetup,
+        LoginState::NeedEmailCode => LoginStatus::NeedEmailCode,
+        LoginState::PaymentRequired => LoginStatus::PaymentRequired,
+        LoginState::LoggedIn { user_id } => LoginStatus::LoggedIn { user_id: *user_id },
+        LoginState::Failed(e) => LoginStatus::Failed {
+            reason: e.code().to_owned(),
+            message: e.to_string(),
+        },
+    }
+}
+
+fn answer(account: &str, state: &LoginState) -> Response {
+    tracing::info!(account, state = state.name(), "account login");
+    axum::Json(status(state)).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MethodName {
+    Qr,
+    Code,
+}
+
+#[derive(Deserialize)]
+struct StartBody {
+    method: MethodName,
+}
+
+async fn start<S: AccountsState>(
+    State(state): State<S>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(target) = state.target(&name) else {
+        return unknown_account();
+    };
+    let Ok(StartBody { method }) = serde_json::from_slice(&body) else {
+        return invalid_body();
+    };
+    let method = match method {
+        MethodName::Qr => Method::Qr,
+        MethodName::Code => Method::Code,
+    };
+    let accounts = state.accounts();
+    if accounts.handle.running(&name) {
+        return running();
+    }
+    let handle = {
+        let mut logins = accounts.logins.lock();
+        match logins.get(&name) {
+            Some((m, h)) if !h.state().is_final() => {
+                if *m != method {
+                    return error(StatusCode::CONFLICT, "login in progress");
+                }
+                Arc::clone(h)
+            }
+            _ => {
+                // An ended login has released the session.
+                logins.remove(&name);
+                match accounts.handle.start_login(&target, method) {
+                    Ok(h) => {
+                        let h = Arc::new(h);
+                        logins.insert(name.clone(), (method, Arc::clone(&h)));
+                        h
+                    }
+                    Err(refusal) => return refused(&name, &refusal),
+                }
+            }
+        }
+    };
+    let state = tokio::time::timeout(SETTLE, handle.settled())
+        .await
+        .unwrap_or_else(|_| handle.state());
+    answer(&name, &state)
+}
+
+async fn current<S: AccountsState>(State(state): State<S>, Path(name): Path<String>) -> Response {
+    if state.target(&name).is_none() {
+        return unknown_account();
+    }
+    match state.accounts().login(&name) {
+        Some(h) => axum::Json(status(&h.state())).into_response(),
+        None => no_login(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    password: String,
+}
+
+async fn code<S: AccountsState>(
+    State(state): State<S>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(CodeBody { code }) = serde_json::from_slice(&body) else {
+        return invalid_body();
+    };
+    submit(&state, &name, async |h: Arc<LoginHandle>| {
+        h.submit_code(code).await
+    })
+    .await
+}
+
+async fn password<S: AccountsState>(
+    State(state): State<S>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(PasswordBody { password }) = serde_json::from_slice(&body) else {
+        return invalid_body();
+    };
+    submit(&state, &name, async |h: Arc<LoginHandle>| {
+        h.submit_password(password).await
+    })
+    .await
+}
+
+/// Hands a code or password to the account's login.
+async fn submit<S: AccountsState>(
+    state: &S,
+    name: &str,
+    hand: impl AsyncFnOnce(Arc<LoginHandle>) -> Result<LoginState, LoginError>,
+) -> Response {
+    if state.target(name).is_none() {
+        return unknown_account();
+    }
+    let Some(h) = state.accounts().login(name) else {
+        return no_login();
+    };
+    match hand(h).await {
+        Ok(next) => answer(name, &next),
+        Err(e) => {
+            tracing::info!(
+                account = name,
+                reason = e.code(),
+                "account login: try again"
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(json!({ "error": e.to_string(), "reason": e.code() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn logout<S: AccountsState>(State(state): State<S>, Path(name): Path<String>) -> Response {
+    let Some(target) = state.target(&name) else {
+        return unknown_account();
+    };
+    let accounts = state.accounts();
+    if accounts.handle.running(&name) {
+        return running();
+    }
+    // A login in progress ends first, releasing the session.
+    let login = accounts.logins.lock().remove(&name);
+    if let Some((_, h)) = login
+        && let Ok(h) = Arc::try_unwrap(h)
+    {
+        h.close().await;
+    }
+    match accounts.handle.log_out(&target).await {
+        Ok(()) => {
+            tracing::info!(account = %name, "account logged out");
+            axum::Json(json!({ "logged_out": true })).into_response()
+        }
+        Err(refusal) => refused(&name, &refusal),
+    }
+}
+
+#[cfg(test)]
+mod tests;

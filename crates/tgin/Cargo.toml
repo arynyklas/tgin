@@ -19,12 +19,15 @@ clap.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true
+qrcode.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tgin-botapi.workspace = true
 tgin-core.workspace = true
+tgin-mtproto.workspace = true
 tgin-runtime.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }
@@ -38,6 +41,9 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
+tempfile.workspace = true
+# Scripted Telegram replies for the login tests.
+tgin-mtproto = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true
 wiremock.workspace = true

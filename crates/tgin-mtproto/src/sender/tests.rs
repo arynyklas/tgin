@@ -1658,3 +1658,112 @@ async fn huge_flood_wait_latches_for_good() {
     ));
     assert!(h.conns.try_recv().is_err(), "no reconnect");
 }
+
+/// The login over MTP frames: a [`crate::login::Dial`] whose senders run
+/// on the scripted transport, so every request and answer below crosses
+/// the real message layer (msg_ids, seqnos, `rpc_result`, pushes).
+mod login_framing {
+    use super::*;
+    use crate::SessionStore;
+    use crate::login::{self, Dial, LoginParams, LoginState, Method};
+    use crate::testkit::{login_token, login_token_success, update_login_token};
+
+    #[derive(Clone)]
+    struct FramedDial(Arc<Script>);
+
+    impl Dial for FramedDial {
+        type Link = Sender;
+
+        async fn dial(
+            &self,
+            dc: i32,
+            key: Option<AuthKey>,
+            logged_in: bool,
+        ) -> Result<(Sender, Pushes, Option<AuthKey>), SenderError> {
+            // The scripted transport makes no key: hand one over as new.
+            let new = key.is_none();
+            let key = key.unwrap_or(AuthKey([dc as u8; 256]));
+            let mut init = init();
+            init.logged_in = logged_in;
+            let (sender, pushes, _) = Sender::start(
+                Scripted(Arc::clone(&self.0)),
+                super::dc(),
+                Some(key.clone()),
+                init,
+                tuning(8),
+            )
+            .await?;
+            Ok((sender, pushes, new.then_some(key)))
+        }
+    }
+
+    fn later() -> i32 {
+        i32::try_from(now_unix().0 + 600).unwrap()
+    }
+
+    /// QR over frames: export → token; the sender's synthetic
+    /// `updatesTooLong` after a lost connection is drained and dropped;
+    /// the renewal reconnects; a scan push wakes the flow, and the
+    /// re-export's `loginTokenSuccess` is recorded.
+    #[tokio::test(start_paused = true)]
+    async fn qr_login_over_mtp_frames() {
+        let (conns_tx, mut conns) = mpsc::unbounded_channel();
+        let script = Arc::new(Script {
+            modes: Mutex::new(VecDeque::new()),
+            conns: conns_tx,
+            opens: Mutex::new(Vec::new()),
+            init_call: init().init_call(),
+            failing_opens: Mutex::new(0),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(tmp.path()).unwrap();
+        let params = LoginParams {
+            api_id: 1,
+            api_hash: "h".into(),
+            phone: None,
+        };
+        let h = login::start(store, FramedDial(Arc::clone(&script)), params, Method::Qr).unwrap();
+        let export = tl::functions::auth::ExportLoginToken {
+            api_id: 1,
+            api_hash: "h".into(),
+            except_ids: Vec::new(),
+        }
+        .to_bytes();
+
+        let mut srv = timeout(WAIT, conns.recv()).await.unwrap().unwrap();
+        srv.handshake().await;
+        let req = srv.request().await.requests()[0].clone();
+        assert_eq!(
+            req.body, export,
+            "the request crosses the frames as written"
+        );
+        srv.answer(req.msg_id, &login_token(b"one", later()));
+        let first = timeout(WAIT, h.settled()).await.unwrap();
+        assert!(matches!(first, LoginState::Qr { .. }), "{first:?}");
+
+        // The connection drops: the sender pushes updatesTooLong, which
+        // the login drops. The renewal (30 s on the paused clock) opens a
+        // fresh connection.
+        srv.close();
+        let mut srv = timeout(Duration::from_secs(60), conns.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        srv.handshake().await;
+        let req = srv.request().await.requests()[0].clone();
+        assert_eq!(req.body, export);
+        srv.answer(req.msg_id, &login_token(b"two", later()));
+        let second = timeout(WAIT, h.changed()).await.unwrap();
+        assert!(matches!(second, LoginState::Qr { .. }));
+        assert_ne!(first, second);
+
+        // The scan: Telegram's push wakes the flow before the token expires.
+        srv.send(&[(true, update_login_token())]);
+        let req = srv.request().await.requests()[0].clone();
+        assert_eq!(req.body, export);
+        srv.answer(req.msg_id, &login_token_success(42, None));
+        let end = timeout(WAIT, h.changed()).await.unwrap();
+        assert_eq!(end, LoginState::LoggedIn { user_id: 42 });
+        drop(h);
+    }
+}

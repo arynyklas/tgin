@@ -37,6 +37,14 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `getUpdates` polls that pull consumer. `logOut` and `close` are refused
   with `400 Bad Request: logOut and close are disabled by tgin; operators
   move bots with tgin admin bot logout|close`.
+- Telegram user accounts can be logged in and out: `tgin admin login
+  <account> [--code]` draws the login QR in the terminal (renewed by
+  itself) and asks for the 2FA password without echo; `tgin admin logout
+  <account> --yes` calls `auth.logOut` and clears the session. Through
+  `POST /v1/accounts/{name}/login` (`qr` or `code`), `…/login/code`,
+  `…/login/password`, `GET …/login` and `POST …/logout`, refused with
+  `409` while the account runs. With a `phone` in the config, a login by
+  another account is logged out again (`wrong_account`).
 - Self-hosted Bot API servers: `upstreams` names Bot API servers (`kind:
   cloud` or `local`, `url`, `local_mode`, `files`, `response_timeout`), and
   a bot picks one with `upstream`; `api_url` stays the shorthand for an

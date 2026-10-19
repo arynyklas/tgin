@@ -1,5 +1,6 @@
 //! The command line: `tgin [run]`, `tgin config validate|schema|print`,
-//! `tgin admin …` and `tgin version`.
+//! `tgin admin …` (`tgin admin login|logout <account>` among them) and
+//! `tgin version`.
 
 use std::borrow::Cow;
 use std::ffi::OsString;
@@ -118,6 +119,23 @@ enum AdminCommand {
     /// Move a bot off its Bot API server, to run it on another.
     #[command(subcommand)]
     Bot(BotCommand),
+    /// Log a Telegram account in: draws the login QR in the terminal (a
+    /// fresh one as it expires) and asks for the 2FA password when needed.
+    Login {
+        /// The account, by its name in the config.
+        account: String,
+        /// Log in with a code sent to the config's `phone` instead of a QR.
+        #[arg(long)]
+        code: bool,
+    },
+    /// Log a Telegram account out (`auth.logOut`) and clear its session.
+    Logout {
+        /// The account, by its name in the config.
+        account: String,
+        /// Do it; without it, only print what would happen.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -196,6 +214,8 @@ where
                 AdminCommand::Drain { name } => Action::Drain(name),
                 AdminCommand::Purge { name } => Action::Purge(name),
                 AdminCommand::Health => Action::Health,
+                AdminCommand::Login { account, code } => Action::Login { account, code },
+                AdminCommand::Logout { account, yes } => Action::AccountLogout { account, yes },
                 AdminCommand::Bot(bot) => {
                     let (how, args) = match bot {
                         BotCommand::Logout(args) => (BotMove::LogOut, args),
@@ -521,6 +541,46 @@ mod tests {
     #[test]
     fn version_names_tgin() {
         assert!(version().starts_with(&format!("tgin {VERSION}")));
+    }
+
+    #[test]
+    fn admin_login_and_logout_parse() {
+        let action = |args: &[&str]| match parsed(args) {
+            Invocation::Admin(command) => command.action,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            action(&["admin", "login", "main"]),
+            Action::Login {
+                account: "main".into(),
+                code: false
+            }
+        );
+        assert_eq!(
+            action(&["admin", "login", "main", "--code"]),
+            Action::Login {
+                account: "main".into(),
+                code: true
+            }
+        );
+        assert_eq!(
+            action(&["admin", "logout", "main", "--yes"]),
+            Action::AccountLogout {
+                account: "main".into(),
+                yes: true
+            }
+        );
+        assert_eq!(
+            action(&["admin", "logout", "main"]),
+            Action::AccountLogout {
+                account: "main".into(),
+                yes: false
+            }
+        );
+        assert_eq!(
+            error(&["admin", "login"]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

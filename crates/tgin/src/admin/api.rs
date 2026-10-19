@@ -22,6 +22,7 @@ use tgin_runtime::obs::{METRICS_CONTENT_TYPE, Readiness};
 use tgin_runtime::secret::Redactor;
 use tgin_runtime::supervisor::TaskState;
 
+use super::accounts::{self, Accounts, AccountsState, Target};
 use super::{
     BotMove, ConsumerStatus, EndpointStatus, MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
 };
@@ -42,6 +43,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/consumers/{name}/purge", post(purge))
         .route("/v1/bots/{name}/logout", post(log_out))
         .route("/v1/bots/{name}/close", post(close))
+        .merge(accounts::routes())
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             require_token,
@@ -52,6 +54,25 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/metrics", get(metrics))
         .merge(protected)
         .with_state(shared)
+}
+
+impl AccountsState for Arc<Shared> {
+    fn accounts(&self) -> &Accounts {
+        &self.accounts
+    }
+
+    fn target(&self, name: &str) -> Option<Target> {
+        let cfg = self.config.load();
+        let account = cfg.accounts.iter().find(|a| a.name == name)?;
+        Some(Target {
+            session_dir: account.session_dir.expose().clone(),
+            params: tgin_mtproto::login::LoginParams {
+                api_id: account.api_id,
+                api_hash: account.api_hash.expose().clone(),
+                phone: account.phone.as_ref().map(|p| p.expose().clone()),
+            },
+        })
+    }
 }
 
 /// Whether `headers` carry the admin token of the running config (so a

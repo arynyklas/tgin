@@ -692,7 +692,11 @@ $ tgin admin consumers
 $ tgin admin pause <consumer>     # also: resume, drain, purge
 $ tgin admin health
 $ tgin admin bot logout <bot> --yes   # also: bot close; --timeout 1m
+$ tgin admin login <account>          # --code: a login code to the config's phone
+$ tgin admin logout <account> --yes
 ```
+
+`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both refuse while the account runs, and the QR's URL, codes and passwords are never logged.
 
 | Option | Environment | Meaning |
 |---|---|---|
@@ -920,7 +924,7 @@ Mount the ConfigMap as a directory: with `subPath` the file never changes, so ho
 | 0 | Clean shutdown, or a command that succeeded. A shutdown signal ends a run this way, also one during start-up. |
 | 1 | The config cannot be read or is invalid, tgin could not start (a listener cannot bind, a certificate cannot be loaded), or a failed `config`/`admin` command (including `tgin admin health` when not ready). |
 | 2 | Every source failed for good: the Bot API server rejected each long-poll bot's token, no webhook bot exists and no bot is parked. |
-| 64 | Malformed command line (unknown command or option, missing argument, a `tgin admin bot` `--timeout` over `1h`), or `tgin admin bot logout` or `close` without `--yes`. |
+| 64 | Malformed command line (unknown command or option, missing argument, a `tgin admin bot` `--timeout` over `1h`), or `tgin admin bot logout` or `close`, or `tgin admin logout`, without `--yes`. |
 | 130 | A second shutdown signal cut the drain short. |
 
 Updates lost at the end of a shutdown do not change the exit code; see `tgin_shutdown_abandoned_total` and the log.

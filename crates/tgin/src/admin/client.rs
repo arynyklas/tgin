@@ -11,7 +11,7 @@ use tgin_core::config::model::HumanDuration;
 use tgin_runtime::http::{self, ClientOptions, describe_error};
 use url::Url;
 
-use super::{BotMove, ConsumerStatus, MAX_MOVE_TIMEOUT, Moved, Status};
+use super::{BotMove, ConsumerStatus, LoginStatus, MAX_MOVE_TIMEOUT, Moved, Status};
 use crate::exit;
 
 /// The admin API `tgin admin` talks to without `--url`: the default of
@@ -21,6 +21,10 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:9090";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long other commands wait; a reload may wait on Telegram.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one call of `login` may take: SRP and Telegram's answer.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(90);
+/// How often `login` asks for the QR's current token.
+const LOGIN_POLL: Duration = Duration::from_secs(1);
 
 /// One `tgin admin` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +53,18 @@ pub enum Action {
         name: String,
         how: BotMove,
         timeout: Option<HumanDuration>,
+        yes: bool,
+    },
+    /// `login`: logs the Telegram account `account` in, by QR or (with
+    /// `code`) by a login code, asking for the 2FA password when needed.
+    Login {
+        account: String,
+        code: bool,
+    },
+    /// `logout`: logs the account out and clears its session; without
+    /// `yes`, only says what would happen.
+    AccountLogout {
+        account: String,
         yes: bool,
     },
 }
@@ -117,6 +133,19 @@ pub fn run(command: &Command) -> u8 {
         eprintln!("{}", move_plan(name, *how, timeout.as_ref()));
         return exit::USAGE;
     }
+    if let Action::AccountLogout {
+        account,
+        yes: false,
+    } = &command.action
+    {
+        eprintln!(
+            "tgin admin logout would, for the account {account}:\n\
+             1. call auth.logOut on Telegram (the account's other devices stay logged in)\n\
+             2. clear its session: auth keys, login, peers and update state\n\
+             It refuses while the account runs. Run it again with --yes to do it."
+        );
+        return exit::USAGE;
+    }
     // `health` reads an unauthenticated probe: a token file it cannot read
     // (a secret the healthcheck's user may not see) must not fail it.
     let token_file = command
@@ -174,6 +203,24 @@ fn client_options(connect: Duration, total: Option<Duration>) -> ClientOptions {
 }
 
 async fn execute(command: &Command, token: Option<&str>) -> u8 {
+    if let Action::Login { account, code } = &command.action {
+        let mut api = HttpLogin {
+            client: http::client(&client_options(REQUEST_TIMEOUT, Some(LOGIN_TIMEOUT))),
+            base: command.url.clone(),
+            token: token.map(str::to_owned),
+            account: account.clone(),
+        };
+        let method = if *code { "code" } else { "qr" };
+        return login(
+            &mut api,
+            &mut Tty,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+            method,
+            LOGIN_POLL,
+        )
+        .await;
+    }
     let (connect, total) = match &command.action {
         Action::Health => (HEALTH_TIMEOUT, Some(HEALTH_TIMEOUT)),
         // tgin bounds a move itself: the timeout (the config's when none is
@@ -196,6 +243,11 @@ async fn execute(command: &Command, token: Option<&str>) -> u8 {
         Action::Purge(name) => (Method::POST, vec!["v1", "consumers", name, "purge"]),
         Action::Health => (Method::GET, vec!["readyz"]),
         Action::Bot { name, how, .. } => (Method::POST, vec!["v1", "bots", name, how.segment()]),
+        Action::AccountLogout { account, .. } => {
+            (Method::POST, vec!["v1", "accounts", account, "logout"])
+        }
+        // Run above.
+        Action::Login { .. } => return exit::FAILURE,
     };
     let mut url = endpoint(&command.url, &segments);
     if let Action::Bot {
@@ -418,7 +470,10 @@ fn render(action: &Action, body: &str) -> Result<String, serde_json::Error> {
             let purged: Purged = serde_json::from_str(body)?;
             format!("purged {} updates from {name}\n", purged.purged)
         }
-        Action::Health => body.to_owned(),
+        Action::Health | Action::Login { .. } => body.to_owned(),
+        Action::AccountLogout { account, .. } => {
+            format!("{account} logged out; its session is cleared\n")
+        }
         Action::Bot { how, .. } => {
             let moved: Moved = serde_json::from_str(body)?;
             let done = match how {
@@ -541,6 +596,244 @@ fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
         text.push('\n');
     }
     text
+}
+
+/// What `login` needs of the admin API; [`HttpLogin`] in production.
+trait LoginApi {
+    /// `POST …/login {"method"}`.
+    async fn start(&mut self, method: &str) -> Result<LoginStatus, String>;
+    /// `GET …/login`.
+    async fn current(&mut self) -> Result<LoginStatus, String>;
+    /// `POST …/login/code` or `…/login/password`: the next state, or why to
+    /// try again.
+    async fn submit(&mut self, field: Secret, value: String) -> Result<Submitted, String>;
+}
+
+/// Which secret `submit` hands over.
+#[derive(Clone, Copy)]
+enum Secret {
+    Code,
+    Password,
+}
+
+enum Submitted {
+    Next(LoginStatus),
+    /// 422: wrong, try again; the server's message.
+    Retry(String),
+}
+
+/// Asks the operator for a code or the 2FA password; [`Tty`] in
+/// production.
+trait Prompt {
+    fn ask(&mut self, prompt: &str) -> std::io::Result<String>;
+}
+
+/// The terminal, without echo.
+struct Tty;
+
+impl Prompt for Tty {
+    fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
+        rpassword::prompt_password(prompt)
+    }
+}
+
+struct HttpLogin {
+    client: reqwest::Client,
+    base: Url,
+    token: Option<String>,
+    account: String,
+}
+
+impl HttpLogin {
+    async fn call(
+        &self,
+        method: Method,
+        last: &[&str],
+        body: Option<String>,
+    ) -> Result<Answer, String> {
+        let mut segments = vec!["v1", "accounts", self.account.as_str(), "login"];
+        segments.extend_from_slice(last);
+        let mut request = self.client.request(method, endpoint(&self.base, &segments));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let origin = self.base.origin().ascii_serialization();
+        let response = request.send().await.map_err(|err| {
+            format!(
+                "the admin API at {origin} did not answer: {}",
+                describe_error(&err)
+            )
+        })?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| format!("the admin API at {origin}: {}", describe_error(&err)))?;
+        Ok(Answer { status, body })
+    }
+
+    fn state(answer: &Answer) -> Result<LoginStatus, String> {
+        if !answer.status.is_success() {
+            return Err(format!("{}: {}", answer.status, failure(&answer.body)));
+        }
+        serde_json::from_str(&answer.body)
+            .map_err(|err| format!("the admin API sent an unexpected answer: {err}"))
+    }
+}
+
+impl LoginApi for HttpLogin {
+    async fn start(&mut self, method: &str) -> Result<LoginStatus, String> {
+        let body = serde_json::json!({ "method": method }).to_string();
+        Self::state(&self.call(Method::POST, &[], Some(body)).await?)
+    }
+
+    async fn current(&mut self) -> Result<LoginStatus, String> {
+        Self::state(&self.call(Method::GET, &[], None).await?)
+    }
+
+    async fn submit(&mut self, field: Secret, value: String) -> Result<Submitted, String> {
+        let (segment, body) = match field {
+            Secret::Code => ("code", serde_json::json!({ "code": value })),
+            Secret::Password => ("password", serde_json::json!({ "password": value })),
+        };
+        let answer = self
+            .call(Method::POST, &[segment], Some(body.to_string()))
+            .await?;
+        if answer.status == StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(Submitted::Retry(failure(&answer.body)));
+        }
+        Self::state(&answer).map(Submitted::Next)
+    }
+}
+
+/// The QR of `url` in Unicode half blocks, light on dark, with its quiet
+/// zone: two modules per character cell.
+fn qr_text(url: &str) -> Option<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
+    Some(
+        code.render::<Dense1x2>()
+            .dark_color(Dense1x2::Light)
+            .light_color(Dense1x2::Dark)
+            .quiet_zone(true)
+            .build(),
+    )
+}
+
+/// `tgin admin login`: drives the account's login through the admin API.
+/// The QR goes to `out` (a fresh one each time the server renews the
+/// token); prompts and messages go to `err`. The URL itself is printed
+/// nowhere: only its QR.
+async fn login(
+    api: &mut impl LoginApi,
+    prompt: &mut impl Prompt,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    method: &str,
+    poll: Duration,
+) -> u8 {
+    match drive_login(api, prompt, out, err, method, poll).await {
+        Ok(code) => code,
+        Err(message) => {
+            let _ = writeln!(err, "tgin: {message}");
+            exit::FAILURE
+        }
+    }
+}
+
+async fn drive_login(
+    api: &mut impl LoginApi,
+    prompt: &mut impl Prompt,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+    method: &str,
+    poll: Duration,
+) -> Result<u8, String> {
+    let io = |e: std::io::Error| format!("the terminal: {e}");
+    let mut state = api.start(method).await?;
+    let mut shown: Option<super::LoginUrl> = None;
+    loop {
+        state = match state {
+            LoginStatus::Connecting => {
+                tokio::time::sleep(poll).await;
+                api.current().await?
+            }
+            LoginStatus::Qr { url, .. } => {
+                if shown.as_ref() != Some(&url) {
+                    let qr = qr_text(&url.0).ok_or("the login URL does not fit a QR code")?;
+                    writeln!(out, "{qr}").map_err(io)?;
+                    out.flush().map_err(io)?;
+                    if shown.is_none() {
+                        writeln!(
+                            err,
+                            "Scan the QR with the Telegram app of the account: Settings > Devices > Link Desktop Device.\n\
+                             A new QR follows by itself when this one expires."
+                        )
+                        .map_err(io)?;
+                    }
+                    shown = Some(url);
+                }
+                tokio::time::sleep(poll).await;
+                api.current().await?
+            }
+            LoginStatus::CodeSent { kind, .. } => {
+                writeln!(err, "Telegram sent a login code ({kind}).").map_err(io)?;
+                let code = prompt.ask("Login code: ").map_err(io)?;
+                submitted(api, err, Secret::Code, code).await?
+            }
+            LoginStatus::NeedPassword { hint } => {
+                let ask = match &hint {
+                    Some(hint) => format!("2FA password (hint: {hint}): "),
+                    None => "2FA password: ".to_owned(),
+                };
+                let password = prompt.ask(&ask).map_err(io)?;
+                submitted(api, err, Secret::Password, password).await?
+            }
+            LoginStatus::LoggedIn { user_id } => {
+                writeln!(out, "logged in as user {user_id}").map_err(io)?;
+                return Ok(exit::OK);
+            }
+            LoginStatus::Failed { reason, message } => {
+                return Err(format!("the login failed ({reason}): {message}"));
+            }
+            LoginStatus::NeedEmailSetup => {
+                return Err(
+                    "Telegram asks to set up a login email first, in an official app".into(),
+                );
+            }
+            LoginStatus::NeedEmailCode => {
+                return Err("Telegram sent the code to the login email, which tgin does not support; log in by QR".into());
+            }
+            LoginStatus::PaymentRequired => {
+                return Err("Telegram asks for a payment to send the code; log in by QR".into());
+            }
+            LoginStatus::Unknown => {
+                return Err("the admin API reports a login state this tgin does not know".into());
+            }
+        };
+    }
+}
+
+/// Hands over a code or password; on a retryable refusal, says why and
+/// shows the state again (which asks again).
+async fn submitted(
+    api: &mut impl LoginApi,
+    err: &mut impl std::io::Write,
+    field: Secret,
+    value: String,
+) -> Result<LoginStatus, String> {
+    match api.submit(field, value).await? {
+        Submitted::Next(state) => Ok(state),
+        Submitted::Retry(why) => {
+            let _ = writeln!(err, "{why}; try again.");
+            api.current().await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -731,5 +1024,166 @@ mod tests {
         std::fs::write(&file, " secret token \r\n").unwrap();
         assert_eq!(read_token(&file).unwrap(), " secret token ");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A scripted admin API for `login`.
+    struct FakeApi {
+        states: std::collections::VecDeque<LoginStatus>,
+        submitted: Vec<(&'static str, String)>,
+        /// What each submit answers.
+        submits: std::collections::VecDeque<Submitted>,
+    }
+
+    impl LoginApi for FakeApi {
+        async fn start(&mut self, method: &str) -> Result<LoginStatus, String> {
+            assert_eq!(method, "qr");
+            self.current().await
+        }
+
+        async fn current(&mut self) -> Result<LoginStatus, String> {
+            self.states
+                .pop_front()
+                .ok_or_else(|| "script ended".to_owned())
+        }
+
+        async fn submit(&mut self, field: Secret, value: String) -> Result<Submitted, String> {
+            let name = match field {
+                Secret::Code => "code",
+                Secret::Password => "password",
+            };
+            self.submitted.push((name, value));
+            self.submits
+                .pop_front()
+                .ok_or_else(|| "script ended".to_owned())
+        }
+    }
+
+    struct Answers(Vec<String>, Vec<String>);
+
+    impl Prompt for Answers {
+        fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
+            self.1.push(prompt.to_owned());
+            Ok(self.0.remove(0))
+        }
+    }
+
+    fn qr(token: &str) -> LoginStatus {
+        LoginStatus::Qr {
+            url: super::super::LoginUrl(format!("tg://login?token={token}")),
+            expires: 1_800_000_000,
+        }
+    }
+
+    /// The QR is drawn in half blocks on stdout, again when the server
+    /// renews the token and not while it stays; the token is printed
+    /// nowhere as text. A wrong 2FA password is asked again; the
+    /// passwords never reach either stream.
+    #[tokio::test]
+    async fn qr_renders_without_token_in_stderr() {
+        let mut api = FakeApi {
+            states: [
+                LoginStatus::Connecting,
+                qr("FIRSTtoken"),
+                qr("FIRSTtoken"),
+                qr("SECONDtoken"),
+                LoginStatus::NeedPassword {
+                    hint: Some("pet".into()),
+                },
+                LoginStatus::NeedPassword {
+                    hint: Some("pet".into()),
+                },
+            ]
+            .into(),
+            submitted: Vec::new(),
+            submits: [
+                Submitted::Retry("the 2FA password is wrong".into()),
+                Submitted::Next(LoginStatus::LoggedIn { user_id: 7 }),
+            ]
+            .into(),
+        };
+        let mut prompt = Answers(vec!["wrong-pw".into(), "right-pw".into()], Vec::new());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = login(
+            &mut api,
+            &mut prompt,
+            &mut out,
+            &mut err,
+            "qr",
+            Duration::ZERO,
+        )
+        .await;
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(code, exit::OK, "{err}");
+        let first = qr_text("tg://login?token=FIRSTtoken").unwrap();
+        let second = qr_text("tg://login?token=SECONDtoken").unwrap();
+        assert!(first.contains('▀') || first.contains('▄'), "{first}");
+        assert_eq!(out.matches(&first).count(), 1, "drawn once while unchanged");
+        assert_eq!(out.matches(&second).count(), 1, "redrawn when renewed");
+        assert!(out.ends_with("logged in as user 7\n"), "{out}");
+        assert!(
+            err.contains("Settings > Devices > Link Desktop Device"),
+            "{err}"
+        );
+        assert!(
+            err.contains("the 2FA password is wrong; try again."),
+            "{err}"
+        );
+        for secret in ["token", "tg://", "wrong-pw", "right-pw"] {
+            assert!(!err.contains(secret), "{secret} in stderr: {err}");
+            assert!(!out.contains(secret), "{secret} in stdout: {out}");
+        }
+        assert_eq!(
+            api.submitted,
+            [
+                ("password", "wrong-pw".to_owned()),
+                ("password", "right-pw".to_owned())
+            ]
+        );
+        assert_eq!(prompt.1, ["2FA password (hint: pet): "; 2]);
+    }
+
+    /// A failed login exits non-zero with its reason; an unknown state
+    /// from a newer server is reported, not misread.
+    #[tokio::test]
+    async fn login_failures_exit_non_zero() {
+        for (state, said) in [
+            (
+                LoginStatus::Failed {
+                    reason: "wrong_account".into(),
+                    message: "not the configured one".into(),
+                },
+                "the login failed (wrong_account): not the configured one",
+            ),
+            (LoginStatus::Unknown, "does not know"),
+        ] {
+            let mut api = FakeApi {
+                states: [state].into(),
+                submitted: Vec::new(),
+                submits: [].into(),
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = login(
+                &mut api,
+                &mut Answers(Vec::new(), Vec::new()),
+                &mut out,
+                &mut err,
+                "qr",
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(code, exit::FAILURE);
+            assert!(String::from_utf8(err).unwrap().contains(said));
+        }
+        let unknown: LoginStatus =
+            serde_json::from_str(r#"{"state":"sms_needed","extra":1}"#).unwrap();
+        assert_eq!(unknown, LoginStatus::Unknown);
+        let qr: LoginStatus = serde_json::from_str(
+            r#"{"state":"qr","url":"tg://login?token=x","expires":5,"new":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(qr, LoginStatus::Qr { expires: 5, .. }));
     }
 }

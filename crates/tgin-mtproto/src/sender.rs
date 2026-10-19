@@ -358,6 +358,12 @@ impl Pushes {
     pub fn try_recv(&mut self) -> Result<Bytes, mpsc::error::TryRecvError> {
         self.0.try_recv()
     }
+
+    /// Pushes from a test's own channel.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(crate) fn from_receiver(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self(rx)
+    }
 }
 
 /// What [`Sender::connect`] returns: the sender, its pushes, and the auth

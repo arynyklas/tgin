@@ -39,8 +39,11 @@ notify-debouncer-full = "0.7.0"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 prometheus-client = "0.25.1"
+qrcode = { version = "0.14.1", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rand = "0.10.3"
+# `tgin admin login` asks for the 2FA password without echo.
+rpassword = "7.5.4"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 # 4.2 needs Rust 1.90; the workspace's MSRV is 1.89.
 redb = "=4.1.0"
@@ -57,6 +60,7 @@ subtle = "2.6.1"
 tempfile = "3.27.0"
 tgin-botapi = { path = "crates/tgin-botapi" }
 tgin-core = { path = "crates/tgin-core" }
+tgin-mtproto = { path = "crates/tgin-mtproto" }
 tgin-runtime = { path = "crates/tgin-runtime" }
 thiserror = "2.0.21"
 tokio = "1.53.3"

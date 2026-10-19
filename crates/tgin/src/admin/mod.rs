@@ -13,6 +13,10 @@
 //! | `POST /v1/consumers/{name}/resume` | token | 204: unpaused, and an admin drain ended |
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
 //! | `POST /v1/bots/{name}/logout`, `/close` | token | 200 [`Moved`] |
+//! | `POST /v1/accounts/{name}/login` `{"method":"qr"\|"code"}` | token | 200 [`LoginStatus`] |
+//! | `GET /v1/accounts/{name}/login` | token | 200 [`LoginStatus`] |
+//! | `POST /v1/accounts/{name}/login/code` `{"code"}`, `/login/password` `{"password"}` | token | 200 [`LoginStatus`] |
+//! | `POST /v1/accounts/{name}/logout` | token | 200 `{"logged_out":true}` |
 //!
 //! The token is `Authorization: Bearer <admin.token>`; without an
 //! `admin.token` (loopback listeners only) the API needs none. After a
@@ -44,13 +48,35 @@
 //! refused` with the server's masked text in `description` when it refused
 //! the call (the bot runs on).
 //!
+//! `POST /v1/accounts/{name}/login` logs a Telegram account in, driving
+//! the login on tgin's own MTProto sender: `qr` answers
+//! `{"state":"qr","url":"tg://login?token=…","expires":…}` and renews the
+//! token by itself until the QR is scanned (`GET …/login` shows the
+//! current one); `code` sends a login code to the config's `phone` and
+//! answers `code_sent`. A cloud password then gives `need_password`. The
+//! end is `logged_in` or `failed` with a `reason` (`wrong_account` when
+//! the account's phone is not the config's `phone`: that login is logged
+//! out again). A repeated `POST …/login` while one runs answers its state.
+//! The `tg://login` URL appears in these answers only; it, codes and
+//! passwords are never logged. `POST …/logout` calls `auth.logOut` and
+//! clears the session (keys, login, peers, update state; the directory
+//! stays, under its lock). Failures: 400 `invalid body`, 404 `unknown
+//! account`, 404 `no login`, 409 `account running` (both refuse while the
+//! account runs), 409 `logged in` (log out first), 409 `session held` (by
+//! another process), 409 `login in progress` (with the other method), 422
+//! with a `reason` for a wrong code or password (try again) or one the
+//! login does not wait for, 502 `logout unconfirmed` when Telegram did
+//! not confirm the logout (nothing is cleared).
+//!
 //! API v1 grows additively within a major version: answers may gain
 //! fields, enum values (state and phase words) and error codes, and the
 //! client ignores what it does not know.
 
+mod accounts;
 mod api;
 pub mod client;
 
+pub(crate) use accounts::{Accounts, Sessions};
 pub(crate) use api::{loop_detected, router};
 use std::time::Duration;
 
@@ -99,6 +125,57 @@ pub struct Moved {
     pub upstream: String,
     /// The server's description of its answer, if any, secrets masked.
     pub result: Option<String>,
+}
+
+/// The `tg://login?token=…` URL of a QR login. A secret: `Debug` hides it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LoginUrl(pub String);
+
+impl std::fmt::Debug for LoginUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginUrl(..)")
+    }
+}
+
+/// `/v1/accounts/{name}/login`: where an account's login stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LoginStatus {
+    /// Connecting to Telegram.
+    Connecting,
+    /// Show `url` as a QR until `expires` (Telegram's unix time); `GET`
+    /// gives the next one.
+    Qr {
+        url: LoginUrl,
+        expires: i64,
+    },
+    /// The login code went out by `kind` (`app`, `sms`, `call`…).
+    CodeSent {
+        kind: String,
+        timeout: Option<i32>,
+    },
+    /// The account has a cloud password.
+    NeedPassword {
+        hint: Option<String>,
+    },
+    /// An official app must add a login email first.
+    NeedEmailSetup,
+    /// The code went to the login email, which tgin does not support.
+    NeedEmailCode,
+    PaymentRequired,
+    LoggedIn {
+        user_id: i64,
+    },
+    /// The login ended without one; `reason` is stable, `message` for
+    /// people.
+    Failed {
+        reason: String,
+        message: String,
+    },
+    /// A state this client does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `GET /v1/status`.

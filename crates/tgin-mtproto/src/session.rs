@@ -299,6 +299,33 @@ impl SessionStore {
         Ok(login)
     }
 
+    /// Clears the authorization for a new login, in one transaction and
+    /// under the lock: every auth key, the home DC, the login marker, the
+    /// cached peers and the update state (common and channels). Kept: the
+    /// DC addresses and the `update_id` high-water mark, so that ids handed
+    /// out downstream never repeat. A login after `needs_login`, a failed
+    /// attempt and a logout go through here; deleting the files instead
+    /// would let another process take the directory between the delete and
+    /// the next open.
+    pub fn reset_for_login(&self) -> Result<(), SessionError> {
+        self.write(|txn| {
+            txn.delete_table(AUTH_KEYS)?;
+            txn.delete_table(HOME_DC)?;
+            txn.delete_table(PEERS)?;
+            txn.delete_table(UPDATE_STATE)?;
+            txn.delete_table(CHANNEL_PTS)?;
+            txn.open_table(AUTH_KEYS)?;
+            txn.open_table(HOME_DC)?;
+            txn.open_table(PEERS)?;
+            txn.open_table(UPDATE_STATE)?;
+            txn.open_table(CHANNEL_PTS)?;
+            let mut meta = txn.open_table(META)?;
+            meta.remove(SELF_USER_ID)?;
+            meta.remove(LOGIN_UNIX)?;
+            Ok(())
+        })
+    }
+
     /// The cached peer with this Bot API dialog id.
     pub fn peer(&self, dialog_id: i64) -> Result<Option<Peer>, SessionError> {
         let txn = self.db.begin_read()?;
@@ -697,6 +724,54 @@ mod tests {
             );
             assert_eq!(s.login().expect("login").is_some(), parts[0]);
         }
+    }
+
+    /// A re-login after `needs_login`: the reset clears the keys, the home
+    /// DC, the login marker, peers and update state in place, under the
+    /// lock (no second open succeeds meanwhile), and keeps the DC
+    /// addresses and the `update_id` high-water mark.
+    #[test]
+    fn reset_for_login_clears_the_authorization_under_the_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        let addr = DcAddr {
+            ipv4: SocketAddrV4::new(Ipv4Addr::new(149, 154, 167, 51), 443),
+            ipv6: SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0),
+        };
+        s.set_dc_option(2, addr).expect("dc");
+        s.set_home_key(2, &AuthKey([1; 256])).expect("home");
+        s.set_dc_key(4, &AuthKey([4; 256])).expect("media");
+        s.record_login(me(42)).expect("login");
+        s.set_update_state(UpdateState {
+            pts: 5,
+            qts: 6,
+            seq: 7,
+            date: 8,
+        })
+        .expect("state");
+        s.set_channel_pts(9, 10).expect("channel");
+        s.set_update_id(77).expect("update_id");
+
+        s.reset_for_login().expect("reset");
+        assert!(matches!(
+            SessionStore::open(tmp.path()),
+            Err(SessionError::Held { .. })
+        ));
+        assert_eq!(s.login().expect("login"), None);
+        assert_eq!(s.home_dc().expect("home"), None);
+        assert_eq!(s.auth_key(2).expect("key"), None);
+        assert_eq!(s.auth_key(4).expect("key"), None);
+        assert_eq!(s.peer(42).expect("peer"), None);
+        assert_eq!(s.update_state().expect("state"), UpdateState::default());
+        assert!(s.channel_pts().expect("channels").is_empty());
+        assert_eq!(s.dc_options().expect("dcs"), vec![(2, addr)]);
+        assert_eq!(s.update_id().expect("update_id"), Some(77));
+        // A new key may now be stored: the marker is gone.
+        s.set_home_key(4, &AuthKey([5; 256])).expect("new home");
+        drop(s);
+        let s = SessionStore::open(tmp.path()).expect("reopen");
+        assert_eq!(s.login().expect("login"), None);
+        assert_eq!(s.home_dc().expect("home"), Some(4));
     }
 
     #[test]
