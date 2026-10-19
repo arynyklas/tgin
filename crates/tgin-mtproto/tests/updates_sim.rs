@@ -592,9 +592,7 @@ async fn channel_too_long_fetches_once() {
         m.next_action(),
         Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
     );
-    // Another signal while the fetch runs: the fetch already covers it.
-    assert!(m.feed_push(b(short(&channel_too_long(1, None)))).is_empty());
-    assert_eq!(m.next_action(), None);
+    assert_eq!(m.next_action(), None, "pending signals join one fetch");
     let batches = m.feed_channel_difference(1, b(channel_difference_empty(true, 9)));
     assert_eq!(commit(&mut m, &batches).channels, vec![(1, 9)]);
     assert_eq!(m.next_action(), None, "final: fetched once");
@@ -610,6 +608,33 @@ async fn channel_too_long_fetches_once() {
     let batches = m.feed_push(b(short(&channel_too_long(3, Some(70)))));
     assert_eq!(commit(&mut m, &batches).channels, vec![(3, 70)]);
     assert_eq!(m.next_action(), None);
+}
+
+/// An `updateChannelTooLong` fed while that channel's call is in flight
+/// may postdate the call's answer (pushes and answers travel apart): one
+/// more fetch follows, even after a `final` answer, however many came.
+#[tokio::test(start_paused = true)]
+async fn channel_too_long_mid_fetch_fetches_once_more() {
+    let mut m = started(stored(10, &[(1, 5)], &[]));
+    assert!(m.feed_push(b(short(&channel_too_long(1, None)))).is_empty());
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
+    );
+    for _ in 0..2 {
+        assert!(m.feed_push(b(short(&channel_too_long(1, None)))).is_empty());
+        assert_eq!(m.next_action(), None, "no parallel fetch");
+    }
+    let batches = m.feed_channel_difference(1, b(channel_difference_empty(true, 7)));
+    commit(&mut m, &batches);
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 7 }),
+        "one more after a final answer"
+    );
+    let batches = m.feed_channel_difference(1, b(channel_difference_empty(true, 9)));
+    assert_eq!(commit(&mut m, &batches).channels, vec![(1, 9)]);
+    assert_eq!(m.next_action(), None, "exactly one more");
 }
 
 #[tokio::test(start_paused = true)]

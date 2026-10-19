@@ -331,6 +331,9 @@ struct Channel {
     held: Vec<Held>,
     deadline: Option<Instant>,
     fetch: ChannelFetch,
+    /// An `updateChannelTooLong` came while a call was in flight: one more
+    /// fetch follows it.
+    again: bool,
     /// Bumped when a refused batch rolls the channel back.
     epoch: u32,
 }
@@ -343,6 +346,7 @@ impl Channel {
             deadline: None,
             fetch: ChannelFetch::Idle,
             epoch: 0,
+            again: false,
         }
     }
 }
@@ -679,6 +683,8 @@ impl UpdateManager {
                 continue;
             };
             ch.fetch = ChannelFetch::InFlight { epoch: ch.epoch };
+            // This call postdates every signal so far.
+            ch.again = false;
             self.in_flight += 1;
             return Some(Fetch::GetChannelDifference { channel: c, pts });
         }
@@ -931,8 +937,9 @@ impl UpdateManager {
             }
         }
         self.switch(&mut out, &home);
-        let more = !d.is_final && d.pts.is_some_and(|p| old.is_none_or(|o| p > o));
+        let mut more = !d.is_final && d.pts.is_some_and(|p| old.is_none_or(|o| p > o));
         if let Some(ch) = self.channels.get_mut(&channel) {
+            more |= std::mem::take(&mut ch.again);
             ch.pts = d.pts;
             if let Some(p) = d.pts {
                 out.open.touch_channel(channel, p);
@@ -1334,14 +1341,19 @@ impl UpdateManager {
                     self.release_channel(c, out);
                 }
             }
-            Some(_) => {
-                if ch.fetch == ChannelFetch::Idle {
+            Some(_) => match ch.fetch {
+                ChannelFetch::Idle => {
                     ch.fetch = ChannelFetch::Wanted;
                     ch.deadline = None;
                     self.gapped.remove(&c);
                     self.queue.push_back(c);
                 }
-            }
+                // The call in flight may predate the signal: one more
+                // fetch follows it, even after a `final` answer.
+                ChannelFetch::InFlight { .. } => ch.again = true,
+                // Not yet asked: the signal joins it.
+                ChannelFetch::Wanted => {}
+            },
         }
     }
 
