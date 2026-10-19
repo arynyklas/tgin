@@ -398,7 +398,10 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
 
     /// A call on the media session to `dc`. A key Telegram no longer
     /// accepts is dropped and the session made and authorized again, once;
-    /// the call was not executed, so it is sent once more. A key still
+    /// the call was not executed, so it is sent once more. That holds for a
+    /// transport −404 too (ruling P13): a server that cannot find the key
+    /// cannot decrypt, and so cannot execute, any request on that
+    /// connection. A key still
     /// refused after that is a media-session failure, never a sign that the
     /// account needs a login: the main session is not involved.
     async fn invoke_media(&self, dc: i32, body: Bytes) -> Result<RpcOutcome, InvokeError> {
@@ -410,6 +413,9 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         self.evict(dc, &media).await?;
         let media = self.media(dc).await?;
         charged(self.charge.as_ref())?;
+        // Safe to resend: a 401 AUTH_KEY_UNREGISTERED / SESSION_REVOKED is
+        // a refusal, and a −404 means Telegram could not decrypt the
+        // request (P13).
         let outcome = media.invoke(body).await;
         if key_gone(&outcome) {
             return Err(failed(dc, "the DC does not accept the media session's key"));
