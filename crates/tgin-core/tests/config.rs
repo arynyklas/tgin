@@ -3336,6 +3336,7 @@ fn account_yaml(extra: &str) -> String {
     format!(
         r#"version: 1
 server: {{}}
+admin: {{ token: admin-t0ken-value }}
 accounts:
   main:
     api_id: 12345
@@ -3478,6 +3479,7 @@ accounts:
     // The developer's app pair is shared; only the directory must differ.
     let cfg = loads(
         r#"version: 1
+admin: { token: admin-t0ken-value }
 accounts:
   a: { api_id: 1, api_hash: shared-hash, session_dir: sessions/a }
   b: { api_id: 1, api_hash: shared-hash, session_dir: sessions/b }
@@ -3562,6 +3564,7 @@ fn rpc_glob_syntax() {
 #[test]
 fn auth_methods_need_exact_listing() {
     let yaml = r#"version: 1
+admin: { token: admin-t0ken-value }
 accounts:
   main:
     api_id: 1
@@ -3790,7 +3793,7 @@ fn account_changing_list() {
 #[test]
 fn account_changing_warning_skips_denied() {
     let cfg = loads(
-        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [auth.logOut, account.updateProfile], deny: [\"auth.*\"] }, d: { token: u, allow: [auth.logOut], deny: [\"*\"] } } } }\n",
+        "version: 1\nadmin: { token: admin-t0ken-value }\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [auth.logOut, account.updateProfile], deny: [\"auth.*\"] }, d: { token: u, allow: [auth.logOut], deny: [\"*\"] } } } }\n",
     );
     let text = render(&cfg.warnings);
     assert_eq!(cfg.warnings.len(), 1, "{text}");
@@ -3958,4 +3961,19 @@ fn api_id_out_of_range() {
         assert_at(&err, "accounts.main.api_id", pos(&yaml, bad));
         assert_message(&err, "must be between 1 and 2147483647");
     }
+}
+
+/// The account routes need `admin.token`: accounts without one load, with
+/// a warning at the first account that says so. With a token, no warning.
+#[test]
+fn accounts_without_admin_token_warn() {
+    let without = account_yaml("").replace("admin: { token: admin-t0ken-value }\n", "");
+    let cfg = load_account(&without).expect("loads");
+    let [warning] = cfg.warnings.as_slice() else {
+        panic!("{}", render(&cfg.warnings));
+    };
+    assert_eq!(warning.at.as_ref().unwrap().path, "accounts.main");
+    assert_message(warning, "admin.token");
+    let cfg = load_account(&account_yaml("")).expect("loads");
+    assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
 }

@@ -61,6 +61,10 @@ impl AccountsState for Arc<Shared> {
         &self.accounts
     }
 
+    fn token_configured(&self) -> bool {
+        self.config.load().admin.token.is_some()
+    }
+
     fn target(&self, name: &str) -> Option<Target> {
         let cfg = self.config.load();
         let account = cfg.accounts.iter().find(|a| a.name == name)?;

@@ -127,6 +127,15 @@ pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) {
                 );
             }
         }
+        // The account routes log Telegram accounts in and out: without a
+        // token every local user and every web page could reach them.
+        if let Some((name, account)) = raw.accounts.first() {
+            diag.warning(
+                format!("accounts.{}", name.as_str()),
+                account.location,
+                "`admin.token` is not set, so `tgin admin login` and `logout` (the `/v1/accounts/…` routes) are refused; set `admin.token` to use them",
+            );
+        }
     }
     duration(diag, "reload.debounce", &raw.reload.debounce);
     if raw.reload.debounce.value.get() < MIN_DEBOUNCE {

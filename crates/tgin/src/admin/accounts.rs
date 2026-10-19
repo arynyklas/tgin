@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::future::BoxFuture;
@@ -139,6 +140,30 @@ pub(crate) trait AccountsState: Clone + Send + Sync + 'static {
     fn accounts(&self) -> &Accounts;
     /// The account `name` of the running config.
     fn target(&self, name: &str) -> Option<Target>;
+    /// Whether the running config has an `admin.token`. Without one the
+    /// account routes refuse (403): on a token-less loopback listener every
+    /// local user and every web page (cross-site or rebound) could reach
+    /// them.
+    fn token_configured(&self) -> bool;
+}
+
+/// The extractor every account route takes first: the 403 without an
+/// `admin.token`, before the account, Telegram or the session is touched.
+pub(crate) struct TokenConfigured;
+
+impl<S: AccountsState> FromRequestParts<S> for TokenConfigured {
+    type Rejection = Response;
+
+    async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Response> {
+        if state.token_configured() {
+            Ok(Self)
+        } else {
+            Err(error(
+                StatusCode::FORBIDDEN,
+                "admin.token required for account login",
+            ))
+        }
+    }
 }
 
 /// The account routes, to be mounted behind the admin token.
@@ -213,7 +238,17 @@ pub(crate) fn status(state: &LoginState) -> LoginStatus {
 
 fn answer(account: &str, state: &LoginState) -> Response {
     tracing::info!(account, state = state.name(), "account login");
-    axum::Json(status(state)).into_response()
+    login_status(state)
+}
+
+/// A login state's answer. It may carry the `tg://login` URL, a secret, so
+/// no cache keeps it.
+fn login_status(state: &LoginState) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(status(state)),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -229,6 +264,7 @@ struct StartBody {
 }
 
 async fn start<S: AccountsState>(
+    _: TokenConfigured,
     State(state): State<S>,
     Path(name): Path<String>,
     body: Bytes,
@@ -276,12 +312,16 @@ async fn start<S: AccountsState>(
     answer(&name, &state)
 }
 
-async fn current<S: AccountsState>(State(state): State<S>, Path(name): Path<String>) -> Response {
+async fn current<S: AccountsState>(
+    _: TokenConfigured,
+    State(state): State<S>,
+    Path(name): Path<String>,
+) -> Response {
     if state.target(&name).is_none() {
         return unknown_account();
     }
     match state.accounts().login(&name) {
-        Some(h) => axum::Json(status(&h.state())).into_response(),
+        Some(h) => login_status(&h.state()),
         None => no_login(),
     }
 }
@@ -297,6 +337,7 @@ struct PasswordBody {
 }
 
 async fn code<S: AccountsState>(
+    _: TokenConfigured,
     State(state): State<S>,
     Path(name): Path<String>,
     body: Bytes,
@@ -311,6 +352,7 @@ async fn code<S: AccountsState>(
 }
 
 async fn password<S: AccountsState>(
+    _: TokenConfigured,
     State(state): State<S>,
     Path(name): Path<String>,
     body: Bytes,
@@ -353,7 +395,11 @@ async fn submit<S: AccountsState>(
     }
 }
 
-async fn logout<S: AccountsState>(State(state): State<S>, Path(name): Path<String>) -> Response {
+async fn logout<S: AccountsState>(
+    _: TokenConfigured,
+    State(state): State<S>,
+    Path(name): Path<String>,
+) -> Response {
     let Some(target) = state.target(&name) else {
         return unknown_account();
     };

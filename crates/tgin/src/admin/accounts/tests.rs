@@ -50,6 +50,7 @@ impl AccountHandle for Fake {
 struct TestState {
     accounts: Arc<Accounts>,
     targets: Arc<HashMap<String, Target>>,
+    token: bool,
 }
 
 impl AccountsState for TestState {
@@ -60,6 +61,10 @@ impl AccountsState for TestState {
     fn target(&self, name: &str) -> Option<Target> {
         self.targets.get(name).cloned()
     }
+
+    fn token_configured(&self) -> bool {
+        self.token
+    }
 }
 
 struct Setup {
@@ -69,6 +74,10 @@ struct Setup {
 }
 
 fn setup(phone: Option<&str>, script: Vec<(u32, Reply)>) -> Setup {
+    setup_with(true, phone, script)
+}
+
+fn setup_with(token: bool, phone: Option<&str>, script: Vec<(u32, Reply)>) -> Setup {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = Arc::new(Fake {
         running: AtomicBool::new(false),
@@ -86,6 +95,7 @@ fn setup(phone: Option<&str>, script: Vec<(u32, Reply)>) -> Setup {
     let state = TestState {
         accounts: Arc::new(Accounts::new(handle)),
         targets: Arc::new(HashMap::from([("main".to_owned(), target)])),
+        token,
     };
     Setup {
         app: routes().with_state(state),
@@ -96,6 +106,17 @@ fn setup(phone: Option<&str>, script: Vec<(u32, Reply)>) -> Setup {
 
 /// `(status, body)` of one request.
 async fn call(app: &Router, method: &str, path: &str, body: &str) -> (StatusCode, String) {
+    let (status, _, body) = call_full(app, method, path, body).await;
+    (status, body)
+}
+
+/// `(status, headers, body)` of one request.
+async fn call_full(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
     let request = Request::builder()
         .method(method)
         .uri(path)
@@ -104,10 +125,15 @@ async fn call(app: &Router, method: &str, path: &str, body: &str) -> (StatusCode
         .expect("request");
     let response = app.clone().oneshot(request).await.expect("infallible");
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    (status, String::from_utf8_lossy(&bytes).into_owned())
+    (
+        status,
+        headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 fn parse(body: &str) -> LoginStatus {
@@ -217,7 +243,7 @@ async fn qr_flow_states() {
             (ids::LOG_OUT, Reply::Ok(logged_out())),
         ],
     );
-    let (status, body) = call(
+    let (status, headers, body) = call_full(
         &s.app,
         "POST",
         "/v1/accounts/main/login",
@@ -225,6 +251,14 @@ async fn qr_flow_states() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "no-store",
+        "the URL is a secret"
+    );
+    let (_, headers, again) = call_full(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(parse(&again), parse(&body));
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let json: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(json["state"], "qr");
     assert_eq!(json["url"], "tg://login?token=c2VjcmV0LXRva2Vu");
@@ -576,4 +610,45 @@ async fn session_free_right_after_the_login_ends() {
         assert_eq!(status, StatusCode::OK, "round {round}: login again: {body}");
         assert_eq!(parse(&body), LoginStatus::LoggedIn { user_id: 78 });
     }
+}
+
+/// Without `admin.token` the account routes refuse with 403, before they
+/// look at the account, Telegram or the session: on a token-less loopback
+/// listener every local user and every web page could reach them.
+#[tokio::test]
+async fn account_routes_need_an_admin_token() {
+    let s = setup_with(
+        false,
+        Some(PHONE),
+        vec![(
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"t", later())),
+        )],
+    );
+    let refused = r#"{"error":"admin.token required for account login"}"#;
+    for (method, path, body) in [
+        ("POST", "/v1/accounts/main/login", r#"{"method":"qr"}"#),
+        ("POST", "/v1/accounts/main/login", r#"{"method":"code"}"#),
+        ("GET", "/v1/accounts/main/login", ""),
+        ("POST", "/v1/accounts/main/login/code", r#"{"code":"1"}"#),
+        (
+            "POST",
+            "/v1/accounts/main/login/password",
+            r#"{"password":"x"}"#,
+        ),
+        ("POST", "/v1/accounts/main/logout", ""),
+        ("POST", "/v1/accounts/other/login", r#"{"method":"qr"}"#),
+    ] {
+        let (status, text) = call(&s.app, method, path, body).await;
+        assert_eq!(
+            (status, text.as_str()),
+            (StatusCode::FORBIDDEN, refused),
+            "{method} {path}"
+        );
+    }
+    assert!(s.fake.dial.dials().is_empty());
+    assert!(
+        !s.dir.path().join("main").exists(),
+        "the session was not opened"
+    );
 }
