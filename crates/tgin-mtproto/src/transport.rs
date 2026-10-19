@@ -16,6 +16,7 @@
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -320,8 +321,24 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 }
 
+/// The smallest `server_DH_inner_data`: constructor, nonce, server_nonce,
+/// g, a 2048-bit dh_prime and g_a (each a 4-byte TL length and 256 bytes),
+/// server_time.
+const MIN_DH_INNER: usize = 4 + 16 + 16 + 4 + (4 + 256) + (4 + 256) + 4;
+/// `server_DH_params_ok`'s `encrypted_answer` starts with a SHA-1.
+const MIN_ENCRYPTED_ANSWER: usize = 20 + MIN_DH_INNER;
+/// Telegram's pq is a 64-bit product of two 32-bit primes; anything at or
+/// below this cannot be one.
+const MIN_PQ: u64 = 1 << 32;
+
 /// grammers' auth key exchange (`authentication` steps 1–3) over plain
 /// messages on this connection.
+///
+/// The answers are unencrypted, so an on-path attacker can forge them.
+/// grammers then panics on a short `encrypted_answer` and loops for ever
+/// factorizing a tiny pq. So the answers are checked first, and each
+/// CPU-bound step runs in `spawn_blocking` under `catch_unwind`; the
+/// caller bounds the whole exchange with a timeout.
 async fn exchange_key<R, W>(
     frames: &mut Frames<R>,
     out: &mut FrameWriter<W>,
@@ -330,25 +347,76 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    fn failed(e: impl std::fmt::Display) -> TransportError {
-        TransportError::Handshake(e.to_string())
-    }
-
     let (request, step) = authentication::step1().map_err(failed)?;
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let res_pq = tl::enums::ResPq::from_bytes(&answer).map_err(failed)?;
-    let (request, step) = authentication::step2(step, res_pq).map_err(failed)?;
+    check_pq(&res_pq)?;
+    let (request, step) = blocking(move || authentication::step2(step, res_pq)).await?;
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let dh_params = tl::enums::ServerDhParams::from_bytes(&answer).map_err(failed)?;
-    let (request, step) = authentication::step3(step, dh_params).map_err(failed)?;
+    check_dh_params(&dh_params)?;
+    let (request, step) = blocking(move || authentication::step3(step, dh_params)).await?;
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let dh_answer = tl::enums::SetClientDhParamsAnswer::from_bytes(&answer).map_err(failed)?;
-    let done = authentication::create_key(step, dh_answer).map_err(failed)?;
+    let done = blocking(move || authentication::create_key(step, dh_answer)).await?;
     Ok(GeneratedKey {
         key: AuthKey(done.auth_key),
         first_salt: done.first_salt,
         time_offset: done.time_offset,
     })
+}
+
+fn failed(e: impl std::fmt::Display) -> TransportError {
+    TransportError::Handshake(e.to_string())
+}
+
+/// `res_pq`'s pq must be an odd 64-bit number above 2^32.
+fn check_pq(res_pq: &tl::enums::ResPq) -> Result<(), TransportError> {
+    let tl::enums::ResPq::Pq(res_pq) = res_pq;
+    let pq = <[u8; 8]>::try_from(res_pq.pq.as_slice())
+        .map(u64::from_be_bytes)
+        .map_err(|_| TransportError::Handshake("pq is not 8 bytes".to_owned()))?;
+    if pq <= MIN_PQ || pq.is_multiple_of(2) {
+        return Err(TransportError::Handshake(
+            "pq is not a product of two large primes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// `server_DH_params_ok`'s `encrypted_answer` must hold at least the
+/// smallest inner data.
+fn check_dh_params(params: &tl::enums::ServerDhParams) -> Result<(), TransportError> {
+    match params {
+        tl::enums::ServerDhParams::Ok(ok) if ok.encrypted_answer.len() < MIN_ENCRYPTED_ANSWER => {
+            Err(TransportError::Handshake(format!(
+                "encrypted_answer of {} bytes is too short",
+                ok.encrypted_answer.len()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// One CPU-bound key exchange step, off the async threads, with a panic
+/// turned into an error.
+async fn blocking<T, F>(step: F) -> Result<T, TransportError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, authentication::Error> + Send + 'static,
+{
+    let caught =
+        tokio::task::spawn_blocking(move || std::panic::catch_unwind(AssertUnwindSafe(step)))
+            .await
+            .map_err(|_| {
+                TransportError::Handshake("the key exchange step was cancelled".to_owned())
+            })?;
+    match caught {
+        Ok(result) => result.map_err(failed),
+        Err(_) => Err(TransportError::Handshake(
+            "the server's answer made the key exchange panic".to_owned(),
+        )),
+    }
 }
 
 /// One unencrypted request and its answer's body.
@@ -383,6 +451,113 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the forged Telegram answers to each plain request.
+    enum Forged {
+        /// `resPQ` with this pq and Telegram's production key fingerprint.
+        ResPq(u64),
+        /// `server_DH_params_ok` with this `encrypted_answer`.
+        DhOk(Vec<u8>),
+    }
+
+    /// Runs `exchange_key` against an on-path forger that answers each
+    /// plain request in turn. A spin or a hang fails at 5 s.
+    async fn forged_exchange(answers: Vec<Forged>) -> Result<GeneratedKey, TransportError> {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(client);
+        let mut frames = Frames::new(read);
+        let mut out = FrameWriter::new(write);
+        let forger = tokio::spawn(async move {
+            let (mut read, mut write) = tokio::io::split(server);
+            let mut tag = [0; 4];
+            read.read_exact(&mut tag).await.ok()?;
+            for answer in answers {
+                let mut len = [0; 4];
+                read.read_exact(&mut len).await.ok()?;
+                let mut payload = vec![0; usize::try_from(i32::from_le_bytes(len)).ok()?];
+                read.read_exact(&mut payload).await.ok()?;
+                // auth_key_id, msg_id, length, then the request.
+                let request = &payload[20..];
+                let nonce: [u8; 16] = request[4..20].try_into().ok()?;
+                let body = match answer {
+                    Forged::ResPq(pq) => tl::enums::ResPq::Pq(tl::types::ResPq {
+                        nonce,
+                        server_nonce: [7; 16],
+                        pq: pq.to_be_bytes().to_vec(),
+                        server_public_key_fingerprints: vec![-3_414_540_481_677_951_611],
+                    })
+                    .to_bytes(),
+                    Forged::DhOk(encrypted_answer) => {
+                        tl::enums::ServerDhParams::Ok(tl::types::ServerDhParamsOk {
+                            nonce,
+                            server_nonce: request[20..36].try_into().ok()?,
+                            encrypted_answer,
+                        })
+                        .to_bytes()
+                    }
+                };
+                let mut message = 0i64.to_le_bytes().to_vec();
+                message.extend_from_slice(&((1_800_000_000i64 << 32) | 1).to_le_bytes());
+                message.extend_from_slice(&i32::try_from(body.len()).ok()?.to_le_bytes());
+                message.extend_from_slice(&body);
+                write
+                    .write_all(&i32::try_from(message.len()).ok()?.to_le_bytes())
+                    .await
+                    .ok()?;
+                write.write_all(&message).await.ok()?;
+            }
+            Some(())
+        });
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), exchange_key(&mut frames, &mut out))
+                .await
+                .expect("a forged answer ends the exchange at once");
+        forger.abort();
+        result
+    }
+
+    fn handshake_error(result: Result<GeneratedKey, TransportError>) -> String {
+        match result {
+            Err(TransportError::Handshake(why)) => why,
+            other => panic!("expected a handshake error, got {other:?}"),
+        }
+    }
+
+    /// A tiny odd pq made grammers' `factorize` loop for ever; an even one
+    /// is no product of two primes either.
+    #[tokio::test]
+    async fn forged_small_or_even_pq_is_refused_without_spinning() {
+        for pq in [7, 1 << 40] {
+            let why = handshake_error(forged_exchange(vec![Forged::ResPq(pq)]).await);
+            assert!(why.contains("pq"), "{pq}: {why}");
+        }
+    }
+
+    /// An empty `encrypted_answer` made grammers' step 3 panic.
+    #[tokio::test]
+    async fn forged_empty_encrypted_answer_is_refused() {
+        // Telegram's documented sample pq: 1229739323 × 1402015859.
+        let answers = vec![
+            Forged::ResPq(0x17ED_4894_1A08_F981),
+            Forged::DhOk(Vec::new()),
+        ];
+        let why = handshake_error(forged_exchange(answers).await);
+        assert!(why.contains("too short"), "{why}");
+    }
+
+    /// A panic in a key exchange step becomes an error, not a crash.
+    #[tokio::test]
+    async fn a_panicking_step_is_an_error() {
+        let result = blocking(|| -> Result<(), authentication::Error> {
+            panic!("a forged answer");
+        })
+        .await;
+        let why = match result {
+            Err(TransportError::Handshake(why)) => why,
+            other => panic!("{other:?}"),
+        };
+        assert!(why.contains("panic"), "{why}");
+    }
 
     #[test]
     fn generated_key_debug_hides_the_salt() {
