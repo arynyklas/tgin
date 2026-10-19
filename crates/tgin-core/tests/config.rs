@@ -4055,3 +4055,31 @@ fn glob_grants_only_reviewed_namespaces() {
         assert!(!config::glob_namespace(namespace), "{namespace}");
     }
 }
+
+/// `allow_paid_stars` lets a client's requests spend Stars on paid
+/// messages; it is off unless set.
+#[test]
+fn allow_paid_stars_per_client() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1 }, b: { token: t2, allow_paid_stars: true } } } }\n",
+    );
+    let clients = &cfg.accounts[0].rpc.clients;
+    assert!(!clients[0].allow_paid_stars);
+    assert!(clients[1].allow_paid_stars);
+    let json = config::redacted_json(&cfg);
+    assert_eq!(
+        json["accounts"]["main"]["rpc"]["clients"]["b"]["allow_paid_stars"],
+        true
+    );
+    assert_eq!(
+        json["accounts"]["main"]["rpc"]["clients"]["a"]["allow_paid_stars"],
+        false
+    );
+    let err = single_error(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1, allow_paid_stars: yes please } } } }\n",
+    );
+    assert!(
+        err.at.as_ref().unwrap().path.contains("allow_paid_stars"),
+        "{err}"
+    );
+}

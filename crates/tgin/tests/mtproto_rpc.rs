@@ -109,6 +109,7 @@ fn rpc_config(max_rps: u32, acl: MethodAcl) -> Rpc {
             name: "bot".to_owned(),
             token: Secret::new(TOKEN.to_owned()),
             acl,
+            allow_paid_stars: false,
         }],
     }
 }

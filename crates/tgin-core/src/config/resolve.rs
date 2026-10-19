@@ -186,6 +186,8 @@ pub struct RpcClient {
     pub name: String,
     pub token: Secret<String>,
     pub acl: MethodAcl,
+    /// Requests may set `allow_paid_stars`.
+    pub allow_paid_stars: bool,
 }
 
 /// A Bot API server bots talk to.
@@ -1373,6 +1375,7 @@ impl Resolver<'_> {
                     allow: globs(&client.value.allow),
                     deny: globs(&client.value.deny),
                 },
+                allow_paid_stars: client.value.allow_paid_stars,
             });
         }
         out

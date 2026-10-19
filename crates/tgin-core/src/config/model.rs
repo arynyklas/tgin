@@ -587,8 +587,12 @@ pub struct RpcClient {
     pub token: SecretText,
     /// Methods the client may call: `*`, `<namespace>.*` such as
     /// `messages.*`, or a method name such as `messages.sendMessage`.
-    /// Empty, it may call none. `auth.*` and the other account-changing
-    /// methods are allowed only when listed by exact name.
+    /// Empty, it may call none. A glob grants only methods of the reviewed
+    /// namespaces (`account`, `channels`, `contacts`, `help`, `langpack`,
+    /// `messages`, `phone`, `photos`, `stats`, `stickers`, `stories`,
+    /// `upload`, `users`) that change nothing account-wide; every other
+    /// method, such as `payments.*`, `auth.*` or `account.updateProfile`,
+    /// is allowed only when listed by exact name.
     #[serde(default)]
     #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
     pub allow: Vec<At<String>>,
@@ -597,6 +601,11 @@ pub struct RpcClient {
     #[serde(default)]
     #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
     pub deny: Vec<At<String>>,
+    /// Let the client's requests set `allow_paid_stars`, which spends the
+    /// account's Stars on messages to peers that charge for them. Off, such
+    /// a request is refused with 403 `paid_stars_not_allowed`.
+    #[serde(default)]
+    pub allow_paid_stars: bool,
 }
 
 /// What an RPC `allow` or `deny` entry may be; `validate` checks the same
