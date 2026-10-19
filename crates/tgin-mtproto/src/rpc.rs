@@ -10,7 +10,8 @@
 //!   one resend of a request never written, never a resend of one that may
 //!   have run, one flood sleep up to the threshold, `*_MIGRATE_X` to a
 //!   media session, and the pts of a `messages.affected*` answer handed to
-//!   the update manager through an [`AffectedSink`].
+//!   the update manager through an [`AffectedSink`], in the box of the
+//!   channel the call targets or the common box.
 //!
 //! Nothing here logs or keeps request or answer bytes.
 
@@ -71,8 +72,9 @@ pub struct Call<'a> {
     pub method: &'static str,
     /// The function's bytes, wrappers stripped; a suffix of the request.
     pub body: &'a [u8],
-    /// The update box an affected-pts answer counts in: the channel for a
-    /// `channels.*` call with a `channel` field, else the common box.
+    /// The update box an affected-pts answer counts in: the channel the
+    /// call targets (its `channel`, `parent_peer` or `peer`), else the
+    /// common box.
     pub context: BoxKind,
 }
 
@@ -172,10 +174,24 @@ fn query_start(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<usize, TlError
     Err(TlError::Eof { at: r.pos })
 }
 
-/// Checks a call's fields strictly; returns its update context.
+/// Checks a call's fields strictly; returns its update context:
+/// - a `channels.*` call: the channel its `channel` field names (none
+///   without one);
+/// - a call with a `parent_peer` field (`messages.deleteSavedHistory`): the
+///   channel it names, else the common box; its `peer` is then a saved
+///   dialog of the account's own Saved Messages;
+/// - any other call: the channel its `peer` names, else the common box.
 fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlError> {
     let channels = ctor.name.starts_with("channels.");
-    let mut context = BoxKind::Common;
+    let has_parent = ctor.params.iter().any(|p| p.name == "parent_peer");
+    let target = if channels {
+        "channel"
+    } else if has_parent {
+        "parent_peer"
+    } else {
+        "peer"
+    };
+    let mut channel = None;
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -186,23 +202,34 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlErro
                 }
                 let start = r.pos;
                 API.skip_value(r, ty, 1)?;
-                if channels && p.name == "channel" {
-                    context =
-                        channel_id(&r.buf[start..r.pos]).map_or(BoxKind::None, BoxKind::Channel);
+                if p.name == target {
+                    channel = channel_id(&r.buf[start..r.pos]);
                 }
             }
         }
     }
-    if channels && context == BoxKind::Common {
-        context = BoxKind::None;
-    }
-    Ok(context)
+    Ok(match channel {
+        Some(id) => BoxKind::Channel(id),
+        None if channels => BoxKind::None,
+        None => BoxKind::Common,
+    })
 }
 
-/// The `channel_id` of an `InputChannel` (already checked).
+/// The `channel_id` of an `inputChannel`, `inputChannelFromMessage`,
+/// `inputPeerChannel` or `inputPeerChannelFromMessage` (already checked);
+/// `None` for any other peer.
 fn channel_id(bytes: &[u8]) -> Option<i64> {
     let mut r = Reader::new(bytes);
     let ctor = API.read_ctor(&mut r, None).ok()?;
+    if !matches!(
+        ctor.name,
+        "inputChannel"
+            | "inputChannelFromMessage"
+            | "inputPeerChannel"
+            | "inputPeerChannelFromMessage"
+    ) {
+        return None;
+    }
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {

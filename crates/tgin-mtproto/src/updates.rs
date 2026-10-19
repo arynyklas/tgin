@@ -575,8 +575,9 @@ impl UpdateManager {
     }
 
     /// The pts of a `messages.affectedMessages`, `affectedHistory` or
-    /// `affectedFoundMessages` answer, in the request's box: the common box,
-    /// or the channel for `channels.*` calls.
+    /// `affectedFoundMessages` answer, in the request's box: the channel the
+    /// call targets (a `channels.*` call's `channel`, or a channel `peer` /
+    /// `parent_peer`), else the common box.
     pub fn feed_affected(&mut self, box_kind: BoxKind, pts: i32, pts_count: i32) -> Vec<Batch> {
         if pts == 0 {
             return Vec::new();

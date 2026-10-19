@@ -460,6 +460,58 @@ async fn affected_pts_reach_the_update_manager_in_the_request_context() {
     );
 }
 
+const CHANNEL_PEER: &str = r#"{"_":"inputPeerChannel","channel_id":"88","access_hash":"5"}"#;
+const USER_PEER: &str = r#"{"_":"inputPeerUser","user_id":"88","access_hash":"5"}"#;
+
+async fn affected_box(call: &str) -> Vec<(BoxKind, i32, i32)> {
+    let affected = r#"{"_":"messages.affectedHistory","pts":500,"pts_count":3,"offset":0}"#;
+    let account = FakeAccount::new([ok(affected)]);
+    let sink = Arc::new(FakeSink::default());
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::clone(&sink),
+        &rpc_config(100, allow_all()),
+    );
+    assert_eq!(send(&app, tl(call)).await.status, StatusCode::OK);
+    std::mem::take(&mut *sink.0.lock())
+}
+
+#[tokio::test]
+async fn affected_on_a_channel_peer_goes_to_the_channel_box() {
+    let read_mentions = format!(r#"{{"_":"messages.readMentions","peer":{CHANNEL_PEER}}}"#);
+    assert_eq!(
+        affected_box(&read_mentions).await,
+        vec![(BoxKind::Channel(88), 500, 3)]
+    );
+    let topic =
+        format!(r#"{{"_":"messages.deleteTopicHistory","peer":{CHANNEL_PEER},"top_msg_id":1}}"#);
+    assert_eq!(
+        affected_box(&topic).await,
+        vec![(BoxKind::Channel(88), 500, 3)]
+    );
+    let from_message = format!(
+        r#"{{"_":"messages.readMentions","peer":{{"_":"inputPeerChannelFromMessage","peer":{USER_PEER},"msg_id":1,"channel_id":"99"}}}}"#
+    );
+    assert_eq!(
+        affected_box(&from_message).await,
+        vec![(BoxKind::Channel(99), 500, 3)]
+    );
+    // A user peer is the common box.
+    let user = format!(r#"{{"_":"messages.readMentions","peer":{USER_PEER}}}"#);
+    assert_eq!(affected_box(&user).await, vec![(BoxKind::Common, 500, 3)]);
+    // deleteSavedHistory: `parent_peer` decides; `peer` is a saved dialog.
+    let saved =
+        format!(r#"{{"_":"messages.deleteSavedHistory","peer":{CHANNEL_PEER},"max_id":0}}"#);
+    assert_eq!(affected_box(&saved).await, vec![(BoxKind::Common, 500, 3)]);
+    let parent = format!(
+        r#"{{"_":"messages.deleteSavedHistory","parent_peer":{CHANNEL_PEER},"peer":{USER_PEER},"max_id":0}}"#
+    );
+    assert_eq!(
+        affected_box(&parent).await,
+        vec![(BoxKind::Channel(88), 500, 3)]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn max_rps_limits() {
     let account = FakeAccount::new((0..4).map(|_| ok(NEAREST)));
