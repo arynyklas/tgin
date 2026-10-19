@@ -233,6 +233,28 @@ fn facts_of_short_forms() {
             Some(PeerId::Channel(4))
         ))
     );
+    // `updateShort.update` is an `Update`: a short form inside it is refused,
+    // as `container` and the codec refuse it.
+    let short_message = tl(
+        r#"{"_":"updateShortMessage","id":1,"user_id":"5","message":"x","pts":3,"pts_count":1,"date":0}"#,
+    );
+    let wrap =
+        |inner: &[u8]| [&UPDATE_SHORT.to_le_bytes()[..], inner, &0i32.to_le_bytes()].concat();
+    for nested in [wrap(&short_message), wrap(&wrap(&short_message))] {
+        let got = match API.ctor_by_id(u32::from_le_bytes([
+            nested[4], nested[5], nested[6], nested[7],
+        ])) {
+            Some(c) => c.name,
+            None => "",
+        };
+        let want = Err(TlError::WrongType {
+            want: "Update",
+            got,
+        });
+        assert_eq!(facts(&nested), want);
+        assert!(container(&nested).is_err());
+        assert!(crate::tl_json::to_json(&nested, &mut String::new()).is_err());
+    }
     // Neither a container nor another type is an update.
     let b = tl(r#"{"_":"updatesTooLong"}"#);
     assert_eq!(

@@ -108,10 +108,16 @@ pub fn facts(bytes: &[u8]) -> Result<UpdateFacts<'_>, TlError> {
 fn facts_at<'a>(r: &mut Reader<'a>, depth: u32) -> Result<UpdateFacts<'a>, TlError> {
     let ctor = API.read_ctor(r, None)?;
     let update_ty = API.type_index("Update");
-    let is_short = matches!(
-        ctor.id,
-        UPDATE_SHORT | UPDATE_SHORT_MESSAGE | UPDATE_SHORT_CHAT_MESSAGE | UPDATE_SHORT_SENT_MESSAGE
-    );
+    // A short form is an `Updates`, so only the top level may be one;
+    // `updateShort.update` is an `Update`.
+    let is_short = depth == 0
+        && matches!(
+            ctor.id,
+            UPDATE_SHORT
+                | UPDATE_SHORT_MESSAGE
+                | UPDATE_SHORT_CHAT_MESSAGE
+                | UPDATE_SHORT_SENT_MESSAGE
+        );
     if ctor.ty.is_none() || (ctor.ty != update_ty && !is_short) {
         return Err(TlError::WrongType {
             want: "Update",
