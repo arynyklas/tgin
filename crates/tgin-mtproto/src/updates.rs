@@ -90,8 +90,9 @@ pub const GAP_HOLD: Duration = Duration::from_millis(500);
 pub const IDLE_DIFFERENCE: Duration = Duration::from_secs(15 * 60);
 /// At most this many `updates.getChannelDifference` calls in flight.
 pub const MAX_CHANNEL_FETCHES: usize = 4;
-/// A failed fetch is asked again after this long, doubling per failure up
-/// to [`RETRY_MAX`] (as TDLib backs off getDifference).
+/// A failed fetch, or the refetch of a refused batch, is asked again after
+/// this long, doubling per failure or refusal up to [`RETRY_MAX`] (as TDLib
+/// backs off getDifference).
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(60);
 /// Held (out-of-order) updates per box. Beyond it, a sequenced update is
@@ -402,6 +403,9 @@ struct Channel {
     /// A failed fetch is asked again then (with `fetch` Wanted).
     retry_at: Option<Instant>,
     backoff: Duration,
+    /// The backoff of the refetch after a refusal: grows per refusal, and
+    /// only a committed batch of the channel resets it.
+    refusals: Duration,
     /// Bumped when a refused batch rolls the channel back.
     epoch: u32,
 }
@@ -417,6 +421,7 @@ impl Channel {
             again: false,
             retry_at: None,
             backoff: Duration::ZERO,
+            refusals: Duration::ZERO,
         }
     }
 }
@@ -530,9 +535,13 @@ pub struct UpdateManager {
     gapped: BTreeSet<i64>,
     /// Channels waiting for a failed fetch's retry.
     retrying: BTreeSet<i64>,
-    /// The common box's failed fetch is asked again then.
+    /// The common box's failed fetch, or the refetch of its refused batch,
+    /// is asked again then.
     retry_at: Option<Instant>,
     backoff: Duration,
+    /// The backoff of the refetch after a refusal: grows per refusal, and
+    /// only a committed batch of the common box resets it.
+    refusals: Duration,
     known_users: HashSet<i64>,
     committed: UpdateState,
     committed_channels: HashMap<i64, i32>,
@@ -603,6 +612,7 @@ impl UpdateManager {
             retrying: BTreeSet::new(),
             retry_at: None,
             backoff: Duration::ZERO,
+            refusals: Duration::ZERO,
             ahead: startup.iter().copied().collect(),
             startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
@@ -820,6 +830,11 @@ impl UpdateManager {
             if ch.fetch != ChannelFetch::Wanted {
                 continue;
             }
+            if ch.retry_at.is_some_and(|d| d > now) {
+                // Backing off after a refusal: queued again when it ends.
+                self.retrying.insert(c);
+                continue;
+            }
             let Some(pts) = ch.pts else {
                 ch.fetch = ChannelFetch::Idle;
                 continue;
@@ -893,7 +908,7 @@ impl UpdateManager {
                 }
                 self.fetch = want;
                 self.backoff = next_backoff(self.backoff);
-                self.retry_at = Some(now + self.backoff);
+                self.retry_at = Some(later(self.retry_at, now + self.backoff));
             }
             Fetch::GetChannelDifference { channel, .. } => {
                 if let Some(ch) = self.channels.get_mut(&channel)
@@ -1249,8 +1264,12 @@ impl UpdateManager {
     }
 
     /// Batch `id` was not admitted. Its boxes roll back to the committed
-    /// state and fetch their difference; its unsequenced updates are
-    /// counted as dropped. Returns the state to persist now, if any.
+    /// state and fetch their difference after a backoff, per box:
+    /// [`RETRY_MIN`], doubling per refusal up to [`RETRY_MAX`], reset when
+    /// the box next commits a batch. A full queue is thus refetched at a
+    /// pace Telegram accepts, not at round-trip rate. Its unsequenced
+    /// updates are counted as dropped. Returns the state to persist now, if
+    /// any.
     ///
     /// A batch with no updates had nothing to admit: refusing it counts as
     /// [`committed`](Self::committed). Its state (an adopted channel's
@@ -1278,6 +1297,16 @@ impl UpdateManager {
             };
             if p.status == Status::Committed {
                 let d = self.still_current(p);
+                // The box takes batches again: its next refusal starts the
+                // backoff over.
+                if d.pts.is_some() || d.qts.is_some() || d.seq.is_some() || d.date.is_some() {
+                    self.refusals = Duration::ZERO;
+                }
+                for (c, _) in &d.channels {
+                    if let Some(ch) = self.channels.get_mut(c) {
+                        ch.refusals = Duration::ZERO;
+                    }
+                }
                 self.committed.pts = d.pts.unwrap_or(self.committed.pts);
                 self.committed.qts = d.qts.unwrap_or(self.committed.qts);
                 self.committed.seq = d.seq.unwrap_or(self.committed.seq);
@@ -1330,8 +1359,11 @@ impl UpdateManager {
 
     fn roll_back(&mut self, p: &Pending) {
         self.dropped.full += p.unsequenced;
+        let now = Instant::now();
         if p.common_epoch == Some(self.epoch) {
             self.epoch += 1;
+            self.refusals = next_backoff(self.refusals);
+            self.retry_at = Some(later(self.retry_at, now + self.refusals));
             self.pts = self.committed.pts;
             self.qts = self.committed.qts;
             self.seq = self.committed.seq;
@@ -1359,11 +1391,15 @@ impl UpdateManager {
             ch.epoch += 1;
             ch.pts = self.committed_channels.get(&c).copied();
             ch.deadline = None;
+            ch.refusals = next_backoff(ch.refusals);
+            ch.retry_at = Some(later(ch.retry_at, now + ch.refusals));
             self.gapped.remove(&c);
             if ch.fetch == ChannelFetch::Idle && ch.pts.is_some() {
                 ch.fetch = ChannelFetch::Wanted;
-                self.queue.push_back(c);
             }
+            // Queued once the backoff is over (a call in flight is stale:
+            // its end queues it, and the queue honours the backoff too).
+            self.retrying.insert(c);
         }
     }
 
@@ -1930,6 +1966,11 @@ impl UpdateManager {
             "update manager: undecodable {what} skipped"
         );
     }
+}
+
+/// The later of a pending retry time and `at`.
+fn later(pending: Option<Instant>, at: Instant) -> Instant {
+    pending.map_or(at, |p| p.max(at))
 }
 
 /// The next retry delay after `prev`: [`RETRY_MIN`], then doubling up to

@@ -15,7 +15,11 @@
 //!    [`SessionStore::commit_state`]; on [`Admission::Refused`], calls
 //!    [`refused(id)`](crate::UpdateManager::refused) and persists what it
 //!    returns the same way. A refused batch is gone from memory; gap
-//!    recovery fetches its sequenced updates again later.
+//!    recovery fetches its sequenced updates again, once the box's backoff
+//!    is over (1 s, doubling per refusal up to 60 s, reset when the box
+//!    next commits a batch). The caller keeps running the manager's fetches
+//!    by [`deadline`](crate::UpdateManager::deadline) and
+//!    [`next_action`](crate::UpdateManager::next_action), which honour it.
 //!
 //! The sink never opens the store, never blocks on the network and never
 //! awaits; it may write the store (see [`UpdateIds`]).

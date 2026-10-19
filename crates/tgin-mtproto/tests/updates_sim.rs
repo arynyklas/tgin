@@ -42,7 +42,7 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::tl_json::from_json;
-use tgin_mtproto::updates::{GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES};
+use tgin_mtproto::updates::{GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES, RETRY_MIN};
 use tgin_mtproto::{Batch, Fetch, PeerKind, StateDelta, StoredState, UpdateManager, UpdateState};
 use tokio::time::{Duration, Instant, advance};
 
@@ -740,6 +740,7 @@ async fn too_long_keeps_held_updates_past_the_committed_state() {
     for batch in &jump {
         m.committed(batch.id);
     }
+    advance(RETRY_MIN).await;
     assert!(matches!(
         m.next_action(),
         Some(Fetch::GetDifference { pts: 10, .. })
@@ -1108,6 +1109,7 @@ async fn rollback_on_fresh_account_resyncs_with_get_state() {
     let batches = m.feed_state(b(state(20, 6, 2, 4)));
     assert_eq!(all_updates(&batches).len(), 1);
     assert_eq!(m.refused(batches[0].id), None);
+    advance(RETRY_MIN).await;
     assert_eq!(m.next_action(), Some(Fetch::GetState));
 
     // Refused while a difference is in flight: its answer is stale.
@@ -1124,6 +1126,8 @@ async fn rollback_on_fresh_account_resyncs_with_get_state() {
     ));
     m.refused(batches[0].id);
     assert!(m.feed_difference(b(difference_empty(2, 4))).is_empty());
+    assert_eq!(m.next_action(), None, "the stale answer keeps the backoff");
+    advance(RETRY_MIN).await;
     assert_eq!(m.next_action(), Some(Fetch::GetState));
 }
 
@@ -1144,6 +1148,7 @@ async fn rollback_while_get_state_pending_fetches_difference() {
     bad[0] ^= 0xff; // an unknown constructor
     assert!(m.feed_difference(b(bad)).is_empty());
     m.refused(batches[0].id);
+    advance(RETRY_MIN).await;
     assert_eq!(
         m.next_action(),
         Some(Fetch::GetDifference {
@@ -1158,7 +1163,8 @@ async fn rollback_while_get_state_pending_fetches_difference() {
 /// failure, transient or permanent, leads to the catch-up from the
 /// committed state, as its answer would: getState on a fresh account (no
 /// difference from pts 0), a difference from the committed pts otherwise
-/// (no getState, which would skip the refused updates). No backoff.
+/// (no getState, which would skip the refused updates), once the
+/// refusal's backoff is over; the failure adds none.
 #[tokio::test(start_paused = true)]
 async fn stale_call_failure_resyncs_from_committed_state() {
     for permanent in [false, true] {
@@ -1180,6 +1186,7 @@ async fn stale_call_failure_resyncs_from_committed_state() {
         assert!(matches!(f, Fetch::GetDifference { pts: 20, .. }));
         m.refused(batches[0].id);
         fail(&mut m, f);
+        advance(RETRY_MIN).await;
         assert_eq!(
             m.next_action(),
             Some(Fetch::GetState),
@@ -1195,6 +1202,7 @@ async fn stale_call_failure_resyncs_from_committed_state() {
         assert!(matches!(f, Fetch::GetDifference { pts: 11, .. }));
         m.refused(batches[0].id);
         fail(&mut m, f);
+        advance(RETRY_MIN).await;
         assert_eq!(
             m.next_action(),
             Some(Fetch::GetDifference {
@@ -1217,7 +1225,10 @@ async fn unsequenced_drop_counted_when_full() {
     // Admission is full: the batch is refused.
     assert_eq!(m.refused(batches[0].id), None, "nothing to persist");
     assert_eq!(m.dropped().full, 1, "the unsequenced update is counted");
-    // The sequenced one comes back through the difference.
+    // The sequenced one comes back through the difference, after the
+    // refusal's backoff.
+    assert_eq!(m.next_action(), None);
+    advance(RETRY_MIN).await;
     assert_eq!(
         m.next_action(),
         Some(Fetch::GetDifference {
@@ -2757,5 +2768,95 @@ async fn kill_at_every_point_loses_no_sequenced_update() {
     assert!(
         killed_runs > SCRIPTS * 50,
         "{killed_runs} kill runs in {runs}"
+    );
+}
+
+/// A refused batch's refetch waits a backoff: 1 s, doubling per refusal
+/// up to 60 s, so a queue that stays full is not refetched at round-trip
+/// rate. The box's next committed batch resets it.
+#[tokio::test(start_paused = true)]
+async fn refusal_paces_the_refetch_and_a_commit_resets_it() {
+    let mut m = started(stored(10, &[], &[5]));
+    let msg = message(1, PeerId::User(5), "x");
+    let from_10 = Some(Fetch::GetDifference {
+        pts: 10,
+        qts: 5,
+        date: 1,
+    });
+    let one = |m: &mut UpdateManager| {
+        let batches = m.feed_difference(b(difference(
+            &Diff {
+                msgs: std::slice::from_ref(&msg),
+                ..EMPTY_DIFF
+            },
+            &state(11, 5, 2, 3),
+            false,
+        )));
+        assert_eq!(batches.iter().filter(|b| !b.updates.is_empty()).count(), 1);
+        batches
+    };
+    let batches = m.feed_push(b(updates(&[new_message(&msg, 11, 1)], NONE, NONE, 2, 0)));
+    m.refused(batches[0].id);
+    for wait in [1, 2, 4] {
+        assert_eq!(m.next_action(), None, "no refetch at once");
+        assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(wait));
+        advance(Duration::from_secs(wait) - Duration::from_millis(1)).await;
+        assert_eq!(m.next_action(), None, "not before {wait} s");
+        advance(Duration::from_millis(1)).await;
+        assert_eq!(m.next_action(), from_10);
+        let batches = one(&mut m);
+        for b in &batches {
+            m.refused(b.id);
+        }
+    }
+    // Admitted at last: the next refusal waits 1 s again.
+    advance(Duration::from_secs(8)).await;
+    assert_eq!(m.next_action(), from_10);
+    let batches = one(&mut m);
+    assert_eq!(commit(&mut m, &batches).pts, Some(11));
+    let u12 = new_message(&message(2, PeerId::User(5), "y"), 12, 1);
+    let batches = m.feed_push(b(updates(&[u12], NONE, NONE, 2, 0)));
+    m.refused(batches[0].id);
+    assert_eq!(m.next_action(), None);
+    assert_eq!(m.deadline(), Instant::now() + RETRY_MIN);
+    advance(RETRY_MIN).await;
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 11, .. })
+    ));
+}
+
+/// A channel's refused batch is refetched after the same backoff.
+#[tokio::test(start_paused = true)]
+async fn channel_refusal_paces_its_refetch() {
+    let c = 77;
+    let mut m = started(stored(10, &[(c, 20)], &[5]));
+    let post = message(1, PeerId::Channel(c), "p");
+    let batches = m.feed_push(b(updates(
+        &[new_channel_message(&post, 21, 1)],
+        NONE,
+        &[channel(c)],
+        2,
+        0,
+    )));
+    let with = batches
+        .iter()
+        .find(|b| !b.updates.is_empty())
+        .expect("a post");
+    for b in &batches {
+        if b.id != with.id {
+            m.committed(b.id);
+        }
+    }
+    m.refused(with.id);
+    assert_eq!(m.next_action(), None, "no refetch at once");
+    assert_eq!(m.deadline(), Instant::now() + RETRY_MIN);
+    advance(RETRY_MIN).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference {
+            channel: c,
+            pts: 20
+        })
     );
 }
