@@ -1896,12 +1896,47 @@ async fn drain_finishes_a_slow_download() {
     tgin.stopped().await;
 }
 
+/// A capture endpoint at `{url}/in` like [`holder`], but gated per push:
+/// the `n`th push to arrive is answered with [`HELD_REPLY`] once the
+/// returned sender holds at least `n`.
+async fn counted_holder() -> (
+    String,
+    mpsc::UnboundedReceiver<axum::body::Bytes>,
+    watch::Sender<u32>,
+) {
+    let (pushes, received) = mpsc::unbounded_channel();
+    let (release, released) = watch::channel(0u32);
+    let arrived = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let router = axum::Router::new().route(
+        "/in",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let n = arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let _ = pushes.send(body);
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|count| *count >= n).await;
+                ([("content-type", "application/json")], HELD_REPLY)
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("http://{addr}"), received, release)
+}
+
 /// A removed push consumer's `tgin_webhook_replies_total` series stay
 /// while its retired instance drains, and go when the drain ends.
+///
+/// Two pushes are held across the removal and released one at a time:
+/// the second keeps the drain open while the first one's reply is
+/// counted, so the count is observed before the series can go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_series_follow_the_drain_of_a_removed_consumer() {
     let telegram = telegram().await;
-    let (capture, mut pushes, release) = holder().await;
+    let (capture, mut pushes, release) = counted_holder().await;
     let yaml = intercept_config(&telegram.uri(), ", webhook_reply: execute").replace(
         "reload: { watch: false }",
         "reload: { watch: false, drain_timeout: 30s }",
@@ -1911,14 +1946,14 @@ async fn reply_series_follow_the_drain_of_a_removed_consumer() {
     let url = format!("{capture}/in");
     assert_eq!(tgin.post_json(&set, &json!({ "url": url })).await.0, 200);
     // Telegram answers every call but getMe with 500: each reply fails.
-    release.send_replace(true);
+    release.send_replace(1);
     tgin.admit(1).await;
     let failed =
         |n: u32| format!(r#"tgin_webhook_replies_total{{consumer="hooks",outcome="failed"}} {n}"#);
     wait_metric(&tgin, &failed(1)).await;
-    release.send_replace(false);
     tgin.admit(2).await;
-    for _ in 1..=2 {
+    tgin.admit(3).await;
+    for _ in 1..=3 {
         timeout(PATIENCE, pushes.recv())
             .await
             .expect("pushed in time")
@@ -1934,8 +1969,9 @@ async fn reply_series_follow_the_drain_of_a_removed_consumer() {
     tgin.reload(&removed, 2).await;
     wait_token(&tgin, TOKEN).await;
     tgin.assert_metric(&failed(1));
-    release.send_replace(true);
+    release.send_replace(2);
     wait_metric(&tgin, &failed(2)).await;
+    release.send_replace(3);
     let started = Instant::now();
     while tgin
         .metrics

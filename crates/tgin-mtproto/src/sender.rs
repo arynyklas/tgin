@@ -1,7 +1,7 @@
 //! tgin's MTProto sender: one connection per DC, honest outcomes.
 //!
-//! [`Sender`] runs tgin's own message loop over a [`Transport`]. It started
-//! from the spike's `raw_sender.rs` (spike/m3 `74ad0e5`) and replaces
+//! [`Sender`] runs tgin's own message loop over a [`Transport`]. It
+//! replaces
 //! grammers' `mtp::Encrypted` with its own message layer: msg_id and
 //! seqno, salts, acks, containers, `bad_server_salt` and
 //! `bad_msg_notification` are handled here, at the message level, and no
@@ -14,13 +14,13 @@
 //!   `rpc_error` with the full message.
 //! - [`SenderError::NotSent`]: the request was never written. No whole
 //!   frame holding it reached the connection. One resend is allowed; the
-//!   sender sends it on a fresh connection [C: S11].
+//!   sender sends it on a fresh connection.
 //! - [`SenderError::NoAnswer`]: the request was written and the connection
 //!   ended before an answer. It may have been executed. Never resend it.
 //! - [`SenderError::KeyRevoked`] / [`SenderError::KeyUnknown`]: transport
-//!   −404, Telegram does not know the auth key [C: S4 F8]. A server that
+//!   −404, Telegram does not know the auth key. A server that
 //!   cannot find the key cannot decrypt, and so cannot execute, any request
-//!   on that connection: the request was not executed (ruling P13).
+//!   on that connection: the request was not executed.
 //! - [`SenderError::BadMessage`]: Telegram ignored the request
 //!   (`bad_msg_notification`), after at most one resend for the codes that
 //!   allow one (16, 17, 48).
@@ -46,7 +46,7 @@
 //! dropped and the waiting requests get [`SenderError::NotSent`]; if
 //! Telegram refuses it they get [`SenderError::InitRefused`].
 //!
-//! Failures before init do not turn into a reconnect loop (ruling P7):
+//! Failures before init do not turn into a reconnect loop:
 //! - a 4xx refusal of the init call latches: every later request gets
 //!   [`SenderError::InitRefused`] without connecting, until the sender is
 //!   rebuilt; a 420 `FLOOD_WAIT_X` latches for X seconds;
@@ -64,7 +64,7 @@
 //! RPC answers included, but still writes the acks it owes and its pings.
 //! Once the receiver is dropped, pushes are discarded. A request's result
 //! whose top constructor is an `Updates` one goes to its caller and also,
-//! in wire order with the pushes, to the receiver (ruling P4);
+//! in wire order with the pushes, to the receiver, so the update state sees it;
 //! `messages.affected*` results reach only the caller.
 //!
 //! # What the sender never does
@@ -133,7 +133,7 @@ const DESTROY_SESSION_OK: u32 = tl::types::DestroySessionOk::CONSTRUCTOR_ID;
 const DESTROY_SESSION_NONE: u32 = tl::types::DestroySessionNone::CONSTRUCTOR_ID;
 const HTTP_WAIT: u32 = tl::types::HttpWait::CONSTRUCTOR_ID;
 /// The `Updates` constructors. A request's result with one of these on top
-/// changes the account's update state, so it is also pushed (ruling P4).
+/// changes the account's update state, so it is also pushed.
 const UPDATES: [u32; 7] = [
     tl::types::UpdatesTooLong::CONSTRUCTOR_ID,
     tl::types::UpdateShortMessage::CONSTRUCTOR_ID,
@@ -166,7 +166,7 @@ pub struct InitParams {
 
 impl InitParams {
     /// tgin's defaults, in grammers' compiled layer. An account serves
-    /// exactly that layer (plan decision 1).
+    /// exactly that layer.
     #[must_use]
     pub fn new(api_id: i32) -> Self {
         Self {
@@ -265,8 +265,7 @@ pub enum SenderError {
     NoAnswer,
     /// Transport −404 on a logged-in key: the authorization is gone. The
     /// sender makes no new key; the account needs a new login. The request
-    /// was not executed: without the key Telegram cannot decrypt it
-    /// (ruling P13).
+    /// was not executed: without the key Telegram cannot decrypt it.
     #[error("Telegram no longer knows the account's auth key (transport -404)")]
     KeyRevoked,
     /// Transport −404 on a key without a self user. Not executed, as for
@@ -601,7 +600,8 @@ impl Shared {
         }
     }
 
-    /// What a connection's end teaches about the next one (ruling P7).
+    /// What a connection's end teaches about the next one, so failures before init
+    /// never loop.
     fn learn(&mut self, cause: &Cause, init_done: bool, now: Instant) {
         if init_done {
             self.backoff = Duration::ZERO;

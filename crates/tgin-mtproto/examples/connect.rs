@@ -2,7 +2,7 @@
 //!
 //! Opens tgin's [`Sender`] on production DC 2 with a scratch auth key that
 //! never logs in, then calls `help.getNearestDc` and `help.getConfig`
-//! (the M3 spike's S2, on tgin's own sender). The first run makes the key
+//! (the M3 spike's connect check, on tgin's own sender). The first run makes the key
 //! and stores it in the scratch session; later runs reuse it, which also
 //! exercises `bad_server_salt` (a stored key starts without a salt).
 //!

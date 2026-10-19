@@ -179,7 +179,7 @@ fn invalid_utf8_string_is_base64_escaped() {
     assert_eq!(tl(&text), Ok(b));
 }
 
-/// NaN and ±Inf, which JSON numbers cannot carry, are `@double` (S11 F1);
+/// NaN and ±Inf, which JSON numbers cannot carry, are `@double`;
 /// finite doubles, -0.0 included, are numbers.
 #[test]
 fn non_finite_doubles_are_escaped() {
@@ -219,7 +219,7 @@ fn non_finite_doubles_are_escaped() {
     }
 }
 
-/// Doubles survive exactly (S11 F2): written in the shortest form that
+/// Doubles survive exactly: written in the shortest form that
 /// reads back to the same bits, read with a correctly rounded parser.
 #[test]
 fn float_roundtrip() {
@@ -255,7 +255,7 @@ fn float_roundtrip() {
     }
 }
 
-/// One case per strict-decoding rule (S11 F4): each is refused, never
+/// One case per strict-decoding rule: each is refused, never
 /// dropped, so a decode that succeeds re-encodes to the same bytes.
 #[test]
 fn strict_decoder_refuses() {

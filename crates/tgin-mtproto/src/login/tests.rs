@@ -370,7 +370,7 @@ async fn check_password_without_answer_is_probed() {
 
 /// DECODE-ONLY: bad SRP parameters end typed instead of panicking: a `p`
 /// that is not a safe prime, and an `srp_B` or `secure_random` longer than
-/// 256 bytes (grammers would panic padding them) [C: S3 F8]. No
+/// 256 bytes (grammers would panic padding them). No
 /// `auth.checkPassword` is sent.
 #[tokio::test]
 async fn unusable_srp_parameters_end_typed() {
@@ -431,7 +431,7 @@ async fn srp_at_256_bytes_runs() {
 
 /// The identity gate: a scan by another account is logged out again
 /// (`auth.logOut` on the new key), nothing is recorded and the key is
-/// gone [C: S3 F1].
+/// gone.
 #[tokio::test]
 async fn wrong_account_is_logged_out_and_not_recorded() {
     let (h, dial, tmp) = begin(
@@ -499,7 +499,7 @@ async fn logged_in_session_refuses_a_login() {
 }
 
 /// A home key left without a login marker may be logged in (its answer was
-/// lost): `start` asks Telegram before it resets anything [C: S3 F7].
+/// lost): `start` asks Telegram before it resets anything.
 /// - logged in, `phone` configured: the identity gate and the marker, no
 ///   new key;
 /// - unknown to Telegram (401, −404): reset, and a fresh login;
@@ -582,7 +582,7 @@ async fn a_leftover_key_is_asked_before_the_reset() {
 }
 
 /// The export after a scan is what fetches the login on the home DC: with
-/// no answer to it, the probe asks who is logged in [C: S3 F7].
+/// no answer to it, the probe asks who is logged in.
 #[tokio::test]
 async fn export_after_scan_without_answer_is_probed() {
     let (h, dial, _tmp) = begin(

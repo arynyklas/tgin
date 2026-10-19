@@ -1,4 +1,4 @@
-//! Media sessions (plan decision 2): a `*_MIGRATE_X` answer sends the call
+//! Media sessions: a `*_MIGRATE_X` answer sends the call
 //! to DC X over a second session, never over the main one.
 //!
 //! A media session is a [`Sender`] to DC X made `without_updates`. Its key
@@ -354,7 +354,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
     /// A call on the media session to `dc`. A key Telegram no longer
     /// accepts is dropped and the session made and authorized again, once;
     /// the call was not executed, so it is sent once more. That holds for a
-    /// transport −404 too (ruling P13): a server that cannot find the key
+    /// transport −404 too: a server that cannot find the key
     /// cannot decrypt, and so cannot execute, any request on that
     /// connection. A key still
     /// refused after that is a media-session failure, never a sign that the
@@ -370,7 +370,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         charged(self.charge.as_ref())?;
         // Safe to resend: a 401 AUTH_KEY_UNREGISTERED / SESSION_REVOKED is
         // a refusal, and a −404 means Telegram could not decrypt the
-        // request (P13).
+        // request.
         let outcome = media.invoke(body).await;
         if key_gone(&outcome) {
             return Err(failed(dc, "the DC does not accept the media session's key"));
