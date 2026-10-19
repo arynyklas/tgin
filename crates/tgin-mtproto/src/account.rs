@@ -233,7 +233,8 @@ pub enum AccountState {
     FloodWait {
         until: SystemTime,
     },
-    /// Telegram answered `FROZEN_*`: the account is read-only.
+    /// Telegram answered `FROZEN_*`: the account is read-only. It stays so
+    /// until the account restarts, is logged out or needs a new login.
     Frozen,
     /// Telegram no longer accepts the account's authorization: log it out
     /// and in again.
@@ -528,7 +529,8 @@ struct Shared {
     full: AtomicU64,
     /// The sessions RPC calls go to, while connected.
     sessions: RwLock<Option<Arc<Sessions>>>,
-    /// A `FROZEN_*` answer came: the state shows `frozen` while connected.
+    /// A `FROZEN_*` answer came: the state shows `frozen` while connected,
+    /// until the account restarts, logs out or needs a new login.
     frozen: AtomicBool,
     /// An RPC call on the main session found the key gone.
     key_gone: AtomicBool,
@@ -873,6 +875,7 @@ async fn run(ctx: Arc<Ctx>) -> End {
         Ok(Known::LoggedIn { user, dc, key }) => (user, dc, *key),
         Ok(Known::LoggedOut) => {
             ctx.registry.release(name);
+            shared.frozen.store(false, Ordering::Relaxed);
             shared.set_state(AccountState::LoggedOut { login: false });
             return End::Wait;
         }
@@ -962,6 +965,8 @@ impl Ctx {
     fn needs_login(&self) -> End {
         tracing::warn!(account = %self.shared.name, "Telegram no longer accepts the account's authorization; log it out and in again");
         self.registry.release(&self.shared.name);
+        // A new login may be another account, or the same one unfrozen.
+        self.shared.frozen.store(false, Ordering::Relaxed);
         self.shared.set_state(AccountState::NeedsLogin);
         End::Wait
     }

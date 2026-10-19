@@ -604,3 +604,35 @@ async fn flood_wait_on_a_catch_up_is_waited_out() {
     assert_eq!(run.sink.updates(), 1);
     run.account.close().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_new_login_clears_frozen() {
+    let net = FakeNetwork::new();
+    let mut calls = 0;
+    net.answer(move |call| {
+        if call.ctor() == ids::GET_DIFFERENCE {
+            return Reply::Ok(crate::testkit::difference_empty(1, 1));
+        }
+        calls += 1;
+        match calls {
+            1 => Reply::Rpc(420, "FROZEN_METHOD_INVALID"),
+            2 => Reply::KeyRevoked,
+            _ => Reply::Ok(Vec::new()),
+        }
+    });
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    let rpc = run.account.rpc();
+    let _ = rpc.invoke(Route::Main, Bytes::from_static(&[0; 4])).await;
+    assert_eq!(run.account.state(), AccountState::Frozen);
+    let _ = rpc.invoke(Route::Main, Bytes::from_static(&[0; 4])).await;
+    until(&run.account, |s| *s == AccountState::NeedsLogin).await;
+    run.account.wake();
+    until(&run.account, |s| {
+        *s != AccountState::NeedsLogin && *s != AccountState::Connecting
+    })
+    .await;
+    assert_eq!(run.account.state(), AccountState::Running);
+    run.account.close().await;
+}
