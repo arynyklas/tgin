@@ -195,7 +195,9 @@ async fn reopen(dir: &TempDir) -> SessionStore {
 /// QR: `qr` with the URL, the same from `GET`, then `logged_in` once the
 /// scan's push arrives. The token is in the answers only, not the logs.
 /// A second login on the logged-in session is refused; logout clears it.
-#[tokio::test]
+/// The clock is paused on a current-thread runtime, so the token's 30 s
+/// renewal and every wait run on virtual time, and load cannot reorder them.
+#[tokio::test(start_paused = true)]
 async fn qr_flow_states() {
     let logs = Logs::default();
     let _guard = logs.capture();
