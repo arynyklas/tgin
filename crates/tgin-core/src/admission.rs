@@ -96,19 +96,7 @@ fn reserve_in(
             Step::Reserved(permit)
         }
         Err(Full::TooLarge) => {
-            slot.metrics.dropped(ConsumerDropReason::Oversized, 1);
-            let source_name = state
-                .source_names
-                .get(usize::from(source.0))
-                .map_or("?", |name| &**name);
-            tracing::warn!(
-                consumer = %slot.name,
-                source = %source_name,
-                update_id,
-                size,
-                capacity = target.capacity_bytes,
-                "update is larger than the consumer's capacity_bytes; dropped for it"
-            );
+            too_large(state, target, source, update_id, size);
             Step::Skipped
         }
         Err(_) if pass == OnFull::Backpressure => {
@@ -122,12 +110,32 @@ fn reserve_in(
     }
 }
 
+/// Counts and logs an update `target` can never take.
+fn too_large(state: &EngineState, target: &Target, source: SourceId, update_id: i64, size: usize) {
+    let slot = &target.slot;
+    slot.metrics.dropped(ConsumerDropReason::Oversized, 1);
+    let source_name = state
+        .source_names
+        .get(usize::from(source.0))
+        .map_or("?", |name| &**name);
+    tracing::warn!(
+        consumer = %slot.name,
+        source = %source_name,
+        update_id,
+        size,
+        capacity = target.capacity_bytes,
+        "update is larger than the consumer's capacity_bytes; dropped for it"
+    );
+}
+
 /// One routed update of a batch, with its payloads once built.
 struct Routed {
     index: usize,
     key: Option<u64>,
     targets: SmallVec<[ConsumerId; 8]>,
-    payload: Bytes,
+    /// For targets with `render: raw`, when one is routed to.
+    payload: Option<Bytes>,
+    /// For targets with `render: tl_json`, when one is routed to.
     rendered: Option<Bytes>,
 }
 
@@ -237,9 +245,12 @@ impl Engine {
     /// Admits every update of `updates` (from the source `source`) or none
     /// of them: [`Admit::Backpressure`] when a `backpressure` target lacks
     /// room for its share of the batch, and then nothing is queued
-    /// anywhere. Otherwise each routed update is queued in batch order for
-    /// each of its targets, as [`Sink::admit`] queues one; a `drop_oldest`
-    /// target may still go without some, as it would one by one.
+    /// anywhere. A share larger than such a target's `capacity` or
+    /// `capacity_bytes` is taken when the target is empty, so it never
+    /// waits for room that cannot come; the target then holds at most one
+    /// batch over its limits. Otherwise each routed update is queued in
+    /// batch order for each of its targets, as [`Sink::admit`] queues one;
+    /// a `drop_oldest` target may still go without some.
     /// [`Admit::Unroutable`] when no rule matches any update.
     ///
     /// Payloads are built only for routed updates, and
@@ -284,7 +295,7 @@ impl Engine {
                 index,
                 key: facts.ordering_key(),
                 targets,
-                payload: Bytes::new(),
+                payload: None,
                 rendered: None,
             });
         }
@@ -294,12 +305,20 @@ impl Engine {
         }
         for r in &mut routed {
             let update = &mut updates[r.index];
-            r.payload = update.payload();
-            let tl_json = r
+            let (mut raw, mut tl_json) = (false, false);
+            for t in r
                 .targets
                 .iter()
                 .filter_map(|id| state.targets.get(usize::from(id.0)))
-                .any(|t| t.tl_json);
+            {
+                if t.tl_json {
+                    tl_json = true;
+                } else {
+                    raw = true;
+                }
+            }
+            let _ = raw;
+            r.payload = Some(update.payload());
             if tl_json {
                 r.rendered = Some(update.rendered());
             }
@@ -307,27 +326,53 @@ impl Engine {
 
         let now = Instant::now();
         let mut permits: Vec<(usize, &Target, Permit)> = Vec::with_capacity(routed.len());
-        for pass in [OnFull::Backpressure, OnFull::DropOldest] {
-            for (i, r) in routed.iter().enumerate() {
-                let update_id = updates[r.index].update_id();
-                let targets = r
-                    .targets
-                    .iter()
-                    .filter_map(|id| state.targets.get(usize::from(id.0)))
-                    .filter(|t| t.on_full == pass);
-                for target in targets {
-                    let size = r.payload_for(target).len();
-                    match reserve_in(state, target, pass, size, now, source, update_id) {
-                        Step::Reserved(permit) => permits.push((i, target, permit)),
-                        Step::Skipped => {}
-                        Step::Full => {
-                            cancel_all(permits);
-                            return Some(Admit::Backpressure);
-                        }
-                        Step::Closed => {
-                            cancel_all(permits);
-                            return None;
-                        }
+        // Each `backpressure` target's share of the batch at once.
+        let mut done: SmallVec<[ConsumerId; 8]> = SmallVec::new();
+        for r in &routed {
+            for &id in &r.targets {
+                let Some(target) = state.targets.get(usize::from(id.0)) else {
+                    continue;
+                };
+                if target.on_full != OnFull::Backpressure || done.contains(&id) {
+                    continue;
+                }
+                done.push(id);
+                match reserve_share(state, target, id, &routed, updates, now, source) {
+                    Ok(share) => permits.extend(share.into_iter().map(|(i, p)| (i, target, p))),
+                    Err(step) => {
+                        cancel_all(permits);
+                        return match step {
+                            Step::Closed => None,
+                            _ => Some(Admit::Backpressure),
+                        };
+                    }
+                }
+            }
+        }
+        // Then the `drop_oldest` targets.
+        for (i, r) in routed.iter().enumerate() {
+            let update_id = updates[r.index].update_id();
+            let targets = r
+                .targets
+                .iter()
+                .filter_map(|id| state.targets.get(usize::from(id.0)))
+                .filter(|t| t.on_full == OnFull::DropOldest);
+            for target in targets {
+                let size = r.payload_for(target).len();
+                match reserve_in(
+                    state,
+                    target,
+                    OnFull::DropOldest,
+                    size,
+                    now,
+                    source,
+                    update_id,
+                ) {
+                    Step::Reserved(permit) => permits.push((i, target, permit)),
+                    Step::Skipped | Step::Full => {}
+                    Step::Closed => {
+                        cancel_all(permits);
+                        return None;
                     }
                 }
             }
@@ -353,14 +398,63 @@ impl Engine {
     }
 }
 
-impl Routed {
-    fn payload_for(&self, target: &Target) -> &Bytes {
-        match &self.rendered {
-            Some(rendered) if target.tl_json => rendered,
-            _ => &self.payload,
+/// Room in the `backpressure` target `target` (consumer `id`) for every
+/// routed update of the batch it takes, all at once: `Err(Step::Full)` when
+/// it has no room for all of them, `Err(Step::Closed)` when it was retired.
+/// An update larger than its `capacity_bytes` is left out, as one by one.
+fn reserve_share<U: BatchUpdate>(
+    state: &EngineState,
+    target: &Target,
+    id: ConsumerId,
+    routed: &[Routed],
+    updates: &[U],
+    now: Instant,
+    source: SourceId,
+) -> Result<Vec<(usize, Permit)>, Step> {
+    let slot = &target.slot;
+    if slot.is_closed() {
+        return Err(Step::Closed);
+    }
+    let mut share: Vec<(usize, usize)> = Vec::new();
+    for (i, r) in routed.iter().enumerate() {
+        if !r.targets.contains(&id) {
+            continue;
+        }
+        let size = r.payload_for(target).len();
+        if size > target.capacity_bytes {
+            too_large(state, target, source, updates[r.index].update_id(), size);
+        } else {
+            share.push((i, size));
+        }
+    }
+    let sizes: Vec<usize> = share.iter().map(|&(_, size)| size).collect();
+    match slot.consumer.queue().try_reserve_all(&sizes) {
+        Ok(permits) => {
+            slot.relieved(now);
+            slot.reserved_cleanly();
+            Ok(share.into_iter().map(|(i, _)| i).zip(permits).collect())
+        }
+        Err(_) => {
+            slot.pressured(now);
+            Err(Step::Full)
         }
     }
 }
+
+impl Routed {
+    /// The form `target` takes; the other one only if that one was not
+    /// built, which admission never lets happen.
+    fn payload_for(&self, target: &Target) -> &Bytes {
+        let (first, second) = if target.tl_json {
+            (&self.rendered, &self.payload)
+        } else {
+            (&self.payload, &self.rendered)
+        };
+        first.as_ref().or(second.as_ref()).unwrap_or(&EMPTY)
+    }
+}
+
+static EMPTY: Bytes = Bytes::from_static(b"");
 
 /// Queues `envelope` in the room `permit` reserved in `target`.
 fn commit_in(target: &Target, permit: Permit, envelope: Envelope) {

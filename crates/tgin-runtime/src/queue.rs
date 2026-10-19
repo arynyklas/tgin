@@ -407,6 +407,56 @@ impl<T: Clone> LeaseQueue<T> {
         })
     }
 
+    /// Reserves room for every item of `sizes` at once, or for none: a
+    /// whole batch. It fits when the queue has room for all of it, never
+    /// evicting, whatever `on_full`; a batch larger than the queue's
+    /// `capacity` or `capacity_bytes` also fits while the queue is empty
+    /// (nothing available, leased or reserved), so the queue holds at most
+    /// one batch over its limits. An item larger than `capacity_bytes` is
+    /// [`Full::TooLarge`]: the caller leaves such items out.
+    pub fn try_reserve_all(&self, sizes: &[usize]) -> Result<Vec<Permit>, Full> {
+        let inner = self.inner.lock();
+        if sizes.iter().any(|&size| size > inner.cfg.capacity_bytes) {
+            return Err(Full::TooLarge);
+        }
+        let (reserved_items, reserved_bytes) = self.reservations.load();
+        let total: usize = sizes.iter().fold(0, |sum, &s| sum.saturating_add(s));
+        let empty = inner.entries.is_empty() && reserved_items == 0;
+        if !empty {
+            if inner
+                .entries
+                .len()
+                .saturating_add(reserved_items)
+                .saturating_add(sizes.len())
+                > inner.cfg.capacity
+            {
+                return Err(Full::Items);
+            }
+            if inner
+                .bytes
+                .saturating_add(reserved_bytes)
+                .saturating_add(total)
+                > inner.cfg.capacity_bytes
+            {
+                return Err(Full::Bytes);
+            }
+        }
+        self.reservations
+            .items
+            .fetch_add(sizes.len(), atomic::Ordering::Relaxed);
+        self.reservations
+            .bytes
+            .fetch_add(total, atomic::Ordering::Relaxed);
+        Ok(sizes
+            .iter()
+            .map(|&size| Permit {
+                evicted: 0,
+                size,
+                reservations: Arc::clone(&self.reservations),
+            })
+            .collect())
+    }
+
     /// Releases the room `permit` reserved, as dropping it does, in the queue
     /// that granted it.
     pub fn cancel(&self, permit: Permit) {
@@ -746,6 +796,46 @@ mod tests {
 
     fn is_ready<F: Future>(fut: Pin<&mut F>) -> bool {
         fut.poll(&mut Context::from_waker(Waker::noop())).is_ready()
+    }
+
+    #[test]
+    fn reserve_all_is_all_or_nothing_and_overshoots_only_when_empty() {
+        let q = queue(config(3, 100));
+        // Fits: all granted.
+        let two = q.try_reserve_all(&[1, 1]).expect("room for two");
+        assert_eq!(q.stats().reserved, 2);
+        // Two more do not fit next to them: none granted.
+        assert_eq!(q.try_reserve_all(&[1, 1]).unwrap_err(), Full::Items);
+        assert_eq!(q.stats().reserved, 2);
+        drop(two);
+        // Larger than the queue, into the empty queue: granted.
+        let five = q
+            .try_reserve_all(&[1; 5])
+            .expect("an empty queue takes one batch");
+        assert_eq!(q.stats().reserved, 5);
+        assert_eq!(
+            q.try_reserve(1).unwrap_err(),
+            Full::Items,
+            "full until it drains"
+        );
+        for (i, permit) in five.into_iter().enumerate() {
+            q.commit(permit, "x", None, i64::try_from(i).expect("small"))
+                .expect("permit from this queue");
+        }
+        assert_eq!(q.stats().available, 5);
+        // Not empty: an oversized batch waits, by items or by bytes.
+        assert_eq!(q.try_reserve_all(&[1; 4]).unwrap_err(), Full::Items);
+        let q = queue(config(10, 10));
+        push(&q, "a", None, 1, 1);
+        assert_eq!(q.try_reserve_all(&[6, 6]).unwrap_err(), Full::Bytes);
+        let q = queue(config(10, 10));
+        assert_eq!(q.try_reserve_all(&[6, 6]).map(|p| p.len()), Ok(2));
+        assert_eq!(q.try_reserve_all(&[11]).unwrap_err(), Full::TooLarge);
+        // A leased item makes the queue not empty either.
+        let q = queue(config(1, 10));
+        push(&q, "a", None, 1, 1);
+        assert_eq!(q.lease(&holder("h"), 1, Instant::now()).len(), 1);
+        assert_eq!(q.try_reserve_all(&[1, 1]).unwrap_err(), Full::Items);
     }
 
     #[test]

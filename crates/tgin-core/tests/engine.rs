@@ -1932,3 +1932,33 @@ consumers:
         "{err}"
     );
 }
+
+/// A batch larger than a `backpressure` consumer's `capacity` is taken
+/// whole once the consumer is empty, so it never waits for room that
+/// cannot come; while the consumer holds anything, it waits.
+#[tokio::test(start_paused = true)]
+async fn oversized_batch_admitted_into_an_empty_queue() {
+    let h = Harness::new(ACCOUNT);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let mut five: Vec<Counted> = (1..=5)
+        .map(|i| Counted::new("updateNewMessage", i))
+        .collect();
+    assert_eq!(h.engine.admit_batch(acct, &mut five), Admit::Admitted);
+    assert_eq!(h.stats("raw").available, 5, "capacity 3, one batch over");
+    let mut more: Vec<Counted> = (6..=9)
+        .map(|i| Counted::new("updateNewMessage", i))
+        .collect();
+    assert_eq!(h.engine.admit_batch(acct, &mut more), Admit::Backpressure);
+    let mut one = [Counted::new("updateNewMessage", 10)];
+    assert_eq!(
+        h.engine.admit_batch(acct, &mut one),
+        Admit::Backpressure,
+        "full"
+    );
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [1, 2, 3, 4, 5]);
+    // Leased is not empty.
+    assert_eq!(h.engine.admit_batch(acct, &mut more), Admit::Backpressure);
+    assert_eq!(poll(&h.pull("raw"), "x", 6).await, Vec::<i64>::new());
+    assert_eq!(h.engine.admit_batch(acct, &mut more), Admit::Admitted);
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [6, 7, 8, 9]);
+}
