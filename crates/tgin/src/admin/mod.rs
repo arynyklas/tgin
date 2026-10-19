@@ -13,6 +13,7 @@
 //! | `POST /v1/consumers/{name}/resume` | token | 204: unpaused, and an admin drain ended |
 //! | `POST /v1/consumers/{name}/purge` | token | 200 `{"purged":N}` |
 //! | `POST /v1/bots/{name}/logout`, `/close` | token | 200 [`Moved`] |
+//! | `GET /v1/accounts` | token | [`AccountsStatus`] |
 //! | `POST /v1/accounts/{name}/login` `{"method":"qr"\|"code"}` | token | 200 [`LoginStatus`] |
 //! | `GET /v1/accounts/{name}/login` | token | 200 [`LoginStatus`] |
 //! | `POST /v1/accounts/{name}/login/code` `{"code"}`, `/login/password` `{"password"}` | token | 200 [`LoginStatus`] |
@@ -189,6 +190,46 @@ pub enum LoginStatus {
     /// A state this client does not know.
     #[serde(other)]
     Unknown,
+}
+
+/// `GET /v1/accounts`: the Telegram accounts of the running config.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountsStatus {
+    pub accounts: Vec<AccountStatus>,
+}
+
+/// One account. Never a secret: no phone, `api_hash`, key, token or path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatus {
+    pub name: String,
+    /// `logged_out`, `connecting`, `running`, `flood_wait`, `frozen`,
+    /// `needs_login` or `failed`.
+    pub state: String,
+    /// `flood_wait`: when the account connects again (unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+    /// `failed`: why (`duplicate_account`, `init_refused`, `session_held`,
+    /// `storage`, `connect`, `panicked`), and whether it tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrying: Option<bool>,
+    /// `logged_out`: a login of this process holds the session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login_in_progress: bool,
+    /// The one layer the account serves.
+    pub layer: i32,
+    /// Once the session was read.
+    pub home_dc: Option<i32>,
+    pub catching_up: CatchingUp,
+}
+
+/// The boxes an account is catching up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchingUp {
+    /// The common box (with `qts`).
+    pub common: bool,
+    pub channels: usize,
 }
 
 /// `GET /v1/status`.

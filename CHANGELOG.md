@@ -45,6 +45,20 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `…/login/password`, `GET …/login` and `POST …/logout`, refused with
   `409` while the account runs. With a `phone` in the config, a login by
   another account is logged out again (`wrong_account`).
+- Logged-in accounts run: each holds its session on its home DC, catches
+  up with `getDifference` (channels only when they show a gap), hands its
+  updates to consumers and serves `POST /mtproto/v1/{account}/invoke`. A
+  panic restarts the account after 1 s, doubling to 60 s; an account that
+  loses its authorization goes `needs_login`, and one logged in as the same
+  user as another goes `failed` (`duplicate_account`). An account starts
+  once a login of it ends, without a restart. `GET /v1/accounts` gives
+  each account's state, layer, home DC and the boxes catching up;
+  `tgin_mtproto_account_state`, `tgin_mtproto_updates_total`,
+  `tgin_mtproto_updates_dropped_total`, `tgin_mtproto_rpc_total` and
+  `tgin_mtproto_rpc_seconds` count them (no series without accounts). A
+  reload restarts an account whose `api_id`, `api_hash` or `session_dir`
+  changed and applies its `rpc` settings in place; the shutdown waits for
+  RPC calls in flight.
 - Self-hosted Bot API servers: `upstreams` names Bot API servers (`kind:
   cloud` or `local`, `url`, `local_mode`, `files`, `response_timeout`), and
   a bot picks one with `upstream`; `api_url` stays the shorthand for an

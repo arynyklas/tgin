@@ -15,6 +15,7 @@ use tgin_core::config::model::HumanDuration;
 use tgin_core::config::{self, Ingress};
 use tgin_core::engine::{BreakerStatus, Mode};
 use tgin_core::metrics::{SourceMetrics, SourceStateLabel};
+use tgin_mtproto::account::AccountState;
 use tgin_runtime::config::ConfigError;
 use tgin_runtime::http::bearer_matches;
 use tgin_runtime::lifecycle::Phase;
@@ -24,7 +25,8 @@ use tgin_runtime::supervisor::TaskState;
 
 use super::accounts::{self, Accounts, AccountsState, Target};
 use super::{
-    BotMove, ConsumerStatus, EndpointStatus, MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
+    AccountStatus, AccountsStatus, BotMove, CatchingUp, ConsumerStatus, EndpointStatus,
+    MAX_MOVE_TIMEOUT, SourceStatus, Status, TaskStatus,
 };
 use crate::app::Shared;
 use crate::cli::VERSION;
@@ -36,6 +38,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
     let protected = Router::new()
         .route("/v1/status", get(status))
         .route("/v1/config", get(running_config))
+        .route("/v1/accounts", get(accounts_status))
         .route("/v1/reload", post(reload))
         .route("/v1/consumers/{name}/pause", post(pause))
         .route("/v1/consumers/{name}/resume", post(resume))
@@ -68,6 +71,53 @@ impl AccountsState for Arc<Shared> {
     fn target(&self, name: &str) -> Option<Target> {
         accounts::target_of(&self.config.load(), name)
     }
+}
+
+/// `GET /v1/accounts`: name, state, layer, home DC and the boxes catching
+/// up of each account. No secret, no path.
+async fn accounts_status(State(shared): State<Arc<Shared>>) -> axum::Json<AccountsStatus> {
+    let accounts = shared
+        .account_sources
+        .statuses()
+        .into_iter()
+        .map(|status| {
+            let (until, reason, retrying, login) = match &status.state {
+                AccountState::FloodWait { until } => (
+                    Some(
+                        until
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs()),
+                    ),
+                    None,
+                    None,
+                    false,
+                ),
+                AccountState::Failed(failure) => (
+                    None,
+                    Some(failure.as_str().to_owned()),
+                    Some(failure.retried()),
+                    false,
+                ),
+                AccountState::LoggedOut { login } => (None, None, None, *login),
+                _ => (None, None, None, false),
+            };
+            AccountStatus {
+                name: status.name.to_string(),
+                state: status.state.name().to_owned(),
+                until,
+                reason,
+                retrying,
+                login_in_progress: login,
+                layer: status.layer,
+                home_dc: status.home_dc,
+                catching_up: CatchingUp {
+                    common: status.catching_up.common,
+                    channels: status.catching_up.channels,
+                },
+            }
+        })
+        .collect();
+    axum::Json(AccountsStatus { accounts })
 }
 
 /// Whether `headers` carry the admin token of the running config (so a

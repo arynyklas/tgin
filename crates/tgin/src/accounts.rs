@@ -206,6 +206,10 @@ impl AccountSources {
         }
     }
 
+    pub(crate) fn statuses(&self) -> Vec<AccountStatus> {
+        self.board.statuses()
+    }
+
     /// Stops every account's ingest; their RPC goes on until
     /// [`close`](Self::close).
     pub(crate) fn stop_ingest(&self) {
