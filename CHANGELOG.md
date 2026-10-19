@@ -42,15 +42,21 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   itself) and asks for the 2FA password without echo; `tgin admin logout
   <account> --yes` calls `auth.logOut` and clears the session. Through
   `POST /v1/accounts/{name}/login` (`qr` or `code`), `…/login/code`,
-  `…/login/password`, `GET …/login` and `POST …/logout`, refused with
-  `409` while the account runs. With a `phone` in the config, a login by
-  another account is logged out again (`wrong_account`).
+  `…/login/password`, `GET …/login` and `POST …/logout`. A login is
+  refused with `409` while the account runs; a logout parks a running
+  account first (its ingest stops with everything admitted committed, its
+  RPC calls get up to 10 s, and it releases its session), then it shows
+  `logged_out`, or runs again on its key when Telegram did not confirm the
+  logout. With a `phone` in the config, a login by another account is
+  logged out again (`wrong_account`).
 - Logged-in accounts run: each holds its session on its home DC, catches
   up with `getDifference` (channels only when they show a gap), hands its
   updates to consumers and serves `POST /mtproto/v1/{account}/invoke`. A
   panic restarts the account after 1 s, doubling to 60 s; an account that
-  loses its authorization goes `needs_login`, and one logged in as the same
-  user as another goes `failed` (`duplicate_account`). An account starts
+  loses its authorization goes `needs_login`, and of two accounts logged in
+  as the same user one runs and the other goes `failed`
+  (`duplicate_account`) until the first gives the user up. Telegram's
+  flood waits on catch-up calls are waited out (`flood_wait`). An account starts
   once a login of it ends, without a restart. `GET /v1/accounts` gives
   each account's state, layer, home DC and the boxes catching up;
   `tgin_mtproto_account_state`, `tgin_mtproto_updates_total`,
