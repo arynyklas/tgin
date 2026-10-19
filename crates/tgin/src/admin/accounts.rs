@@ -256,6 +256,27 @@ impl Login {
     }
 }
 
+/// A start's [`Entry::Starting`] reservation. Dropping it removes the
+/// entry if it is still this start's reservation; once the login is
+/// installed the entry is `Running`, so there is nothing to remove.
+struct Reservation<'a> {
+    accounts: &'a Accounts,
+    name: &'a str,
+    id: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut logins = self.accounts.logins.lock();
+        if matches!(
+            logins.get(self.name),
+            Some(Entry::Starting { id, .. }) if *id == self.id
+        ) {
+            logins.remove(self.name);
+        }
+    }
+}
+
 /// What the routes need of their state.
 pub(crate) trait AccountsState: Clone + Send + Sync + 'static {
     fn accounts(&self) -> &Accounts;
@@ -445,6 +466,13 @@ async fn start<S: AccountsState>(
     let handle = match running {
         Some(handle) => handle,
         None => {
+            // Removes the reservation on every way out (a refusal, a
+            // client that goes away, a panic) unless the login is installed.
+            let reservation = Reservation {
+                accounts,
+                name: &name,
+                id,
+            };
             let started = accounts.handle.start_login(&target, method).await;
             // No await while the map is locked.
             let installed = {
@@ -467,14 +495,10 @@ async fn start<S: AccountsState>(
                         Ok(h)
                     }
                     Ok(h) => Err(Err(h)),
-                    Err(refusal) => {
-                        if ours {
-                            logins.remove(&name);
-                        }
-                        Err(Ok(refusal))
-                    }
+                    Err(refusal) => Err(Ok(refusal)),
                 }
             };
+            drop(reservation);
             match installed {
                 Ok(h) => h,
                 // Cancelled meanwhile (DELETE, or a reload changed the
@@ -579,7 +603,11 @@ async fn submit<S: AccountsState>(
 }
 
 /// `DELETE …/login`: ends the account's login (`tgin admin login` sends it
-/// on Ctrl+C) and waits until it has released the session.
+/// on Ctrl+C). A running login is closed and has released the session when
+/// the answer comes. A login still starting is cancelled at once, but its
+/// start may hold the session a little longer, up to
+/// `login::LEFTOVER_DEADLINE` (20 s) while it asks Telegram about a
+/// leftover key; it then ends without being installed.
 async fn cancel<S: AccountsState>(
     _: TokenConfigured,
     State(state): State<S>,

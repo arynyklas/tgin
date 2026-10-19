@@ -938,3 +938,55 @@ async fn a_start_cancelled_while_probing_is_not_installed() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     reopen(&s.dir).await;
 }
+
+/// A start whose request goes away partway through (a client that
+/// disconnects, a killed CLI) leaves no reservation behind: the next start
+/// is not refused as `login starting`.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_start_releases_its_reservation() {
+    let s = setup(Some(PHONE), vec![(ids::GET_USERS, Reply::Hang)]);
+    {
+        let store = SessionStore::open(&s.dir.path().join("main")).expect("open");
+        store
+            .set_home_key(2, &tgin_mtproto::AuthKey([1; 256]))
+            .expect("key");
+    }
+    let app = s.app.clone();
+    let starting = tokio::spawn(async move {
+        call(
+            &app,
+            "POST",
+            "/v1/accounts/main/login",
+            r#"{"method":"qr"}"#,
+        )
+        .await
+    });
+    while s.fake.dial.calls().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let (_, text) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(parse(&text), LoginStatus::Connecting);
+    // The request goes away while its start waits on Telegram.
+    starting.abort();
+    assert!(starting.await.expect_err("aborted").is_cancelled());
+
+    let (status, text) = call(&s.app, "GET", "/v1/accounts/main/login", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    // The leftover key is now asked again: gone, so a fresh login.
+    s.fake.dial.extend(vec![
+        (ids::GET_USERS, Reply::Rpc(401, "AUTH_KEY_UNREGISTERED")),
+        (
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"u", later())),
+        ),
+    ]);
+    let (status, text) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert_ne!(text, r#"{"error":"login starting"}"#);
+    assert_eq!(status, StatusCode::OK, "{text}");
+}
