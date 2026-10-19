@@ -1353,3 +1353,37 @@ async fn pings_continue_while_reads_are_paused() {
     srv.answer(packet.requests()[0].msg_id, &ANSWER);
     assert_eq!(outcome(call).await.unwrap(), answered());
 }
+
+/// While the full pushes channel pauses reads, the init call's answer may
+/// sit unread: its deadline is extended, not fired.
+#[tokio::test(start_paused = true)]
+async fn init_deadline_waits_while_reads_are_paused() {
+    // A paused connection never sees a close, so the first one ends on a
+    // failed write once the pushes channel is full.
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Gated, Writes::Deliver], 2).await;
+    srv.handshake().await;
+    let mut pushes = h.pushes.take().unwrap();
+    srv.write_attempt().await; // the ack for the init answer, held
+    srv.send(&[(true, update(1)), (true, update(2)), (true, update(3))]);
+    timeout(WAIT, async {
+        while srv.frames_taken() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pushes are read");
+    srv.refuse_write();
+
+    let call = h.invoke(get_config());
+    let mut fresh = h.next_conn().await;
+    let init_msg = fresh.init_packet().await;
+    fresh.answer(init_msg.msg_id, &ANSWER);
+    // Three init timeouts with the answer unread.
+    tokio::time::sleep(Duration::from_secs(100)).await;
+    assert_eq!(fresh.frames_taken(), 0, "reads stay paused");
+
+    while let Ok(Some(_)) = timeout(WAIT, pushes.recv()).await {}
+    let packet = fresh.request().await;
+    fresh.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}

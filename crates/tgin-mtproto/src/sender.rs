@@ -1214,7 +1214,14 @@ impl Conn {
         if let Init::Pending { deadline } = self.init
             && now >= deadline
         {
-            return Err(Cause::InitTimeout);
+            // As with the pong: the answer may sit behind frames the full
+            // pushes channel keeps unread.
+            if st.backlog.is_empty() {
+                return Err(Cause::InitTimeout);
+            }
+            self.init = Init::Pending {
+                deadline: now + st.tuning.init_timeout,
+            };
         }
         if let Some(deadline) = self.pong_deadline
             && now >= deadline
