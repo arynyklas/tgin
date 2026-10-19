@@ -677,6 +677,63 @@ async fn unknown_peer_short_update_gets_entities() {
     assert_eq!(m.next_action(), None);
 }
 
+/// A fresh account's first state is refused: nothing was ever committed,
+/// so the box resyncs with getState, never a difference from pts 0
+/// (PERSISTENT_TIMESTAMP_EMPTY). Also when the refusal lands while a call
+/// is in flight.
+#[tokio::test(start_paused = true)]
+async fn rollback_on_fresh_account_resyncs_with_get_state() {
+    let fresh = || UpdateManager::new(stored(0, &[], &[5]));
+    let mut m = fresh();
+    assert_eq!(m.next_action(), Some(Fetch::GetState));
+    let u = new_message(&message(1, PeerId::User(5), "a"), 21, 1);
+    assert!(m.feed_push(b(updates(&[u], NONE, NONE, 2, 0))).is_empty());
+    let batches = m.feed_state(b(state(20, 6, 2, 4)));
+    assert_eq!(all_updates(&batches).len(), 1);
+    assert_eq!(m.refused(batches[0].id), None);
+    assert_eq!(m.next_action(), Some(Fetch::GetState));
+
+    // Refused while a difference is in flight: its answer is stale.
+    let mut m = fresh();
+    assert_eq!(m.next_action(), Some(Fetch::GetState));
+    let batches = m.feed_state(b(state(20, 6, 2, 4)));
+    m.feed_push(too_long());
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 20, .. })
+    ));
+    m.refused(batches[0].id);
+    assert!(m.feed_difference(b(difference_empty(2, 4))).is_empty());
+    assert_eq!(m.next_action(), Some(Fetch::GetState));
+}
+
+/// A refusal while a getState resync is pending (after an undecodable
+/// difference) catches up from the committed state instead: getState would
+/// take the server state whole, past the refused updates.
+#[tokio::test(start_paused = true)]
+async fn rollback_while_get_state_pending_fetches_difference() {
+    let mut m = started(stored(10, &[], &[5]));
+    let u11 = new_message(&message(1, PeerId::User(5), "a"), 11, 1);
+    let batches = m.feed_push(b(updates(&[u11], NONE, NONE, 2, 0)));
+    m.feed_push(too_long());
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 11, .. })
+    ));
+    let mut bad = difference(&EMPTY_DIFF, &state(12, 5, 2, 3), false);
+    bad[0] ^= 0xff; // an unknown constructor
+    assert!(m.feed_difference(b(bad)).is_empty());
+    m.refused(batches[0].id);
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetDifference {
+            pts: 10,
+            qts: 5,
+            date: 1
+        })
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn unsequenced_drop_counted_when_full() {
     let mut m = started(stored(10, &[], &[5]));

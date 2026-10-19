@@ -754,7 +754,7 @@ impl UpdateManager {
             return Vec::new();
         };
         if epoch != self.epoch {
-            self.fetch = CommonFetch::WantDifference;
+            self.fetch = self.resync();
             return Vec::new();
         }
         let s = match decode::state(&bytes) {
@@ -796,7 +796,7 @@ impl UpdateManager {
         };
         if epoch != self.epoch {
             // Asked before a refused batch rolled the state back.
-            self.fetch = CommonFetch::WantDifference;
+            self.fetch = self.resync();
             return Vec::new();
         }
         self.idle_at = Instant::now() + IDLE_DIFFERENCE;
@@ -1034,10 +1034,15 @@ impl UpdateManager {
             self.date = self.committed.date;
             self.seq_seen.clear();
             self.gap_deadline = None;
-            // A fetch in flight is now stale; its answer is dropped and
-            // asked again from the rolled-back state.
-            if matches!(self.fetch, CommonFetch::Idle) {
-                self.fetch = CommonFetch::WantDifference;
+            // A fetch in flight is now stale: its answer is dropped and
+            // asked again (`resync`). A pending one starts from the
+            // rolled-back state: a pending getState would take the server
+            // state whole, past the refused updates.
+            if matches!(
+                self.fetch,
+                CommonFetch::Idle | CommonFetch::WantState | CommonFetch::WantDifference
+            ) {
+                self.fetch = self.resync();
             }
         }
         for &(c, e) in &p.channel_epochs {
@@ -1354,6 +1359,17 @@ impl UpdateManager {
                 // Not yet asked: the signal joins it.
                 ChannelFetch::Wanted => {}
             },
+        }
+    }
+
+    /// The catch-up after a rollback: a difference from the committed
+    /// state, or `updates.getState` when none was ever committed (a
+    /// difference from pts 0 is refused: PERSISTENT_TIMESTAMP_EMPTY).
+    fn resync(&self) -> CommonFetch {
+        if self.committed.pts == 0 {
+            CommonFetch::WantState
+        } else {
+            CommonFetch::WantDifference
         }
     }
 
