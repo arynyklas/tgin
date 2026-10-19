@@ -1151,3 +1151,28 @@ async fn flood_wait_keeps_its_seconds() {
     assert_eq!(e, LoginError::FloodWait { seconds: 86400 });
     assert!(e.to_string().contains("86400"), "{e}");
 }
+
+/// `Step`'s `Debug` leaves out the QR token and the phone_code_hash.
+#[test]
+fn step_debug_hides_token_and_hash() {
+    for step in [
+        Step::Token {
+            token: b"SECRETTOKEN".to_vec(),
+            expires: 5,
+        },
+        Step::Migrate {
+            dc: 4,
+            token: b"SECRETTOKEN".to_vec(),
+        },
+        Step::CodeSent {
+            kind: CodeKind::Sms,
+            timeout: Some(60),
+            hash: "SECRETHASH".into(),
+        },
+    ] {
+        let shown = format!("{step:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // Bytes would show as numbers.
+        assert!(!shown.contains("83, 69, 67"), "{shown}");
+    }
+}

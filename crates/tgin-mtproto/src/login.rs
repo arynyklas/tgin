@@ -469,8 +469,8 @@ impl Me {
     }
 }
 
-/// One step's result.
-#[derive(Debug)]
+/// One step's result. `Debug` leaves out the QR token and the
+/// phone_code_hash.
 enum Step {
     Token {
         token: Vec<u8>,
@@ -491,6 +491,31 @@ enum Step {
     /// A final state that is not a login (email, payment).
     Stop(LoginState),
     Authorized(Me),
+}
+
+impl fmt::Debug for Step {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token { expires, .. } => f
+                .debug_struct("Token")
+                .field("expires", expires)
+                .finish_non_exhaustive(),
+            Self::Migrate { dc, .. } => f
+                .debug_struct("Migrate")
+                .field("dc", dc)
+                .finish_non_exhaustive(),
+            Self::NeedPassword { hint } => {
+                f.debug_struct("NeedPassword").field("hint", hint).finish()
+            }
+            Self::CodeSent { kind, timeout, .. } => f
+                .debug_struct("CodeSent")
+                .field("kind", kind)
+                .field("timeout", timeout)
+                .finish_non_exhaustive(),
+            Self::Stop(state) => f.debug_tuple("Stop").field(state).finish(),
+            Self::Authorized(me) => f.debug_tuple("Authorized").field(me).finish(),
+        }
+    }
 }
 
 fn authorized(auth: tl::enums::auth::Authorization) -> Result<Step, LoginError> {
