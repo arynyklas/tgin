@@ -3618,8 +3618,20 @@ accounts:
         .unwrap_or_else(|| panic!("{text}"));
     assert_message(exact_warning, "account.updateProfile");
     assert_message(exact_warning, "auth.logOut");
-    // Two warnings: `account.*` in `wide` is reported with `auth.*`.
-    assert_message(wide_warning, "`account.*`");
+    // `account.*` grants the read-only getters, so it is not reported as
+    // useless, and the hint never says to remove a glob.
+    assert!(
+        !wide_warning.message.contains("account.*"),
+        "{wide_warning}"
+    );
+    assert!(
+        !wide_warning
+            .hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("remove"),
+        "{wide_warning}"
+    );
 }
 
 #[test]
@@ -3727,6 +3739,10 @@ fn account_changing_list() {
         "contacts.deleteContacts",
         "contacts.importContacts",
         "contacts.addContact",
+        "contacts.deleteByPhones",
+        "contacts.acceptContact",
+        "contacts.updateContactNote",
+        "photos.uploadContactProfilePhoto",
         "account.getTmpPassword",
         "account.getPassword",
         "account.getPasswordSettings",
@@ -3751,13 +3767,22 @@ fn account_changing_list() {
         assert!(!config::account_changing(method), "{method}");
     }
     let cfg = loads(
-        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"account.*\", \"contacts.*\"] } } } }\n",
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"account.*\", \"contacts.*\", \"photos.*\"] } } } }\n",
     );
     let acl = &cfg.accounts[0].rpc.clients[0].acl;
     assert!(acl.allows("account.getPrivacy"));
     assert!(acl.allows("contacts.getContacts"));
     assert!(!acl.allows("contacts.addContact"));
+    for method in [
+        "contacts.deleteByPhones",
+        "contacts.acceptContact",
+        "contacts.updateContactNote",
+    ] {
+        assert!(!acl.allows(method), "{method}");
+    }
     assert!(!acl.allows("account.getTmpPassword"));
+    assert!(!acl.allows("photos.uploadContactProfilePhoto"));
+    assert!(acl.allows("photos.getUserPhotos"));
 }
 
 /// An exactly listed account-changing method that `deny` blocks is not
@@ -3847,7 +3872,9 @@ fn api_id_interpolates() {
             .unwrap_or_else(|| panic!("{bad} loaded"));
         assert_eq!(errors.len(), 1, "{}", render(&errors));
         assert_at(&errors[0], "accounts.main.api_id", pos(yaml, "\"${env"));
-        assert_message(&errors[0], "positive");
+        assert_message(&errors[0], "must be between 1 and 2147483647");
+        // The expanded value is never quoted.
+        assert!(!errors[0].to_string().contains(bad), "{}", errors[0]);
     }
     let errors = config::load(yaml, Path::new("tgin.yaml"), &env(&[])).unwrap_err();
     assert_message(&errors[0], "TG_API_ID");
@@ -3917,5 +3944,18 @@ fn session_dir_case_follows_the_platform() {
         assert_message(&err, "already uses this session directory");
     } else {
         loads(&yaml);
+    }
+}
+
+/// A literal `api_id` out of range names the range.
+#[test]
+fn api_id_out_of_range() {
+    for bad in ["0", "-3", "99999999999"] {
+        let yaml = format!(
+            "version: 1\naccounts:\n  main: {{ api_id: {bad}, api_hash: h, session_dir: s }}\n"
+        );
+        let err = single_error(&yaml);
+        assert_at(&err, "accounts.main.api_id", pos(&yaml, bad));
+        assert_message(&err, "must be between 1 and 2147483647");
     }
 }

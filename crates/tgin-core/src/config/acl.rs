@@ -23,17 +23,21 @@
 ///
 /// A glob never allows these, `*` included: an operator lists each one
 /// exactly in a client's `allow`, and the loader warns about it.
-pub const ACCOUNT_CHANGING: [&str; 11] = [
+pub const ACCOUNT_CHANGING: [&str; 15] = [
     "auth.*",
     "account.*",
+    "contacts.acceptContact",
     "contacts.addContact",
+    "contacts.deleteByPhones",
     "contacts.deleteContacts",
     "contacts.importContacts",
+    "contacts.updateContactNote",
     "contacts.resetSaved",
     "contacts.toggleTopPeers",
     "photos.uploadProfilePhoto",
     "photos.updateProfilePhoto",
     "photos.deletePhotos",
+    "photos.uploadContactProfilePhoto",
     "help.acceptTermsOfService",
 ];
 

@@ -220,8 +220,9 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             }
         }
     }
-    // Globs that name a protected namespace, which allow none of its
-    // protected methods.
+    // Globs over a protected namespace that grant nothing at all: none of
+    // its methods but the read-only getters may be granted by a glob, and
+    // this namespace has none (`auth.*`; `account.*` grants the getters).
     let mut useless: Vec<(usize, &At<String>)> = Vec::new();
     // Protected methods listed exactly that no `deny` glob blocks, which
     // the client may call.
@@ -233,8 +234,13 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
         .collect();
     for (k, glob) in client.allow.iter().enumerate() {
         match MethodGlob::parse(&glob.value) {
-            Some(MethodGlob::Namespace(_))
-                if acl::ACCOUNT_CHANGING.contains(&glob.value.as_str()) =>
+            Some(MethodGlob::Namespace(namespace))
+                if acl::ACCOUNT_CHANGING.contains(&glob.value.as_str())
+                    && !acl::ACCOUNT_READ_ONLY.iter().any(|getter| {
+                        getter
+                            .strip_prefix(namespace.as_str())
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    }) =>
             {
                 useless.push((k, glob));
             }
@@ -262,11 +268,11 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
     if let Some((k, first)) = useless.first() {
         diag.warnings.push(
             ConfigError::warning(format!(
-                "{} in client `{name}`'s `allow` grant none of its auth and account-changing methods: only an exact name allows one",
+                "{} in client `{name}`'s `allow` grant nothing: auth and account-changing methods are allowed only by exact name",
                 list(&useless, true)
             ))
             .at(located(format!("{path}.allow[{k}]"), first.location))
-            .hint("list each method the client needs, such as `auth.logOut`, or remove the glob"),
+            .hint("list each method the client needs by exact name, such as `auth.logOut`"),
         );
     }
     if let Some((k, first)) = exact.first() {

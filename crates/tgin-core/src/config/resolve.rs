@@ -1302,9 +1302,12 @@ impl Resolver<'_> {
             Some(n) if n >= 1 => Some(n),
             _ => {
                 self.diag.errors.push(
-                    ConfigError::new(format!("`api_id` must be a positive number{shown}"))
-                        .at(located(path, api_id.location))
-                        .hint("use the api_id my.telegram.org shows for your app"),
+                    ConfigError::new(format!(
+                        "`api_id` must be between 1 and {}{shown}",
+                        i32::MAX
+                    ))
+                    .at(located(path, api_id.location))
+                    .hint("use the api_id my.telegram.org shows for your app"),
                 );
                 None
             }
