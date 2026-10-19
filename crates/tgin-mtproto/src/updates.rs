@@ -1070,11 +1070,14 @@ impl UpdateManager {
                 Some(p) if p > self.pts => {
                     // The box jumps to `p`: no difference from there brings
                     // back the held pushes it covers, so they go as they
-                    // are (as `feed_state` does).
-                    let (mut covered, rest): (Vec<Held>, Vec<Held>) =
+                    // are (as `feed_state` does). Those already applied go.
+                    let local = self.pts;
+                    let (covered, rest): (Vec<Held>, Vec<Held>) =
                         std::mem::take(&mut self.held_pts)
                             .into_iter()
                             .partition(|h| h.pts <= p);
+                    let mut covered: Vec<Held> =
+                        covered.into_iter().filter(|h| h.pts > local).collect();
                     self.held_pts = rest;
                     covered.sort_by_key(|h| h.group.origin);
                     for h in covered {
@@ -1174,9 +1177,13 @@ impl UpdateManager {
             // back: the held pushes it covers go as they are (as for
             // `differenceTooLong`); its `messages` are only the latest.
             if let Some(ch) = self.channels.get_mut(&channel) {
-                let (mut covered, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut ch.held)
+                let local = old.unwrap_or(0);
+                let (covered, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut ch.held)
                     .into_iter()
                     .partition(|h| h.pts <= pts);
+                // Those already applied go.
+                let mut covered: Vec<Held> =
+                    covered.into_iter().filter(|h| h.pts > local).collect();
                 ch.held = rest;
                 covered.sort_by_key(|h| h.group.origin);
                 for h in covered {

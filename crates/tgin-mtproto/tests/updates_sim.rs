@@ -609,6 +609,87 @@ async fn channel_difference_too_long_delivers_covered_held_updates() {
     );
 }
 
+/// A too-long answer delivers only the held pushes the box has not applied
+/// yet: a push a slice already covered is not delivered twice.
+#[tokio::test(start_paused = true)]
+async fn too_long_skips_held_updates_already_applied() {
+    // Common box: 12 held for a gap, 11 then fed during the catch-up.
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let msg = |i: u32| message(i, PeerId::User(5), &format!("m{i}"));
+    let u12 = new_message(&msg(12), 12, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&u12), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    advance(GAP_HOLD).await;
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+    let u11 = new_message(&msg(11), 11, 1);
+    let batches = m.feed_push(b(updates(&[u11], NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    let first = [msg(11)];
+    let batches = m.feed_difference(b(difference(
+        &Diff {
+            msgs: &first,
+            ..EMPTY_DIFF
+        },
+        &state(11, 5, 2, 3),
+        true,
+    )));
+    commit(&mut m, &batches);
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 11, .. })
+    ));
+    let batches = m.feed_difference(b(T::new(DIFFERENCE_TOO_LONG).int(14).done()));
+    assert_eq!(
+        all_updates(&batches),
+        vec![b(u12)],
+        "11 was applied by the slice"
+    );
+    commit(&mut m, &batches);
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 14, .. })
+    ));
+    let batches = m.feed_difference(b(difference_empty(2, 3)));
+    commit(&mut m, &batches);
+
+    // Channel: 7 held for a gap, 6 fed during the catch-up.
+    let post = |id: u32| message(id, PeerId::Channel(1), &format!("p{id}"));
+    let p7 = new_channel_message(&post(7), 7, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&p7), NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    advance(GAP_HOLD).await;
+    let f = m.next_action();
+    assert_eq!(f, Some(Fetch::GetChannelDifference { channel: 1, pts: 5 }));
+    let p6 = new_channel_message(&post(6), 6, 1);
+    let batches = m.feed_push(b(updates(&[p6], NONE, NONE, 2, 0)));
+    nothing(&mut m, &batches);
+    let batches = m.feed_channel_difference(
+        1,
+        b(channel_difference(
+            false,
+            6,
+            &Diff {
+                msgs: &[post(6)],
+                ..EMPTY_DIFF
+            },
+        )),
+    );
+    commit(&mut m, &batches);
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 6 })
+    );
+    let batches = m.feed_channel_difference(1, b(channel_difference_too_long(1, 9, &[post(9)])));
+    assert_eq!(
+        all_updates(&batches),
+        vec![b(p7), b(new_channel_message(&post(9), 9, 0))],
+        "6 was applied by the first part"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn live_push_not_blocked_by_1000_channel_catchup() {
     let behind: Vec<(i64, i32)> = (1..=1000).map(|c| (c, 1)).collect();
@@ -1381,7 +1462,7 @@ async fn difference_message_composed_bytes_equal_typed() {
     assert!(matches!(m.next_action(), Some(Fetch::GetDifference { .. })));
     let msgs = [
         message(1, PeerId::User(5), "plain"),
-        message(2, PeerId::Chat(6), "ünïcødé ✓ 日本語 🎉"),
+        message(2, PeerId::Chat(6), "Ã¼nÃ¯cÃ¸dÃ© âœ“ æ—¥æœ¬èªž ðŸŽ‰"),
     ];
     let enc = [encrypted(3)];
     let batches = m.feed_difference(b(difference(
@@ -1416,7 +1497,7 @@ async fn difference_message_composed_bytes_equal_typed() {
     assert_eq!(got.iter().map(|g| g.to_vec()).collect::<Vec<_>>(), want);
     commit(&mut m, &batches);
 
-    let post = message(4, PeerId::Channel(9), "κανάλι");
+    let post = message(4, PeerId::Channel(9), "ÎºÎ±Î½Î¬Î»Î¹");
     let batches = m.feed_push(b(short(&channel_too_long(9, None))));
     nothing(&mut m, &batches);
     assert!(matches!(
@@ -1450,7 +1531,7 @@ const MAIN_EVENTS: usize = 24;
 const SEED: u64 = 0x7467_696e_5f6d_3335;
 const USERS: [i64; 5] = [100, 101, 102, 103, 104];
 const KNOWN_USERS: [i64; 2] = [100, 101];
-/// Channels 1–3, 5 and 6 start known; channel 4 is unknown until its
+/// Channels 1â€“3, 5 and 6 start known; channel 4 is unknown until its
 /// first update.
 const CHANNELS: [i64; 6] = [1, 2, 3, 4, 5, 6];
 const UNKNOWN_CHANNEL: i64 = 4;
@@ -1516,7 +1597,7 @@ struct Script {
     phases: [usize; 3],
     users: HashMap<i64, Vec<u8>>,
     chats: HashMap<i64, Vec<u8>>,
-    /// Message bytes (and short message pushes) → event index.
+    /// Message bytes (and short message pushes) â†’ event index.
     by_bytes: HashMap<Vec<u8>, usize>,
     /// What the manager starts from: a fresh account (common pts 0, no
     /// channel known) or a stored state.
