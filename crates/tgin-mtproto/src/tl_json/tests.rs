@@ -420,6 +420,70 @@ fn from_json_refuses_what_is_not_tl_json() {
     assert!(matches!(tl("{"), Err(TlError::JsonSyntax { line: 1, .. })));
 }
 
+/// An object may hold at most `MAX_KEYS` keys, above the largest
+/// constructor's field count, so the duplicate-key check stays bounded: a
+/// 200 000-key object (a 2 MB request body) is refused quickly instead of
+/// costing n²/2 key comparisons.
+#[test]
+fn object_keys_are_bounded() {
+    let widest = API
+        .ctors
+        .iter()
+        .map(|c| {
+            c.params
+                .iter()
+                .filter(|p| matches!(p.kind, Kind::Field { .. }))
+                .count()
+        })
+        .max()
+        .unwrap_or_default();
+    assert!(widest < MAX_KEYS, "{widest} fields plus \"_\" must fit");
+
+    let mut text = String::from(r#"{"_":"inputPeerEmpty""#);
+    for i in 0..200_000 {
+        let _ = write!(text, r#","a{i}":0"#);
+    }
+    text.push('}');
+    let started = std::time::Instant::now();
+    let res = tl(&text);
+    assert_eq!(
+        res,
+        Err(TlError::Json {
+            ctor: "",
+            field: "",
+            what: "an object has more than 128 keys"
+        })
+    );
+    // Inside an escape object too.
+    let head = r#"{"_":"inputPeerEmpty""#.len();
+    let lat = format!(
+        r#"{{"@double":"7ff0000000000000"{}}}"#,
+        &text[head..text.len() - 1]
+    );
+    let res = tl(&format!(r#"{{"_":"inputGeoPoint","lat":{lat},"long":0}}"#));
+    assert!(matches!(
+        res,
+        Err(TlError::Json {
+            what: "an object has more than 128 keys",
+            ..
+        })
+    ));
+    // Generous: the linear scan takes milliseconds even in debug; the
+    // quadratic one took minutes.
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+
+    // A duplicate is still refused.
+    assert_eq!(
+        tl(r#"{"_":"inputPeerEmpty","_":"inputPeerEmpty"}"#),
+        Err(TlError::Json {
+            ctor: "",
+            field: "",
+            what: "an object has a duplicate key"
+        })
+    );
+}
+
 /// A hostile request nests `invokeWithLayer` deeper than any real object:
 /// both directions refuse it instead of exhausting the stack.
 #[test]

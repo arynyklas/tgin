@@ -37,6 +37,11 @@ use crate::schema::{
 /// Largest integer a JS double holds exactly (2^53 − 1).
 const MAX_SAFE: i64 = (1 << 53) - 1;
 
+/// The most keys a TL-JSON object may have: above the widest constructor
+/// of the layer (`channelFull`, 70 fields) plus `"_"`, and small enough
+/// that the duplicate-key check, quadratic in the keys, stays cheap.
+const MAX_KEYS: usize = 128;
+
 /// One boxed object of the api schema (a type or a function) → TL-JSON,
 /// appended to `out`. On error `out` is left as it was.
 pub fn to_json(bytes: &[u8], out: &mut String) -> Result<(), TlError> {
@@ -234,7 +239,7 @@ impl Schema {
         depth: u32,
     ) -> Result<(), TlError> {
         let depth = deeper(depth)?;
-        for (k, _) in &fields.0 {
+        for (k, _) in &fields.items {
             let known = k == "_"
                 || ctor
                     .params
@@ -436,13 +441,17 @@ fn is_set(v: Option<&RawValue>, ty: &Ty, at: At) -> Result<bool, TlError> {
     Ok(true)
 }
 
-/// An object's members in order, keys borrowed when unescaped; duplicate
-/// keys are refused.
-struct Fields<'a>(Vec<(Cow<'a, str>, &'a RawValue)>);
+/// An object's members in order, keys borrowed when unescaped. More than
+/// [`MAX_KEYS`] keys, or a duplicate key, refuse the object: the rest of
+/// it is then skipped unread, so the cost stays linear in its length.
+struct Fields<'a> {
+    items: Vec<(Cow<'a, str>, &'a RawValue)>,
+    refused: Option<&'static str>,
+}
 
 impl<'a> Fields<'a> {
     fn get(&self, key: &str) -> Option<&'a RawValue> {
-        self.0.iter().find(|(k, _)| k == key).map(|&(_, v)| v)
+        self.items.iter().find(|(k, _)| k == key).map(|&(_, v)| v)
     }
 }
 
@@ -455,14 +464,21 @@ impl<'de> Deserialize<'de> for Fields<'de> {
                 f.write_str("an object")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Fields<'de>, A::Error> {
-                let mut v: Vec<(Cow<'de, str>, &'de RawValue)> = Vec::new();
-                while let Some(Str(k)) = m.next_key::<Str<'de>>()? {
-                    if v.iter().any(|(e, _)| *e == k) {
-                        return Err(de::Error::custom("duplicate key"));
+                let mut items: Vec<(Cow<'de, str>, &'de RawValue)> = Vec::new();
+                let mut refused = None;
+                while refused.is_none() {
+                    let Some(Str(k)) = m.next_key::<Str<'de>>()? else {
+                        return Ok(Fields { items, refused });
+                    };
+                    if items.len() == MAX_KEYS {
+                        refused = Some("an object has more than 128 keys");
+                    } else if items.iter().any(|(e, _)| *e == k) {
+                        refused = Some("an object has a duplicate key");
                     }
-                    v.push((k, m.next_value()?));
+                    items.push((k, m.next_value()?));
                 }
-                Ok(Fields(v))
+                while m.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+                Ok(Fields { items, refused })
             }
         }
         d.deserialize_map(V)
@@ -495,7 +511,11 @@ impl<'de> Deserialize<'de> for Str<'de> {
 }
 
 fn object<'a>(v: &'a RawValue, at: At) -> Result<Fields<'a>, TlError> {
-    parse(v.get()).map_err(|_| json_err(at, "an object is expected"))
+    let fields: Fields<'a> = parse(v.get()).map_err(|_| json_err(at, "an object is expected"))?;
+    match fields.refused {
+        Some(what) => Err(json_err(at, what)),
+        None => Ok(fields),
+    }
 }
 
 fn string<'a>(v: &'a RawValue, at: At) -> Result<Cow<'a, str>, TlError> {
@@ -527,7 +547,7 @@ fn escaped<'a>(v: &'a RawValue, key: &str, at: At) -> Result<Option<Cow<'a, str>
         return Ok(None);
     }
     let f = object(v, at)?;
-    match f.0.as_slice() {
+    match f.items.as_slice() {
         [(k, s)] if k == key => string(s, at).map(Some),
         _ => Ok(None),
     }
