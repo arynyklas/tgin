@@ -1135,3 +1135,47 @@ async fn a_login_waits_for_a_logout() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
 }
+
+/// A reload that changes only the account's phone during a logout keeps
+/// the logout's reservation: the account stays parked until
+/// `auth.logOut` is done, and the logout ends logged out.
+#[tokio::test]
+async fn a_logout_survives_a_phone_only_reload() {
+    let s = setup(None, vec![(ids::LOG_OUT, Reply::Ok(logged_out()))]);
+    home_key(&s);
+    s.fake.running.store(true, Ordering::SeqCst);
+    s.fake.hold.store(true, Ordering::SeqCst);
+    let logout = {
+        let app = s.app.clone();
+        tokio::spawn(async move { call(&app, "POST", "/v1/accounts/main/logout", "").await })
+    };
+    timeout(WAIT, async {
+        while s.fake.parked.lock().expect("parked").is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the account is parked");
+    let mut changed = s.state.target("main").expect("main");
+    changed.params.phone = Some(PHONE.to_owned());
+    s.state
+        .accounts
+        .reconcile(|name| (name == "main").then(|| changed.clone()))
+        .await;
+    assert!(
+        s.state.accounts.login_in_progress("main"),
+        "the account stays parked"
+    );
+    assert!(s.fake.changed.lock().expect("changed").is_empty());
+    s.fake.release.notify_one();
+    let (status, body) = timeout(WAIT, logout)
+        .await
+        .expect("ends")
+        .expect("no panic");
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, r#"{"logged_out":true}"#)
+    );
+    let store = reopen(&s.dir).await;
+    assert_eq!(store.home_dc().expect("home"), None, "logged out");
+}

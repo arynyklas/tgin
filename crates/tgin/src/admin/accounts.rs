@@ -240,14 +240,20 @@ impl Accounts {
 
     /// After a reload: closes every login whose account is gone, or whose
     /// `session_dir` or `phone` changed (`target` gives the new config's).
-    /// Closing waits until the login has released its session.
+    /// A logout's reservation stays unless the account is gone or its
+    /// `session_dir` changed: the logout still holds that session, and the
+    /// account must not take it back before `auth.logOut`. Closing waits
+    /// until the login has released its session.
     pub(crate) async fn reconcile(&self, target: impl Fn(&str) -> Option<Target>) {
         let stale: Vec<(String, Entry)> = {
             let mut logins = self.logins.lock();
             let names: Vec<String> = logins
                 .iter()
                 .filter(|(name, entry)| {
-                    !target(name).is_some_and(|new| entry.target().same_login(&new))
+                    !target(name).is_some_and(|new| match entry {
+                        Entry::LoggingOut { target, .. } => target.session_dir == new.session_dir,
+                        _ => entry.target().same_login(&new),
+                    })
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
