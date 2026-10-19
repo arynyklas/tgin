@@ -977,6 +977,29 @@ fn token_directory_forms_are_secrets() {
     }
 }
 
+/// An account's `api_hash`, `phone` and RPC client tokens are secrets the
+/// logs mask; `api_id` is not one.
+#[test]
+fn account_secrets_are_secrets() {
+    let yaml = "version: 1\naccounts:\n  main:\n    api_id: 4242\n    api_hash: \"${env:API_HASH}\"\n    session_dir: s\n    phone: \"+15550001234\"\n    rpc: { clients: { c: { token: c1ient-t0ken }, d: { token: \"${env:D_TOKEN}\" } } }\n";
+    let mut env = MapEnv::default();
+    env.vars
+        .insert("API_HASH".into(), "0123456789abcdef".into());
+    env.vars.insert("D_TOKEN".into(), "d-t0ken-value".into());
+    let cfg = tgin_core::config::load(yaml, Path::new("tgin.yaml"), &env)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let secrets = secrets(&cfg);
+    for secret in [
+        "0123456789abcdef",
+        "+15550001234",
+        "c1ient-t0ken",
+        "d-t0ken-value",
+    ] {
+        assert!(secrets.iter().any(|s| s == secret), "{secret}: {secrets:?}");
+    }
+    assert!(!secrets.iter().any(|s| s == "4242"), "{secrets:?}");
+}
+
 /// The answer to a local file reference tgin refuses.
 const LOCAL_REFUSED: &str = "Bad Request: local file uploads are disabled by tgin";
 /// A local file reference; the logs never show its path.

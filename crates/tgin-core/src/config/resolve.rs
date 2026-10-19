@@ -63,6 +63,20 @@ pub struct Config {
     pub(super) raw: RawConfig,
     /// Masks the config's secrets in [`redacted_json`](super::redacted_json).
     pub(super) masker: Masker,
+    /// Every secret the config expanded, in load order.
+    secrets: Vec<String>,
+}
+
+impl Config {
+    /// Every secret value the config holds, as expanded: bot tokens,
+    /// webhook and push `secret_token`s, the admin token, pull
+    /// `auth_token`s, and each account's `api_hash`, `phone` and RPC client
+    /// tokens. Each was collected as it was loaded, so a new kind of secret
+    /// joins the list on its own. Forms derived from them (a token's
+    /// directory names, an automatic webhook secret) are not included.
+    pub fn secrets(&self) -> &[String] {
+        &self.secrets
+    }
 }
 
 impl fmt::Debug for Config {
@@ -496,7 +510,8 @@ pub(super) fn resolve(
         r.compile_all(&raw, &bots);
         r.compile_accounts(&raw, &accounts);
     }
-    let masker = Masker::new(r.secrets);
+    let secrets = r.secrets;
+    let masker = Masker::new(secrets.iter().cloned());
     let mut config = Config {
         runtime: Runtime {
             worker_threads: match raw.runtime.worker_threads {
@@ -524,6 +539,7 @@ pub(super) fn resolve(
         warnings: Vec::new(),
         raw,
         masker,
+        secrets,
     };
     mask(&mut config);
     config
