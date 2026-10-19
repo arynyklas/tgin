@@ -155,6 +155,40 @@ impl Built {
         }
     }
 
+    /// A function's result type: `Ty::Any` for a generic `X` (the
+    /// `invoke*` wrappers) or a type with no constructor in this schema.
+    fn result_ty(&self, ty: &Type) -> String {
+        if self.resolvable(ty) {
+            self.ty(ty)
+        } else {
+            "Ty::Any".into()
+        }
+    }
+
+    fn resolvable(&self, ty: &Type) -> bool {
+        if ty.generic_ref {
+            return false;
+        }
+        match ty.generic_arg.as_deref() {
+            Some(arg) => ty.namespace.is_empty() && ty.name == "Vector" && self.resolvable(arg),
+            None => {
+                (ty.namespace.is_empty()
+                    && matches!(
+                        ty.name.as_str(),
+                        "int"
+                            | "long"
+                            | "double"
+                            | "string"
+                            | "bytes"
+                            | "int128"
+                            | "int256"
+                            | "Bool"
+                    ))
+                    || (!ty.bare && self.types.contains_key(&full_name(&ty.namespace, &ty.name)))
+            }
+        }
+    }
+
     fn emit(&self, layer: i32) -> String {
         let mut s = String::new();
         let type_names: Vec<&String> = self.types.keys().collect();
@@ -168,6 +202,11 @@ impl Built {
                 format!("Some({})", self.type_index(&ty_name))
             } else {
                 "None".into()
+            };
+            let result = if d.category == Category::Types {
+                "None".to_owned()
+            } else {
+                format!("Some({})", self.result_ty(&d.ty))
             };
             let mut slots: Vec<&str> = Vec::new();
             let mut params = String::new();
@@ -233,7 +272,7 @@ impl Built {
             };
             writeln!(
                 s,
-                "        Ctor {{ id: 0x{:08x}, name: {name:?}, ty: {ty}, seq: Seq::{seq}, params: &[\n{params}        ] }},",
+                "        Ctor {{ id: 0x{:08x}, name: {name:?}, ty: {ty}, result: {result}, seq: Seq::{seq}, params: &[\n{params}        ] }},",
                 d.id
             )
             .ok();

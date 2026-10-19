@@ -6,7 +6,9 @@
 //! serialized in; it must be the account's) and the call:
 //! `application/octet-stream` TL, or with `Content-Type: application/json`
 //! TL-JSON that the codec encodes. `Accept: application/json` renders the
-//! answer as TL-JSON.
+//! answer as TL-JSON, by the called function's result type (a `Vector<T>`
+//! is an array). An answer that cannot be rendered is sent raw, with
+//! `X-Tgin-Render: raw`: the call has run, so it is never an error.
 //!
 //! tgin refuses with 403, whatever a client's allowlist says, the update
 //! methods (`updates.getState`, `getDifference`, `getChannelDifference`)
@@ -69,6 +71,9 @@ pub const MAX_JSON_BODY: usize = 2 << 20;
 
 /// The header naming the request's layer.
 pub const LAYER_HEADER: &str = "x-tgin-layer";
+/// Set to `raw` on an answer the client asked as TL-JSON that could not be
+/// rendered: the body is then Telegram's raw bytes.
+pub const RENDER_HEADER: &str = "x-tgin-render";
 
 /// Every account the endpoint serves, by name.
 #[derive(Default)]
@@ -283,7 +288,7 @@ async fn invoke(
         account.flood_sleep_threshold,
     )
     .await;
-    let response = answer_response(answer, wants_json(&headers, header::ACCEPT));
+    let response = answer_response(answer, wants_json(&headers, header::ACCEPT), method);
     tracing::debug!(account = %account.name, method, status = response.status().as_u16(), "mtproto rpc");
     response
 }
@@ -328,42 +333,64 @@ fn refusal(refused: &Refused, layer: i32) -> Response {
     }
 }
 
-/// Telegram's bytes, raw or as TL-JSON in `schema`.
-fn telegram_bytes(status: StatusCode, bytes: Bytes, json: bool, mtproto: bool) -> Response {
-    if !json {
-        return (
-            status,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response();
-    }
-    let schema = if mtproto { &MTPROTO } else { &API };
-    let mut out = String::new();
-    match schema.to_json(&bytes, &mut out) {
-        Ok(()) => (status, [(header::CONTENT_TYPE, "application/json")], out).into_response(),
-        Err(e) => tgin_error(StatusCode::BAD_GATEWAY, "render_failed", &e.to_string()),
-    }
+/// What Telegram's bytes are: the result of a call to a function, or an
+/// `rpc_error`.
+#[derive(Clone, Copy)]
+enum Payload {
+    Result(&'static str),
+    RpcError,
 }
 
-fn answer_response(answer: Answer, json: bool) -> Response {
+/// Telegram's bytes, raw or, when the client asked, as TL-JSON. The call
+/// has run, so a rendering failure never turns into an error: the answer
+/// is then the raw bytes, with `X-Tgin-Render: raw`.
+fn telegram_bytes(status: StatusCode, bytes: Bytes, json: bool, what: Payload) -> Response {
+    if json {
+        let mut out = String::new();
+        let rendered = match what {
+            Payload::Result(method) => API.result_to_json(method, &bytes, &mut out),
+            Payload::RpcError => MTPROTO.to_json(&bytes, &mut out),
+        };
+        if rendered.is_ok() {
+            return (status, [(header::CONTENT_TYPE, "application/json")], out).into_response();
+        }
+    }
+    let mut response = (
+        status,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response();
+    if json {
+        response
+            .headers_mut()
+            .insert(RENDER_HEADER, HeaderValue::from_static("raw"));
+    }
+    response
+}
+
+fn answer_response(answer: Answer, json: bool, method: &'static str) -> Response {
     match answer {
-        Answer::Result(bytes) => telegram_bytes(StatusCode::OK, bytes, json, false),
+        Answer::Result(bytes) => {
+            telegram_bytes(StatusCode::OK, bytes, json, Payload::Result(method))
+        }
         Answer::Error {
             code,
             message,
             class,
         } => {
             let bytes = Bytes::from(rpc_error_bytes(code, &message));
+            let status = match class {
+                ErrorClass::FloodWait(_) | ErrorClass::SlowMode(_) => StatusCode::TOO_MANY_REQUESTS,
+                ErrorClass::Frozen => StatusCode::FORBIDDEN,
+                ErrorClass::Migrate(_) | ErrorClass::Other => StatusCode::OK,
+            };
+            let response = telegram_bytes(status, bytes, json, Payload::RpcError);
             match class {
-                ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x) => with_retry_after(
-                    telegram_bytes(StatusCode::TOO_MANY_REQUESTS, bytes, json, true),
-                    u64::from(x),
-                ),
-                ErrorClass::Frozen => telegram_bytes(StatusCode::FORBIDDEN, bytes, json, true),
-                ErrorClass::Migrate(_) | ErrorClass::Other => {
-                    telegram_bytes(StatusCode::OK, bytes, json, true)
+                ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x) => {
+                    with_retry_after(response, u64::from(x))
                 }
+                _ => response,
             }
         }
         Answer::Failed(e) => failure(&e),

@@ -465,6 +465,27 @@ mod tests {
     }
 
     #[test]
+    fn every_function_has_a_result_type() {
+        use crate::schema::Ty;
+        for schema in [&API, &crate::schema::MTPROTO] {
+            for ctor in schema.ctors {
+                match (ctor.ty, &ctor.result) {
+                    (Some(_), None) => {}
+                    (None, Some(Ty::Any)) => {
+                        assert!(is_wrapper(ctor), "{} has no known result type", ctor.name)
+                    }
+                    (None, Some(_)) => {}
+                    _ => panic!("{} result {:?}", ctor.name, ctor.result),
+                }
+            }
+        }
+        let users = API
+            .ctor_by_name("users.getUsers")
+            .and_then(|c| c.result.as_ref());
+        assert!(matches!(users, Some(Ty::Vector(Ty::Boxed(_)))));
+    }
+
+    #[test]
     fn classify_names_each_class() {
         assert_eq!(classify(420, "FLOOD_WAIT_30"), ErrorClass::FloodWait(30));
         assert_eq!(

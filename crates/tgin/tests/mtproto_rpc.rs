@@ -444,6 +444,8 @@ async fn rpc_error_passed_raw() {
     );
 }
 
+const GET_NEAREST: &str = r#"{"_":"help.getNearestDc"}"#;
+
 #[tokio::test]
 async fn tl_json_request_and_answer() {
     let account = FakeAccount::new([ok(NEAREST)]);
@@ -451,7 +453,7 @@ async fn tl_json_request_and_answer() {
     let answer = send_with(
         &app,
         "230",
-        GET_CONFIG.as_bytes().to_vec(),
+        GET_NEAREST.as_bytes().to_vec(),
         &[
             ("content-type", "application/json"),
             ("accept", "application/json"),
@@ -460,7 +462,45 @@ async fn tl_json_request_and_answer() {
     .await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(answer.body, Bytes::from_static(NEAREST.as_bytes()));
-    assert_eq!(account.calls()[0].1, Bytes::from(tl(GET_CONFIG)));
+    assert_eq!(account.calls()[0].1, Bytes::from(tl(GET_NEAREST)));
+}
+
+#[tokio::test]
+async fn vector_result_renders_as_array() {
+    let mut users = Vec::new();
+    users.extend_from_slice(&0x1cb5_c415_u32.to_le_bytes());
+    users.extend_from_slice(&1_i32.to_le_bytes());
+    users.extend_from_slice(&tl(r#"{"_":"userEmpty","id":"5"}"#));
+    let account = FakeAccount::new([
+        Ok(RpcOutcome::Result(Bytes::from(users.clone()))),
+        Ok(RpcOutcome::Result(Bytes::from_static(&[1, 2, 3, 4]))),
+    ]);
+    let app = app(Arc::clone(&account));
+    let get_users = tl(r#"{"_":"users.getUsers","id":[{"_":"inputUserSelf"}]}"#);
+    let json = [("accept", "application/json")];
+    let answer = send_with(&app, "230", get_users.clone(), &json).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(
+        answer.body,
+        Bytes::from_static(br#"[{"_":"userEmpty","id":"5"}]"#)
+    );
+    assert!(answer.headers.get("x-tgin-render").is_none());
+    // Bytes that do not render: the call ran, so 200 with the raw bytes.
+    let raw = send_with(&app, "230", get_users, &json).await;
+    assert_eq!(raw.status, StatusCode::OK);
+    assert_eq!(raw.body, Bytes::from_static(&[1, 2, 3, 4]));
+    assert_eq!(
+        raw.headers
+            .get("x-tgin-render")
+            .and_then(|v| v.to_str().ok()),
+        Some("raw")
+    );
+    assert_eq!(
+        raw.headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
+    );
 }
 
 #[tokio::test]
