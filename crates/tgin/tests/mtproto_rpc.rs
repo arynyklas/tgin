@@ -231,6 +231,57 @@ async fn foreign_layer_409() {
 }
 
 #[tokio::test]
+async fn refusal_edges() {
+    let account = FakeAccount::new([]);
+    let app = app(Arc::clone(&account));
+    let mut trailing = tl(GET_CONFIG);
+    trailing.extend_from_slice(&[0; 4]);
+    let wrapped_without_updates = init_connection(
+        LAYER,
+        &format!(r#"{{"_":"invokeWithoutUpdates","query":{GET_CONFIG}}}"#),
+    );
+    let cases: [(Vec<u8>, StatusCode, &str); 5] = [
+        // An id no constructor has.
+        (
+            0xdead_beef_u32.to_le_bytes().to_vec(),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        // A type's constructor, not a function.
+        (tl(NEAREST), StatusCode::BAD_REQUEST, "bad_request"),
+        (trailing, StatusCode::BAD_REQUEST, "bad_request"),
+        // Another wrapper under the accepted ones.
+        (
+            tl(&wrapped_without_updates),
+            StatusCode::BAD_REQUEST,
+            "wrapper_refused",
+        ),
+        (
+            tl(&format!(
+                r#"{{"_":"invokeAfterMsg","msg_id":"1","query":{GET_CONFIG}}}"#
+            )),
+            StatusCode::BAD_REQUEST,
+            "wrapper_refused",
+        ),
+    ];
+    for (body, status, error) in cases {
+        let answer = send(&app, body).await;
+        assert_eq!((answer.status, answer.error()), (status, error.to_owned()));
+    }
+    assert!(account.calls().is_empty());
+}
+
+#[tokio::test]
+async fn account_changing_method_needs_an_exact_entry() {
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    let answer = send(&app, tl(r#"{"_":"account.updateUsername","username":"x"}"#)).await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN);
+    assert_eq!(answer.error(), "method_not_allowed");
+    assert!(account.calls().is_empty());
+}
+
+#[tokio::test]
 async fn get_difference_403() {
     let account = FakeAccount::new([]);
     let app = app(Arc::clone(&account));
