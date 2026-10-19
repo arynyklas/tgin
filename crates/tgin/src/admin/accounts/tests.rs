@@ -199,12 +199,14 @@ async fn reopen(dir: &TempDir) -> SessionStore {
 async fn qr_flow_states() {
     let logs = Logs::default();
     let _guard = logs.capture();
+    // One wall-clock read: a second `later()` may land a second on.
+    let expires = later();
     let s = setup(
         None,
         vec![
             (
                 ids::EXPORT_LOGIN_TOKEN,
-                Reply::Ok(login_token(b"secret-token", later())),
+                Reply::Ok(login_token(b"secret-token", expires)),
             ),
             (
                 ids::EXPORT_LOGIN_TOKEN,
@@ -224,7 +226,7 @@ async fn qr_flow_states() {
     let json: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(json["state"], "qr");
     assert_eq!(json["url"], "tg://login?token=c2VjcmV0LXRva2Vu");
-    assert_eq!(json["expires"], later());
+    assert_eq!(json["expires"], expires);
     let LoginStatus::Qr { url, .. } = parse(&body) else {
         panic!("qr: {body}");
     };
