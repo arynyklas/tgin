@@ -659,6 +659,7 @@ async fn account_routes_need_an_admin_token() {
             r#"{"password":"x"}"#,
         ),
         ("POST", "/v1/accounts/main/logout", ""),
+        ("DELETE", "/v1/accounts/main/login", ""),
         ("POST", "/v1/accounts/other/login", r#"{"method":"qr"}"#),
     ] {
         let (status, text) = call(&s.app, method, path, body).await;
