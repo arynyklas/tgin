@@ -892,6 +892,94 @@ async fn refused_media_key_is_dropped_and_authorized_again() {
     }
 }
 
+fn rpc_err(code: i32, message: &str) -> Result<RpcOutcome, SenderError> {
+    Ok(RpcOutcome::Error {
+        code,
+        message: message.to_owned(),
+    })
+}
+
+#[tokio::test]
+async fn media_export_refused_is_503_not_executed() {
+    let m = media_app(
+        [migrate(4), rpc_err(400, "DC_ID_INVALID")],
+        [],
+        2,
+        Arc::new(FakeKeys::default()),
+    );
+    let answer = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.error(), "media_session");
+    assert_eq!(answer.retry_after(), Some("1"));
+    assert!(m.media.methods().is_empty());
+}
+
+#[tokio::test]
+async fn media_import_refused_is_503_and_retry_repeats_only_export_import() {
+    let keys = Arc::new(FakeKeys::default());
+    let m = media_app(
+        [
+            migrate(4),
+            sender_ok(EXPORTED),
+            migrate(4),
+            sender_ok(EXPORTED),
+        ],
+        [
+            rpc_err(400, "AUTH_BYTES_INVALID"),
+            sender_ok(IMPORTED),
+            sender_ok(FILE),
+        ],
+        2,
+        Arc::clone(&keys),
+    );
+    let first = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first.error(), "media_session");
+    assert!(keys.0.lock().is_empty());
+    let second = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(second.status, StatusCode::OK);
+    // One key exchange for both attempts.
+    assert_eq!(*m.connects.lock(), vec![(4, false)]);
+    assert_eq!(
+        m.media.methods(),
+        vec![tl_json(IMPORT), tl_json(IMPORT), tl_json(GET_FILE)]
+    );
+    assert_eq!(*keys.0.lock(), vec![(4, AuthKey([7; 256]))]);
+}
+
+#[tokio::test]
+async fn media_no_answer_during_setup_is_not_executed() {
+    for (main, media) in [
+        (vec![migrate(4), Err(SenderError::NoAnswer)], vec![]),
+        (
+            vec![migrate(4), sender_ok(EXPORTED)],
+            vec![Err(SenderError::NoAnswer)],
+        ),
+    ] {
+        let m = media_app(main, media, 2, Arc::new(FakeKeys::default()));
+        let answer = send(&m.app, tl(GET_FILE)).await;
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.error(), "media_session");
+    }
+}
+
+#[tokio::test]
+async fn media_flood_wait_during_setup_is_429() {
+    for (main, media) in [
+        (vec![migrate(4), rpc_err(420, "FLOOD_WAIT_30")], vec![]),
+        (
+            vec![migrate(4), sender_ok(EXPORTED)],
+            vec![rpc_err(420, "FLOOD_WAIT_30")],
+        ),
+    ] {
+        let m = media_app(main, media, 2, Arc::new(FakeKeys::default()));
+        let answer = send(&m.app, tl(GET_FILE)).await;
+        assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(answer.error(), "media_flood_wait");
+        assert_eq!(answer.retry_after(), Some("30"));
+    }
+}
+
 #[tokio::test]
 async fn media_key_gone_is_a_media_failure_not_a_login() {
     let keys = Arc::new(FakeKeys::default());

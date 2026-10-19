@@ -43,11 +43,25 @@ pub enum Route {
 pub enum InvokeError {
     #[error(transparent)]
     Sender(#[from] SenderError),
-    /// The media session to `dc` could not be set up (export or import of
-    /// the authorization refused, or the session store failed). The
-    /// request was not sent.
-    #[error("media session to DC {dc}: {what}")]
-    Media { dc: i32, what: &'static str },
+    /// The media session to `dc` could not be set up or used. The request
+    /// was not executed.
+    #[error("media session to DC {dc}: {failure}")]
+    Media { dc: i32, failure: MediaFailure },
+}
+
+/// Why a media session could not take a request. Either way the request
+/// was not executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MediaFailure {
+    /// Telegram asked tgin to wait this many seconds (`FLOOD_WAIT_X` on
+    /// `auth.exportAuthorization`, `auth.importAuthorization` or the media
+    /// connection's init call).
+    #[error("{what}: wait {seconds} s")]
+    FloodWait { what: &'static str, seconds: u32 },
+    /// Anything else: connecting, the authorization or the session store
+    /// failed.
+    #[error("{what}")]
+    Failed { what: &'static str },
 }
 
 /// A running account, as the RPC endpoint sees it. Task 7's account

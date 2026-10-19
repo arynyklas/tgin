@@ -29,7 +29,9 @@
 //!   body is the `rpc_error` in every case.
 //! - tgin's own errors: JSON `{"error","description"}`. 502 `no_answer`:
 //!   the call was written and may have been executed; tgin never resends
-//!   it. 503 with `Retry-After`: not executed, safe to retry.
+//!   it. 503 with `Retry-After`: not executed, safe to retry; a media
+//!   session that could not be set up is one (`media_session`), or 429
+//!   `media_flood_wait` with `Retry-After` when Telegram asked to wait.
 //!
 //! **Order.** The account and the bearer token are checked from the
 //! headers before the body is read; the body must then arrive within
@@ -59,8 +61,8 @@ use tgin_core::config::{self, MethodAcl};
 use tgin_mtproto::SenderError;
 use tgin_mtproto::decode::BoxKind;
 use tgin_mtproto::rpc::{
-    AccountRpc, AffectedSink, Answer, ErrorClass, InvokeError, Refused, classify, rpc_error_bytes,
-    unwrap_request,
+    AccountRpc, AffectedSink, Answer, ErrorClass, InvokeError, MediaFailure, Refused, classify,
+    rpc_error_bytes, unwrap_request,
 };
 use tgin_mtproto::schema::{API, MTPROTO};
 use tgin_runtime::limit::{KeyedLimiter, Quota};
@@ -471,8 +473,24 @@ fn unavailable(error: &str, description: &str) -> Response {
 }
 
 fn failure(e: &InvokeError) -> Response {
-    let InvokeError::Sender(e) = e else {
-        return tgin_error(StatusCode::BAD_GATEWAY, "media_session", &e.to_string());
+    let e = match e {
+        InvokeError::Sender(e) => e,
+        InvokeError::Media {
+            failure: MediaFailure::FloodWait { seconds, .. },
+            ..
+        } => {
+            return with_retry_after(
+                tgin_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "media_flood_wait",
+                    &format!("{e}; the call was not executed"),
+                ),
+                u64::from(*seconds),
+            );
+        }
+        InvokeError::Media { .. } => {
+            return unavailable("media_session", &format!("{e}; the call was not executed"));
+        }
     };
     match e {
         SenderError::NoAnswer => tgin_error(

@@ -18,7 +18,7 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable as _, Serializable as _};
 use tokio::sync::Mutex;
 
-use crate::rpc::{AccountRpc, BoxFuture, InvokeError, Route};
+use crate::rpc::{AccountRpc, BoxFuture, ErrorClass, InvokeError, MediaFailure, Route, classify};
 use crate::{
     AuthKey, DcOption, InitParams, RpcOutcome, Sender, SenderError, SessionError, SessionStore,
 };
@@ -151,6 +151,42 @@ fn key_gone(outcome: &Result<RpcOutcome, SenderError>) -> bool {
     }
 }
 
+/// A failed media setup step.
+fn failed(dc: i32, what: &'static str) -> InvokeError {
+    InvokeError::Media {
+        dc,
+        failure: MediaFailure::Failed { what },
+    }
+}
+
+/// A setup call's `rpc_error`: a flood wait keeps its seconds.
+fn refused(dc: i32, what: &'static str, message: &str) -> InvokeError {
+    match classify(420, message) {
+        ErrorClass::FloodWait(seconds) => InvokeError::Media {
+            dc,
+            failure: MediaFailure::FloodWait { what, seconds },
+        },
+        _ => failed(dc, what),
+    }
+}
+
+/// A setup call's [`SenderError`]: the client's request was not sent
+/// whatever it is, so it is a media failure, never the request's outcome.
+fn setup_error(dc: i32, what: &'static str, e: &SenderError) -> InvokeError {
+    match e {
+        SenderError::InitRefused { code: 420, message } => refused(dc, what, message),
+        _ => failed(dc, what),
+    }
+}
+
+/// One DC's media session: made and authorized, or connected with a new
+/// key whose authorization has not succeeded yet. The latter is kept so a
+/// retry repeats only the export and import, never the key exchange.
+enum Slot<S> {
+    Ready(Arc<S>),
+    Unauthorized(Arc<S>, Box<AuthKey>),
+}
+
 /// An account's sessions: the main one on the home DC and one media
 /// session per DC, made on first use. The [`AccountRpc`] the endpoint
 /// calls.
@@ -160,7 +196,7 @@ pub struct AccountSessions<M, C: Connect, K> {
     layer: i32,
     connect: C,
     keys: K,
-    media: Mutex<HashMap<i32, Arc<C::Session>>>,
+    media: Mutex<HashMap<i32, Slot<C::Session>>>,
 }
 
 impl<M, C: Connect, K> AccountSessions<M, C, K> {
@@ -181,33 +217,45 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
     /// under the cache's lock, so two calls never authorize one DC twice.
     async fn media(&self, dc: i32) -> Result<Arc<C::Session>, InvokeError> {
         let mut cache = self.media.lock().await;
-        if let Some(session) = cache.get(&dc) {
-            return Ok(Arc::clone(session));
-        }
-        let failed = |what| InvokeError::Media { dc, what };
-        let stored = self
-            .keys
-            .load(dc)
-            .map_err(|_| failed("the session store failed"))?;
-        let (session, new_key) = self.connect.connect(dc, stored).await?;
-        if let Some(key) = new_key {
-            self.authorize(dc, &session).await?;
-            self.keys
-                .save(dc, &key)
-                .map_err(|_| failed("the session store failed"))?;
-        }
-        let session = Arc::new(session);
-        cache.insert(dc, Arc::clone(&session));
+        let (session, key) = match cache.get(&dc) {
+            Some(Slot::Ready(session)) => return Ok(Arc::clone(session)),
+            Some(Slot::Unauthorized(session, key)) => (Arc::clone(session), AuthKey::clone(key)),
+            None => {
+                let stored = self
+                    .keys
+                    .load(dc)
+                    .map_err(|_| failed(dc, "the session store failed"))?;
+                let (session, new_key) = self
+                    .connect
+                    .connect(dc, stored)
+                    .await
+                    .map_err(|e| setup_error(dc, "connecting", &e))?;
+                let session = Arc::new(session);
+                let Some(key) = new_key else {
+                    cache.insert(dc, Slot::Ready(Arc::clone(&session)));
+                    return Ok(session);
+                };
+                cache.insert(
+                    dc,
+                    Slot::Unauthorized(Arc::clone(&session), Box::new(key.clone())),
+                );
+                (session, key)
+            }
+        };
+        self.authorize(dc, session.as_ref()).await?;
+        self.keys
+            .save(dc, &key)
+            .map_err(|_| failed(dc, "the session store failed"))?;
+        cache.insert(dc, Slot::Ready(Arc::clone(&session)));
         Ok(session)
     }
 
     /// Drops the media session to `dc` and its stored key.
     async fn evict(&self, dc: i32) -> Result<(), InvokeError> {
         self.media.lock().await.remove(&dc);
-        self.keys.remove(dc).map_err(|_| InvokeError::Media {
-            dc,
-            what: "the session store failed",
-        })
+        self.keys
+            .remove(dc)
+            .map_err(|_| failed(dc, "the session store failed"))
     }
 
     /// A call on the media session to `dc`. A key Telegram no longer
@@ -225,10 +273,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         let media = self.media(dc).await?;
         let outcome = media.invoke(body).await;
         if key_gone(&outcome) {
-            return Err(InvokeError::Media {
-                dc,
-                what: "the DC does not accept the media session's key",
-            });
+            return Err(failed(dc, "the DC does not accept the media session's key"));
         }
         Ok(outcome?)
     }
@@ -236,22 +281,26 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
     /// `auth.exportAuthorization(dc)` on the main session, then
     /// `auth.importAuthorization` on `media`.
     async fn authorize(&self, dc: i32, media: &C::Session) -> Result<(), InvokeError> {
-        let failed = |what| InvokeError::Media { dc, what };
+        const EXPORT: &str = "auth.exportAuthorization";
+        const IMPORT: &str = "auth.importAuthorization";
         let export = tl::functions::auth::ExportAuthorization { dc_id: dc }.to_bytes();
-        let RpcOutcome::Result(bytes) = self.main.invoke(Bytes::from(export)).await? else {
-            return Err(failed("auth.exportAuthorization refused"));
+        let bytes = match self.main.invoke(Bytes::from(export)).await {
+            Ok(RpcOutcome::Result(bytes)) => bytes,
+            Ok(RpcOutcome::Error { message, .. }) => return Err(refused(dc, EXPORT, &message)),
+            Err(e) => return Err(setup_error(dc, EXPORT, &e)),
         };
         let tl::enums::auth::ExportedAuthorization::Authorization(exported) =
             tl::enums::auth::ExportedAuthorization::from_bytes(&bytes)
-                .map_err(|_| failed("auth.exportAuthorization answer unreadable"))?;
+                .map_err(|_| failed(dc, "auth.exportAuthorization answer unreadable"))?;
         let import = tl::functions::auth::ImportAuthorization {
             id: exported.id,
             bytes: exported.bytes,
         }
         .to_bytes();
-        match media.invoke(Bytes::from(import)).await? {
-            RpcOutcome::Result(_) => Ok(()),
-            RpcOutcome::Error { .. } => Err(failed("auth.importAuthorization refused")),
+        match media.invoke(Bytes::from(import)).await {
+            Ok(RpcOutcome::Result(_)) => Ok(()),
+            Ok(RpcOutcome::Error { message, .. }) => Err(refused(dc, IMPORT, &message)),
+            Err(e) => Err(setup_error(dc, IMPORT, &e)),
         }
     }
 }
