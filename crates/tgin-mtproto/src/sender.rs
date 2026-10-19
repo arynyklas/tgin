@@ -1132,12 +1132,12 @@ impl Conn {
         bad_msg_id: i64,
         code: i32,
     ) -> Result<(), Cause> {
-        // grammers `handle_bad_notification`.
-        match code {
-            16 | 17 => st.clock.correct(server_msg_id),
-            32 => self.seq += 64,
-            33 => self.seq -= 16,
-            _ => {}
+        // grammers `handle_bad_notification` for the clock. Codes 32 and 33
+        // (msg_seqno too low or too high) are not guessed at as grammers
+        // does: the named request fails, and the connection ends, so the
+        // next one is a fresh session with seqno from 0.
+        if matches!(code, 16 | 17) {
+            st.clock.correct(server_msg_id);
         }
         let retry = matches!(code, 16 | 17 | 48);
         let mut kept = VecDeque::with_capacity(self.sent_acks.len());
@@ -1170,6 +1170,9 @@ impl Conn {
                     let _ = reply.send(Err(SenderError::BadMessage { code }));
                 }
             }
+        }
+        if matches!(code, 32 | 33) {
+            return Err(Cause::Protocol("msg_seqno refused"));
         }
         Ok(())
     }

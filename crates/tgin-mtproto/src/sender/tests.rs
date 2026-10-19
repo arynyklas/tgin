@@ -723,6 +723,33 @@ async fn code_16_moves_msg_ids_up_to_server_time() {
     assert_eq!(outcome(call).await.unwrap(), answered());
 }
 
+/// Codes 32 and 33 (msg_seqno too low or too high): the named request
+/// fails, and the connection ends, so the next request goes out on a fresh
+/// session with seqno from 0.
+#[tokio::test(start_paused = true)]
+async fn seqno_codes_fail_the_request_and_end_the_connection() {
+    for code in [32, 33] {
+        let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+        let call = h.invoke(get_config());
+        let packet = srv.request().await;
+        let sent = packet.requests()[0].msg_id;
+        srv.bad_msg_at(secs(sent), packet.bad_msg_id(), code);
+        let result = outcome(call).await;
+        assert!(
+            matches!(result, Err(SenderError::BadMessage { code: c }) if c == code),
+            "{code}: {result:?}"
+        );
+        let closed = timeout(WAIT, srv.from_client.recv()).await;
+        assert!(matches!(closed, Ok(None)), "{code}: the connection ends");
+
+        let call = h.invoke(get_config());
+        let mut fresh = h.ready_conn().await;
+        let packet = fresh.request().await;
+        fresh.answer(packet.requests()[0].msg_id, &ANSWER);
+        assert_eq!(outcome(call).await.unwrap(), answered());
+    }
+}
+
 /// Answers one `help.getConfig`, so the server knows the session.
 async fn first_call(h: &Harness, srv: &mut Server) {
     let call = h.invoke(get_config());
