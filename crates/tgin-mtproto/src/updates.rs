@@ -211,6 +211,12 @@ impl UpdateBytes {
         seq.filter(|&s| s != 0).map(|_| f.box_kind)
     }
 
+    /// Sequenced, or `updateChannelTooLong` (a channel's catch-up signal,
+    /// with or without a pts): handled by its box's rules, not the seq's.
+    fn has_box(&self) -> bool {
+        self.sequenced_box().is_some() || self.facts.constructor == "updateChannelTooLong"
+    }
+
     /// The update's facts ([`decode::facts`] of [`bytes`](Self::bytes)).
     #[must_use]
     pub fn facts(&self) -> UpdateFacts<'_> {
@@ -533,8 +539,13 @@ impl UpdateManager {
 
         // The seq rules apply to `updates` and `updatesCombined` only. A
         // seq_start of 0 is unordered: applied, and the seq state is kept
-        // (grammers' NO_SEQ).
+        // (grammers' NO_SEQ). Box updates are handled first, by their own
+        // box's rules, whatever the seq says; the seq decides only for the
+        // rest (Telegram's rules, as TDLib does): an already applied
+        // container still carries a channel update the common difference
+        // that moved seq past it does not cover.
         let mut seq_step = None;
+        let mut stale = false;
         if let Some(end) = c.seq
             && !self.fetch.busy()
         {
@@ -546,7 +557,7 @@ impl UpdateManager {
                         seq_step = Some((end, c.date.unwrap_or(self.date)));
                     }
                     // Already applied.
-                    std::cmp::Ordering::Less => return Vec::new(),
+                    std::cmp::Ordering::Less => stale = true,
                     std::cmp::Ordering::Greater => {
                         self.seq_seen.push((start, end));
                         self.arm_gap();
@@ -557,6 +568,7 @@ impl UpdateManager {
 
         for u in &c.updates {
             match UpdateBytes::new(container.slice_ref(u)) {
+                Ok(ub) if stale && !ub.has_box() => {}
                 Ok(ub) => self.offer(ub, Mode::Live, &mut out),
                 Err(e) => self.undecodable("update", u, &e),
             }

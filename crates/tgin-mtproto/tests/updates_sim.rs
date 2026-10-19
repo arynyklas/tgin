@@ -324,6 +324,42 @@ async fn in_order_pushes_delivered_immediately() {
     assert_eq!(m.next_action(), None, "nothing to fetch");
 }
 
+/// A container whose seq is already applied (it arrived after the
+/// difference that moved seq past it) still carries box updates: each is
+/// offered by its own box's rules. Only its unsequenced updates go.
+#[tokio::test(start_paused = true)]
+async fn stale_seq_container_routes_box_updates() {
+    let mut m = started(stored(10, &[(1, 5), (2, 9)], &[5]));
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 6, 1);
+    let applied = new_message(&message(2, PeerId::User(5), "old"), 10, 1);
+    let push = b(updates(
+        &[
+            user_status(5),
+            applied,
+            post.clone(),
+            channel_too_long(2, None),
+        ],
+        NONE,
+        NONE,
+        2,
+        3, // seq 3: already applied
+    ));
+    let batches = m.feed_push(push);
+    assert_eq!(
+        all_updates(&batches),
+        vec![b(post)],
+        "the channel post only"
+    );
+    let d = commit(&mut m, &batches);
+    assert_eq!(d.channels, vec![(1, 6)]);
+    assert_eq!((d.seq, d.date), (None, None), "the seq state is kept");
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 2, pts: 9 }),
+        "its updateChannelTooLong is a signal still"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn gap_triggers_difference_after_hold() {
     let mut m = started(stored(10, &[], &[5]));
