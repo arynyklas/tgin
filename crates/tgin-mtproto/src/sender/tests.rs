@@ -131,6 +131,9 @@ impl Transport for Scripted {
             session_id: None,
             next_msg_id: (1_800_000_000 << 32) | 1,
             seq: 0,
+            last_msg_id: 0,
+            last_seqno: -1,
+            floors: Vec::new(),
         };
         self.0.conns.send(server).unwrap();
         Ok(Opened {
@@ -217,6 +220,7 @@ struct Packet {
     salt: i64,
     session_id: i64,
     container: Option<i64>,
+    container_seqno: i32,
     msgs: Vec<Msg>,
 }
 
@@ -247,6 +251,7 @@ fn parse_msg(b: &[u8], at: usize) -> (Msg, usize) {
 impl Packet {
     fn parse(raw: &[u8]) -> Self {
         let (outer, _) = parse_msg(raw, 16);
+        let container_seqno = outer.seqno;
         let (container, msgs) = if le_u32(&outer.body) == MSG_CONTAINER {
             let count = le_i32(&outer.body[4..]);
             let mut at = 8;
@@ -268,6 +273,7 @@ impl Packet {
             salt: le_i64(raw),
             session_id: le_i64(&raw[8..]),
             container,
+            container_seqno,
             msgs,
         }
     }
@@ -313,19 +319,54 @@ struct Server {
     session_id: Option<i64>,
     next_msg_id: i64,
     seq: i32,
+    /// The client's last msg_id and seqno on this session.
+    last_msg_id: i64,
+    last_seqno: i32,
+    /// `(packet's bad_msg_id, last_msg_id before it)`, to forget a packet
+    /// Telegram ignored for its msg_ids (codes 16 and 17).
+    floors: Vec<(i64, i64)>,
 }
 
 impl Server {
+    /// Parses a packet the sender wrote and checks it the way Telegram
+    /// does: one session per connection; msg_ids divisible by 4 and rising
+    /// across the session, the container's above its messages; seqnos odd
+    /// and rising for content messages, even and not falling for acks and
+    /// containers.
+    fn check(&mut self, raw: &[u8]) -> Packet {
+        let packet = Packet::parse(raw);
+        let session = *self.session_id.get_or_insert(packet.session_id);
+        assert_eq!(packet.session_id, session, "one session per connection");
+        self.floors.push((packet.bad_msg_id(), self.last_msg_id));
+        let container = packet.container.map(|id| Msg {
+            msg_id: id,
+            seqno: packet.container_seqno,
+            body: Vec::new(),
+        });
+        for m in packet.msgs.iter().chain(container.as_ref()) {
+            assert_eq!(m.msg_id % 4, 0, "msg_id divisible by 4: {packet:?}");
+            assert!(m.msg_id > self.last_msg_id, "msg_ids rise: {packet:?}");
+            self.last_msg_id = m.msg_id;
+            let content = !m.body.is_empty() && le_u32(&m.body) != MSGS_ACK;
+            if content {
+                assert_eq!(m.seqno % 2, 1, "content seqno odd: {packet:?}");
+                assert!(m.seqno > self.last_seqno, "seqnos rise: {packet:?}");
+            } else {
+                assert_eq!(m.seqno % 2, 0, "service seqno even: {packet:?}");
+                assert!(m.seqno >= self.last_seqno, "seqnos rise: {packet:?}");
+            }
+            self.last_seqno = m.seqno;
+        }
+        packet
+    }
+
     /// The next packet the sender wrote.
     async fn packet(&mut self) -> Packet {
         let raw = timeout(WAIT, self.from_client.recv())
             .await
             .expect("the sender writes a packet")
             .expect("the connection is open");
-        let packet = Packet::parse(&raw);
-        let session = *self.session_id.get_or_insert(packet.session_id);
-        assert_eq!(packet.session_id, session, "one session per connection");
-        packet
+        self.check(&raw)
     }
 
     /// The next packet that carries more than acks.
@@ -344,7 +385,7 @@ impl Server {
             match timeout(WAIT, self.from_client.recv()).await {
                 Err(_) | Ok(None) => return,
                 Ok(Some(raw)) => {
-                    let packet = Packet::parse(&raw);
+                    let packet = self.check(&raw);
                     assert!(packet.requests().is_empty(), "unexpected {packet:?}");
                 }
             }
@@ -357,7 +398,7 @@ impl Server {
         timeout(within, async {
             loop {
                 let raw = self.from_client.recv().await.expect("connection open");
-                let packet = Packet::parse(&raw);
+                let packet = self.check(&raw);
                 if let Some(ping) = packet
                     .msgs
                     .iter()
@@ -515,6 +556,10 @@ impl Server {
         self.next_msg_id = (server_secs << 32) | 1;
         self.send(&[(false, body)]);
         self.next_msg_id = counter;
+        // Telegram ignored the packet: its msg_ids no longer count.
+        if let Some(&(_, floor)) = self.floors.iter().find(|(id, _)| *id == bad_msg_id) {
+            self.last_msg_id = floor;
+        }
     }
 
     /// `new_session_created`: Telegram made a new session at the client's
@@ -630,16 +675,41 @@ fn secs(msg_id: i64) -> i64 {
     msg_id >> 32
 }
 
-/// Code 17 (msg_id too high) from a server an hour behind the client: the
-/// resend carries Telegram's time, not a floor left by the fast clock.
+/// Code 17 (msg_id too high) from a server an hour behind the client, on
+/// the session's first packet: the resend and everything after it carry
+/// Telegram's time, not a floor left by the fast clock.
 #[tokio::test(start_paused = true)]
 async fn code_17_moves_msg_ids_back_to_server_time() {
+    let (h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let first = srv.init_packet().await;
+    let server_secs = secs(first.msg_id) - 3600;
+    srv.bad_msg_at(server_secs, first.msg_id, 17);
+
+    let again = srv.init_packet().await;
+    assert!(
+        (secs(again.msg_id) - server_secs).abs() <= 5,
+        "resent at {} s, server at {server_secs} s",
+        secs(again.msg_id)
+    );
+    srv.answer(again.msg_id, &ANSWER);
+    let packet = srv.request().await;
+    let request = packet.requests()[0].clone();
+    assert!((secs(request.msg_id) - server_secs).abs() <= 5);
+    srv.answer(request.msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+/// Code 16 (msg_id too low) from a server an hour ahead: the resend
+/// carries Telegram's time.
+#[tokio::test(start_paused = true)]
+async fn code_16_moves_msg_ids_up_to_server_time() {
     let (h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
     let call = h.invoke(get_config());
     let first = srv.request().await;
     let sent = first.requests()[0].clone();
-    let server_secs = secs(sent.msg_id) - 3600;
-    srv.bad_msg_at(server_secs, first.bad_msg_id(), 17);
+    let server_secs = secs(sent.msg_id) + 3600;
+    srv.bad_msg_at(server_secs, first.bad_msg_id(), 16);
 
     let again = srv.request().await;
     let resent = again.requests()[0].clone();
@@ -664,7 +734,7 @@ async fn first_call(h: &Harness, srv: &mut Server) {
 /// Every packet that already reached the connection carries acks only.
 fn assert_no_request_reached(srv: &mut Server) {
     while let Ok(raw) = srv.from_client.try_recv() {
-        let packet = Packet::parse(&raw);
+        let packet = srv.check(&raw);
         assert!(packet.requests().is_empty(), "reached: {packet:?}");
     }
 }
@@ -1180,4 +1250,106 @@ async fn pushes_channel_full_pauses_reads_not_acks() {
         acked.extend(srv.packet().await.acks());
     }
     assert_eq!(srv.frames_taken(), taken + 2);
+}
+
+fn pinging(pushes: usize) -> Tuning {
+    Tuning {
+        ping_interval: Duration::from_secs(20),
+        pong_timeout: Duration::from_secs(10),
+        ..tuning(pushes)
+    }
+}
+
+/// `pong` for a `ping_delay_disconnect` message.
+fn pong(ping: &Msg) -> Vec<u8> {
+    tl::enums::Pong::Pong(tl::types::Pong {
+        msg_id: ping.msg_id,
+        ping_id: le_i64(&ping.body[4..]),
+    })
+    .to_bytes()
+}
+
+/// `msg_detailed_info` names an answer Telegram sent earlier: the sender
+/// acknowledges it.
+#[tokio::test(start_paused = true)]
+async fn msg_detailed_info_acknowledges_the_answer() {
+    let (_h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let answer_msg_id = (1_800_000_100_i64 << 32) | 5;
+    let info = tl::enums::MsgDetailedInfo::Info(tl::types::MsgDetailedInfo {
+        msg_id: 4,
+        answer_msg_id,
+        bytes: 64,
+        status: 0,
+    })
+    .to_bytes();
+    srv.send(&[(false, info)]);
+    let mut acked = Vec::new();
+    while !acked.contains(&answer_msg_id) {
+        acked.extend(srv.packet().await.acks());
+    }
+}
+
+/// A ping unanswered within the pong timeout ends the connection: the
+/// written request gets `NoAnswer`, and the update manager is told.
+#[tokio::test(start_paused = true)]
+async fn missing_pong_ends_the_connection() {
+    let (mut h, mut srv) = Harness::start_with(init(), &[Writes::Deliver], pinging(8)).await;
+    srv.handshake().await;
+    let mut pushes = h.pushes.take().unwrap();
+    let call = h.invoke(get_config());
+    srv.request().await;
+    srv.ping(Duration::from_secs(30)).await;
+    let result = timeout(Duration::from_secs(30), call)
+        .await
+        .expect("the pong timeout ends the call")
+        .unwrap();
+    assert!(matches!(result, Err(SenderError::NoAnswer)), "{result:?}");
+    assert_eq!(timeout(WAIT, pushes.recv()).await, Ok(Some(too_long())));
+}
+
+/// Acks that went out in a packet Telegram ignored are sent again.
+#[tokio::test(start_paused = true)]
+async fn acks_of_an_ignored_packet_are_sent_again() {
+    let (_h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let pushed = srv.send(&[(true, update(1))])[0];
+    let ignored = loop {
+        let packet = srv.packet().await;
+        if packet.acks().contains(&pushed) {
+            break packet.bad_msg_id();
+        }
+    };
+    srv.bad_server_salt(ignored, 0x5a1f);
+    let again = srv.packet().await;
+    assert_eq!(again.salt, 0x5a1f);
+    assert!(again.acks().contains(&pushed), "{again:?}");
+}
+
+/// While the full pushes channel pauses reads, pings still go out and the
+/// unreadable pongs do not end the connection.
+#[tokio::test(start_paused = true)]
+async fn pings_continue_while_reads_are_paused() {
+    let (mut h, mut srv) = Harness::start_with(init(), &[Writes::Deliver], pinging(2)).await;
+    srv.handshake().await;
+    let mut pushes = h.pushes.take().unwrap();
+    let full = srv.send(&[(true, update(1)), (true, update(2)), (true, update(3))]);
+    let mut acked = Vec::new();
+    while !full.iter().all(|id| acked.contains(id)) {
+        acked.extend(srv.packet().await.acks());
+    }
+    let taken = srv.frames_taken();
+
+    // Two ping intervals, well past one pong timeout, with reads paused.
+    let first = srv.ping(Duration::from_secs(30)).await;
+    let second = srv.ping(Duration::from_secs(30)).await;
+    srv.send(&[(false, pong(&first)), (false, pong(&second))]);
+    assert_eq!(srv.frames_taken(), taken, "reads stay paused");
+
+    for n in 1..=3 {
+        let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+        assert_eq!(push, update(n));
+    }
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
 }
