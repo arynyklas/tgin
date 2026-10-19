@@ -664,10 +664,16 @@ impl Shared {
     }
 
     fn froze(&self) {
+        self.mark_frozen();
+        self.set_state(AccountState::Frozen);
+    }
+
+    /// Records that Telegram reports the account frozen; the state shows
+    /// it at the next [`connected`](Self::connected).
+    fn mark_frozen(&self) {
         if !self.frozen.swap(true, Ordering::Relaxed) {
             tracing::warn!(account = %self.name, "Telegram reports the account frozen: it is read-only");
         }
-        self.set_state(AccountState::Frozen);
     }
 
     fn main_key_gone(&self) {
@@ -1030,6 +1036,7 @@ async fn run(ctx: Arc<Ctx>) -> End {
             fetches: JoinSet::new(),
             dropped: Dropped::default(),
             flood: None,
+            reached: None,
         };
         ingest.run(conn.pushes, &mut affected).await
     };
@@ -1132,6 +1139,9 @@ struct Ingest<'a> {
     dropped: Dropped,
     /// What [`UpdateManager::flood_wait`] said last.
     flood: Option<(Instant, SystemTime)>,
+    /// Whether this turn's catch-up answers reached Telegram, for
+    /// [`publish`](Self::publish).
+    reached: Option<bool>,
 }
 
 impl Ingest<'_> {
@@ -1211,7 +1221,7 @@ impl Ingest<'_> {
         let name = &self.ctx.shared.name;
         match outcome {
             Ok(RpcOutcome::Result(bytes)) => {
-                self.ctx.shared.connected();
+                self.reached = Some(true);
                 let batches = match fetch {
                     Fetch::GetState => self.manager.feed_state(bytes),
                     Fetch::GetDifference { .. } => self.manager.feed_difference(bytes),
@@ -1222,14 +1232,14 @@ impl Ingest<'_> {
                 self.handle(&batches)
             }
             Ok(RpcOutcome::Error { code, message }) => {
-                self.ctx.shared.connected();
+                self.reached = Some(true);
                 tracing::debug!(account = %name, fetch = fetch_name(fetch), code, error = %message, "a catch-up call was refused");
                 if lost_authorization(code, &message) {
                     return Err(self.ctx.needs_login());
                 }
                 match (classify(code, &message), fetch) {
                     (ErrorClass::Frozen, _) => {
-                        self.ctx.shared.froze();
+                        self.ctx.shared.mark_frozen();
                         self.manager.fetch_failed(fetch);
                     }
                     (ErrorClass::FloodWait(x) | ErrorClass::SlowMode(x), _) => {
@@ -1261,7 +1271,7 @@ impl Ingest<'_> {
                 }
                 e => {
                     tracing::debug!(account = %name, fetch = fetch_name(fetch), error = %e, "a catch-up call failed; it is asked again");
-                    self.ctx.shared.set_state(AccountState::Connecting);
+                    self.reached = Some(false);
                     self.manager.fetch_failed(fetch);
                     Ok(())
                 }
@@ -1319,21 +1329,25 @@ impl Ingest<'_> {
             Ordering::Relaxed,
         );
         self.dropped = dropped;
-        // The common box waits out Telegram's flood wait: the account shows
-        // it until then, whatever answered meanwhile (a channel's fetch, an
-        // RPC call), re-asserted on every turn.
+        // The state, decided once per turn: the common box waiting out
+        // Telegram's flood wait shows it until then, whatever answered
+        // meanwhile (a channel's fetch, an RPC call); otherwise whether the
+        // last catch-up call reached Telegram.
         let flood = self.manager.flood_wait();
         if flood != self.flood.map(|(at, _)| at) {
             self.flood = flood.map(|at| {
                 let until = SystemTime::now() + at.saturating_duration_since(Instant::now());
                 (at, until)
             });
-            if flood.is_none() {
-                shared.connected();
+            if flood.is_none() && self.reached.is_none() {
+                self.reached = Some(true);
             }
         }
-        if let Some((_, until)) = self.flood {
-            shared.set_state(AccountState::FloodWait { until });
+        match (self.flood, self.reached.take()) {
+            (Some((_, until)), _) => shared.set_state(AccountState::FloodWait { until }),
+            (None, Some(true)) => shared.connected(),
+            (None, Some(false)) => shared.set_state(AccountState::Connecting),
+            (None, None) => {}
         }
     }
 }

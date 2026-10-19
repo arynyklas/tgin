@@ -761,6 +761,8 @@ async fn a_channel_answer_keeps_flood_wait_showing() {
         matches!(s, AccountState::FloodWait { .. })
     })
     .await;
+    let mut states = run.account.watch();
+    states.mark_unchanged();
     assert!(net.push(updates(&[
         r#"{"_":"updateChannelTooLong","channel_id":"8"}"#.to_owned()
     ])));
@@ -776,6 +778,10 @@ async fn a_channel_answer_keeps_flood_wait_showing() {
         matches!(run.account.state(), AccountState::FloodWait { .. }),
         "{:?}",
         run.account.state()
+    );
+    assert!(
+        !states.has_changed().expect("alive"),
+        "the state never left flood_wait, even for a moment"
     );
     run.account.close().await;
 }
