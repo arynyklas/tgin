@@ -65,13 +65,22 @@ pub enum TransportError {
 }
 
 /// A key the transport made while opening a connection.
-#[derive(Debug)]
 pub struct GeneratedKey {
     pub key: AuthKey,
     /// The first server salt, from the key exchange.
     pub first_salt: i64,
     /// Telegram's clock minus ours, in seconds.
     pub time_offset: i32,
+}
+
+/// Leaves out the salt; the key's own `Debug` hides it.
+impl std::fmt::Debug for GeneratedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedKey")
+            .field("key", &self.key)
+            .field("time_offset", &self.time_offset)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An open connection.
@@ -374,6 +383,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_key_debug_hides_the_salt() {
+        let generated = GeneratedKey {
+            key: AuthKey([3; 256]),
+            first_salt: 0x0123_4567_89ab_cdef,
+            time_offset: -7,
+        };
+        let shown = format!("{generated:?}");
+        assert!(shown.contains("time_offset: -7"), "{shown}");
+        for salt in [
+            0x0123_4567_89ab_cdef_i64.to_string(),
+            "123456789abcdef".to_owned(),
+        ] {
+            assert!(!shown.to_lowercase().contains(&salt), "{shown}");
+        }
+        assert!(!shown.contains("first_salt"), "{shown}");
+    }
 
     /// A frame arriving one byte at a time, with the read cancelled after
     /// every byte, still comes out whole.
