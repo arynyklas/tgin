@@ -101,6 +101,17 @@ pub fn parse_timeout(text: &str) -> Result<HumanDuration, String> {
     Ok(timeout)
 }
 
+/// What `logout` without `--yes` prints: the steps it would take.
+fn logout_plan(account: &str) -> String {
+    format!(
+        "tgin admin logout would, for the account {account}:\n\
+         1. park it if it runs: stop its ingest, give its RPC calls up to 10 s, close its session\n\
+         2. call auth.logOut on Telegram (the account's other devices stay logged in)\n\
+         3. clear its session: auth keys, login, peers and update state\n\
+         Run it again with --yes to do it."
+    )
+}
+
 /// What `bot logout|close` without `--yes` prints: the steps it would take.
 fn move_plan(name: &str, how: BotMove, timeout: Option<&HumanDuration>) -> String {
     let call = match how {
@@ -138,12 +149,7 @@ pub fn run(command: &Command) -> u8 {
         yes: false,
     } = &command.action
     {
-        eprintln!(
-            "tgin admin logout would, for the account {account}:\n\
-             1. call auth.logOut on Telegram (the account's other devices stay logged in)\n\
-             2. clear its session: auth keys, login, peers and update state\n\
-             It refuses while the account runs. Run it again with --yes to do it."
-        );
+        eprintln!("{}", logout_plan(account));
         return exit::USAGE;
     }
     // `health` reads an unauthenticated probe: a token file it cannot read
@@ -948,6 +954,15 @@ mod tests {
         );
         assert!(parse_url("ftp://host").is_err());
         assert!(parse_url("not a url").is_err());
+    }
+
+    #[test]
+    fn logout_plan_says_a_running_account_is_parked() {
+        let plan = logout_plan("main");
+        let park = plan.find("park it if it runs").expect("the park step");
+        let log_out = plan.find("auth.logOut").expect("the logout step");
+        assert!(park < log_out, "{plan}");
+        assert!(!plan.contains("refuses"), "{plan}");
     }
 
     #[test]
