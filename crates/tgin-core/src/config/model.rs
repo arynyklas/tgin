@@ -744,6 +744,7 @@ pub struct Pull {
     /// How account updates are rendered; `tl_json` only for a consumer
     /// that accounts alone feed.
     #[serde(skip_serializing_if = "Render::is_raw")]
+    #[schemars(extend("default" = "raw"))]
     pub render: At<Render>,
 }
 
@@ -796,6 +797,7 @@ pub struct Push {
     /// How account updates are rendered; `tl_json` only for a consumer
     /// that accounts alone feed.
     #[serde(default = "defaults::render", skip_serializing_if = "Render::is_raw")]
+    #[schemars(extend("default" = "raw"))]
     pub render: At<Render>,
 }
 

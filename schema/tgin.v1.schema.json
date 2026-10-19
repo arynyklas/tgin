@@ -857,6 +857,7 @@
         },
         "render": {
           "$ref": "#/$defs/Render",
+          "default": "raw",
           "description": "How account updates are rendered; `tl_json` only for a consumer\nthat accounts alone feed."
         }
       },
@@ -924,6 +925,7 @@
         },
         "render": {
           "$ref": "#/$defs/Render",
+          "default": "raw",
           "description": "How account updates are rendered; `tl_json` only for a consumer\nthat accounts alone feed."
         },
         "retry": {

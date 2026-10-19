@@ -349,7 +349,7 @@ Bots fetch updates from tgin with `getUpdates` on `/c/<consumer>/getUpdates` and
 | `lease_timeout` | [Duration](#duration) | `2m` | How long a fetched update waits for its acknowledgement before another poll may receive it; at least 1s. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |
-| `render` | [Render](#render) |  | How account updates are rendered; `tl_json` only for a consumer that accounts alone feed. |
+| `render` | [Render](#render) | `raw` | How account updates are rendered; `tl_json` only for a consumer that accounts alone feed. |
 
 ## `ByteSize`
 
@@ -405,7 +405,7 @@ tgin posts each update to HTTP endpoints, with retries and a circuit breaker per
 | `max_in_flight` | integer (at least 1) | `32` | Most deliveries at once over all endpoints, counting those waiting to retry. |
 | `on_full` | [OnFull](#onfull) | `backpressure` | What a full queue does with a new update. |
 | `ordering` | [Ordering](#ordering) | `none` | The order a consumer hands out updates in. |
-| `render` | [Render](#render) |  | How account updates are rendered; `tl_json` only for a consumer that accounts alone feed. |
+| `render` | [Render](#render) | `raw` | How account updates are rendered; `tl_json` only for a consumer that accounts alone feed. |
 | `retry` | [Retry](#retry) | `{"initial":"1s","max":"1m","max_age":"1h","max_attempts":10}` | Retries of failed deliveries. |
 | `webhook_reply` | [WebhookReply](#webhookreply) | `execute` | What tgin does with a Bot API method call in an endpoint's response body, the way Telegram handles a webhook reply. |
 
