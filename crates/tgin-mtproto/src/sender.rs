@@ -360,7 +360,7 @@ impl Sender {
         key: Option<AuthKey>,
         init: InitParams,
     ) -> Result<Connected, SenderError> {
-        Self::connect_with(TcpTransport, dc, key, init).await
+        Self::connect_with(TcpTransport::new(), dc, key, init).await
     }
 
     /// [`connect`](Self::connect) over another [`Transport`].

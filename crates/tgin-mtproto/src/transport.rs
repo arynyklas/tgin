@@ -17,6 +17,7 @@ use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -28,6 +29,7 @@ use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{AuthKey, DcOption};
 
@@ -131,7 +133,29 @@ pub trait PacketWriter: Send + 'static {
 
 /// The production transport: MTProto's intermediate framing over TCP to
 /// the DC's IPv4 address, with the MTProto 2.0 cipher.
-pub struct TcpTransport;
+///
+/// A sender owns one. It runs one auth key exchange at a time: a second
+/// waits until the first one's CPU-bound steps have finished, even ones a
+/// timeout abandoned, so forged answers cannot pile up blocking threads.
+#[derive(Clone)]
+pub struct TcpTransport {
+    exchanges: Arc<Semaphore>,
+}
+
+impl TcpTransport {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            exchanges: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+impl Default for TcpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Transport for TcpTransport {
     type Reader = TcpReader;
@@ -153,10 +177,12 @@ impl Transport for TcpTransport {
         let (key, generated) = match key {
             Some(key) => (key.clone(), None),
             None => {
-                let generated =
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange_key(&mut frames, &mut out))
-                        .await
-                        .map_err(|_| TransportError::Timeout)??;
+                let generated = tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    guarded_exchange(&self.exchanges, &mut frames, &mut out),
+                )
+                .await
+                .map_err(|_| TransportError::Timeout)??;
                 (generated.key.clone(), Some(generated))
             }
         };
@@ -170,6 +196,24 @@ impl Transport for TcpTransport {
             generated,
         })
     }
+}
+
+/// [`exchange_key`] once `exchanges` lets it run: one at a time, and the
+/// permit is held by every step, the detached ones included.
+async fn guarded_exchange<R, W>(
+    exchanges: &Arc<Semaphore>,
+    frames: &mut Frames<R>,
+    out: &mut FrameWriter<W>,
+) -> Result<GeneratedKey, TransportError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let permit = Arc::clone(exchanges)
+        .acquire_owned()
+        .await
+        .map_err(|_| failed("the key exchange guard is closed"))?;
+    exchange_key(frames, out, Arc::new(permit)).await
 }
 
 /// [`TcpTransport`]'s incoming half: decrypts each frame in place.
@@ -335,13 +379,15 @@ const MIN_PQ: u64 = 1 << 32;
 /// messages on this connection.
 ///
 /// The answers are unencrypted, so an on-path attacker can forge them.
-/// grammers then panics on a short `encrypted_answer` and loops for ever
-/// factorizing a tiny pq. So the answers are checked first, and each
-/// CPU-bound step runs in `spawn_blocking` under `catch_unwind`; the
-/// caller bounds the whole exchange with a timeout.
+/// grammers then panics on a short `encrypted_answer`, loops for ever
+/// factorizing a tiny pq and runs for a very long time on a prime one. So
+/// the answers are checked first, and each CPU-bound step runs in
+/// `spawn_blocking` under `catch_unwind`, holding `permit`; the caller
+/// bounds the whole exchange with a timeout.
 async fn exchange_key<R, W>(
     frames: &mut Frames<R>,
     out: &mut FrameWriter<W>,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<GeneratedKey, TransportError>
 where
     R: AsyncRead + Unpin,
@@ -351,14 +397,14 @@ where
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let res_pq = tl::enums::ResPq::from_bytes(&answer).map_err(failed)?;
     check_pq(&res_pq)?;
-    let (request, step) = blocking(move || authentication::step2(step, res_pq)).await?;
+    let (request, step) = blocking(&permit, move || authentication::step2(step, res_pq)).await?;
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let dh_params = tl::enums::ServerDhParams::from_bytes(&answer).map_err(failed)?;
     check_dh_params(&dh_params)?;
-    let (request, step) = blocking(move || authentication::step3(step, dh_params)).await?;
+    let (request, step) = blocking(&permit, move || authentication::step3(step, dh_params)).await?;
     let answer = plain_call(frames, out, &request.to_bytes()).await?;
     let dh_answer = tl::enums::SetClientDhParamsAnswer::from_bytes(&answer).map_err(failed)?;
-    let done = blocking(move || authentication::create_key(step, dh_answer)).await?;
+    let done = blocking(&permit, move || authentication::create_key(step, dh_answer)).await?;
     Ok(GeneratedKey {
         key: AuthKey(done.auth_key),
         first_salt: done.first_salt,
@@ -370,18 +416,67 @@ fn failed(e: impl std::fmt::Display) -> TransportError {
     TransportError::Handshake(e.to_string())
 }
 
-/// `res_pq`'s pq must be an odd 64-bit number above 2^32.
+/// `res_pq`'s pq must be an odd composite 64-bit number above 2^32. A
+/// composite one has a prime factor below 2^32, which grammers'
+/// Pollard–Brent finds in milliseconds; a prime one would keep it busy for
+/// a very long time.
 fn check_pq(res_pq: &tl::enums::ResPq) -> Result<(), TransportError> {
     let tl::enums::ResPq::Pq(res_pq) = res_pq;
     let pq = <[u8; 8]>::try_from(res_pq.pq.as_slice())
         .map(u64::from_be_bytes)
         .map_err(|_| TransportError::Handshake("pq is not 8 bytes".to_owned()))?;
-    if pq <= MIN_PQ || pq.is_multiple_of(2) {
+    if pq <= MIN_PQ || pq.is_multiple_of(2) || is_prime(pq) {
         return Err(TransportError::Handshake(
             "pq is not a product of two large primes".to_owned(),
         ));
     }
     Ok(())
+}
+
+/// Deterministic Miller–Rabin for 64-bit numbers: the bases 2 to 37 decide
+/// every `n < 3.3 * 10^24`.
+fn is_prime(n: u64) -> bool {
+    const BASES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    fn mul(a: u64, b: u64, m: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b) % u128::from(m);
+        u64::try_from(product).unwrap_or(0)
+    }
+    fn pow(mut base: u64, mut exp: u64, m: u64) -> u64 {
+        let mut acc = 1 % m;
+        base %= m;
+        while exp > 0 {
+            if exp & 1 == 1 {
+                acc = mul(acc, base, m);
+            }
+            base = mul(base, base, m);
+            exp >>= 1;
+        }
+        acc
+    }
+    if n < 2 {
+        return false;
+    }
+    for p in BASES {
+        if n.is_multiple_of(p) {
+            return n == p;
+        }
+    }
+    let shift = (n - 1).trailing_zeros();
+    let odd = (n - 1) >> shift;
+    'bases: for a in BASES {
+        let mut x = pow(a, odd, n);
+        if x == 1 || x == n - 1 {
+            continue;
+        }
+        for _ in 1..shift {
+            x = mul(x, x, n);
+            if x == n - 1 {
+                continue 'bases;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 /// `server_DH_params_ok`'s `encrypted_answer` must hold at least the
@@ -399,18 +494,20 @@ fn check_dh_params(params: &tl::enums::ServerDhParams) -> Result<(), TransportEr
 }
 
 /// One CPU-bound key exchange step, off the async threads, with a panic
-/// turned into an error.
-async fn blocking<T, F>(step: F) -> Result<T, TransportError>
+/// turned into an error. The thread holds `permit` until it finishes.
+async fn blocking<T, F>(permit: &Arc<OwnedSemaphorePermit>, step: F) -> Result<T, TransportError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, authentication::Error> + Send + 'static,
 {
-    let caught =
-        tokio::task::spawn_blocking(move || std::panic::catch_unwind(AssertUnwindSafe(step)))
-            .await
-            .map_err(|_| {
-                TransportError::Handshake("the key exchange step was cancelled".to_owned())
-            })?;
+    let permit = Arc::clone(permit);
+    let caught = tokio::task::spawn_blocking(move || {
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(step));
+        drop(permit);
+        caught
+    })
+    .await
+    .map_err(|_| TransportError::Handshake("the key exchange step was cancelled".to_owned()))?;
     match caught {
         Ok(result) => result.map_err(failed),
         Err(_) => Err(TransportError::Handshake(
@@ -508,10 +605,13 @@ mod tests {
             }
             Some(())
         });
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), exchange_key(&mut frames, &mut out))
-                .await
-                .expect("a forged answer ends the exchange at once");
+        let exchanges = Arc::new(Semaphore::new(1));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            guarded_exchange(&exchanges, &mut frames, &mut out),
+        )
+        .await
+        .expect("a forged answer ends the exchange at once");
         forger.abort();
         result
     }
@@ -545,18 +645,139 @@ mod tests {
         assert!(why.contains("too short"), "{why}");
     }
 
+    /// A permit for one key exchange step.
+    fn permit(exchanges: &Arc<Semaphore>) -> Arc<OwnedSemaphorePermit> {
+        Arc::new(Arc::clone(exchanges).try_acquire_owned().unwrap())
+    }
+
     /// A panic in a key exchange step becomes an error, not a crash.
     #[tokio::test]
     async fn a_panicking_step_is_an_error() {
-        let result = blocking(|| -> Result<(), authentication::Error> {
-            panic!("a forged answer");
-        })
+        let exchanges = Arc::new(Semaphore::new(1));
+        let result = blocking(
+            &permit(&exchanges),
+            || -> Result<(), authentication::Error> {
+                panic!("a forged answer");
+            },
+        )
         .await;
         let why = match result {
             Err(TransportError::Handshake(why)) => why,
             other => panic!("{other:?}"),
         };
         assert!(why.contains("panic"), "{why}");
+    }
+
+    /// A forged prime pq kept grammers' Pollard–Brent busy for a very long
+    /// time; it is refused before grammers sees it.
+    #[tokio::test]
+    async fn forged_prime_pq_is_refused_in_milliseconds() {
+        // 2^64 − 59 and 2^63 − 25, both prime.
+        for pq in [18_446_744_073_709_551_557, 9_223_372_036_854_775_783] {
+            let started = std::time::Instant::now();
+            let why = handshake_error(forged_exchange(vec![Forged::ResPq(pq)]).await);
+            assert!(why.contains("pq"), "{pq}: {why}");
+            assert!(started.elapsed() < Duration::from_secs(1), "{pq}");
+        }
+    }
+
+    #[test]
+    fn miller_rabin_is_exact_on_hard_cases() {
+        for p in [
+            2,
+            3,
+            37,
+            1_000_000_007,
+            4_294_967_291,
+            18_446_744_073_709_551_557,
+        ] {
+            assert!(is_prime(p), "{p}");
+        }
+        // Strong pseudoprimes to the first bases, Carmichael numbers, and
+        // Telegram's sample pq (1229739323 × 1402015859).
+        for c in [
+            0,
+            1,
+            561,
+            3_215_031_751,
+            2_152_302_898_747,
+            3_825_123_056_546_413_051,
+            0x17ED_4894_1A08_F981,
+            4_294_967_291 * 4_294_967_279,
+        ] {
+            assert!(!is_prime(c), "{c}");
+        }
+    }
+
+    /// A detached step (its caller timed out) keeps the permit until its
+    /// thread finishes, so no second exchange starts beside it.
+    #[tokio::test]
+    async fn an_abandoned_step_holds_the_exchange_permit() {
+        let exchanges = Arc::new(Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let held = permit(&exchanges);
+        let step = blocking(&held, move || {
+            let _ = wait.recv();
+            Ok::<_, authentication::Error>(())
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), step)
+                .await
+                .is_err()
+        );
+        // The caller gave up: only the detached thread holds the permit now.
+        drop(held);
+        assert!(
+            Arc::clone(&exchanges).try_acquire_owned().is_err(),
+            "the detached step still holds the permit"
+        );
+        release.send(()).unwrap();
+        let freed = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&exchanges).acquire_owned(),
+        )
+        .await;
+        assert!(matches!(freed, Ok(Ok(_))), "released when the step ends");
+    }
+
+    /// A second exchange through the same guard waits: it writes nothing
+    /// while the first one runs, and starts once it is gone.
+    #[tokio::test(start_paused = true)]
+    async fn one_key_exchange_at_a_time() {
+        let exchanges = Arc::new(Semaphore::new(1));
+        let (first_client, _first_server) = tokio::io::duplex(1 << 16);
+        let first = {
+            let exchanges = Arc::clone(&exchanges);
+            tokio::spawn(async move {
+                let (read, write) = tokio::io::split(first_client);
+                let (mut frames, mut out) = (Frames::new(read), FrameWriter::new(write));
+                guarded_exchange(&exchanges, &mut frames, &mut out).await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let (second_client, mut second_server) = tokio::io::duplex(1 << 16);
+        let second = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(second_client);
+            let (mut frames, mut out) = (Frames::new(read), FrameWriter::new(write));
+            guarded_exchange(&exchanges, &mut frames, &mut out).await
+        });
+        let mut tag = [0; 4];
+        let waited =
+            tokio::time::timeout(Duration::from_secs(60), second_server.read_exact(&mut tag)).await;
+        assert!(
+            waited.is_err(),
+            "the second exchange wrote while the first ran"
+        );
+
+        first.abort();
+        let started =
+            tokio::time::timeout(Duration::from_secs(5), second_server.read_exact(&mut tag)).await;
+        assert!(
+            matches!(started, Ok(Ok(_))),
+            "it starts once the first is gone"
+        );
+        second.abort();
     }
 
     #[test]
