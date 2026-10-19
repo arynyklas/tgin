@@ -368,7 +368,7 @@ async fn envelope_carries_the_update_and_its_entities() {
     assert_eq!(b64("chats"), batch.chats.to_vec());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn backpressure_drops_sequenced_without_commit_then_recovered() {
     let mut h = Harness::new(
         &account_config(PULL, PULL_CONSUMERS),
@@ -393,6 +393,8 @@ async fn backpressure_drops_sequenced_without_commit_then_recovered() {
         m.refused(b.id)
             .is_none_or(|d| d.pts.is_none_or(|p| p <= 102))
     );
+    assert_eq!(m.next_action(), None, "not at once: the refetch backs off");
+    tokio::time::advance(tgin_mtproto::updates::RETRY_MIN).await;
     assert!(
         matches!(m.next_action(), Some(Fetch::GetDifference { pts: 102, .. })),
         "gap recovery asks from the committed pts"
