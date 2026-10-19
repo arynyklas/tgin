@@ -708,14 +708,27 @@ mod tests {
         assert!(login.login_unix > 1_700_000_000);
     }
 
+    /// A directory and files that already exist with wider modes are
+    /// narrowed by `open`, not only created narrow.
     #[cfg(unix)]
     #[test]
     fn files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("acct");
-        let _s = SessionStore::open(&dir).expect("open");
+        let set = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        std::fs::create_dir(&dir).expect("mkdir");
+        set(&dir, 0o755);
+        for file in ["lock", "session.redb"] {
+            std::fs::File::create(dir.join(file)).expect("create");
+            set(&dir.join(file), 0o644);
+            assert_eq!(mode(&dir.join(file)), 0o644);
+        }
+        assert_eq!(mode(&dir), 0o755);
+        let _s = SessionStore::open(&dir).expect("open");
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("session.redb")), 0o600);
         assert_eq!(mode(&dir.join("lock")), 0o600);

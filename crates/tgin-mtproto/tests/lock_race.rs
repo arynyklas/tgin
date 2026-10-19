@@ -18,18 +18,61 @@ fn main() -> ExitCode {
     if let Some(dir) = std::env::var_os(CHILD_DIR) {
         return child(Path::new(&dir));
     }
-    // `cargo test -- <filter>` passes arguments; run unless filtered out.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--list") {
-        println!("second_open_is_held_across_processes: test");
+        println!("{NAME}: test");
         return ExitCode::SUCCESS;
     }
-    if let Some(filter) = args.iter().find(|a| !a.starts_with('-'))
-        && !"second_open_is_held_across_processes".contains(filter.as_str())
-    {
+    if !selected(&args) {
+        println!("lock_race: skipped (filter)");
         return ExitCode::SUCCESS;
     }
     race()
+}
+
+const NAME: &str = "second_open_is_held_across_processes";
+
+/// Libtest options whose value is the next argument.
+const VALUED: &[&str] = &[
+    "--skip",
+    "--test-threads",
+    "--format",
+    "--color",
+    "--logfile",
+    "--shuffle-seed",
+    "-Z",
+];
+
+/// Whether libtest's arguments (`cargo test -- <args>`) select this test:
+/// no name filter or one that matches (`--exact`: equal), and no `--skip`
+/// that matches.
+fn selected(args: &[String]) -> bool {
+    let exact = args.iter().any(|a| a == "--exact");
+    let matches = |pattern: &str| {
+        if exact {
+            NAME == pattern
+        } else {
+            NAME.contains(pattern)
+        }
+    };
+    let mut filters = Vec::new();
+    let mut skips = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if let Some(skip) = arg.strip_prefix("--skip=") {
+            skips.push(skip.to_owned());
+        } else if VALUED.contains(&arg.as_str()) {
+            let value = args.next();
+            if arg == "--skip"
+                && let Some(skip) = value
+            {
+                skips.push(skip.clone());
+            }
+        } else if !arg.starts_with('-') {
+            filters.push(arg.clone());
+        }
+    }
+    (filters.is_empty() || filters.iter().any(|f| matches(f))) && !skips.iter().any(|s| matches(s))
 }
 
 /// Opens the store, prints `won` or `held`, and (if it won) keeps the lock
