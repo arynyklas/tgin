@@ -305,13 +305,13 @@ impl SessionStore {
     }
 
     /// Clears the authorization for a new login, in one transaction and
-    /// under the lock: every auth key, the home DC, the login marker, the
-    /// cached peers and the update state (common and channels). Kept: the
-    /// DC addresses and the `update_id` high-water mark, so that ids handed
-    /// out downstream never repeat. A login after `needs_login`, a failed
-    /// attempt and a logout go through here; deleting the files instead
-    /// would let another process take the directory between the delete and
-    /// the next open.
+    /// under the lock: every auth key and media key, the home DC, the login
+    /// marker, the cached peers and the update state (common and channels).
+    /// Kept: the DC addresses and the `update_id` high-water mark, so that
+    /// ids handed out downstream never repeat. A login after `needs_login`,
+    /// a failed attempt and a logout go through here; deleting the files
+    /// instead would let another process take the directory between the
+    /// delete and the next open.
     pub fn reset_for_login(&self) -> Result<(), SessionError> {
         self.write(|txn| {
             txn.delete_table(AUTH_KEYS)?;
@@ -320,6 +320,9 @@ impl SessionStore {
             txn.delete_table(UPDATE_STATE)?;
             txn.delete_table(CHANNEL_PTS)?;
             txn.delete_table(CHANNELS_BEHIND)?;
+            // The old account's media authorizations; the table is made
+            // again on first write.
+            txn.delete_table(MEDIA_KEYS)?;
             txn.open_table(AUTH_KEYS)?;
             txn.open_table(HOME_DC)?;
             txn.open_table(PEERS)?;
@@ -862,6 +865,7 @@ mod tests {
         s.set_dc_option(2, addr).expect("dc");
         s.set_home_key(2, &AuthKey([1; 256])).expect("home");
         s.set_dc_key(4, &AuthKey([4; 256])).expect("media");
+        s.set_media_key(3, &AuthKey([3; 256])).expect("media key");
         s.record_login(me(42)).expect("login");
         s.set_update_state(UpdateState {
             pts: 5,
@@ -884,6 +888,7 @@ mod tests {
         assert_eq!(s.home_dc().expect("home"), None);
         assert_eq!(s.auth_key(2).expect("key"), None);
         assert_eq!(s.auth_key(4).expect("key"), None);
+        assert_eq!(s.media_key(3).expect("media key"), None);
         assert_eq!(s.peer(42).expect("peer"), None);
         assert_eq!(s.update_state().expect("state"), UpdateState::default());
         assert!(s.channel_pts().expect("channels").is_empty());
