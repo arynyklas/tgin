@@ -1744,6 +1744,8 @@ struct Counted {
     id: i64,
     payloads: usize,
     rendered: usize,
+    /// Bytes of padding in the raw payload.
+    pad: usize,
 }
 
 impl Counted {
@@ -1753,6 +1755,7 @@ impl Counted {
             id,
             payloads: 0,
             rendered: 0,
+            pad: 0,
         }
     }
 }
@@ -1776,7 +1779,11 @@ impl BatchUpdate for Counted {
 
     fn payload(&mut self) -> Bytes {
         self.payloads += 1;
-        Bytes::from(format!(r#"{{"update_id":{},"form":"raw"}}"#, self.id))
+        Bytes::from(format!(
+            r#"{{"update_id":{},"form":"raw"{}}}"#,
+            self.id,
+            " ".repeat(self.pad)
+        ))
     }
 
     fn rendered(&mut self) -> Bytes {
@@ -2064,4 +2071,27 @@ async fn oversized_batch_gets_in_beside_a_trickle() {
         Admit::Backpressure,
         "over"
     );
+}
+
+/// A batch whose every update is too large for a consumer leaves that
+/// consumer out (counted as oversized), even while it is over its limits:
+/// there is nothing to reserve, so nothing to refuse.
+#[tokio::test(start_paused = true)]
+async fn nothing_to_reserve_never_refuses() {
+    let yaml = ACCOUNT.replace(
+        "raw: { pull: { auth_token: t0, capacity: 3 } }",
+        "raw: { pull: { auth_token: t0, capacity: 3, capacity_bytes: 1MiB } }",
+    );
+    let h = Harness::new(&yaml);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let mut five: Vec<Counted> = (1..=5)
+        .map(|i| Counted::new("updateNewMessage", i))
+        .collect();
+    assert_eq!(h.engine.admit_batch(acct, &mut five), Admit::Admitted);
+    assert_eq!(h.stats("raw").available, 5, "over its limits");
+    let mut big = [Counted::new("updateNewMessage", 6)];
+    big[0].pad = 1 << 20;
+    assert_eq!(h.engine.admit_batch(acct, &mut big), Admit::Admitted);
+    assert_eq!(h.stats("raw").available, 5, "left out");
+    h.assert_metric(r#"tgin_consumer_dropped_total{consumer="raw",reason="oversized"} 1"#);
 }

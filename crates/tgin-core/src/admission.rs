@@ -448,6 +448,10 @@ fn reserve_share<U: BatchUpdate>(
             share.push((i, size));
         }
     }
+    if share.is_empty() {
+        // Every update was too large for it: nothing to reserve.
+        return Ok(Vec::new());
+    }
     let sizes: Vec<usize> = share.iter().map(|&(_, size)| size).collect();
     match slot.consumer.queue().try_reserve_all(&sizes) {
         Ok(permits) => {
