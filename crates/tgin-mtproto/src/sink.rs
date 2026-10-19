@@ -10,6 +10,9 @@
 //!    one manager call in one write), before admitting any of them;
 //! 2. calls [`BatchSink::admit`] with the account's [`UpdateIds`] and the
 //!    same store;
+//!    An `Err` ([`IdsError`]) is a storage failure: the id mark could not
+//!    be persisted, nothing was admitted, and the batch stays open (neither
+//!    committed nor refused). The account fails with a storage error.
 //! 3. on [`Admission::Admitted`], persists what
 //!    [`committed(id)`](crate::UpdateManager::committed) returns with
 //!    [`SessionStore::commit_state`]; on [`Admission::Refused`], calls
@@ -37,8 +40,7 @@ pub enum Admission {
     /// Every update is queued for each consumer its rules route it to (an
     /// update no rule matches counts as handled).
     Admitted,
-    /// Nothing of the batch was queued: a consumer queue had no room, or
-    /// its ids could not be persisted.
+    /// Nothing of the batch was queued: a consumer queue had no room.
     Refused,
 }
 
@@ -47,7 +49,17 @@ pub trait BatchSink: Send + Sync + 'static {
     /// Offers `batch`, taking its update ids from `ids` (persisted through
     /// `store`). Call it in batch order, from one task per account; see the
     /// [module docs](self) for what to do with the answer.
-    fn admit(&self, batch: &Batch, ids: &mut UpdateIds, store: &SessionStore) -> Admission;
+    ///
+    /// # Errors
+    ///
+    /// The ids could not be handed out ([`UpdateIds::take`]): a storage
+    /// failure, never backpressure. Nothing was admitted.
+    fn admit(
+        &self,
+        batch: &Batch,
+        ids: &mut UpdateIds,
+        store: &SessionStore,
+    ) -> Result<Admission, IdsError>;
 }
 
 /// Hands out an account's `update_id`s: strictly increasing, starting at 1,

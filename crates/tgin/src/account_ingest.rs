@@ -17,7 +17,7 @@ use tgin_core::sink::{Admit, BatchUpdate};
 use tgin_mtproto::decode::PeerId;
 use tgin_mtproto::envelope::{self, Meta};
 use tgin_mtproto::schema::API;
-use tgin_mtproto::{Admission, Batch, BatchSink, SessionStore, UpdateBytes, UpdateIds};
+use tgin_mtproto::{Admission, Batch, BatchSink, IdsError, SessionStore, UpdateBytes, UpdateIds};
 
 /// The most text the rules see, in bytes, as for bot updates.
 const TEXT_CAP: usize = 4096;
@@ -41,28 +41,23 @@ impl AccountIngest {
 }
 
 impl BatchSink for AccountIngest {
-    fn admit(&self, batch: &Batch, ids: &mut UpdateIds, store: &SessionStore) -> Admission {
+    fn admit(
+        &self,
+        batch: &Batch,
+        ids: &mut UpdateIds,
+        store: &SessionStore,
+    ) -> Result<Admission, IdsError> {
         if batch.updates.is_empty() {
-            return Admission::Admitted;
+            return Ok(Admission::Admitted);
         }
         let Some(source) = self.engine.account_source(&self.account) else {
             tracing::warn!(
                 account = %self.account,
                 "the account is not in the current config; its updates are refused"
             );
-            return Admission::Refused;
+            return Ok(Admission::Refused);
         };
-        let first = match ids.take(batch.updates.len(), store) {
-            Ok(first) => first,
-            Err(err) => {
-                tracing::error!(
-                    account = %self.account,
-                    error = %err,
-                    "no update ids for a batch; it is refused"
-                );
-                return Admission::Refused;
-            }
-        };
+        let first = ids.take(batch.updates.len(), store)?;
         let received_at = SystemTime::now();
         let mut items: Vec<Item<'_>> = batch
             .updates
@@ -82,10 +77,10 @@ impl BatchSink for AccountIngest {
                 rendered: None,
             })
             .collect();
-        match self.engine.admit_batch(source, &mut items) {
+        Ok(match self.engine.admit_batch(source, &mut items) {
             Admit::Admitted | Admit::Unroutable => Admission::Admitted,
             Admit::Backpressure => Admission::Refused,
-        }
+        })
     }
 }
 

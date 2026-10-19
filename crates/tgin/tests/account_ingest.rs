@@ -25,8 +25,8 @@ use tgin_core::metrics::CoreMetrics;
 use tgin_core::reply::{Reply, ReplyExecutor, ReplyHandle};
 use tgin_mtproto::tl_json::from_json;
 use tgin_mtproto::{
-    Admission, Batch, BatchSink, Fetch, SessionStore, StoredState, UpdateIds, UpdateManager,
-    UpdateState,
+    Admission, Batch, BatchSink, Fetch, IdsError, SessionStore, StoredState, UpdateIds,
+    UpdateManager, UpdateState,
 };
 use tgin_runtime::config::MapEnv;
 use tgin_runtime::obs::MetricsRegistry;
@@ -151,7 +151,9 @@ impl Harness {
     }
 
     fn admit(&mut self, batch: &Batch) -> Admission {
-        self.ingest.admit(batch, &mut self.ids, &self.store)
+        self.ingest
+            .admit(batch, &mut self.ids, &self.store)
+            .expect("ids handed out")
     }
 
     fn pending(&self, consumer: &str) -> usize {
@@ -664,4 +666,22 @@ async fn no_content_in_logs() {
     for needle in [SECRET, &tl[..16], "s3cr3t"] {
         assert!(!logs.contains(needle), "{needle} logged:\n{logs}");
     }
+}
+
+/// Ids that cannot be handed out are a storage failure, not backpressure:
+/// the caller fails the account instead of refetching forever. Nothing is
+/// admitted.
+#[tokio::test]
+async fn id_failure_is_an_error_not_a_refusal() {
+    let mut h = Harness::new(
+        &account_config(PULL, PULL_CONSUMERS),
+        ReplyHandle::default(),
+    );
+    h.store.set_update_id(i64::MAX - 1).expect("mark");
+    h.ids = UpdateIds::load(&h.store).expect("ids");
+    let mut m = manager();
+    let batch = pushed(&mut m, &[101, 102]);
+    let got = h.ingest.admit(&batch, &mut h.ids, &h.store);
+    assert!(matches!(got, Err(IdsError::Exhausted)), "{got:?}");
+    assert_eq!(h.pending("feed"), 0);
 }
