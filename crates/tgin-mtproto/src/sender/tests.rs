@@ -419,6 +419,22 @@ impl Server {
         self.send(&[(false, body)]);
     }
 
+    /// `bad_msg_notification` `code` for `bad_msg_id`, sent as a message
+    /// whose id carries Telegram's clock: `server_secs` seconds since the
+    /// epoch.
+    fn bad_msg_at(&mut self, server_secs: i64, bad_msg_id: i64, code: i32) {
+        let body = tl::enums::BadMsgNotification::Notification(tl::types::BadMsgNotification {
+            bad_msg_id,
+            bad_msg_seqno: 1,
+            error_code: code,
+        })
+        .to_bytes();
+        let counter = self.next_msg_id;
+        self.next_msg_id = (server_secs << 32) | 1;
+        self.send(&[(false, body)]);
+        self.next_msg_id = counter;
+    }
+
     /// The transport fails with `error` (a −404, say) and the connection
     /// ends.
     fn fail(&mut self, error: TransportError) {
@@ -499,6 +515,34 @@ async fn outcome(
 
 fn answered() -> RpcOutcome {
     RpcOutcome::Result(Bytes::from_static(&ANSWER))
+}
+
+/// Seconds since the epoch in a msg_id.
+fn secs(msg_id: i64) -> i64 {
+    msg_id >> 32
+}
+
+/// Code 17 (msg_id too high) from a server an hour behind the client: the
+/// resend carries Telegram's time, not a floor left by the fast clock.
+#[tokio::test(start_paused = true)]
+async fn code_17_moves_msg_ids_back_to_server_time() {
+    let (h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    let first = srv.request().await;
+    let sent = first.requests()[0].clone();
+    let server_secs = secs(sent.msg_id) - 3600;
+    srv.bad_msg_at(server_secs, first.bad_msg_id(), 17);
+
+    let again = srv.request().await;
+    let resent = again.requests()[0].clone();
+    assert_eq!(resent.body, sent.body);
+    assert!(
+        (secs(resent.msg_id) - server_secs).abs() <= 5,
+        "resent at {} s, server at {server_secs} s",
+        secs(resent.msg_id)
+    );
+    srv.answer(resent.msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
 }
 
 /// Answers one `help.getConfig`, so the connection is initialized and the

@@ -421,10 +421,16 @@ impl Clock {
         id
     }
 
-    /// Takes Telegram's time from one of its msg_ids.
+    /// Takes Telegram's time from one of its msg_ids. A new offset also
+    /// drops the floor: ids made with a wrong offset must not hold the next
+    /// ones in the future (Telethon's `update_time_offset`).
     fn correct(&mut self, server_msg_id: i64) {
         let (secs, _) = now_unix();
-        self.offset = i32::try_from((server_msg_id >> 32) - secs).unwrap_or(self.offset);
+        let offset = i32::try_from((server_msg_id >> 32) - secs).unwrap_or(self.offset);
+        if offset != self.offset {
+            self.offset = offset;
+            self.last = 0;
+        }
     }
 }
 
