@@ -258,23 +258,40 @@ impl Engine {
     /// takes: [`BatchUpdate::payload`] for targets with `render: raw`,
     /// [`BatchUpdate::rendered`] for those with `render: tl_json`.
     pub fn admit_batch<U: BatchUpdate>(&self, source: SourceId, updates: &mut [U]) -> Admit {
+        let mut unmatched = 0;
         let state = self.shared.state.load();
-        if let Some(admit) = self.admit_batch_on(&state, source, updates) {
-            return admit;
+        let admit = match self.admit_batch_on(&state, source, updates, &mut unmatched) {
+            Some(admit) => Some((admit, state)),
+            None => {
+                let current = self.shared.state.load();
+                self.admit_batch_on(&current, source, updates, &mut unmatched)
+                    .map(|admit| (admit, current))
+            }
+        };
+        let Some((admit, state)) = admit else {
+            return Admit::Backpressure;
+        };
+        // Counted once, for the attempt that decided; as for a bot source,
+        // under the account's name.
+        if unmatched > 0
+            && let Some((name, _)) = state.accounts.iter().find(|(_, id)| *id == source)
+        {
+            self.shared.metrics.unmatched(name, unmatched);
         }
-        let current = self.shared.state.load();
-        self.admit_batch_on(&current, source, updates)
-            .unwrap_or(Admit::Backpressure)
+        admit
     }
 
     /// [`Engine::admit_batch`] on `state`; `None` when a target was retired
-    /// meanwhile and nothing was reserved.
+    /// meanwhile and nothing was reserved. `unmatched` counts the updates no
+    /// rule matched.
     fn admit_batch_on<U: BatchUpdate>(
         &self,
         state: &EngineState,
         source: SourceId,
         updates: &mut [U],
+        unmatched: &mut u64,
     ) -> Option<Admit> {
+        *unmatched = 0;
         let mut routed: Vec<Routed> = Vec::with_capacity(updates.len());
         let mut scratch = self.scratch.lock().pop().unwrap_or_default();
         for (index, update) in updates.iter().enumerate() {
@@ -285,6 +302,7 @@ impl Engine {
                 .route(source, &facts, &mut targets, &mut scratch)
                 .is_none()
             {
+                *unmatched += 1;
                 tracing::debug!(
                     update_id = update.update_id(),
                     update_type = facts.update_type,

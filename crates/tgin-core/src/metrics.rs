@@ -295,6 +295,16 @@ impl CoreMetrics {
         self.shutdown_abandoned.inc_by(n);
     }
 
+    /// `n` updates of the account `source` that no rule matched
+    /// (`tgin_routes_unmatched_total`, as for a bot source).
+    pub fn unmatched(&self, source: &str, n: u64) {
+        self.routes_unmatched
+            .get_or_create(&SourceLabels {
+                source: Arc::from(source),
+            })
+            .inc_by(n);
+    }
+
     /// Resolves the handles of every label combination of one source.
     pub fn source(&self, name: &str) -> SourceMetrics {
         let source: Arc<str> = Arc::from(name);

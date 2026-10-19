@@ -316,3 +316,29 @@ async fn shutdown_waits_for_an_in_flight_rpc() {
     let answer = call.await.expect("no panic").expect("the call is answered");
     assert_eq!(answer.status(), 200);
 }
+
+#[tokio::test]
+async fn unmatched_account_updates_are_counted() {
+    let net = FakeNetwork::new();
+    net.answer(|call| match call.ctor() {
+        ids::GET_DIFFERENCE => Reply::Ok(tgin_mtproto::testkit::difference(
+            &[tgin_mtproto::testkit::private_message(1, 100, "hi")],
+            11,
+            1,
+            1,
+        )),
+        _ => Reply::Ok(ANSWER.to_vec()),
+    });
+    // The account has no rule: its update matches none.
+    let tgin = start(&config(CLIENT_A, ""), Some(net)).await;
+    tgin.until_state("running").await;
+    let line = r#"tgin_routes_unmatched_total{source="main"} 1"#;
+    timeout(PATIENCE, async {
+        while !tgin.metrics.encode().lines().any(|l| l == line) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{line} missing:\n{}", tgin.metrics.encode()));
+    tgin.stop().await;
+}
