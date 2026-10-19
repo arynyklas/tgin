@@ -483,6 +483,18 @@ impl Server {
         self.next_msg_id = counter;
     }
 
+    /// `new_session_created`: Telegram made a new session at the client's
+    /// message `first_msg_id`.
+    fn new_session(&mut self, first_msg_id: i64, salt: i64) {
+        let body = tl::enums::NewSession::Created(tl::types::NewSessionCreated {
+            first_msg_id,
+            unique_id: 77,
+            server_salt: salt,
+        })
+        .to_bytes();
+        self.send(&[(true, body)]);
+    }
+
     /// The transport fails with `error` (a −404, say) and the connection
     /// ends.
     fn fail(&mut self, error: TransportError) {
@@ -829,6 +841,51 @@ async fn mark_logged_in_turns_minus_404_into_key_revoked() {
     srv.fail(TransportError::Status(404));
     let result = outcome(call).await;
     assert!(matches!(result, Err(SenderError::KeyRevoked)), "{result:?}");
+}
+
+/// The synthetic `updatesTooLong` the sender pushes when the session's
+/// update stream may have a gap.
+fn too_long() -> Bytes {
+    Bytes::from_static(&[0x7e, 0xaf, 0x17, 0xe3])
+}
+
+/// A lost connection tells the update manager to catch up (P1); a −404
+/// does not, since there is nothing to catch up with.
+#[tokio::test(start_paused = true)]
+async fn connection_loss_pushes_updates_too_long() {
+    let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    srv.close();
+    let push = timeout(WAIT, pushes.recv()).await.unwrap();
+    assert_eq!(push, Some(too_long()));
+
+    let call = h.invoke(get_config());
+    let mut fresh = h.ready_conn().await;
+    fresh.request().await;
+    fresh.fail(TransportError::Status(404));
+    assert!(matches!(outcome(call).await, Err(SenderError::KeyUnknown)));
+    assert!(
+        timeout(WAIT, pushes.recv()).await.is_err(),
+        "no catch-up on a dead key"
+    );
+}
+
+/// `new_session_created` means Telegram may have dropped updates: the
+/// sender pushes `updatesTooLong` and takes the new salt (P1).
+#[tokio::test(start_paused = true)]
+async fn new_session_created_pushes_updates_too_long() {
+    let (mut h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    let sent = packet.requests()[0].msg_id;
+    srv.new_session(sent, 0x5e55);
+    let push = timeout(WAIT, pushes.recv()).await.unwrap();
+    assert_eq!(push, Some(too_long()));
+    srv.answer(sent, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+    let next = srv.packet().await;
+    assert_eq!(next.salt, 0x5e55, "the new session's salt");
 }
 
 /// Every connection opens with the sender's own `initConnection` call;

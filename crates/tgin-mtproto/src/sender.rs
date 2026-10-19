@@ -28,8 +28,11 @@
 //! One connection at a time, each a new MTProto session (fresh
 //! `session_id`, seqno from 0). When one ends, the sender stays without a
 //! connection until the next `invoke`, which opens a fresh one. Pushes
-//! therefore stop until then; after a reconnect the caller re-subscribes
-//! the session with its next update call.
+//! therefore stop until then. So on a main session, whenever a connection
+//! ends (except on −404 and when the sender is dropped) and whenever
+//! Telegram reports `new_session_created`, the sender pushes a synthetic
+//! `updatesTooLong`: the update manager then calls `getDifference`, which
+//! reconnects and re-subscribes the session.
 //!
 //! Every connection opens with the sender's own init call,
 //! `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`; no
@@ -98,6 +101,9 @@ const MSGS_ACK: u32 = tl::types::MsgsAck::CONSTRUCTOR_ID;
 const BAD_MSG_NOTIFICATION: u32 = tl::types::BadMsgNotification::CONSTRUCTOR_ID;
 const BAD_SERVER_SALT: u32 = tl::types::BadServerSalt::CONSTRUCTOR_ID;
 const NEW_SESSION_CREATED: u32 = tl::types::NewSessionCreated::CONSTRUCTOR_ID;
+/// `updatesTooLong#e317af7e`: what the sender pushes when the session's
+/// update stream may have a gap.
+const UPDATES_TOO_LONG: [u8; 4] = tl::types::UpdatesTooLong::CONSTRUCTOR_ID.to_le_bytes();
 const PONG: u32 = tl::types::Pong::CONSTRUCTOR_ID;
 const MSG_DETAILED_INFO: u32 = tl::types::MsgDetailedInfo::CONSTRUCTOR_ID;
 const MSG_NEW_DETAILED_INFO: u32 = tl::types::MsgNewDetailedInfo::CONSTRUCTOR_ID;
@@ -506,6 +512,15 @@ struct Shared {
 }
 
 impl Shared {
+    /// The session's update stream may have a gap: tell the update
+    /// manager, on main sessions.
+    fn session_lost(&mut self) {
+        if !self.without_updates {
+            self.backlog
+                .push_back(Bytes::from_static(&UPDATES_TOO_LONG));
+        }
+    }
+
     /// What goes in front of a caller's request.
     fn wrapper_len(&self) -> usize {
         if self.without_updates {
@@ -752,6 +767,9 @@ impl<T: Transport> Actor<T> {
             None => tracing::debug!(dc = st.dc_id, cause = %cause, "mtproto connection ended"),
         }
         st.dead = st.dead.or(gone);
+        if gone.is_none() && !matches!(cause, Cause::Shutdown) {
+            st.session_lost();
+        }
         conn.end(writer.is_flushed(), gone, &cause);
         matches!(cause, Cause::Shutdown)
     }
@@ -1014,7 +1032,10 @@ impl Conn {
                 let code = i32_at(&body, 16).ok_or(bad())?;
                 self.on_bad_msg(st, msg_id, bad_msg_id, code)?;
             }
-            NEW_SESSION_CREATED => st.salt = i64_at(&body, 20).ok_or(bad())?,
+            NEW_SESSION_CREATED => {
+                st.salt = i64_at(&body, 20).ok_or(bad())?;
+                st.session_lost();
+            }
             PONG => {
                 let ping_msg_id = i64_at(&body, 4).ok_or(bad())?;
                 self.resolve(ping_msg_id, Err(SenderError::NoAnswer))?;
