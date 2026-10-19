@@ -288,19 +288,32 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
     }
 }
 
-/// The consumers each target list reaches, by index.
-fn reach(consumers: &IndexMap<Name, At<Consumer>>, targets: &[At<Target>], out: &mut Vec<usize>) {
-    for target in targets {
+/// The consumers each target list reaches, as (index, location, path).
+fn reach(
+    consumers: &IndexMap<Name, At<Consumer>>,
+    targets: &[At<Target>],
+    path: &str,
+    out: &mut Vec<(usize, Location, String)>,
+) {
+    for (k, target) in targets.iter().enumerate() {
+        let path = format!("{path}[{k}]");
         match &target.value {
-            Target::Consumer(name) => out.extend(consumers.get_index_of(name.as_str())),
-            Target::All(children) => reach(consumers, children, out),
-            Target::Split(split) => reach(consumers, &split.among, out),
+            Target::Consumer(name) => {
+                if let Some(index) = consumers.get_index_of(name.as_str()) {
+                    out.push((index, target.location, path));
+                }
+            }
+            Target::All(children) => reach(consumers, children, &format!("{path}.all"), out),
+            Target::Split(split) => {
+                reach(consumers, &split.among, &format!("{path}.split.among"), out);
+            }
         }
     }
 }
 
-/// A consumer takes bot updates or account updates, never both, and
-/// renders TL-JSON only for accounts.
+/// A consumer takes bot updates or account updates, never both; a pull
+/// consumer serves one account; and only accounts' consumers render
+/// TL-JSON.
 fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
     if raw.accounts.is_empty()
         && raw
@@ -314,22 +327,49 @@ fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
     // The first bot and the first account feeding each consumer.
     let mut bot_of: Vec<Option<&str>> = vec![None; raw.consumers.len()];
     let mut account_of: Vec<Option<&str>> = vec![None; raw.consumers.len()];
-    for bot in &raw.bots {
+    for (i, bot) in raw.bots.iter().enumerate() {
         reached.clear();
-        for route in &bot.routes {
-            reach(&raw.consumers, &route.value.to, &mut reached);
+        for (j, route) in bot.routes.iter().enumerate() {
+            let path = format!("bots[{i}].routes[{j}].to");
+            reach(&raw.consumers, &route.value.to, &path, &mut reached);
         }
-        for &c in &reached {
-            bot_of[c].get_or_insert(bot.name.value.as_str());
+        for (c, _, _) in &reached {
+            bot_of[*c].get_or_insert(bot.name.value.as_str());
         }
     }
     for (name, account) in &raw.accounts {
+        let name = name.as_str();
         reached.clear();
-        for route in &account.value.routes {
-            reach(&raw.consumers, &route.value.to, &mut reached);
+        for (j, route) in account.value.routes.iter().enumerate() {
+            let path = format!("accounts.{name}.routes[{j}].to");
+            reach(&raw.consumers, &route.value.to, &path, &mut reached);
         }
-        for &c in &reached {
-            account_of[c].get_or_insert(name.as_str());
+        // One report per consumer and account, at its first reference.
+        let mut seen = HashSet::new();
+        reached.retain(|(consumer, _, _)| seen.insert(*consumer));
+        for (c, location, target_path) in reached.drain(..) {
+            let first = *account_of[c].get_or_insert(name);
+            if first == name {
+                continue;
+            }
+            let Some((
+                consumer,
+                At {
+                    value: Consumer::Pull(_),
+                    ..
+                },
+            )) = raw.consumers.get_index(c)
+            else {
+                continue;
+            };
+            diag.errors.push(
+                ConfigError::new(format!(
+                    "pull consumer `{}` is targeted by accounts `{first}` and `{name}`; a pull consumer serves one account",
+                    consumer.as_str()
+                ))
+                .at(located(target_path, location))
+                .hint("each account's update ids make their own offsets; give each account its own pull consumer"),
+            );
         }
     }
     for (index, (name, consumer)) in raw.consumers.iter().enumerate() {

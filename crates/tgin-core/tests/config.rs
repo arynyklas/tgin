@@ -3776,3 +3776,31 @@ fn account_changing_warning_skips_denied() {
         "accounts.main.rpc.clients.c.allow[1]"
     );
 }
+
+/// A pull consumer serves one account, as it serves one bot: two
+/// accounts' update ids would share one offset.
+#[test]
+fn account_pull_consumer_single_account() {
+    let yaml = r#"version: 1
+server: {}
+accounts:
+  a: { api_id: 1, api_hash: h, session_dir: sa, routes: [{ to: [feed] }, { to: [feed] }] }
+  b: { api_id: 1, api_hash: h, session_dir: sb, routes: [{ to: [other, feed] }] }
+consumers:
+  feed: { pull: { auth_token: t1 } }
+  other: { pull: { auth_token: t2 } }
+"#;
+    let err = single_error(yaml);
+    let (line, column) = pos(yaml, "other, feed");
+    assert_at(&err, "accounts.b.routes[0].to[1]", (line, column + 7));
+    assert_message(
+        &err,
+        "pull consumer `feed` is targeted by accounts `a` and `b`",
+    );
+    assert!(err.hint.is_some(), "{err}");
+    // A push consumer may take several accounts.
+    loads(&yaml.replace(
+        "feed: { pull: { auth_token: t1 } }",
+        "feed: { push: { endpoints: [{ url: \"http://x\" }] } }",
+    ));
+}
