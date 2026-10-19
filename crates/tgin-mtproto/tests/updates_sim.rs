@@ -1134,6 +1134,56 @@ async fn refused_batch_without_updates_keeps_its_state() {
     );
 }
 
+/// A signal cuts a pending retry short: after a long cut the backoff is at
+/// 60 s, and the reconnect's `updatesTooLong` (or a channel's
+/// `updateChannelTooLong`) asks at once instead of waiting it out.
+#[tokio::test(start_paused = true)]
+async fn signal_cuts_a_pending_retry_short() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    m.feed_push(too_long());
+    for _ in 0..8 {
+        let f = m.next_action().expect("asked");
+        m.fetch_failed(f);
+        advance(m.deadline().saturating_duration_since(Instant::now())).await;
+    }
+    let f = m.next_action().expect("asked");
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(60));
+    m.feed_push(too_long());
+    assert!(
+        matches!(m.next_action(), Some(Fetch::GetDifference { pts: 10, .. })),
+        "at once"
+    );
+    // The answer's backoff starts afresh on the next failure.
+    let f = Fetch::GetDifference {
+        pts: 10,
+        qts: 5,
+        date: 1,
+    };
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    advance(Duration::from_secs(1)).await;
+    let f = m.next_action().expect("the difference again");
+    assert!(matches!(f, Fetch::GetDifference { .. }));
+    let batches = m.feed_difference(b(difference_empty(1, 3)));
+    commit(&mut m, &batches);
+
+    let f = m.next_action().expect("channel 1");
+    assert_eq!(f, Fetch::GetChannelDifference { channel: 1, pts: 5 });
+    for _ in 0..3 {
+        m.fetch_failed(f);
+        advance(m.deadline().saturating_duration_since(Instant::now())).await;
+        assert_eq!(m.next_action(), Some(f));
+    }
+    m.fetch_failed(f);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(8));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    assert_eq!(m.next_action(), Some(f), "the channel at once");
+}
+
 #[tokio::test(start_paused = true)]
 async fn affected_pts_advance_the_box() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));

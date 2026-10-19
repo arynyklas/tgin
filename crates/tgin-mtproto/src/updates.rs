@@ -604,6 +604,12 @@ impl UpdateManager {
             }
         };
         if c.constructor == "updatesTooLong" {
+            // A pending retry is cut short: the signal (Telegram's, or the
+            // sender's on a new connection) shows the server is reachable
+            // again. The sender sends one per connection end or new
+            // session, so this cannot loop.
+            self.retry_at = None;
+            self.backoff = Duration::ZERO;
             self.want_difference();
             return Vec::new();
         }
@@ -1585,8 +1591,15 @@ impl UpdateManager {
                 // The call in flight may predate the signal: one more
                 // fetch follows it, even after a `final` answer.
                 ChannelFetch::InFlight { .. } => ch.again = true,
-                // Not yet asked: the signal joins it.
-                ChannelFetch::Wanted => {}
+                // Not yet asked: the signal joins it. A pending retry is
+                // cut short: the server just showed it is reachable.
+                ChannelFetch::Wanted => {
+                    if ch.retry_at.take().is_some() {
+                        ch.backoff = Duration::ZERO;
+                        self.retrying.remove(&c);
+                        self.queue.push_back(c);
+                    }
+                }
             },
         }
         if self.channels.get(&c).is_some_and(|ch| ch.pts.is_some()) {
