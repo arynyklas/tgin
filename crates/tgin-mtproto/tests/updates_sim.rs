@@ -6,6 +6,12 @@
 //! the run in turn (each step, and before admission, after admission and
 //! after the commit of each batch) and checks that every sequenced update
 //! of the server's log reached admission at least once.
+//!
+//! The server's rules the model relies on, no more: half its answers are
+//! computed when asked and fed after later pushes; its getDifference
+//! signals (`updateChannelTooLong`) only channels with an update the
+//! client never got and that is not on the way; two channels are quiet
+//! (nothing after the main phase reveals what they missed).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -1414,6 +1420,13 @@ impl Persisted {
     }
 }
 
+/// An answer computed when its call was asked.
+struct Answer {
+    bytes: Vec<u8>,
+    /// A channel difference's pts: the client is told of everything up to it.
+    to: i32,
+}
+
 struct Sim<'a> {
     s: &'a Script,
     rng: Rng,
@@ -1421,11 +1434,15 @@ struct Sim<'a> {
     persisted: Persisted,
     /// Pushes on the way, with their event.
     net: VecDeque<(usize, Bytes)>,
-    in_flight: VecDeque<Fetch>,
-    /// Events the server told the client of: their push was fed, or a fed
-    /// channel difference covered them. It signals the others' channels
-    /// (`updateChannelTooLong` in getDifference): what a client never got,
-    /// the server tells it to fetch; what it got, the client must keep.
+    /// Calls on the way. Some answers are computed when asked, as a server
+    /// does, and fed after pushes that came later: an answer may predate
+    /// the pushes fed before it.
+    in_flight: VecDeque<(Fetch, Option<Answer>)>,
+    /// Events the client got: their push was fed, or a fed channel
+    /// difference covered them. The server signals the channels of the
+    /// others not on the way (`updateChannelTooLong` in getDifference):
+    /// what a client never got, the server tells it to fetch; what it got,
+    /// or is getting, the client must keep.
     received: HashSet<usize>,
     /// Events that have happened on the server.
     done: usize,
@@ -1543,7 +1560,28 @@ impl<'a> Sim<'a> {
 
     fn pump(&mut self) {
         while let Some(f) = self.m.next_action() {
-            self.in_flight.push_back(f);
+            let early = self.rng.chance(50).then(|| self.compute(f));
+            self.in_flight.push_back((f, early));
+        }
+    }
+
+    fn compute(&self, f: Fetch) -> Answer {
+        match f {
+            Fetch::GetState => {
+                let (pts, qts, seq, date) = self.current();
+                Answer {
+                    bytes: state(pts, qts, date, seq),
+                    to: 0,
+                }
+            }
+            Fetch::GetDifference { pts, qts, .. } => Answer {
+                bytes: self.difference(pts, qts),
+                to: 0,
+            },
+            Fetch::GetChannelDifference { channel, pts } => {
+                let (bytes, to) = self.channel_difference(channel, pts);
+                Answer { bytes, to }
+            }
         }
     }
 
@@ -1577,18 +1615,13 @@ impl<'a> Sim<'a> {
         self.take(batches);
     }
 
-    fn answer(&mut self, f: Fetch) {
+    fn answer(&mut self, f: Fetch, early: Option<Answer>) {
+        let a = early.unwrap_or_else(|| self.compute(f));
         let batches = match f {
-            Fetch::GetState => {
-                let (pts, qts, seq, date) = self.current();
-                self.m.feed_state(b(state(pts, qts, date, seq)))
-            }
-            Fetch::GetDifference { pts, qts, .. } => {
-                let d = self.difference(pts, qts);
-                self.m.feed_difference(b(d))
-            }
-            Fetch::GetChannelDifference { channel, pts } => {
-                let (d, to) = self.channel_difference(channel, pts);
+            Fetch::GetState => self.m.feed_state(b(a.bytes)),
+            Fetch::GetDifference { .. } => self.m.feed_difference(b(a.bytes)),
+            Fetch::GetChannelDifference { channel, .. } => {
+                let to = a.to;
                 self.received.extend(
                     self.s.events[..self.done]
                         .iter()
@@ -1596,7 +1629,7 @@ impl<'a> Sim<'a> {
                         .filter(|(_, e)| e.kind == Kind::Chan(channel) && e.chan_pts <= to)
                         .map(|(i, _)| i),
                 );
-                self.m.feed_channel_difference(channel, b(d))
+                self.m.feed_channel_difference(channel, b(a.bytes))
             }
         };
         self.take(batches);
@@ -1656,12 +1689,15 @@ impl<'a> Sim<'a> {
             return difference(&d, &state(last.pts, last.qts, last.date, last.seq), true);
         }
         // Channels with an update the client was never told of are
-        // signalled.
+        // signalled. A push on the way counts as told: the server sent
+        // it, and learns otherwise only when the connection drops with it
+        // unacknowledged.
+        let on_the_way: HashSet<usize> = self.net.iter().map(|&(i, _)| i).collect();
         let since: BTreeSet<i64> = log
             .iter()
             .enumerate()
             .filter_map(|(i, e)| match e.kind {
-                Kind::Chan(c) if !self.received.contains(&i) => Some(c),
+                Kind::Chan(c) if !self.received.contains(&i) && !on_the_way.contains(&i) => Some(c),
                 _ => None,
             })
             .collect();
@@ -1719,11 +1755,11 @@ impl<'a> Sim<'a> {
             }
             30..58 => self.deliver(),
             58..76 => {
-                if let Some(f) = self.in_flight.pop_front() {
+                if let Some((f, early)) = self.in_flight.pop_front() {
                     if self.rng.chance(5) {
                         self.m.fetch_failed(f);
                     } else {
-                        self.answer(f);
+                        self.answer(f, early);
                     }
                 }
             }
@@ -1732,7 +1768,7 @@ impl<'a> Sim<'a> {
                 // The connection ends: its pushes and calls are lost, and
                 // the sender adds `updatesTooLong`.
                 self.net.clear();
-                for f in std::mem::take(&mut self.in_flight) {
+                for (f, _) in std::mem::take(&mut self.in_flight) {
                     self.m.fetch_failed(f);
                 }
                 let batches = self.m.feed_push(b(T::new(UPDATES_TOO_LONG).done()));
@@ -1756,8 +1792,8 @@ impl<'a> Sim<'a> {
                     self.received.insert(i);
                     let batches = self.m.feed_push(p);
                     self.take(batches);
-                } else if let Some(f) = self.in_flight.pop_front() {
-                    self.answer(f);
+                } else if let Some((f, early)) = self.in_flight.pop_front() {
+                    self.answer(f, early);
                 } else {
                     break;
                 }
