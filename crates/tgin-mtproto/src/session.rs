@@ -34,9 +34,10 @@ const PEERS: TableDefinition<i64, &[u8]> = TableDefinition::new("peers");
 const UPDATE_STATE: TableDefinition<&str, i32> = TableDefinition::new("update_state");
 /// Bare channel id → channel pts.
 const CHANNEL_PTS: TableDefinition<i64, i32> = TableDefinition::new("channel_pts");
-/// Bare channel id → nothing: a batch moved the channel ahead of its
-/// stored pts and it has not caught up since, so it catches up at start.
-const CHANNELS_BEHIND: TableDefinition<i64, ()> = TableDefinition::new("channels_behind");
+/// Bare channel id → mark (the id of the batch that named it last): a
+/// batch moved the channel ahead of its stored pts and it has not caught up
+/// since, so it catches up at start.
+const CHANNELS_BEHIND: TableDefinition<i64, u64> = TableDefinition::new("channels_behind");
 /// `schema`, `created_unix`, `self_user_id`, `login_unix`, `update_id`;
 /// integers are little-endian `i64`.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -381,7 +382,8 @@ impl SessionStore {
         {
             let txn = self.db.begin_read()?;
             for row in txn.open_table(CHANNELS_BEHIND)?.iter()? {
-                behind.push(row?.0.value());
+                let (c, g) = row?;
+                behind.push((c.value(), g.value()));
             }
         }
         Ok(StoredState {
@@ -411,24 +413,35 @@ impl SessionStore {
             for &(channel, pts) in &delta.channels {
                 channels.insert(channel, pts)?;
             }
+            // A row marked again since (a higher mark) stays: the delta
+            // and a newer mark may be written in either order.
             let mut behind = txn.open_table(CHANNELS_BEHIND)?;
-            for channel in &delta.caught_up {
-                behind.remove(channel)?;
+            for &(channel, mark) in &delta.caught_up {
+                let current = behind.get(channel)?.map(|g| g.value());
+                if current.is_some_and(|g| g <= mark) {
+                    behind.remove(channel)?;
+                }
             }
             Ok(())
         })
     }
 
-    /// Records a batch's [`ahead`](crate::Batch::ahead) channels, before
-    /// the batch is admitted: after a crash, they catch up at start.
-    pub fn mark_channels_behind(&self, channels: &[i64]) -> Result<(), SessionError> {
+    /// Records a batch's [`ahead`](crate::Batch::ahead) channels with the
+    /// batch's id as their `mark`, before the batch is admitted: after a
+    /// crash, they catch up at start. A row keeps its highest mark, so
+    /// marks and [`commit_state`](Self::commit_state) may land in any
+    /// order.
+    pub fn mark_channels_behind(&self, channels: &[i64], mark: u64) -> Result<(), SessionError> {
         if channels.is_empty() {
             return Ok(());
         }
         self.write(|txn| {
             let mut behind = txn.open_table(CHANNELS_BEHIND)?;
             for &channel in channels {
-                behind.insert(channel, ())?;
+                let current = behind.get(channel)?.map(|g| g.value());
+                if current.is_none_or(|g| g < mark) {
+                    behind.insert(channel, mark)?;
+                }
             }
             Ok(())
         })
@@ -784,7 +797,7 @@ mod tests {
         })
         .expect("state");
         s.set_channel_pts(9, 10).expect("channel");
-        s.mark_channels_behind(&[9]).expect("behind");
+        s.mark_channels_behind(&[9], 3).expect("behind");
         s.set_update_id(77).expect("update_id");
 
         s.reset_for_login().expect("reset");
@@ -952,13 +965,13 @@ mod tests {
             date: 4,
         })
         .expect("state");
-        s.mark_channels_behind(&[5, 6, 7]).expect("behind");
-        s.mark_channels_behind(&[]).expect("none");
+        s.mark_channels_behind(&[5, 6, 7], 2).expect("behind");
+        s.mark_channels_behind(&[], 9).expect("none");
         s.commit_state(&StateDelta {
             pts: Some(10),
             seq: Some(30),
             channels: vec![(5, 50), (6, 60)],
-            caught_up: vec![5, 7],
+            caught_up: vec![(5, 2), (7, 2)],
             ..StateDelta::default()
         })
         .expect("commit");
@@ -975,8 +988,33 @@ mod tests {
             }
         );
         assert_eq!(st.channels, vec![(5, 50), (6, 60)]);
-        assert_eq!(st.behind, vec![6]);
+        assert_eq!(st.behind, vec![(6, 2)]);
         assert!(st.known_users.is_empty());
+    }
+
+    /// P8's ordering: a commit reporting a channel caught up and a newer
+    /// mark of that channel (a later batch's) may be written in either
+    /// order, and the newer mark stays. A mark lower than the row's is
+    /// kept out.
+    #[test]
+    fn caught_up_never_erases_a_newer_mark() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        let caught_up = |c, g| StateDelta {
+            caught_up: vec![(c, g)],
+            ..StateDelta::default()
+        };
+        // The newer mark lands first, then the older caught-up.
+        s.mark_channels_behind(&[1, 2], 4).expect("first mark");
+        s.mark_channels_behind(&[1], 9).expect("newer mark");
+        s.commit_state(&caught_up(1, 4)).expect("stale caught-up");
+        s.commit_state(&caught_up(2, 4)).expect("caught-up");
+        assert_eq!(s.stored_state().expect("stored").behind, vec![(1, 9)]);
+        // A stale mark after its own caught-up: kept out of a newer row.
+        s.mark_channels_behind(&[1], 5).expect("older mark");
+        assert_eq!(s.stored_state().expect("stored").behind, vec![(1, 9)]);
+        s.commit_state(&caught_up(1, 9)).expect("caught-up");
+        assert!(s.stored_state().expect("stored").behind.is_empty());
     }
 
     /// A directory and files that already exist with wider modes are

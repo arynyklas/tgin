@@ -635,10 +635,25 @@ async fn channels_left_behind_catch_up_after_restart() {
     );
     let second = m.feed_push(b(updates(&[post(2, 7)], NONE, NONE, 2, 0)));
     assert!(second.iter().all(|b| b.ahead.is_empty()), "named once");
+    // A caught-up report carries the mark it clears: the id of the batch
+    // that named the channel, so it never erases a later batch's mark.
+    let marked = first
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked")
+        .id;
+    let d = commit(&mut m, &[first, second].concat());
+    assert_eq!(d.caught_up, vec![(1, marked)]);
+    let third = m.feed_push(b(updates(&[post(3, 8)], NONE, NONE, 2, 0)));
+    let again = third
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked again");
+    assert!(again.id > marked, "a later mark is higher");
 
     // Killed before either batch was committed.
     let mut st = stored(10, &[(1, 5), (2, 5)], &[]);
-    st.behind = vec![1, 9]; // 9: never committed a state
+    st.behind = vec![(1, 4), (9, 2)]; // 9: never committed a state
     let mut m = UpdateManager::new(st);
     assert!(matches!(
         m.next_action(),
@@ -653,12 +668,24 @@ async fn channels_left_behind_catch_up_after_restart() {
     // 1 caught up: it has not been fetched yet.
     let live = new_channel_message(&message(3, PeerId::Channel(2), "l"), 6, 1);
     let batches = m.feed_push(b(updates(&[live], NONE, NONE, 2, 0)));
+    assert!(
+        batches.iter().all(|b| b.id > 4),
+        "batch ids go on past the stored marks"
+    );
     let d = commit(&mut m, &batches);
-    assert!(!d.caught_up.contains(&1), "{:?}", d.caught_up);
-    assert!(d.caught_up.contains(&9), "nothing to catch up from");
+    assert!(
+        d.caught_up.iter().all(|&(c, _)| c != 1),
+        "{:?}",
+        d.caught_up
+    );
+    assert!(d.caught_up.contains(&(9, 2)), "nothing to catch up from");
     let batches = m.feed_difference(b(difference_empty(1, 3)));
     let d = commit(&mut m, &batches);
-    assert!(!d.caught_up.contains(&1), "{:?}", d.caught_up);
+    assert!(
+        d.caught_up.iter().all(|&(c, _)| c != 1),
+        "{:?}",
+        d.caught_up
+    );
     assert_eq!(
         m.next_action(),
         Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
@@ -682,7 +709,7 @@ async fn channels_left_behind_catch_up_after_restart() {
     assert_eq!(all_updates(&batches).len(), 2);
     let d = commit(&mut m, &batches);
     assert_eq!(d.channels, vec![(1, 7)]);
-    assert!(d.caught_up.contains(&1), "{:?}", d.caught_up);
+    assert!(d.caught_up.contains(&(1, 4)), "{:?}", d.caught_up);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1607,8 +1634,9 @@ struct Persisted {
     common: UpdateState,
     channels: BTreeMap<i64, i32>,
     known: BTreeSet<i64>,
-    /// The batches' `ahead` channels, until a delta says caught up.
-    behind: BTreeSet<i64>,
+    /// The batches' `ahead` channels and marks, until a delta says caught
+    /// up (as `SessionStore` does: the highest mark stays).
+    behind: BTreeMap<i64, u64>,
 }
 
 impl Persisted {
@@ -1617,7 +1645,7 @@ impl Persisted {
             common: self.common,
             channels: self.channels.iter().map(|(&c, &p)| (c, p)).collect(),
             known_users: self.known.iter().copied().collect(),
-            behind: self.behind.iter().copied().collect(),
+            behind: self.behind.iter().map(|(&c, &g)| (c, g)).collect(),
         }
     }
 
@@ -1629,8 +1657,17 @@ impl Persisted {
         for &(c, p) in &d.channels {
             self.channels.insert(c, p);
         }
-        for c in &d.caught_up {
-            self.behind.remove(c);
+        for &(c, g) in &d.caught_up {
+            if self.behind.get(&c).is_some_and(|&m| m <= g) {
+                self.behind.remove(&c);
+            }
+        }
+    }
+
+    fn mark(&mut self, channels: &[i64], mark: u64) {
+        for &c in channels {
+            let row = self.behind.entry(c).or_insert(mark);
+            *row = (*row).max(mark);
         }
     }
 }
@@ -1687,7 +1724,7 @@ impl<'a> Sim<'a> {
             common: s.initial.common,
             channels: s.initial.channels.iter().copied().collect(),
             known: s.initial.known_users.iter().copied().collect(),
-            behind: BTreeSet::new(),
+            behind: BTreeMap::new(),
         };
         Self {
             s,
@@ -1734,7 +1771,7 @@ impl<'a> Sim<'a> {
         for batch in batches {
             // The caller persists the channels a batch moves ahead before
             // it offers the batch to admission.
-            self.persisted.behind.extend(batch.ahead.iter().copied());
+            self.persisted.mark(&batch.ahead, batch.id);
             if self.tick() {
                 return; // before admission
             }

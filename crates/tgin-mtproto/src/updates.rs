@@ -12,12 +12,18 @@
 //!   backoff) or
 //!   [`fetch_failed_permanently`](UpdateManager::fetch_failed_permanently);
 //!   it calls `next_action` again by [`deadline`](UpdateManager::deadline);
-//! - persists each [`Batch`]'s [`ahead`](Batch::ahead) channels
+//! - persists each [`Batch`]'s [`ahead`](Batch::ahead) channels with the
+//!   batch's id as their mark
 //!   ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind)),
 //!   offers the batch to admission, in id order, then reports
 //!   [`committed`](UpdateManager::committed) or
 //!   [`refused`](UpdateManager::refused), and persists the [`StateDelta`]
 //!   either returns ([`SessionStore::commit_state`](crate::SessionStore::commit_state)).
+//!   Marks and deltas may be written in any order and by different writers:
+//!   a delta clears a channel only up to the mark it names, so a later
+//!   batch's mark is never erased by an earlier caught-up report;
+//! - before it drops the manager (shutdown, reload), persists the marks of
+//!   every batch it was given; unadmitted batches may then be dropped.
 //!
 //! # Delivery (plan decision 5)
 //!
@@ -27,6 +33,13 @@
 //! rolls its boxes back to the last committed state and refetches them, so
 //! its sequenced updates come back; its unsequenced ones are counted in
 //! [`Dropped::full`]. There is no dedup: replays may repeat updates.
+//!
+//! A crash loses a channel's update in one window only: after the feed
+//! call that returned its batch, before that batch's mark is durable. Only
+//! the client knew the channel moved, so a quiet channel (no later post,
+//! no signal from Telegram) does not bring it back. Every other crash
+//! point replays it (the channel catches up at start). This is the one
+//! exception to at-least-once for channel boxes.
 //!
 //! # Catch-up (plan decision 6)
 //!
@@ -46,7 +59,7 @@
 //! bytes (constructor id, the raw message, then the difference's final
 //! `pts` and a `pts_count` of 0, or its final `qts`).
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::Range;
 
@@ -72,6 +85,8 @@ pub const RETRY_MAX: Duration = Duration::from_secs(60);
 /// dropped from memory; the box's state has not moved past it, so the
 /// difference brings it back.
 const MAX_HELD: usize = 4096;
+/// A channel's mark before the batch that names it is closed.
+const MARK_PENDING: u64 = u64::MAX;
 
 const UPDATE_NEW_MESSAGE: u32 = 0x1f2b_0afd;
 const UPDATE_NEW_CHANNEL_MESSAGE: u32 = 0x62ba_04d9;
@@ -91,10 +106,11 @@ pub struct StoredState {
     /// The users whose access hash is cached.
     pub known_users: Vec<i64>,
     /// Channels a batch moved ahead of their stored pts that have not
-    /// caught up since ([`Batch::ahead`]): each fetches its difference
-    /// after the start-up difference, so a crash before their batches were
-    /// committed loses none of a quiet channel's updates.
-    pub behind: Vec<i64>,
+    /// caught up since ([`Batch::ahead`]), each with the id of the batch
+    /// that marked it last: each fetches its difference after the
+    /// start-up difference, so a crash before their batches were committed
+    /// loses none of a quiet channel's updates.
+    pub behind: Vec<(i64, u64)>,
 }
 
 /// State to persist: each `Some` field and each channel row replaces the
@@ -107,8 +123,10 @@ pub struct StateDelta {
     pub date: Option<i32>,
     /// `(bare channel id, pts)`, one row per channel.
     pub channels: Vec<(i64, i32)>,
-    /// Channels caught up with their committed pts: no longer behind.
-    pub caught_up: Vec<i64>,
+    /// Channels caught up with their committed pts, each with the mark it
+    /// clears (the id of the batch that marked it): a row marked again
+    /// since, by a later batch, stays.
+    pub caught_up: Vec<(i64, u64)>,
 }
 
 impl StateDelta {
@@ -138,9 +156,10 @@ impl StateDelta {
         for (c, p) in later.channels {
             self.set_channel(c, p);
         }
-        for c in later.caught_up {
-            if !self.caught_up.contains(&c) {
-                self.caught_up.push(c);
+        for (c, g) in later.caught_up {
+            match self.caught_up.iter_mut().find(|(k, _)| *k == c) {
+                Some(row) => row.1 = row.1.max(g),
+                None => self.caught_up.push((c, g)),
             }
         }
     }
@@ -289,8 +308,8 @@ pub struct Batch {
     /// after a refused one must not persist past the refused updates.
     pub commit: StateDelta,
     /// The channels this batch is the first to move ahead of their
-    /// committed state. Persist them
-    /// ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind))
+    /// committed state. Persist them, with the batch's `id` as their mark
+    /// ([`SessionStore::mark_channels_behind`](crate::SessionStore::mark_channels_behind)),
     /// before admitting the batch, admitted or not: after a crash they
     /// catch up at start, so a quiet channel loses nothing. A batch may
     /// carry only this (an update held for a gap, a catch-up signal).
@@ -509,13 +528,15 @@ pub struct UpdateManager {
     next_origin: u64,
     dropped: Dropped,
     /// Channels persisted as behind ([`Batch::ahead`]), not yet caught up.
-    ahead: BTreeSet<i64>,
+    /// The value is the mark: the id of the batch that named the channel
+    /// last ([`MARK_PENDING`] until that batch is closed).
+    ahead: BTreeMap<i64, u64>,
     /// Newly ahead, for the next batch's `ahead`.
     ahead_new: Vec<i64>,
     /// Channels behind at start, queued once the start-up difference ends.
     startup: Vec<i64>,
-    /// Channels caught up, for the next committed delta.
-    caught_up: Vec<i64>,
+    /// Channels caught up, with their marks, for the next committed delta.
+    caught_up: Vec<(i64, u64)>,
 }
 
 impl UpdateManager {
@@ -538,10 +559,17 @@ impl UpdateManager {
             .collect();
         // A channel behind without a stored pts has nothing to catch up
         // from (its first state was never committed).
-        let (startup, caught_up): (Vec<i64>, Vec<i64>) = state
+        let (startup, caught_up): (Vec<_>, Vec<_>) = state
             .behind
             .into_iter()
-            .partition(|c| channels.contains_key(c));
+            .partition(|(c, _)| channels.contains_key(c));
+        // Batch ids go on from the marks, so a later mark is always higher.
+        let next_id = startup
+            .iter()
+            .chain(&caught_up)
+            .map(|&(_, g)| g.saturating_add(1))
+            .max()
+            .unwrap_or(0);
         Self {
             pts: common.pts,
             qts: common.qts,
@@ -563,14 +591,14 @@ impl UpdateManager {
             retry_at: None,
             backoff: Duration::ZERO,
             ahead: startup.iter().copied().collect(),
+            startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
-            startup,
             caught_up,
             known_users: state.known_users.into_iter().collect(),
             committed: common,
             committed_channels: state.channels.into_iter().collect(),
             pending: VecDeque::new(),
-            next_id: 0,
+            next_id,
             next_origin: 0,
             dropped: Dropped::default(),
         }
@@ -925,8 +953,8 @@ impl UpdateManager {
         self.retrying.remove(&channel);
         self.committed_channels.remove(&channel);
         self.startup.retain(|&c| c != channel);
-        if self.ahead.remove(&channel) {
-            self.caught_up.push(channel);
+        if let Some(g) = self.ahead.remove(&channel) {
+            self.caught_up.push((channel, g));
         }
     }
 
@@ -1223,10 +1251,10 @@ impl UpdateManager {
         caught_up.extend(
             self.ahead
                 .iter()
-                .copied()
-                .filter(|&c| self.caught_up_with_commit(c)),
+                .map(|(&c, &g)| (c, g))
+                .filter(|&(c, g)| g != MARK_PENDING && self.caught_up_with_commit(c)),
         );
-        for c in &caught_up {
+        for (c, _) in &caught_up {
             self.ahead.remove(c);
         }
         delta.caught_up = caught_up;
@@ -1656,7 +1684,8 @@ impl UpdateManager {
     /// `c` is ahead of its committed state: the next batch names it, unless
     /// it is already persisted as behind.
     fn mark_ahead(&mut self, c: i64) {
-        if self.ahead.insert(c) {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.ahead.entry(c) {
+            e.insert(MARK_PENDING);
             self.ahead_new.push(c);
         }
     }
@@ -1800,7 +1829,13 @@ impl UpdateManager {
             chats: open.group.chats,
             peers,
             commit: open.delta,
-            ahead: std::mem::take(&mut self.ahead_new),
+            ahead: {
+                let ahead = std::mem::take(&mut self.ahead_new);
+                for c in &ahead {
+                    self.ahead.insert(*c, id);
+                }
+                ahead
+            },
         });
     }
 
