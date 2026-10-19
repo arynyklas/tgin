@@ -420,6 +420,51 @@ fn from_json_refuses_what_is_not_tl_json() {
     assert!(matches!(tl("{"), Err(TlError::JsonSyntax { line: 1, .. })));
 }
 
+/// A `true` flag that shares its bit with a data field is set exactly when
+/// that field is: `account.initTakeoutSession` has `files:flags.5?true` and
+/// `file_max_size:flags.5?long`, so a request with the size but without
+/// `files` (or with `files: false`) is refused, never sent asking for files.
+#[test]
+fn true_flag_sharing_a_bit_comes_with_its_field() {
+    let flags = |text: &str| tl(text).map(|b| u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
+    assert_eq!(
+        flags(r#"{"_":"account.initTakeoutSession","files":true,"file_max_size":"1048576"}"#),
+        Ok(1 << 5)
+    );
+    assert_eq!(
+        flags(r#"{"_":"account.initTakeoutSession","contacts":true}"#),
+        Ok(1)
+    );
+    assert_eq!(
+        flags(r#"{"_":"account.initTakeoutSession","files":false}"#),
+        Ok(0)
+    );
+    for text in [
+        r#"{"_":"account.initTakeoutSession","file_max_size":"1048576"}"#,
+        r#"{"_":"account.initTakeoutSession","files":false,"file_max_size":"1048576"}"#,
+        r#"{"_":"account.initTakeoutSession","files":null,"file_max_size":"1048576"}"#,
+        r#"{"_":"account.initTakeoutSession","files":true}"#,
+    ] {
+        assert_eq!(
+            tl(text),
+            Err(TlError::Json {
+                ctor: "account.initTakeoutSession",
+                field: if text.contains("\"files\":true") {
+                    "file_max_size"
+                } else {
+                    "files"
+                },
+                what: if text.contains("\"files\":true") {
+                    "a required field is missing"
+                } else {
+                    "a field that shares its flag bit is missing"
+                },
+            }),
+            "{text}"
+        );
+    }
+}
+
 /// An object may hold at most `MAX_KEYS` keys, above the largest
 /// constructor's field count, so the duplicate-key check stays bounded: a
 /// 200 000-key object (a 2 MB request body) is refused quickly instead of

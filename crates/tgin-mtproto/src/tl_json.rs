@@ -273,7 +273,18 @@ impl Schema {
                     out.extend_from_slice(&w.to_le_bytes());
                 }
                 Kind::Field { ty, flag } => {
-                    if !present(&words, *flag) || *ty == Ty::True {
+                    if !present(&words, *flag) {
+                        continue;
+                    }
+                    if *ty == Ty::True {
+                        // Its bit is set, so a sibling on the bit was given:
+                        // the flag must be given as `true` too.
+                        if !is_set(fields.get(p.name), ty, at)? {
+                            return Err(json_err(
+                                at,
+                                "a field that shares its flag bit is missing",
+                            ));
+                        }
                         continue;
                     }
                     let v = fields
