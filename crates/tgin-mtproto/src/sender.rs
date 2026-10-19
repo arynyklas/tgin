@@ -36,11 +36,12 @@
 //! # Pushes
 //!
 //! Every message that is neither a service message nor an answer is an
-//! update container: its body goes to [`Sender::pushes`] as received
-//! (`gzip_packed` unwrapped). The channel is bounded; while it is full the
-//! loop reads no further frames, but still writes the acks it owes and its
-//! pings. Updates that come back as a request's `rpc_result` go to that
-//! request's caller only.
+//! update container: its body goes to the [`Pushes`] receiver that
+//! [`Sender::connect`] returns, as received (`gzip_packed` unwrapped). The
+//! channel is bounded; while it is full the loop reads no further frames,
+//! RPC answers included, but still writes the acks it owes and its pings.
+//! Once the receiver is dropped, pushes are discarded. Updates that come
+//! back as a request's `rpc_result` go to that request's caller only.
 //!
 //! # What the sender never does
 //!
@@ -282,8 +283,34 @@ pub struct Sender {
     dc_id: i32,
     max_body: usize,
     commands: mpsc::Sender<Command>,
-    pushes: Option<mpsc::Receiver<Bytes>>,
 }
+
+/// The update containers a main session's connection pushes, in arrival
+/// order; a media session's never yields one.
+///
+/// **Contract.** Drain it on a task that never awaits [`Sender::invoke`] on
+/// the same sender. While this channel is full the sender reads nothing,
+/// so an `invoke` awaited by the draining task waits for ever. Drop it to
+/// have pushes discarded instead.
+#[derive(Debug)]
+pub struct Pushes(mpsc::Receiver<Bytes>);
+
+impl Pushes {
+    /// The next push; `None` once the sender is gone (or on a media
+    /// session).
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.0.recv().await
+    }
+
+    /// The next push if one is waiting.
+    pub fn try_recv(&mut self) -> Result<Bytes, mpsc::error::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+/// What [`Sender::connect`] returns: the sender, its pushes, and the auth
+/// key it made when it was given none (for the caller to store).
+pub type Connected = (Sender, Pushes, Option<AuthKey>);
 
 impl Sender {
     /// Opens the first connection to `dc` over TCP. With `key: None` it
@@ -292,7 +319,7 @@ impl Sender {
         dc: DcOption,
         key: Option<AuthKey>,
         init: InitParams,
-    ) -> Result<(Self, Option<AuthKey>), SenderError> {
+    ) -> Result<Connected, SenderError> {
         Self::connect_with(TcpTransport, dc, key, init).await
     }
 
@@ -302,7 +329,7 @@ impl Sender {
         dc: DcOption,
         key: Option<AuthKey>,
         init: InitParams,
-    ) -> Result<(Self, Option<AuthKey>), SenderError> {
+    ) -> Result<Connected, SenderError> {
         Self::start(transport, dc, key, init, Tuning::PRODUCTION).await
     }
 
@@ -312,7 +339,7 @@ impl Sender {
         key: Option<AuthKey>,
         init: InitParams,
         tuning: Tuning,
-    ) -> Result<(Self, Option<AuthKey>), SenderError> {
+    ) -> Result<Connected, SenderError> {
         let opened = transport.open(&dc, key.as_ref()).await?;
         let (key, salt, time_offset, new_key) = match (opened.generated, key) {
             (Some(g), _) => (g.key.clone(), g.first_salt, g.time_offset, Some(g.key)),
@@ -328,7 +355,13 @@ impl Sender {
             MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - init_prefix.len() - WITHOUT_UPDATES.len();
         let (commands, commands_rx) = mpsc::channel(COMMANDS);
         let (pushes_tx, pushes_rx) = mpsc::channel(tuning.pushes.max(1));
-        let pushes = (!init.without_updates).then_some(pushes_rx);
+        // A media session's pushes go nowhere: its caller gets a closed
+        // channel, and the loop's receiver is dropped.
+        let pushes = if init.without_updates {
+            mpsc::channel(1).1
+        } else {
+            pushes_rx
+        };
         let actor = Actor {
             transport,
             dc,
@@ -356,8 +389,8 @@ impl Sender {
                 dc_id: dc.id,
                 max_body,
                 commands,
-                pushes,
             },
+            Pushes(pushes),
             new_key,
         ))
     }
@@ -381,12 +414,6 @@ impl Sender {
         // The loop is gone without answering: the request may have been
         // written.
         answer.await.unwrap_or(Err(SenderError::NoAnswer))
-    }
-
-    /// The pushed update containers, in arrival order. `Some` once; `None`
-    /// afterwards and on media sessions.
-    pub fn pushes(&mut self) -> Option<mpsc::Receiver<Bytes>> {
-        self.pushes.take()
     }
 }
 

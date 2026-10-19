@@ -455,7 +455,7 @@ impl Server {
 
 struct Harness {
     sender: Arc<Sender>,
-    pushes: Option<mpsc::Receiver<Bytes>>,
+    pushes: Option<Pushes>,
     conns: mpsc::UnboundedReceiver<Server>,
     script: Arc<Script>,
 }
@@ -469,7 +469,7 @@ impl Harness {
             opens: Mutex::new(Vec::new()),
         });
         let key = Some(AuthKey([9; 256]));
-        let (mut sender, new_key) = Sender::start(
+        let (sender, pushes, new_key) = Sender::start(
             Scripted(Arc::clone(&script)),
             dc(),
             key,
@@ -480,10 +480,9 @@ impl Harness {
         .unwrap();
         assert!(new_key.is_none(), "the sender made no key");
         let first = conns.recv().await.unwrap();
-        let pushes = sender.pushes();
         let harness = Self {
             sender: Arc::new(sender),
-            pushes,
+            pushes: Some(pushes),
             conns,
             script,
         };
@@ -800,12 +799,30 @@ async fn init_wraps_only_first_request() {
     assert_eq!(outcome(call).await.unwrap(), answered());
 }
 
+/// A dropped receiver makes the sender discard pushes instead of pausing
+/// its reads, so answers still arrive.
+#[tokio::test(start_paused = true)]
+async fn dropped_pushes_receiver_discards_pushes() {
+    let (mut h, mut srv) = Harness::start(init(), &[Writes::Deliver], 2).await;
+    drop(h.pushes.take());
+    first_call(&h, &mut srv).await;
+    for n in 0..10 {
+        srv.send(&[(true, update(n))]);
+    }
+    let call = h.invoke(get_nearest_dc());
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
 #[tokio::test(start_paused = true)]
 async fn without_updates_wrapper_on_media_sessions() {
     let mut init = init();
     init.without_updates = true;
-    let (h, mut srv) = Harness::start(init.clone(), &[Writes::Deliver], 8).await;
-    assert!(h.pushes.is_none(), "a media session hands out no pushes");
+    let (mut h, mut srv) = Harness::start(init.clone(), &[Writes::Deliver], 8).await;
+    let mut pushes = h.pushes.take().unwrap();
+    let closed = timeout(WAIT, pushes.recv()).await;
+    assert_eq!(closed, Ok(None), "a media session hands out no pushes");
 
     let call = h.invoke(get_config());
     let packet = srv.request().await;

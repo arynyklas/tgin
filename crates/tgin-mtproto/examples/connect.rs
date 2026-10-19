@@ -63,7 +63,9 @@ async fn run() -> Result<(), AnyError> {
     let mut init = InitParams::new(api_id);
     init.device_model = "tgin M3 connect check".to_owned();
     let started = Instant::now();
-    let (sender, new_key) = Sender::connect(dc, key, init).await?;
+    // No update calls here: the pushes are dropped, so they are discarded.
+    let (sender, pushes, new_key) = Sender::connect(dc, key, init).await?;
+    drop(pushes);
     if let Some(key) = &new_key {
         store.set_home_key(DC, key)?;
     }

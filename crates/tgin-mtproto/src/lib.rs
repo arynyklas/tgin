@@ -19,7 +19,7 @@ mod transport;
 
 pub use dc::DcOption;
 pub use error::SessionError;
-pub use sender::{InitParams, RpcOutcome, Sender, SenderError};
+pub use sender::{Connected, InitParams, Pushes, RpcOutcome, Sender, SenderError};
 pub use session::{AuthKey, ChannelKind, DcAddr, Login, Peer, PeerKind, SessionStore, UpdateState};
 pub use transport::{
     GeneratedKey, Opened, PacketReader, PacketWriter, TcpTransport, Transport, TransportError,
