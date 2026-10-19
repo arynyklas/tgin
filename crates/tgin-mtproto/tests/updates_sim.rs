@@ -55,6 +55,7 @@ const DIFFERENCE_SLICE: u32 = 0xa8fb_1981;
 const DIFFERENCE_TOO_LONG: u32 = 0x4afe_8f6d;
 const CHANNEL_DIFFERENCE_EMPTY: u32 = 0x3e11_affb;
 const CHANNEL_DIFFERENCE: u32 = 0x2064_674e;
+const CHANNEL_DIFFERENCE_TOO_LONG: u32 = 0xa4bc_c6fe;
 
 const NONE: &[Vec<u8>] = &[];
 
@@ -258,6 +259,24 @@ fn channel_difference(fin: bool, pts: i32, d: &Diff<'_>) -> Vec<u8> {
         .vec(d.other)
         .vec(d.chats)
         .vec(d.users)
+        .done()
+}
+
+/// `updates.channelDifferenceTooLong`: the channel's dialog (its `pts`),
+/// and its latest messages.
+fn channel_difference_too_long(channel: i64, pts: i32, msgs: &[Vec<u8>]) -> Vec<u8> {
+    let dialog = tl(&format!(
+        r#"{{"_":"dialog","peer":{{"_":"peerChannel","channel_id":"{channel}"}},"top_message":1,
+        "read_inbox_max_id":0,"read_outbox_max_id":0,"unread_count":0,"unread_mentions_count":0,
+        "unread_reactions_count":0,"unread_poll_votes_count":0,
+        "notify_settings":{{"_":"peerNotifySettings"}},"pts":{pts}}}"#
+    ));
+    T::new(CHANNEL_DIFFERENCE_TOO_LONG)
+        .int(1) // final
+        .raw(&dialog)
+        .vec(msgs)
+        .vec(NONE)
+        .vec(NONE)
         .done()
 }
 
@@ -552,6 +571,42 @@ async fn difference_too_long_delivers_covered_held_updates() {
     ));
     let batches = m.feed_difference(b(difference_empty(2, 3)));
     assert!(all_updates(&batches).is_empty(), "15 still waits for 14");
+}
+
+/// `channelDifferenceTooLong` moves a channel past updates no difference
+/// brings back: the held pushes it covers are delivered, not dropped.
+#[tokio::test(start_paused = true)]
+async fn channel_difference_too_long_delivers_covered_held_updates() {
+    let mut m = started(stored(10, &[(1, 5)], &[]));
+    let post = |id: u32| message(id, PeerId::Channel(1), &format!("p{id}"));
+    let p7 = new_channel_message(&post(7), 7, 1);
+    let p12 = new_channel_message(&post(12), 12, 1);
+    for p in [&p7, &p12] {
+        let batches = m.feed_push(b(updates(std::slice::from_ref(p), NONE, NONE, 2, 0)));
+        nothing(&mut m, &batches);
+    }
+    advance(GAP_HOLD).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference { channel: 1, pts: 5 })
+    );
+    let latest = [post(10)];
+    let batches = m.feed_channel_difference(1, b(channel_difference_too_long(1, 10, &latest)));
+    assert_eq!(
+        all_updates(&batches),
+        vec![b(p7), b(new_channel_message(&latest[0], 10, 0))],
+        "the covered held push, then the latest messages"
+    );
+    assert_eq!(commit(&mut m, &batches).channels, vec![(1, 10)]);
+    advance(GAP_HOLD).await;
+    assert_eq!(
+        m.next_action(),
+        Some(Fetch::GetChannelDifference {
+            channel: 1,
+            pts: 10
+        }),
+        "12 still waits for 11"
+    );
 }
 
 #[tokio::test(start_paused = true)]

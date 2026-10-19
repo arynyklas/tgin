@@ -1167,6 +1167,24 @@ impl UpdateManager {
         let home = self.group(&bytes, d.users, d.chats);
         let mut out = Out::new(home.clone());
         let pts = d.pts.or(old).unwrap_or(0);
+        if d.constructor == "updates.channelDifferenceTooLong" {
+            // The channel jumps to `pts`, past updates no difference brings
+            // back: the held pushes it covers go as they are (as for
+            // `differenceTooLong`); its `messages` are only the latest.
+            if let Some(ch) = self.channels.get_mut(&channel) {
+                let (mut covered, rest): (Vec<Held>, Vec<Held>) = std::mem::take(&mut ch.held)
+                    .into_iter()
+                    .partition(|h| h.pts <= pts);
+                ch.held = rest;
+                covered.sort_by_key(|h| h.group.origin);
+                for h in covered {
+                    if let Item::Update(ub) = h.item {
+                        self.deliver(&mut out, &h.group, ub);
+                    }
+                }
+            }
+            self.switch(&mut out, &home);
+        }
         for m in &d.new_messages {
             self.compose(&mut out, UPDATE_NEW_CHANNEL_MESSAGE, m, &[pts, 0]);
         }
