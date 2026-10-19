@@ -32,6 +32,7 @@ const STATE: u32 = 0xa56c_2a3e;
 const DIFFERENCE_EMPTY: u32 = 0x5d75_a138;
 const DIFFERENCE: u32 = 0x00f4_9ca0;
 const DIFFERENCE_SLICE: u32 = 0xa8fb_1981;
+const DIFFERENCE_TOO_LONG: u32 = 0x4afe_8f6d;
 const CHANNEL_DIFFERENCE_EMPTY: u32 = 0x3e11_affb;
 const CHANNEL_DIFFERENCE: u32 = 0x2064_674e;
 
@@ -484,6 +485,36 @@ async fn difference_slices_until_final() {
     );
     assert_eq!(commit(&mut m, &batches).pts, Some(14));
     assert_eq!(m.next_action(), None, "final: no more slices");
+}
+
+/// `differenceTooLong` moves the box past updates no difference brings
+/// back: the held pushes it covers are delivered as they are, not dropped.
+#[tokio::test(start_paused = true)]
+async fn difference_too_long_delivers_covered_held_updates() {
+    let mut m = started(stored(10, &[], &[5]));
+    let msg = |i: u32| message(i, PeerId::User(5), &format!("m{i}"));
+    let u12 = new_message(&msg(12), 12, 1);
+    let u15 = new_message(&msg(15), 15, 1);
+    for u in [&u12, &u15] {
+        assert!(
+            m.feed_push(b(updates(std::slice::from_ref(u), NONE, NONE, 2, 0)))
+                .is_empty()
+        );
+    }
+    advance(GAP_HOLD).await;
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 10, .. })
+    ));
+    let batches = m.feed_difference(b(T::new(DIFFERENCE_TOO_LONG).int(13).done()));
+    assert_eq!(all_updates(&batches), vec![b(u12)], "covered: delivered");
+    assert_eq!(commit(&mut m, &batches).pts, Some(13));
+    assert!(matches!(
+        m.next_action(),
+        Some(Fetch::GetDifference { pts: 13, .. })
+    ));
+    let batches = m.feed_difference(b(difference_empty(2, 3)));
+    assert!(all_updates(&batches).is_empty(), "15 still waits for 14");
 }
 
 #[tokio::test(start_paused = true)]

@@ -154,7 +154,9 @@ pub enum Fetch {
     /// [`feed_state`](UpdateManager::feed_state).
     GetState,
     /// `updates.getDifference`; feed the answer to
-    /// [`feed_difference`](UpdateManager::feed_difference).
+    /// [`feed_difference`](UpdateManager::feed_difference). Never pass
+    /// `pts_total_limit`: its `differenceTooLong` skips updates no
+    /// difference brings back.
     GetDifference { pts: i32, qts: i32, date: i32 },
     /// `updates.getChannelDifference` for the channel (the caller supplies
     /// its access hash); feed the answer to
@@ -991,6 +993,21 @@ impl UpdateManager {
             }
             "updates.differenceTooLong" => match d.pts {
                 Some(p) if p > self.pts => {
+                    // The box jumps to `p`: no difference from there brings
+                    // back the held pushes it covers, so they go as they
+                    // are (as `feed_state` does).
+                    let (mut covered, rest): (Vec<Held>, Vec<Held>) =
+                        std::mem::take(&mut self.held_pts)
+                            .into_iter()
+                            .partition(|h| h.pts <= p);
+                    self.held_pts = rest;
+                    covered.sort_by_key(|h| h.group.origin);
+                    for h in covered {
+                        if let Item::Update(ub) = h.item {
+                            self.deliver(&mut out, &h.group, ub);
+                        }
+                    }
+                    self.switch(&mut out, &home);
                     self.pts = p;
                     out.open.delta.pts = Some(p);
                     out.open.common = true;
