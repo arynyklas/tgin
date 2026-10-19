@@ -17,6 +17,7 @@ use crate::{AuthKey, DcAddr, Opened};
 /// passes only once the runtime is idle.
 const WAIT: Duration = Duration::from_secs(5);
 const ANSWER: [u8; 8] = [0x15, 0xc4, 0xb5, 0x1c, 0, 0, 0, 0];
+const PING_DELAY_DISCONNECT: u32 = tl::functions::PingDelayDisconnect::CONSTRUCTOR_ID;
 
 fn tuning(pushes: usize) -> Tuning {
     Tuning {
@@ -346,6 +347,39 @@ impl Server {
                     let packet = Packet::parse(&raw);
                     assert!(packet.requests().is_empty(), "unexpected {packet:?}");
                 }
+            }
+        }
+    }
+
+    /// The next ping the sender writes within `within`, skipping other
+    /// packets.
+    async fn ping(&mut self, within: Duration) -> Msg {
+        timeout(within, async {
+            loop {
+                let raw = self.from_client.recv().await.expect("connection open");
+                let packet = Packet::parse(&raw);
+                if let Some(ping) = packet
+                    .msgs
+                    .iter()
+                    .find(|m| le_u32(&m.body) == PING_DELAY_DISCONNECT)
+                {
+                    return ping.clone();
+                }
+            }
+        })
+        .await
+        .expect("the sender pings")
+    }
+
+    /// Sends one push and returns the id of the ack-only packet that
+    /// acknowledges it: a client message later than everything before.
+    async fn provoke_ack(&mut self, n: u8) -> i64 {
+        let id = self.send(&[(true, update(n))])[0];
+        loop {
+            let packet = self.packet().await;
+            if packet.acks().contains(&id) {
+                assert!(packet.requests().is_empty());
+                return packet.bad_msg_id();
             }
         }
     }
@@ -886,6 +920,66 @@ async fn new_session_created_pushes_updates_too_long() {
     assert_eq!(outcome(call).await.unwrap(), answered());
     let next = srv.packet().await;
     assert_eq!(next.salt, 0x5e55, "the new session's salt");
+}
+
+/// Requests written before `new_session_created`'s `first_msg_id` went to
+/// a session whose answers are lost: they get `NoAnswer`. Later ones are
+/// still answered.
+#[tokio::test(start_paused = true)]
+async fn new_session_created_orphans_earlier_requests() {
+    let (h, mut srv) = Harness::ready(init(), &[Writes::Deliver], 8).await;
+    let early = h.invoke(get_config());
+    let first = srv.request().await.requests()[0].msg_id;
+    let late = h.invoke(get_nearest_dc());
+    let second = srv.request().await;
+    let second_id = second.requests()[0].msg_id;
+    assert!(second.bad_msg_id() > first);
+
+    srv.new_session(second_id, 0x5e55);
+    let result = outcome(early).await;
+    assert!(matches!(result, Err(SenderError::NoAnswer)), "{result:?}");
+    srv.answer(second_id, &ANSWER);
+    assert_eq!(outcome(late).await.unwrap(), answered());
+}
+
+/// An init call orphaned by `new_session_created` is made again, and the
+/// requests behind it then go out.
+#[tokio::test(start_paused = true)]
+async fn new_session_created_repeats_an_orphaned_init() {
+    let (h, mut srv) = Harness::start(init(), &[Writes::Deliver], 8).await;
+    let call = h.invoke(get_config());
+    srv.init_packet().await;
+    let later = srv.provoke_ack(1).await;
+    srv.new_session(later, 0x5e55);
+
+    srv.handshake().await;
+    let packet = srv.request().await;
+    assert_eq!(packet.requests()[0].body, get_config());
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
+}
+
+/// A ping orphaned by `new_session_created` gets no pong; dropping it keeps
+/// its pong deadline from ending a healthy connection.
+#[tokio::test(start_paused = true)]
+async fn new_session_created_drops_orphaned_pings() {
+    let tuning = Tuning {
+        ping_interval: Duration::from_secs(20),
+        pong_timeout: Duration::from_secs(10),
+        ..tuning(8)
+    };
+    let (h, mut srv) = Harness::start_with(init(), &[Writes::Deliver], tuning).await;
+    srv.handshake().await;
+    srv.ping(Duration::from_secs(30)).await;
+    let later = srv.provoke_ack(1).await;
+    srv.new_session(later, 0x5e55);
+    // Past the dropped ping's pong deadline, before the next ping.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    let call = h.invoke(get_config());
+    let packet = srv.request().await;
+    srv.answer(packet.requests()[0].msg_id, &ANSWER);
+    assert_eq!(outcome(call).await.unwrap(), answered());
 }
 
 /// Every connection opens with the sender's own `initConnection` call;

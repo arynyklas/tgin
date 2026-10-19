@@ -590,6 +590,14 @@ impl Slot {
         }
     }
 
+    /// The container the message went out in (itself when alone).
+    fn container(self) -> Option<i64> {
+        match self {
+            Self::Queued => None,
+            Self::InFlight { container, .. } | Self::Written { container, .. } => Some(container),
+        }
+    }
+
     /// `id` names this message or its container.
     fn matches(self, id: i64) -> bool {
         match self {
@@ -1033,7 +1041,9 @@ impl Conn {
                 self.on_bad_msg(st, msg_id, bad_msg_id, code)?;
             }
             NEW_SESSION_CREATED => {
+                let first_msg_id = i64_at(&body, 4).ok_or(bad())?;
                 st.salt = i64_at(&body, 20).ok_or(bad())?;
+                self.orphan_before(first_msg_id);
                 st.session_lost();
             }
             PONG => {
@@ -1129,6 +1139,42 @@ impl Conn {
             }
         }
         Ok(())
+    }
+
+    /// Telegram's new session starts at the client's message
+    /// `first_msg_id`: whatever went out in an earlier packet reached the
+    /// old session, whose answers are lost (TDLib's
+    /// `on_new_session_created`). Those requests get
+    /// [`SenderError::NoAnswer`], an orphaned init call is made again, and
+    /// orphaned pings are dropped.
+    fn orphan_before(&mut self, first_msg_id: i64) {
+        let floor = self
+            .pending
+            .iter()
+            .find(|p| p.slot.msg_id() == Some(first_msg_id))
+            .and_then(|p| p.slot.container())
+            .unwrap_or(first_msg_id);
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].slot.container().is_none_or(|c| c >= floor) {
+                i += 1;
+                continue;
+            }
+            match self.pending.remove(i).what {
+                What::Ping { .. } => {}
+                What::Init => self.init = Init::Needed,
+                What::Request { reply, .. } => {
+                    let _ = reply.send(Err(SenderError::NoAnswer));
+                }
+            }
+        }
+        if !self
+            .pending
+            .iter()
+            .any(|p| matches!(p.what, What::Ping { .. }))
+        {
+            self.pong_deadline = None;
+        }
     }
 
     fn on_timer(&mut self, st: &Shared, now: Instant) -> Result<(), Cause> {
