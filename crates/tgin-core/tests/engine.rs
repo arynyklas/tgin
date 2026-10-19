@@ -2025,3 +2025,43 @@ consumers:
     assert!(!metrics.contains("newbot"), "{metrics}");
     assert_eq!(h.engine.consumer("freshq").map(|c| c.pending()), None);
 }
+
+/// An oversized batch gets in while a steady trickle of small batches
+/// keeps the consumer busy but within its limits: it never waits for an
+/// empty queue. Once in, the consumer takes nothing more until it is back
+/// within its limits.
+#[tokio::test(start_paused = true)]
+async fn oversized_batch_gets_in_beside_a_trickle() {
+    let h = Harness::new(ACCOUNT);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let raw = h.pull("raw");
+    let mut id = 0;
+    let mut next = |n: i64| -> Vec<Counted> {
+        let batch = (id + 1..=id + n)
+            .map(|i| Counted::new("updateNewMessage", i))
+            .collect();
+        id += n;
+        batch
+    };
+    // The trickle: each round one update comes in and the one before it
+    // is acked, so the consumer never empties.
+    for n in 1..=3 {
+        let mut small = next(1);
+        assert_eq!(h.engine.admit_batch(acct, &mut small), Admit::Admitted);
+        assert_eq!(poll(&raw, "x", n).await, [n]);
+        assert_eq!(h.stats("raw").available + h.stats("raw").leased, 1);
+    }
+    let mut big = next(5);
+    assert_eq!(
+        h.engine.admit_batch(acct, &mut big),
+        Admit::Admitted,
+        "capacity 3, one update held: within limits"
+    );
+    assert_eq!(h.stats("raw").available + h.stats("raw").leased, 6);
+    let mut small = next(1);
+    assert_eq!(
+        h.engine.admit_batch(acct, &mut small),
+        Admit::Backpressure,
+        "over"
+    );
+}

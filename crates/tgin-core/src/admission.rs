@@ -246,9 +246,9 @@ impl Engine {
     /// of them: [`Admit::Backpressure`] when a `backpressure` target lacks
     /// room for its share of the batch, and then nothing is queued
     /// anywhere. A share larger than such a target's `capacity` or
-    /// `capacity_bytes` is taken when the target is empty, so it never
-    /// waits for room that cannot come; the target then holds at most one
-    /// batch over its limits. Otherwise each routed update is queued in
+    /// `capacity_bytes` is taken while the target is within its limits, so
+    /// it never waits for room that cannot come, nor for the target to
+    /// empty; the target then holds at most one batch over its limits. Otherwise each routed update is queued in
     /// batch order for each of its targets, as [`Sink::admit`] queues one;
     /// a `drop_oldest` target short of room keeps the batch's newest
     /// updates, as it would one by one. [`Admit::Unroutable`] when no rule
