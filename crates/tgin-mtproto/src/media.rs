@@ -2,13 +2,14 @@
 //! to DC X over a second session, never over the main one.
 //!
 //! A media session is a [`Sender`] to DC X made `without_updates`. Its key
-//! is the session store's key for X (`auth_keys`, keyed by DC, as for the
-//! home DC); a DC without one gets a new key, authorized with
-//! `auth.exportAuthorization` on the main session and
+//! is the session store's media key for X (`media_keys`, apart from the
+//! `auth_keys` a login writes); a DC without one gets a new key, authorized
+//! with `auth.exportAuthorization` on the main session and
 //! `auth.importAuthorization` on the new one, and stored only once the
 //! import succeeded, so a stored media key is always an authorized one.
-//! [`AccountSessions`] keeps one media session per DC for the account's
-//! life.
+//! A key Telegram stops accepting (`AUTH_KEY_UNREGISTERED`,
+//! `SESSION_REVOKED`, transport −404) is dropped, and the session is made
+//! and authorized again once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,19 +100,28 @@ impl Connect for TcpConnect {
     }
 }
 
-/// Where media keys are kept: per DC.
+/// Where authorized media keys are kept, per DC. A key is saved only once
+/// `auth.importAuthorization` succeeded on it, so a loaded key is
+/// authorized.
 pub trait KeyStore: Send + Sync {
     fn load(&self, dc: i32) -> Result<Option<AuthKey>, SessionError>;
     fn save(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError>;
+    fn remove(&self, dc: i32) -> Result<(), SessionError>;
 }
 
+/// The store's `media_keys` table, never `auth_keys`: that table may hold
+/// keys that were never authorized (a login's first DC).
 impl KeyStore for SessionStore {
     fn load(&self, dc: i32) -> Result<Option<AuthKey>, SessionError> {
-        self.auth_key(dc)
+        self.media_key(dc)
     }
 
     fn save(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError> {
-        self.set_dc_key(dc, key)
+        self.set_media_key(dc, key)
+    }
+
+    fn remove(&self, dc: i32) -> Result<(), SessionError> {
+        self.remove_media_key(dc)
     }
 }
 
@@ -122,6 +132,22 @@ impl<K: KeyStore + ?Sized> KeyStore for Arc<K> {
 
     fn save(&self, dc: i32, key: &AuthKey) -> Result<(), SessionError> {
         K::save(self, dc, key)
+    }
+
+    fn remove(&self, dc: i32) -> Result<(), SessionError> {
+        K::remove(self, dc)
+    }
+}
+
+/// Telegram does not know the media session's key, or no longer accepts
+/// its authorization: the call was not executed.
+fn key_gone(outcome: &Result<RpcOutcome, SenderError>) -> bool {
+    match outcome {
+        Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => true,
+        Ok(RpcOutcome::Error { code: 401, message }) => {
+            message == "AUTH_KEY_UNREGISTERED" || message == "SESSION_REVOKED"
+        }
+        _ => false,
     }
 }
 
@@ -175,6 +201,38 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         Ok(session)
     }
 
+    /// Drops the media session to `dc` and its stored key.
+    async fn evict(&self, dc: i32) -> Result<(), InvokeError> {
+        self.media.lock().await.remove(&dc);
+        self.keys.remove(dc).map_err(|_| InvokeError::Media {
+            dc,
+            what: "the session store failed",
+        })
+    }
+
+    /// A call on the media session to `dc`. A key Telegram no longer
+    /// accepts is dropped and the session made and authorized again, once;
+    /// the call was not executed, so it is sent once more. A key still
+    /// refused after that is a media-session failure, never a sign that the
+    /// account needs a login: the main session is not involved.
+    async fn invoke_media(&self, dc: i32, body: Bytes) -> Result<RpcOutcome, InvokeError> {
+        let media = self.media(dc).await?;
+        let outcome = media.invoke(body.clone()).await;
+        if !key_gone(&outcome) {
+            return Ok(outcome?);
+        }
+        self.evict(dc).await?;
+        let media = self.media(dc).await?;
+        let outcome = media.invoke(body).await;
+        if key_gone(&outcome) {
+            return Err(InvokeError::Media {
+                dc,
+                what: "the DC does not accept the media session's key",
+            });
+        }
+        Ok(outcome?)
+    }
+
     /// `auth.exportAuthorization(dc)` on the main session, then
     /// `auth.importAuthorization` on `media`.
     async fn authorize(&self, dc: i32, media: &C::Session) -> Result<(), InvokeError> {
@@ -206,10 +264,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountRpc for AccountSessions<M, C, K
     fn invoke(&self, route: Route, body: Bytes) -> BoxFuture<'_, Result<RpcOutcome, InvokeError>> {
         Box::pin(async move {
             match route {
-                Route::Media(dc) if dc != self.home_dc => {
-                    let media = self.media(dc).await?;
-                    Ok(media.invoke(body).await?)
-                }
+                Route::Media(dc) if dc != self.home_dc => self.invoke_media(dc, body).await,
                 _ => Ok(self.main.invoke(body).await?),
             }
         })

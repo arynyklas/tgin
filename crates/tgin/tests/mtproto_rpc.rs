@@ -775,6 +775,142 @@ impl KeyStore for FakeKeys {
         self.0.lock().push((dc, key.clone()));
         Ok(())
     }
+
+    fn remove(&self, dc: i32) -> Result<(), SessionError> {
+        self.0.lock().retain(|(d, _)| *d != dc);
+        Ok(())
+    }
+}
+
+const GET_FILE: &str = r#"{"_":"upload.getFile","location":{"_":"inputDocumentFileLocation","id":"1","access_hash":"2","file_reference":"AQ==","thumb_size":""},"offset":"0","limit":1024}"#;
+const FILE: &str =
+    r#"{"_":"upload.file","type":{"_":"storage.filePartial"},"mtime":0,"bytes":"AAEC"}"#;
+const EXPORTED: &str = r#"{"_":"auth.exportedAuthorization","id":"99","bytes":"BQYH"}"#;
+const IMPORTED: &str = r#"{"_":"auth.authorization","user":{"_":"userEmpty","id":"1"}}"#;
+const EXPORT_4: &str = r#"{"_":"auth.exportAuthorization","dc_id":4}"#;
+const IMPORT: &str = r#"{"_":"auth.importAuthorization","id":"99","bytes":"BQYH"}"#;
+
+fn migrate(dc: i32) -> Result<RpcOutcome, SenderError> {
+    Ok(RpcOutcome::Error {
+        code: 303,
+        message: format!("FILE_MIGRATE_{dc}"),
+    })
+}
+
+/// A media fixture: the main and media sessions' scripts, the keys stored
+/// before, and what the endpoint makes of them.
+struct Media {
+    main: Arc<FakeSession>,
+    media: Arc<FakeSession>,
+    connects: Arc<Mutex<Vec<(i32, bool)>>>,
+    app: Router,
+}
+
+fn media_app<K: KeyStore + 'static>(
+    main: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>,
+    media: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>,
+    home_dc: i32,
+    keys: K,
+) -> Media {
+    let main = FakeSession::new(main);
+    let media = FakeSession::new(media);
+    let connects = Arc::new(Mutex::new(Vec::new()));
+    let connect = FakeConnect {
+        media: Arc::clone(&media),
+        connects: Arc::clone(&connects),
+    };
+    let sessions = AccountSessions::new(Arc::clone(&main), home_dc, LAYER, connect, keys);
+    let app = app_with(
+        Arc::new(sessions),
+        Arc::default(),
+        &rpc_config(100, allow_all()),
+    );
+    Media {
+        main,
+        media,
+        connects,
+        app,
+    }
+}
+
+#[tokio::test]
+async fn stored_never_imported_key_gets_imported() {
+    // A login that started on DC 2 and moved home to DC 4 leaves DC 2's
+    // key in `auth_keys`: it was never imported, so it is not a media key.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(tgin_mtproto::SessionStore::open(dir.path()).expect("store"));
+    store.set_home_key(2, &AuthKey([1; 256])).expect("first DC");
+    store.set_home_key(4, &AuthKey([2; 256])).expect("home");
+    let export_2 = r#"{"_":"auth.exportAuthorization","dc_id":2}"#;
+    let m = media_app(
+        [migrate(2), sender_ok(EXPORTED)],
+        [sender_ok(IMPORTED), sender_ok(FILE)],
+        4,
+        Arc::clone(&store),
+    );
+    let answer = send(&m.app, tl(GET_FILE)).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(*m.connects.lock(), vec![(2, false)]);
+    assert_eq!(m.main.methods(), vec![tl_json(GET_FILE), tl_json(export_2)]);
+    assert_eq!(m.media.methods(), vec![tl_json(IMPORT), tl_json(GET_FILE)]);
+    assert_eq!(store.media_key(2).expect("read"), Some(AuthKey([7; 256])));
+    assert_eq!(store.auth_key(2).expect("read"), Some(AuthKey([1; 256])));
+}
+
+#[tokio::test]
+async fn refused_media_key_is_dropped_and_authorized_again() {
+    for refusal in [
+        Ok(RpcOutcome::Error {
+            code: 401,
+            message: "AUTH_KEY_UNREGISTERED".to_owned(),
+        }),
+        Ok(RpcOutcome::Error {
+            code: 401,
+            message: "SESSION_REVOKED".to_owned(),
+        }),
+        Err(SenderError::KeyUnknown),
+    ] {
+        let keys = Arc::new(FakeKeys::default());
+        keys.save(4, &AuthKey([3; 256])).expect("stored");
+        let m = media_app(
+            [migrate(4), sender_ok(EXPORTED)],
+            [refusal, sender_ok(IMPORTED), sender_ok(FILE)],
+            2,
+            Arc::clone(&keys),
+        );
+        let answer = send(&m.app, tl(GET_FILE)).await;
+        assert_eq!(answer.status, StatusCode::OK);
+        assert_eq!(answer.body, Bytes::from(tl(FILE)));
+        // The stored key first, then a new one, authorized and stored.
+        assert_eq!(*m.connects.lock(), vec![(4, true), (4, false)]);
+        assert_eq!(m.main.methods(), vec![tl_json(GET_FILE), tl_json(EXPORT_4)]);
+        assert_eq!(
+            m.media.methods(),
+            vec![tl_json(GET_FILE), tl_json(IMPORT), tl_json(GET_FILE)]
+        );
+        assert_eq!(*keys.0.lock(), vec![(4, AuthKey([7; 256]))]);
+    }
+}
+
+#[tokio::test]
+async fn media_key_gone_is_a_media_failure_not_a_login() {
+    let keys = Arc::new(FakeKeys::default());
+    keys.save(4, &AuthKey([3; 256])).expect("stored");
+    let m = media_app(
+        [migrate(4), sender_ok(EXPORTED)],
+        [
+            Err(SenderError::KeyRevoked),
+            sender_ok(IMPORTED),
+            Err(SenderError::KeyRevoked),
+        ],
+        2,
+        Arc::clone(&keys),
+    );
+    let answer = send(&m.app, tl(GET_FILE)).await;
+    assert_ne!(answer.error(), "account_unavailable");
+    assert!(answer.error().starts_with("media"), "{}", answer.error());
+    // Sent twice at most: once per key.
+    assert_eq!(m.media.methods().len(), 3);
 }
 
 fn sender_ok(json: &str) -> Result<RpcOutcome, SenderError> {

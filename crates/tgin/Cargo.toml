@@ -38,6 +38,7 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true

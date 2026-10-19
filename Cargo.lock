@@ -2762,6 +2762,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tgin-botapi",
  "tgin-core",
  "tgin-mtproto",
