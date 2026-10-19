@@ -2,7 +2,10 @@
 //! it: on `/c/<consumer>/getUpdates` and each alias ([`PullRoutes`], with
 //! the consumer's bearer token), and on the gateway path
 //! `/c/<consumer>/bot<token>/getUpdates` ([`poll`], the bot token being the
-//! authority there).
+//! authority there). A consumer an account feeds is served on
+//! `/c/<consumer>/mtproto/v1/getUpdates` and its aliases instead, with the
+//! same offset and ack rules, its envelopes in `result`; its bearer token
+//! is required.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -24,7 +27,7 @@ use serde::de::{
 };
 use tgin_core::consumer::PullConsumer;
 use tgin_core::consumer::pull::PollRequest;
-use tgin_core::engine::Engine;
+use tgin_core::engine::{Engine, Feed};
 use tgin_runtime::http::bearer_matches;
 use tgin_runtime::queue::HolderId;
 use tgin_runtime::secret::Secret;
@@ -67,9 +70,11 @@ impl PullRoutes {
         }
     }
 
-    /// One `getUpdates` poll of the consumer `name`: `404` unless it is
-    /// served, `401` without its bearer token when it has one.
-    pub async fn get_updates(&self, name: &str, req: Request) -> Response {
+    /// One `getUpdates` poll of the consumer `name` on `path`: `404` unless
+    /// it is served, and served on that path; `401` without its bearer
+    /// token when it has one, or when it holds account updates and has
+    /// none.
+    pub async fn get_updates(&self, name: &str, path: PollPath, req: Request) -> Response {
         let Some(token) = self.auth.get(name) else {
             return errors::error(StatusCode::NOT_FOUND, "Not Found");
         };
@@ -78,11 +83,36 @@ impl PullRoutes {
         {
             return errors::error(StatusCode::UNAUTHORIZED, "Unauthorized");
         }
-        let Some(consumer) = self.engine.pull_consumer(name) else {
+        let Some((consumer, feed)) = self.engine.pull_consumer_fed(name) else {
             return errors::error(StatusCode::NOT_FOUND, "Not Found");
         };
+        let account = feed == Some(Feed::Account);
+        let served = match path {
+            PollPath::Bot => !account,
+            PollPath::Account => account,
+            PollPath::Alias => true,
+        };
+        if !served {
+            return errors::error(StatusCode::NOT_FOUND, "Not Found");
+        }
+        // An account's updates are private: never served without a token,
+        // whatever let the consumer have none.
+        if account && token.is_none() {
+            return errors::error(StatusCode::UNAUTHORIZED, "Unauthorized");
+        }
         poll(&consumer, req, &self.trusted_proxies).await
     }
+}
+
+/// The path a pull consumer is polled on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollPath {
+    /// `/c/<consumer>/getUpdates`: bot updates only.
+    Bot,
+    /// `/c/<consumer>/mtproto/v1/getUpdates`: account envelopes only.
+    Account,
+    /// One of the consumer's aliases: whichever it holds.
+    Alias,
 }
 
 /// One `getUpdates` poll of `consumer`, which the caller has authorized.

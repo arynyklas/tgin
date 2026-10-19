@@ -29,12 +29,12 @@ use tgin_runtime::supervisor::TaskState;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{self, Config, ConsumerKind, WebhookReply};
+use crate::config::{self, Config, ConsumerKind, Render, WebhookReply};
 use crate::consumer::push::{Endpoint, PushOptions};
 use crate::consumer::{PullConsumer, PushConsumer};
 use crate::engine::{
-    BuildError, Consumer, Engine, EngineRuntime, EngineState, Mode, Shared, Slot, SourceInfo,
-    Target,
+    BuildError, Consumer, Engine, EngineRuntime, EngineState, Feed, Mode, Shared, Slot, SourceInfo,
+    Target, feed_of,
 };
 use crate::ids::SourceId;
 use crate::metrics::{CoreMetrics, ReloadOutcome};
@@ -128,6 +128,8 @@ pub(crate) struct Changes {
     /// Removed or replaced instances, to drain.
     retiring: Vec<Arc<Slot>>,
     removed_sources: Vec<String>,
+    /// What each instance of the new generation is fed, recorded on it.
+    feeds: Vec<(Arc<Slot>, Feed)>,
     drain_timeout: Duration,
     report: ReloadReport,
 }
@@ -193,9 +195,30 @@ impl Plan {
             };
             bots.push(entry);
         }
+        // Accounts take ids from the same space, by name, as bots do: no
+        // account shares a bot's name.
+        let mut accounts = Vec::with_capacity(cfg.accounts.len());
+        for account in &cfg.accounts {
+            let id = match old.and_then(|old| old.account_named(&account.name)) {
+                Some(id) => id,
+                None => {
+                    let id =
+                        u16::try_from(names.len()).map_err(|_| BuildError::SourceIdsExhausted)?;
+                    names.push(Arc::from(account.name.as_str()));
+                    SourceId(id)
+                }
+            };
+            accounts.push((Arc::<str>::from(account.name.as_str()), id));
+        }
         let rules: Vec<(SourceId, Vec<RuleSpec>)> = bots
             .iter()
             .map(|b| (b.id, b.config.rules.clone()))
+            .chain(
+                accounts
+                    .iter()
+                    .zip(&cfg.accounts)
+                    .map(|((_, id), a)| (*id, a.rules.clone())),
+            )
             .collect();
         let usernames: Vec<_> = bots.iter().map(|b| (b.id, b.username.clone())).collect();
         let table = RouteTable::compile(&rules, &usernames)?;
@@ -218,8 +241,11 @@ impl Plan {
         let mut revived = Vec::new();
         let mut retiring = Vec::new();
         let mut targets = Vec::with_capacity(cfg.consumers.len());
+        let mut feeds = Vec::with_capacity(cfg.consumers.len());
         for consumer in &cfg.consumers {
             let mode = mode(&consumer.kind);
+            let feed = feed_of(cfg, consumer.id);
+            let account = feed == Some(Feed::Account);
             let previous = old.and_then(|old| {
                 let target = old.target(&consumer.name)?;
                 let written = old
@@ -231,6 +257,7 @@ impl Plan {
             });
             let slot = match previous {
                 Some((target, written)) if target.slot.mode() == mode => {
+                    let was = check_feed(&target.slot, feed, old)?;
                     if written.kind != consumer.kind {
                         report.changed.push(consumer.name.clone());
                     }
@@ -238,22 +265,26 @@ impl Plan {
                         &target.slot,
                         &written.kind,
                         &consumer.kind,
-                        names_grew,
+                        names_grew || (feed.is_some() && was != feed),
                         &source_names,
                         &rt.reply,
+                        account,
                     ));
                     Arc::clone(&target.slot)
                 }
                 previous => {
+                    let draining = retired
+                        .iter()
+                        .find(|s| *s.name == *consumer.name && s.mode() == mode);
+                    if let Some(slot) = draining {
+                        check_feed(slot, feed, old)?;
+                    }
                     if let Some((target, _)) = previous {
                         report.changed.push(consumer.name.clone());
                         retiring.push(Arc::clone(&target.slot));
                     } else {
                         report.added.push(consumer.name.clone());
                     }
-                    let draining = retired
-                        .iter()
-                        .find(|s| *s.name == *consumer.name && s.mode() == mode);
                     match draining {
                         Some(slot) => {
                             live.push(Live {
@@ -262,7 +293,7 @@ impl Plan {
                                 endpoints: match &consumer.kind {
                                     ConsumerKind::Push(push) => Some((
                                         endpoints(push),
-                                        options(push, &source_names, &rt.reply),
+                                        options(push, &source_names, &rt.reply, account),
                                     )),
                                     ConsumerKind::Pull(_) => None,
                                 },
@@ -272,17 +303,22 @@ impl Plan {
                             Arc::clone(slot)
                         }
                         None => {
-                            let slot = new_slot(consumer, metrics, client, &source_names, rt);
+                            let slot =
+                                new_slot(consumer, metrics, client, &source_names, rt, account);
                             started.push(Arc::clone(&slot));
                             slot
                         }
                     }
                 }
             };
+            if let Some(feed) = feed {
+                feeds.push((Arc::clone(&slot), feed));
+            }
             targets.push(Target {
                 slot,
                 on_full: on_full(&consumer.kind),
                 capacity_bytes: queue(&consumer.kind).capacity_bytes,
+                tl_json: consumer.render == Render::TlJson,
             });
         }
 
@@ -339,6 +375,7 @@ impl Plan {
             sources,
             targets,
             source_names,
+            accounts,
             config: Arc::new(cfg.clone()),
         };
         Ok(Self {
@@ -349,6 +386,7 @@ impl Plan {
                 revived,
                 retiring,
                 removed_sources,
+                feeds,
                 drain_timeout: cfg.reload.drain_timeout,
                 report,
             },
@@ -370,6 +408,9 @@ pub(crate) fn commit(
 ) -> ReloadReport {
     let shared = &engine.shared;
     let draining = shared.draining.load(std::sync::atomic::Ordering::SeqCst);
+    for (slot, feed) in &changes.feeds {
+        *slot.feed.lock() = Some(*feed);
+    }
     for change in changes.live {
         let consumer = &change.slot.consumer;
         if let Some(queue) = change.queue {
@@ -456,17 +497,23 @@ pub(crate) fn commit(
 }
 
 /// Recompiles the route table of `cfg` with the ids and usernames of
-/// `sources`.
+/// `sources` and the ids of `accounts`.
 pub(crate) fn compile(
     cfg: &Config,
     sources: &[Option<SourceInfo>],
+    accounts: &[(Arc<str>, SourceId)],
 ) -> Result<RouteTable, RuleError> {
-    let mut rules = Vec::with_capacity(cfg.bots.len());
+    let mut rules = Vec::with_capacity(cfg.bots.len() + accounts.len());
     let mut usernames = Vec::with_capacity(cfg.bots.len());
     for info in sources.iter().flatten() {
         if let Some(bot) = cfg.bots.iter().find(|b| *b.name == *info.name) {
             rules.push((info.id, bot.rules.clone()));
             usernames.push((info.id, info.username.clone()));
+        }
+    }
+    for (name, id) in accounts {
+        if let Some(account) = cfg.accounts.iter().find(|a| *a.name == **name) {
+            rules.push((*id, account.rules.clone()));
         }
     }
     RouteTable::compile(&rules, &usernames)
@@ -594,16 +641,18 @@ fn on_full(kind: &ConsumerKind) -> OnFull {
 
 /// The live changes from `old` to `new` of the same mode, if any. A push
 /// consumer gets new endpoints (and breakers) when its delivery settings
-/// change; when only `webhook_reply` changes or new bots appear, it keeps
-/// them and gets new options (the bots' names and the reply handle among
+/// change; when only `webhook_reply` changes, or `refresh` (new source
+/// names, or the instance now fed another kind of updates), it keeps them
+/// and gets new options (the sources' names and the reply handle among
 /// them).
 fn live_change(
     slot: &Arc<Slot>,
     old: &ConsumerKind,
     new: &ConsumerKind,
-    names_grew: bool,
+    refresh: bool,
     source_names: &Arc<[Arc<str>]>,
     reply: &ReplyHandle,
+    account: bool,
 ) -> Option<Live> {
     let (queue, endpoints, opts) = match (old, new) {
         (ConsumerKind::Pull(old), ConsumerKind::Pull(new)) => {
@@ -615,11 +664,12 @@ fn live_change(
                 || old.max_in_flight != new.max_in_flight
                 || old.retry != new.retry
                 || old.breaker != new.breaker;
-            let refresh = names_grew || old.webhook_reply != new.webhook_reply;
+            let refresh = refresh || old.webhook_reply != new.webhook_reply;
+            let opts = || options(new, source_names, reply, account);
             (
                 (old.queue() != new.queue()).then(|| new.queue()),
-                delivery.then(|| (endpoints(new), options(new, source_names, reply))),
-                (!delivery && refresh).then(|| options(new, source_names, reply)),
+                delivery.then(|| (endpoints(new), opts())),
+                (!delivery && refresh).then(opts),
             )
         }
         _ => (None, None, None),
@@ -638,6 +688,7 @@ fn new_slot(
     client: &reqwest::Client,
     source_names: &Arc<[Arc<str>]>,
     rt: &EngineRuntime,
+    account: bool,
 ) -> Arc<Slot> {
     let name: Arc<str> = Arc::from(consumer.name.as_str());
     let handles = metrics.consumer(&name);
@@ -651,7 +702,7 @@ fn new_slot(
             Arc::clone(&name),
             push.queue(),
             endpoints(push),
-            options(push, source_names, &rt.reply),
+            options(push, source_names, &rt.reply, account),
             client.clone(),
             &rt.via,
             handles.clone(),
@@ -673,11 +724,14 @@ fn endpoints(push: &config::Push) -> Vec<Endpoint> {
         .collect()
 }
 
-/// A push consumer's options; `reply` goes with `webhook_reply: execute`.
+/// A push consumer's options; `reply` goes with `webhook_reply: execute`,
+/// unless an account feeds the consumer (`account`): an account update has
+/// no bot to run a Bot API reply as, so its answers are ignored unread.
 fn options(
     push: &config::Push,
     source_names: &Arc<[Arc<str>]>,
     reply: &ReplyHandle,
+    account: bool,
 ) -> PushOptions {
     PushOptions {
         max_in_flight: push.max_in_flight,
@@ -686,8 +740,43 @@ fn options(
         source_names: Arc::clone(source_names),
         breaker: push.breaker,
         runtime_timeout: config::DEFAULT_ENDPOINT_TIMEOUT,
-        reply: (push.webhook_reply == WebhookReply::Execute).then(|| Arc::clone(reply)),
+        reply: (push.webhook_reply == WebhookReply::Execute && !account).then(|| Arc::clone(reply)),
     }
+}
+
+/// The kind of updates `slot` was given so far, when it may take `to` from
+/// now on. It may not when it was given the other kind and still holds
+/// some, or the old generation `old` still gives it that kind: a bot poll
+/// would get account envelopes, or an account consumer Bot API updates.
+/// Clearing them instead would drop updates the operator did not ask to
+/// drop; a consumer of a new name starts empty.
+fn check_feed(
+    slot: &Slot,
+    to: Option<Feed>,
+    old: Option<&EngineState>,
+) -> Result<Option<Feed>, BuildError> {
+    let was = *slot.feed.lock();
+    let (Some(from), Some(to)) = (was, to) else {
+        return Ok(was);
+    };
+    if from == to {
+        return Ok(was);
+    }
+    let fed = old.is_some_and(|old| {
+        old.config
+            .consumers
+            .iter()
+            .find(|c| *c.name == *slot.name)
+            .is_some_and(|c| feed_of(&old.config, c.id) == Some(from))
+    });
+    if fed || slot.consumer.pending() > 0 {
+        return Err(BuildError::FeedChanged {
+            consumer: slot.name.to_string(),
+            from,
+            to,
+        });
+    }
+    Ok(was)
 }
 
 /// The settings that changed and need a restart: what the process sets up

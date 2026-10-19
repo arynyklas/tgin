@@ -9,6 +9,11 @@
 //! commits every reservation. One queue lock is held at a time, and nothing
 //! awaits.
 //!
+//! A batch ([`Engine::admit_batch`]) goes the same way, all its updates at
+//! once: room for every update in every `backpressure` target first, so one
+//! full queue refuses the whole batch and queues nothing; then the
+//! `drop_oldest` targets; then the commits, in batch order.
+//!
 //! A reload may retire a target between loading the state and committing.
 //! Admission checks each target's `closed` flag before reserving, and routes
 //! once more on the current state if one is closed; after committing it
@@ -24,7 +29,7 @@ use crate::envelope::Envelope;
 use crate::facts::Facts;
 use crate::ids::{ConsumerId, SourceId};
 use crate::metrics::ConsumerDropReason;
-use crate::sink::{Admit, Sink};
+use crate::sink::{Admit, BatchUpdate, Sink};
 
 impl Sink for Engine {
     fn admit(&self, source: SourceId, update_id: i64, payload: Bytes, facts: &Facts<'_>) -> Admit {
@@ -49,6 +54,81 @@ pub(crate) enum Attempt<'s> {
 pub(crate) struct Reserved<'s> {
     permits: SmallVec<[(&'s Target, Permit); 8]>,
     now: Instant,
+}
+
+/// How reserving in one target went.
+enum Step {
+    Reserved(Permit),
+    /// The update can never fit, or a `drop_oldest` queue is all leased:
+    /// this target goes without it.
+    Skipped,
+    /// A `backpressure` queue is full.
+    Full,
+    /// The target was retired.
+    Closed,
+}
+
+/// Room for an update of `size` in `target`, with the metrics and logs of
+/// what happened.
+fn reserve_in(
+    state: &EngineState,
+    target: &Target,
+    pass: OnFull,
+    size: usize,
+    now: Instant,
+    source: SourceId,
+    update_id: i64,
+) -> Step {
+    let slot = &target.slot;
+    if slot.is_closed() {
+        return Step::Closed;
+    }
+    match slot.consumer.queue().try_reserve(size) {
+        Ok(permit) => {
+            slot.relieved(now);
+            // A reload may have switched the queue to `drop_oldest` since
+            // `state` was loaded.
+            if permit.evicted > 0 {
+                slot.overflowed(u64::try_from(permit.evicted).unwrap_or(u64::MAX));
+            } else {
+                slot.reserved_cleanly();
+            }
+            Step::Reserved(permit)
+        }
+        Err(Full::TooLarge) => {
+            slot.metrics.dropped(ConsumerDropReason::Oversized, 1);
+            let source_name = state
+                .source_names
+                .get(usize::from(source.0))
+                .map_or("?", |name| &**name);
+            tracing::warn!(
+                consumer = %slot.name,
+                source = %source_name,
+                update_id,
+                size,
+                capacity = target.capacity_bytes,
+                "update is larger than the consumer's capacity_bytes; dropped for it"
+            );
+            Step::Skipped
+        }
+        Err(_) if pass == OnFull::Backpressure => {
+            slot.pressured(now);
+            Step::Full
+        }
+        Err(_) => {
+            slot.overflowed(1);
+            Step::Skipped
+        }
+    }
+}
+
+/// One routed update of a batch, with its payloads once built.
+struct Routed {
+    index: usize,
+    key: Option<u64>,
+    targets: SmallVec<[ConsumerId; 8]>,
+    payload: Bytes,
+    rendered: Option<Bytes>,
 }
 
 impl Engine {
@@ -113,44 +193,17 @@ impl Engine {
                 .filter_map(|id| state.targets.get(usize::from(id.0)))
                 .filter(|t| t.on_full == pass);
             for target in targets {
-                let slot = &target.slot;
-                if slot.is_closed() {
-                    cancel(permits);
-                    return Attempt::Closed;
-                }
-                match slot.consumer.queue().try_reserve(size) {
-                    Ok(permit) => {
-                        slot.relieved(now);
-                        // A reload may have switched the queue to
-                        // `drop_oldest` since `state` was loaded.
-                        if permit.evicted > 0 {
-                            slot.overflowed(u64::try_from(permit.evicted).unwrap_or(u64::MAX));
-                        } else {
-                            slot.reserved_cleanly();
-                        }
-                        permits.push((target, permit));
-                    }
-                    Err(Full::TooLarge) => {
-                        slot.metrics.dropped(ConsumerDropReason::Oversized, 1);
-                        let source_name = state
-                            .source_names
-                            .get(usize::from(source.0))
-                            .map_or("?", |name| &**name);
-                        tracing::warn!(
-                            consumer = %slot.name,
-                            source = %source_name,
-                            update_id,
-                            size,
-                            capacity = target.capacity_bytes,
-                            "update is larger than the consumer's capacity_bytes; dropped for it"
-                        );
-                    }
-                    Err(_) if pass == OnFull::Backpressure => {
-                        slot.pressured(now);
+                match reserve_in(state, target, pass, size, now, source, update_id) {
+                    Step::Reserved(permit) => permits.push((target, permit)),
+                    Step::Skipped => {}
+                    Step::Full => {
                         cancel(permits);
                         return Attempt::Done(Admit::Backpressure);
                     }
-                    Err(_) => slot.overflowed(1),
+                    Step::Closed => {
+                        cancel(permits);
+                        return Attempt::Closed;
+                    }
                 }
             }
         }
@@ -176,26 +229,165 @@ impl Engine {
             received_at: reserved.now,
         };
         for (target, permit) in reserved.permits {
-            let slot = &target.slot;
-            if let Err(foreign) =
-                slot.consumer
-                    .queue()
-                    .commit(permit, envelope.clone(), key, update_id)
-            {
-                // Every permit comes from the queue it is committed to.
-                debug_assert!(false, "a permit went to another queue");
-                drop(foreign);
-                slot.metrics.dropped(ConsumerDropReason::Overflow, 1);
-            }
-            if slot.is_closed() {
-                // Retired after the check before reserving: its final drain
-                // may have run before this commit.
-                slot.drain_late();
-            } else {
-                slot.consumer.update_depth();
-            }
+            commit_in(target, permit, envelope.clone());
         }
         Admit::Admitted
+    }
+
+    /// Admits every update of `updates` (from the source `source`) or none
+    /// of them: [`Admit::Backpressure`] when a `backpressure` target lacks
+    /// room for its share of the batch, and then nothing is queued
+    /// anywhere. Otherwise each routed update is queued in batch order for
+    /// each of its targets, as [`Sink::admit`] queues one; a `drop_oldest`
+    /// target may still go without some, as it would one by one.
+    /// [`Admit::Unroutable`] when no rule matches any update.
+    ///
+    /// Payloads are built only for routed updates, and
+    /// [`BatchUpdate::rendered`] only for those routed to a `render:
+    /// tl_json` consumer.
+    pub fn admit_batch<U: BatchUpdate>(&self, source: SourceId, updates: &mut [U]) -> Admit {
+        let state = self.shared.state.load();
+        if let Some(admit) = self.admit_batch_on(&state, source, updates) {
+            return admit;
+        }
+        let current = self.shared.state.load();
+        self.admit_batch_on(&current, source, updates)
+            .unwrap_or(Admit::Backpressure)
+    }
+
+    /// [`Engine::admit_batch`] on `state`; `None` when a target was retired
+    /// meanwhile and nothing was reserved.
+    fn admit_batch_on<U: BatchUpdate>(
+        &self,
+        state: &EngineState,
+        source: SourceId,
+        updates: &mut [U],
+    ) -> Option<Admit> {
+        let mut routed: Vec<Routed> = Vec::with_capacity(updates.len());
+        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        for (index, update) in updates.iter().enumerate() {
+            let facts = update.facts();
+            let mut targets = SmallVec::new();
+            if state
+                .table
+                .route(source, &facts, &mut targets, &mut scratch)
+                .is_none()
+            {
+                tracing::debug!(
+                    update_id = update.update_id(),
+                    update_type = facts.update_type,
+                    "no rule matched the update"
+                );
+                continue;
+            }
+            routed.push(Routed {
+                index,
+                key: facts.ordering_key(),
+                targets,
+                payload: Bytes::new(),
+                rendered: None,
+            });
+        }
+        self.scratch.lock().push(scratch);
+        if routed.is_empty() {
+            return Some(Admit::Unroutable);
+        }
+        for r in &mut routed {
+            let update = &mut updates[r.index];
+            r.payload = update.payload();
+            let tl_json = r
+                .targets
+                .iter()
+                .filter_map(|id| state.targets.get(usize::from(id.0)))
+                .any(|t| t.tl_json);
+            if tl_json {
+                r.rendered = Some(update.rendered());
+            }
+        }
+
+        let now = Instant::now();
+        let mut permits: Vec<(usize, &Target, Permit)> = Vec::with_capacity(routed.len());
+        for pass in [OnFull::Backpressure, OnFull::DropOldest] {
+            for (i, r) in routed.iter().enumerate() {
+                let update_id = updates[r.index].update_id();
+                let targets = r
+                    .targets
+                    .iter()
+                    .filter_map(|id| state.targets.get(usize::from(id.0)))
+                    .filter(|t| t.on_full == pass);
+                for target in targets {
+                    let size = r.payload_for(target).len();
+                    match reserve_in(state, target, pass, size, now, source, update_id) {
+                        Step::Reserved(permit) => permits.push((i, target, permit)),
+                        Step::Skipped => {}
+                        Step::Full => {
+                            cancel_all(permits);
+                            return Some(Admit::Backpressure);
+                        }
+                        Step::Closed => {
+                            cancel_all(permits);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Batch order within each queue; the sort is stable, so an update's
+        // targets keep their order too.
+        permits.sort_by_key(|&(i, _, _)| i);
+        for (i, target, permit) in permits {
+            let r = &routed[i];
+            let update = &updates[r.index];
+            let envelope = Envelope {
+                source,
+                update_id: update.update_id(),
+                update_type: Bytes::from_static(update.update_type().as_bytes()),
+                key: r.key,
+                payload: r.payload_for(target).clone(),
+                received_at: now,
+            };
+            commit_in(target, permit, envelope);
+        }
+        Some(Admit::Admitted)
+    }
+}
+
+impl Routed {
+    fn payload_for(&self, target: &Target) -> &Bytes {
+        match &self.rendered {
+            Some(rendered) if target.tl_json => rendered,
+            _ => &self.payload,
+        }
+    }
+}
+
+/// Queues `envelope` in the room `permit` reserved in `target`.
+fn commit_in(target: &Target, permit: Permit, envelope: Envelope) {
+    let slot = &target.slot;
+    let (key, update_id) = (envelope.key, envelope.update_id);
+    if let Err(foreign) = slot
+        .consumer
+        .queue()
+        .commit(permit, envelope, key, update_id)
+    {
+        // Every permit comes from the queue it is committed to.
+        debug_assert!(false, "a permit went to another queue");
+        drop(foreign);
+        slot.metrics.dropped(ConsumerDropReason::Overflow, 1);
+    }
+    if slot.is_closed() {
+        // Retired after the check before reserving: its final drain may
+        // have run before this commit.
+        slot.drain_late();
+    } else {
+        slot.consumer.update_depth();
+    }
+}
+
+fn cancel_all(permits: Vec<(usize, &Target, Permit)>) {
+    for (_, target, permit) in permits {
+        target.slot.consumer.queue().cancel(permit);
     }
 }
 

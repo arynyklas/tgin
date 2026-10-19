@@ -15,6 +15,7 @@ dist = true
 [dependencies]
 arc-swap.workspace = true
 axum.workspace = true
+bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 http-body.workspace = true
@@ -40,6 +41,7 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tempfile.workspace = true
 # Scripted Telegram replies for the login tests.
