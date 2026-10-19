@@ -29,9 +29,14 @@
 //! `session_id`, seqno from 0). When one ends, the sender stays without a
 //! connection until the next `invoke`, which opens a fresh one. Pushes
 //! therefore stop until then; after a reconnect the caller re-subscribes
-//! the session with its next update call. The first request on each
-//! connection is wrapped in `invokeWithLayer(layer, initConnection(…))`,
-//! and later requests wait until Telegram has answered it.
+//! the session with its next update call.
+//!
+//! Every connection opens with the sender's own init call,
+//! `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`; no
+//! caller's request is ever wrapped. Requests wait until Telegram answers
+//! it. If no answer comes within the init timeout the connection is
+//! dropped and the waiting requests get [`SenderError::NotSent`]; if
+//! Telegram refuses it they get [`SenderError::InitRefused`].
 //!
 //! # Pushes
 //!
@@ -114,8 +119,8 @@ pub struct InitParams {
     pub system_lang_code: String,
     pub lang_pack: String,
     pub lang_code: String,
-    /// A media session: every request is wrapped in `invokeWithoutUpdates`,
-    /// and pushes are dropped ([`Sender::pushes`] gives `None`).
+    /// A media session: every request, the init call included, is wrapped
+    /// in `invokeWithoutUpdates`, and pushes are dropped.
     pub without_updates: bool,
     /// The key has a self user: a transport −404 is
     /// [`SenderError::KeyRevoked`], else [`SenderError::KeyUnknown`].
@@ -148,29 +153,34 @@ impl InitParams {
         self.layer
     }
 
-    /// `invokeWithLayer(layer, initConnection(…, ` up to the query, which
-    /// is `initConnection`'s last field.
-    fn init_prefix(&self) -> Vec<u8> {
-        struct Nothing;
-        impl Serializable for Nothing {
-            fn serialize(&self, _: &mut impl Extend<u8>) {}
+    /// The sender's own first call on each connection:
+    /// `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`, with
+    /// the query in `invokeWithoutUpdates` on media sessions.
+    fn init_call(&self) -> Vec<u8> {
+        fn wrap<Q: Serializable>(p: &InitParams, query: Q) -> Vec<u8> {
+            tl::functions::InvokeWithLayer {
+                layer: p.layer,
+                query: tl::functions::InitConnection {
+                    api_id: p.api_id,
+                    device_model: p.device_model.clone(),
+                    system_version: p.system_version.clone(),
+                    app_version: p.app_version.clone(),
+                    system_lang_code: p.system_lang_code.clone(),
+                    lang_pack: p.lang_pack.clone(),
+                    lang_code: p.lang_code.clone(),
+                    proxy: None,
+                    params: None,
+                    query,
+                },
+            }
+            .to_bytes()
         }
-        tl::functions::InvokeWithLayer {
-            layer: self.layer,
-            query: tl::functions::InitConnection {
-                api_id: self.api_id,
-                device_model: self.device_model.clone(),
-                system_version: self.system_version.clone(),
-                app_version: self.app_version.clone(),
-                system_lang_code: self.system_lang_code.clone(),
-                lang_pack: self.lang_pack.clone(),
-                lang_code: self.lang_code.clone(),
-                proxy: None,
-                params: None,
-                query: Nothing,
-            },
+        let query = tl::functions::help::GetNearestDc {};
+        if self.without_updates {
+            wrap(self, tl::functions::InvokeWithoutUpdates { query })
+        } else {
+            wrap(self, query)
         }
-        .to_bytes()
     }
 }
 
@@ -231,6 +241,10 @@ pub enum SenderError {
     /// The request is not whole TL words, or too large for one message.
     #[error("the request is not whole TL words or is too large")]
     BadRequest,
+    /// Telegram answered the connection's `initConnection` call with this
+    /// `rpc_error`. The request was not sent.
+    #[error("Telegram refused initConnection: {code} {message}")]
+    InitRefused { code: i32, message: String },
     /// [`Sender::connect`] could not open the first connection.
     #[error("connect: {0}")]
     Connect(#[from] TransportError),
@@ -267,6 +281,8 @@ pub(crate) struct Tuning {
     pub(crate) ping_interval: Duration,
     /// A ping unanswered this long ends the connection.
     pub(crate) pong_timeout: Duration,
+    /// The init call unanswered this long ends the connection.
+    pub(crate) init_timeout: Duration,
 }
 
 impl Tuning {
@@ -274,6 +290,7 @@ impl Tuning {
         pushes: 1024,
         ping_interval: Duration::from_secs(60),
         pong_timeout: Duration::from_secs(30),
+        init_timeout: Duration::from_secs(10),
     };
 }
 
@@ -350,9 +367,8 @@ impl Sender {
                 )));
             }
         };
-        let init_prefix = init.init_prefix();
-        let max_body =
-            MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - init_prefix.len() - WITHOUT_UPDATES.len();
+        let init_call = Bytes::from(init.init_call());
+        let max_body = MAX_CONTAINER_PAYLOAD - MESSAGE_HEADER - WITHOUT_UPDATES.len();
         let (commands, commands_rx) = mpsc::channel(COMMANDS);
         let (pushes_tx, pushes_rx) = mpsc::channel(tuning.pushes.max(1));
         // A media session's pushes go nowhere: its caller gets a closed
@@ -370,7 +386,7 @@ impl Sender {
             pushes: pushes_tx,
             st: Shared {
                 dc_id: dc.id,
-                init_prefix,
+                init_call,
                 without_updates: init.without_updates,
                 logged_in: init.logged_in,
                 tuning,
@@ -464,7 +480,8 @@ impl Clock {
 /// State that outlives a connection.
 struct Shared {
     dc_id: i32,
-    init_prefix: Vec<u8>,
+    /// The connection's first call; see [`InitParams::init_call`].
+    init_call: Bytes,
     without_updates: bool,
     logged_in: bool,
     tuning: Tuning,
@@ -477,15 +494,13 @@ struct Shared {
 }
 
 impl Shared {
-    fn wrapper_len(&self, init: bool) -> usize {
-        let mut len = 0;
-        if init {
-            len += self.init_prefix.len();
-        }
+    /// What goes in front of a caller's request.
+    fn wrapper_len(&self) -> usize {
         if self.without_updates {
-            len += WITHOUT_UPDATES.len();
+            WITHOUT_UPDATES.len()
+        } else {
+            0
         }
-        len
     }
 }
 
@@ -495,6 +510,8 @@ enum Cause {
     Transport(TransportError),
     Protocol(&'static str),
     PongTimeout,
+    InitTimeout,
+    InitRefused { code: i32, message: String },
     Shutdown,
 }
 
@@ -504,6 +521,10 @@ impl fmt::Display for Cause {
             Self::Transport(e) => write!(f, "{e}"),
             Self::Protocol(what) => write!(f, "protocol: {what}"),
             Self::PongTimeout => f.write_str("no pong"),
+            Self::InitTimeout => f.write_str("no answer to initConnection"),
+            Self::InitRefused { code, message } => {
+                write!(f, "initConnection refused: {code} {message}")
+            }
             Self::Shutdown => f.write_str("sender dropped"),
         }
     }
@@ -554,25 +575,33 @@ impl Slot {
 }
 
 enum What {
-    Request { body: Bytes, reply: Reply },
-    Ping { body: Bytes },
+    Request {
+        body: Bytes,
+        reply: Reply,
+    },
+    Ping {
+        body: Bytes,
+    },
+    /// The connection's own init call.
+    Init,
 }
 
 struct Pending {
-    id: u64,
     what: What,
     slot: Slot,
     /// Already resent once after a retryable `bad_msg_notification`.
     resent: bool,
 }
 
-/// `initConnection` on this connection.
+/// The init call on this connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Init {
-    /// The next request is wrapped.
+    /// The next packet carries a new init call.
     Needed,
-    /// This request carries it; other requests wait for its answer.
-    Pending(u64),
+    /// Sent; requests wait for its answer until `deadline`.
+    Pending {
+        deadline: Instant,
+    },
     Done,
 }
 
@@ -587,7 +616,6 @@ struct Conn {
     /// `(ack msg_id, container msg_id, ids)` of recent packets.
     sent_acks: VecDeque<(i64, i64, Vec<i64>)>,
     pending: Vec<Pending>,
-    next_id: u64,
     packet: Vec<u8>,
     picks: Vec<usize>,
     next_ping: Instant,
@@ -661,9 +689,12 @@ impl<T: Transport> Actor<T> {
                 writer.queue(&conn.packet);
             }
             let reading = st.backlog.is_empty();
-            let timer = conn
+            let mut timer = conn
                 .pong_deadline
                 .map_or(conn.next_ping, |d| d.min(conn.next_ping));
+            if let Init::Pending { deadline } = conn.init {
+                timer = timer.min(deadline);
+            }
             tokio::select! {
                 packet = reader.recv(), if reading => match packet {
                     Ok(packet) => {
@@ -707,7 +738,7 @@ impl<T: Transport> Actor<T> {
             None => tracing::debug!(dc = st.dc_id, cause = %cause, "mtproto connection ended"),
         }
         st.dead = st.dead.or(gone);
-        conn.end(writer.is_flushed(), gone);
+        conn.end(writer.is_flushed(), gone, &cause);
         matches!(cause, Cause::Shutdown)
     }
 }
@@ -737,7 +768,6 @@ impl Conn {
             acks: Vec::new(),
             sent_acks: VecDeque::new(),
             pending: Vec::new(),
-            next_id: 0,
             packet: Vec::new(),
             picks: Vec::new(),
             next_ping: Instant::now() + ping_interval,
@@ -746,10 +776,7 @@ impl Conn {
     }
 
     fn push_pending(&mut self, what: What) {
-        let id = self.next_id;
-        self.next_id += 1;
         self.pending.push(Pending {
-            id,
             what,
             slot: Slot::Queued,
             resent: false,
@@ -774,13 +801,27 @@ impl Conn {
     }
 
     /// Builds the next packet into `self.packet`: owed acks, then queued
-    /// pings and requests in order. `false` when there is nothing to send.
+    /// messages in order, the init call first on a fresh connection.
+    /// `false` when there is nothing to send.
     fn build(&mut self, st: &mut Shared) -> bool {
         // A caller that gave up before its request was written never has
         // it written.
         self.pending.retain(|p| {
             !matches!((&p.slot, &p.what), (Slot::Queued, What::Request { reply, .. }) if reply.is_closed())
         });
+        if self.init == Init::Needed {
+            self.pending.insert(
+                0,
+                Pending {
+                    what: What::Init,
+                    slot: Slot::Queued,
+                    resent: false,
+                },
+            );
+            self.init = Init::Pending {
+                deadline: Instant::now() + st.tuning.init_timeout,
+            };
+        }
         let ack_count = self.acks.len().min(MAX_ACKS_PER_MESSAGE);
         let ack_len = 4 + 4 + 4 + 8 * ack_count;
         let mut count = usize::from(ack_count > 0);
@@ -789,8 +830,6 @@ impl Conn {
         } else {
             0
         };
-        let mut init = self.init;
-        let mut init_pick = None;
         self.picks.clear();
         for (i, p) in self.pending.iter().enumerate() {
             if p.slot != Slot::Queued {
@@ -798,20 +837,15 @@ impl Conn {
             }
             let len = match &p.what {
                 What::Ping { body } => body.len(),
-                What::Request { body, .. } => match init {
-                    Init::Pending(_) => continue,
-                    Init::Needed => st.wrapper_len(true) + body.len(),
-                    Init::Done => st.wrapper_len(false) + body.len(),
-                },
+                What::Init => st.init_call.len(),
+                // Requests wait for the init call's answer.
+                What::Request { .. } if self.init != Init::Done => continue,
+                What::Request { body, .. } => st.wrapper_len() + body.len(),
             };
             if count == MAX_CONTAINER_MESSAGES
                 || size + MESSAGE_HEADER + len > MAX_CONTAINER_PAYLOAD
             {
                 break;
-            }
-            if matches!(p.what, What::Request { .. }) && init == Init::Needed {
-                init = Init::Pending(p.id);
-                init_pick = Some(i);
             }
             count += 1;
             size += MESSAGE_HEADER + len;
@@ -820,7 +854,6 @@ impl Conn {
         if count == 0 {
             return false;
         }
-        self.init = init;
 
         let mut packet = std::mem::take(&mut self.packet);
         packet.clear();
@@ -854,12 +887,12 @@ impl Conn {
                     write_header(&mut packet, msg_id, seq, body.len());
                     packet.extend_from_slice(body);
                 }
+                What::Init => {
+                    write_header(&mut packet, msg_id, seq, st.init_call.len());
+                    packet.extend_from_slice(&st.init_call);
+                }
                 What::Request { body, .. } => {
-                    let init = init_pick == Some(i);
-                    write_header(&mut packet, msg_id, seq, st.wrapper_len(init) + body.len());
-                    if init {
-                        packet.extend_from_slice(&st.init_prefix);
-                    }
+                    write_header(&mut packet, msg_id, seq, st.wrapper_len() + body.len());
                     if st.without_updates {
                         packet.extend_from_slice(&WITHOUT_UPDATES);
                     }
@@ -939,7 +972,7 @@ impl Conn {
             RPC_RESULT => {
                 let req_msg_id = i64_at(&body, 4).ok_or(bad())?;
                 let outcome = rpc_outcome(body.slice(12..), true);
-                self.resolve(req_msg_id, outcome);
+                self.resolve(req_msg_id, outcome)?;
             }
             MSG_CONTAINER => {
                 let count = u32_at(&body, 4).ok_or(bad())?;
@@ -960,17 +993,17 @@ impl Conn {
                 let code = i32_at(&body, 16).ok_or(bad())?;
                 let salt = i64_at(&body, 20).ok_or(bad())?;
                 st.salt = salt;
-                self.on_bad_msg(st, msg_id, bad_msg_id, code);
+                self.on_bad_msg(st, msg_id, bad_msg_id, code)?;
             }
             BAD_MSG_NOTIFICATION => {
                 let bad_msg_id = i64_at(&body, 4).ok_or(bad())?;
                 let code = i32_at(&body, 16).ok_or(bad())?;
-                self.on_bad_msg(st, msg_id, bad_msg_id, code);
+                self.on_bad_msg(st, msg_id, bad_msg_id, code)?;
             }
             NEW_SESSION_CREATED => st.salt = i64_at(&body, 20).ok_or(bad())?,
             PONG => {
                 let ping_msg_id = i64_at(&body, 4).ok_or(bad())?;
-                self.resolve(ping_msg_id, Err(SenderError::NoAnswer));
+                self.resolve(ping_msg_id, Err(SenderError::NoAnswer))?;
             }
             // grammers `handle_detailed_info`: acknowledge the answer.
             MSG_DETAILED_INFO => self.acks.push(i64_at(&body, 12).ok_or(bad())?),
@@ -984,31 +1017,43 @@ impl Conn {
     }
 
     /// An answer for the message `msg_id`.
-    fn resolve(&mut self, msg_id: i64, outcome: Result<RpcOutcome, SenderError>) {
+    fn resolve(
+        &mut self,
+        msg_id: i64,
+        outcome: Result<RpcOutcome, SenderError>,
+    ) -> Result<(), Cause> {
         let Some(i) = self
             .pending
             .iter()
             .position(|p| p.slot.msg_id() == Some(msg_id))
         else {
-            return;
+            return Ok(());
         };
         let p = self.pending.remove(i);
         match p.what {
             What::Ping { .. } => self.pong_deadline = None,
-            What::Request { reply, .. } => {
-                if self.init == Init::Pending(p.id) {
-                    self.init = match outcome {
-                        Ok(RpcOutcome::Result(_)) => Init::Done,
-                        _ => Init::Needed,
-                    };
+            What::Init => match outcome {
+                Ok(RpcOutcome::Result(_)) => self.init = Init::Done,
+                Ok(RpcOutcome::Error { code, message }) => {
+                    return Err(Cause::InitRefused { code, message });
                 }
+                Err(_) => return Err(Cause::Protocol("initConnection answer")),
+            },
+            What::Request { reply, .. } => {
                 let _ = reply.send(outcome);
             }
         }
+        Ok(())
     }
 
     /// Telegram ignored the message `bad_msg_id` (a request or a container).
-    fn on_bad_msg(&mut self, st: &mut Shared, server_msg_id: i64, bad_msg_id: i64, code: i32) {
+    fn on_bad_msg(
+        &mut self,
+        st: &mut Shared,
+        server_msg_id: i64,
+        bad_msg_id: i64,
+        code: i32,
+    ) -> Result<(), Cause> {
         // grammers `handle_bad_notification`.
         match code {
             16 | 17 => st.clock.correct(server_msg_id),
@@ -1033,9 +1078,6 @@ impl Conn {
                 i += 1;
                 continue;
             }
-            if self.init == Init::Pending(p.id) {
-                self.init = Init::Needed;
-            }
             if retry && !p.resent {
                 p.slot = Slot::Queued;
                 p.resent = true;
@@ -1045,14 +1087,21 @@ impl Conn {
             let p = self.pending.remove(i);
             match p.what {
                 What::Ping { .. } => self.pong_deadline = None,
+                What::Init => return Err(Cause::Protocol("initConnection ignored")),
                 What::Request { reply, .. } => {
                     let _ = reply.send(Err(SenderError::BadMessage { code }));
                 }
             }
         }
+        Ok(())
     }
 
     fn on_timer(&mut self, st: &Shared, now: Instant) -> Result<(), Cause> {
+        if let Init::Pending { deadline } = self.init
+            && now >= deadline
+        {
+            return Err(Cause::InitTimeout);
+        }
         if let Some(deadline) = self.pong_deadline
             && now >= deadline
         {
@@ -1079,17 +1128,23 @@ impl Conn {
     }
 
     /// The connection is gone: every request still here gets its outcome.
-    fn end(self, flushed: bool, gone: Option<KeyGone>) {
+    fn end(self, flushed: bool, gone: Option<KeyGone>, cause: &Cause) {
         for p in self.pending {
             let What::Request { reply, .. } = p.what else {
                 continue;
             };
-            let error = match (gone, p.slot) {
-                (Some(gone), _) => gone.error(),
-                (None, Slot::Queued) => SenderError::NotSent,
+            let error = match (gone, p.slot, cause) {
+                (Some(gone), _, _) => gone.error(),
+                (None, Slot::Queued, Cause::InitRefused { code, message }) => {
+                    SenderError::InitRefused {
+                        code: *code,
+                        message: message.clone(),
+                    }
+                }
+                (None, Slot::Queued, _) => SenderError::NotSent,
                 // Telegram cannot have a frame the connection never took whole.
-                (None, Slot::InFlight { .. }) if !flushed => SenderError::NotSent,
-                (None, Slot::InFlight { .. } | Slot::Written { .. }) => SenderError::NoAnswer,
+                (None, Slot::InFlight { .. }, _) if !flushed => SenderError::NotSent,
+                (None, Slot::InFlight { .. } | Slot::Written { .. }, _) => SenderError::NoAnswer,
             };
             let _ = reply.send(Err(error));
         }
