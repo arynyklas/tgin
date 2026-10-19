@@ -890,6 +890,59 @@ async fn rollback_while_get_state_pending_fetches_difference() {
     );
 }
 
+/// A call made stale by a rollback can fail instead of answering. Its
+/// failure, transient or permanent, leads to the catch-up from the
+/// committed state, as its answer would: getState on a fresh account (no
+/// difference from pts 0), a difference from the committed pts otherwise
+/// (no getState, which would skip the refused updates). No backoff.
+#[tokio::test(start_paused = true)]
+async fn stale_call_failure_resyncs_from_committed_state() {
+    for permanent in [false, true] {
+        let fail = |m: &mut UpdateManager, f| {
+            if permanent {
+                assert!(m.fetch_failed_permanently(f).is_empty());
+            } else {
+                m.fetch_failed(f);
+            }
+        };
+        // Fresh account: the first state's batch is refused mid-call.
+        let mut m = UpdateManager::new(stored(0, &[], &[5]));
+        assert_eq!(m.next_action(), Some(Fetch::GetState));
+        let u = new_message(&message(1, PeerId::User(5), "a"), 21, 1);
+        assert!(m.feed_push(b(updates(&[u], NONE, NONE, 2, 0))).is_empty());
+        let batches = m.feed_state(b(state(20, 6, 2, 4)));
+        m.feed_push(too_long());
+        let f = m.next_action().expect("a difference");
+        assert!(matches!(f, Fetch::GetDifference { pts: 20, .. }));
+        m.refused(batches[0].id);
+        fail(&mut m, f);
+        assert_eq!(
+            m.next_action(),
+            Some(Fetch::GetState),
+            "permanent: {permanent}"
+        );
+
+        // Committed state: a pushed update's batch is refused mid-call.
+        let mut m = started(stored(10, &[], &[5]));
+        let u11 = new_message(&message(1, PeerId::User(5), "a"), 11, 1);
+        let batches = m.feed_push(b(updates(&[u11], NONE, NONE, 2, 0)));
+        m.feed_push(too_long());
+        let f = m.next_action().expect("a difference");
+        assert!(matches!(f, Fetch::GetDifference { pts: 11, .. }));
+        m.refused(batches[0].id);
+        fail(&mut m, f);
+        assert_eq!(
+            m.next_action(),
+            Some(Fetch::GetDifference {
+                pts: 10,
+                qts: 5,
+                date: 1
+            }),
+            "permanent: {permanent}"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn unsequenced_drop_counted_when_full() {
     let mut m = started(stored(10, &[], &[5]));

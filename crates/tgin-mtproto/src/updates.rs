@@ -821,30 +821,44 @@ impl UpdateManager {
     /// connection error or an RPC error). It is asked again after a
     /// backoff, per box: [`RETRY_MIN`], doubling up to [`RETRY_MAX`], reset
     /// by the box's next answer. Its updates wait meanwhile.
+    ///
+    /// A call made stale by a rollback (a batch refused while it was in
+    /// flight) is replaced at once by the catch-up from the committed
+    /// state, as its answer would have been.
     pub fn fetch_failed(&mut self, fetch: Fetch) {
         let now = Instant::now();
         match fetch {
             Fetch::GetState | Fetch::GetDifference { .. } => {
-                let want = match (fetch, self.fetch) {
-                    (Fetch::GetState, CommonFetch::State { .. }) => CommonFetch::WantState,
-                    (Fetch::GetDifference { .. }, CommonFetch::Difference { .. }) => {
-                        CommonFetch::WantDifference
+                let (want, epoch) = match (fetch, self.fetch) {
+                    (Fetch::GetState, CommonFetch::State { epoch }) => {
+                        (CommonFetch::WantState, epoch)
+                    }
+                    (Fetch::GetDifference { .. }, CommonFetch::Difference { epoch }) => {
+                        (CommonFetch::WantDifference, epoch)
                     }
                     _ => return,
                 };
+                if epoch != self.epoch {
+                    self.fetch = self.resync();
+                    return;
+                }
                 self.fetch = want;
                 self.backoff = next_backoff(self.backoff);
                 self.retry_at = Some(now + self.backoff);
             }
             Fetch::GetChannelDifference { channel, .. } => {
                 if let Some(ch) = self.channels.get_mut(&channel)
-                    && matches!(ch.fetch, ChannelFetch::InFlight { .. })
+                    && let ChannelFetch::InFlight { epoch } = ch.fetch
                 {
+                    self.in_flight = self.in_flight.saturating_sub(1);
                     ch.fetch = ChannelFetch::Wanted;
+                    if epoch != ch.epoch {
+                        self.queue.push_back(channel);
+                        return;
+                    }
                     ch.backoff = next_backoff(ch.backoff);
                     ch.retry_at = Some(now + ch.backoff);
                     self.retrying.insert(channel);
-                    self.in_flight = self.in_flight.saturating_sub(1);
                 }
             }
         }
@@ -857,23 +871,36 @@ impl UpdateManager {
     /// [`fetch_failed`](Self::fetch_failed). A channel's state is dropped,
     /// as for an undecodable answer: its next update starts it again, and
     /// its held updates are delivered from there.
+    ///
+    /// A call made stale by a rollback failed about a state that is gone:
+    /// it is replaced by the catch-up from the committed state instead, so
+    /// the refused updates are fetched again, not skipped.
     pub fn fetch_failed_permanently(&mut self, fetch: Fetch) -> Vec<Batch> {
         match fetch {
             Fetch::GetState => self.fetch_failed(fetch),
             Fetch::GetDifference { .. } => {
-                if matches!(self.fetch, CommonFetch::Difference { .. }) {
-                    self.fetch = CommonFetch::WantState;
+                if let CommonFetch::Difference { epoch } = self.fetch {
+                    self.fetch = if epoch == self.epoch {
+                        CommonFetch::WantState
+                    } else {
+                        self.resync()
+                    };
                 }
             }
             Fetch::GetChannelDifference { channel, .. } => {
-                if self
-                    .channels
-                    .get(&channel)
-                    .is_some_and(|ch| matches!(ch.fetch, ChannelFetch::InFlight { .. }))
-                {
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    return self.abandon_channel(channel);
+                let Some(ch) = self.channels.get_mut(&channel) else {
+                    return Vec::new();
+                };
+                let ChannelFetch::InFlight { epoch } = ch.fetch else {
+                    return Vec::new();
+                };
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if epoch != ch.epoch {
+                    ch.fetch = ChannelFetch::Wanted;
+                    self.queue.push_back(channel);
+                    return Vec::new();
                 }
+                return self.abandon_channel(channel);
             }
         }
         Vec::new()
