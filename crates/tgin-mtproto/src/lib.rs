@@ -9,7 +9,8 @@
 //! The account serves one layer, 230 ([`schema::API`]). [`decode`] reads the
 //! routing and update-state facts of Telegram's bytes straight from that
 //! schema; [`tl_json`] renders the same bytes as TL-JSON (design §10.5) and
-//! back.
+//! back. [`updates`] is tgin's own update-state handling and gap recovery
+//! over those bytes.
 
 pub mod decode;
 mod error;
@@ -19,7 +20,9 @@ mod session;
 #[cfg(test)]
 mod testgen;
 pub mod tl_json;
+pub mod updates;
 
 pub use error::SessionError;
 pub use schema::TlError;
 pub use session::{AuthKey, ChannelKind, DcAddr, Login, Peer, PeerKind, SessionStore, UpdateState};
+pub use updates::{Batch, Dropped, Fetch, StateDelta, StoredState, UpdateBytes, UpdateManager};

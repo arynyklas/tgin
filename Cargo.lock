@@ -2587,6 +2587,7 @@ name = "tgin-mtproto"
 version = "1.0.0-dev"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "fd-lock",
  "grammers-tl-parser",
  "grammers-tl-types",
@@ -2595,6 +2596,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

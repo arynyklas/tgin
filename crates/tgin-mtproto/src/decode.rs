@@ -8,14 +8,17 @@
 //!   and of its `users` and `chats` vectors.
 //! - [`difference`]: an `updates.getDifference` or
 //!   `updates.getChannelDifference` answer cut the same way, plus its state.
+//! - [`state`]: an `updates.getState` answer.
+//! - [`peers`]: the peers and access hashes of a `users` or `chats` vector.
 //!
 //! Every slice is a sub-slice of the input: Telegram's bytes, never
-//! re-encoded (plan decision 7). All three check the bytes as strictly as
-//! the TL-JSON codec does.
+//! re-encoded (plan decision 7). Each checks the bytes as strictly as the
+//! TL-JSON codec does.
 
 use crate::schema::{
     API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Seq, TlError, Ty, deeper, present,
 };
+use crate::session::{ChannelKind, Peer, PeerKind};
 
 const PEER_USER: u32 = 0x5951_1722;
 const PEER_CHAT: u32 = 0x36c6_019a;
@@ -479,6 +482,125 @@ pub fn difference(bytes: &[u8]) -> Result<Difference<'_>, TlError> {
     }
     r.finish()?;
     Ok(d)
+}
+
+/// The fields of an `updates.State`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct State {
+    pub pts: i32,
+    pub qts: i32,
+    pub date: i32,
+    pub seq: i32,
+    pub unread_count: i32,
+}
+
+/// Reads one boxed `updates.State` (the answer to `updates.getState`).
+pub fn state(bytes: &[u8]) -> Result<State, TlError> {
+    let mut r = Reader::new(bytes);
+    let ctor = API.read_ctor(&mut r, API.type_index("updates.State"))?;
+    let mut s = State::default();
+    let mut words = [0u32; MAX_FLAG_WORDS];
+    for p in ctor.params {
+        match &p.kind {
+            Kind::Flags { slot, known } => words[usize::from(*slot)] = r.flags(ctor, p, *known)?,
+            Kind::Field { ty, flag } => {
+                if !present(&words, *flag) {
+                    continue;
+                }
+                match (p.name, ty) {
+                    ("pts", Ty::Int) => s.pts = r.i32()?,
+                    ("qts", Ty::Int) => s.qts = r.i32()?,
+                    ("date", Ty::Int) => s.date = r.i32()?,
+                    ("seq", Ty::Int) => s.seq = r.i32()?,
+                    ("unread_count", Ty::Int) => s.unread_count = r.i32()?,
+                    _ => API.skip_value(&mut r, ty, 1)?,
+                }
+            }
+        }
+    }
+    r.finish()?;
+    Ok(s)
+}
+
+/// Appends the peers a raw `Vector<User>` or `Vector<Chat>` names to `out`:
+/// each user, basic group, channel or community with its kind and access
+/// hash. Empty constructors (`userEmpty`, `chatEmpty`) name nothing. A
+/// `min` constructor's access hash is not one tgin may cache, so it is
+/// left out (Telegram: a min hash never replaces a full one).
+pub fn peers(vector: &[u8], out: &mut Vec<Peer>) -> Result<(), TlError> {
+    let mut r = Reader::new(vector);
+    r.vector_id()?;
+    let n = r.count(4)?;
+    let (user_ty, chat_ty) = (API.type_index("User"), API.type_index("Chat"));
+    for _ in 0..n {
+        let ctor = API.read_ctor(&mut r, None)?;
+        if ctor.ty.is_none() || (ctor.ty != user_ty && ctor.ty != chat_ty) {
+            return Err(TlError::WrongType {
+                want: "User or Chat",
+                got: ctor.name,
+            });
+        }
+        if let Some(p) = peer_entry(&mut r, ctor)? {
+            out.push(p);
+        }
+    }
+    r.finish()
+}
+
+/// One `User` or `Chat` constructor's fields (its id already read).
+fn peer_entry(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Option<Peer>, TlError> {
+    let (mut id, mut hash) = (None, None);
+    let (mut min, mut bot, mut is_self) = (false, false, false);
+    let (mut broadcast, mut megagroup, mut gigagroup) = (false, false, false);
+    let mut words = [0u32; MAX_FLAG_WORDS];
+    for p in ctor.params {
+        match &p.kind {
+            Kind::Flags { slot, known } => words[usize::from(*slot)] = r.flags(ctor, p, *known)?,
+            Kind::Field { ty, flag } => {
+                if !present(&words, *flag) {
+                    continue;
+                }
+                match (p.name, ty) {
+                    ("id", Ty::Long) => id = Some(r.i64()?),
+                    ("access_hash", Ty::Long) => hash = Some(r.i64()?),
+                    ("min", Ty::True) => min = true,
+                    ("bot", Ty::True) => bot = true,
+                    ("self", Ty::True) => is_self = true,
+                    ("broadcast", Ty::True) => broadcast = true,
+                    ("megagroup", Ty::True) => megagroup = true,
+                    ("gigagroup", Ty::True) => gigagroup = true,
+                    _ => API.skip_value(r, ty, 1)?,
+                }
+            }
+        }
+    }
+    let kind = match ctor.name {
+        "user" => PeerKind::User {
+            bot: Some(bot),
+            is_self: (!min).then_some(is_self),
+        },
+        "chat" | "chatForbidden" => PeerKind::Chat,
+        "channel" | "channelForbidden" => PeerKind::Channel {
+            kind: if gigagroup {
+                Some(ChannelKind::Gigagroup)
+            } else if megagroup {
+                Some(ChannelKind::Megagroup)
+            } else if broadcast {
+                Some(ChannelKind::Broadcast)
+            } else {
+                None
+            },
+        },
+        "community" | "communityForbidden" => PeerKind::Channel {
+            kind: Some(ChannelKind::Community),
+        },
+        _ => return Ok(None),
+    };
+    Ok(id.map(|id| Peer {
+        id,
+        kind,
+        access_hash: hash.filter(|_| !min),
+    }))
 }
 
 /// One boxed object of type `ty`, keeping its top-level `pts`, and with

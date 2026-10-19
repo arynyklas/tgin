@@ -20,6 +20,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 
 use crate::SessionError;
 use crate::lock::{DirLock, lock_dir};
+use crate::updates::{StateDelta, StoredState};
 
 /// DC id → `ipv4(4) port(2) ipv6(16) port(2)`, ports little-endian.
 const DC_OPTIONS: TableDefinition<i32, &[u8]> = TableDefinition::new("dc_options");
@@ -309,12 +310,64 @@ impl SessionStore {
         }
     }
 
-    /// Caches `peers` in one transaction, replacing rows with the same id.
+    /// Caches `peers` in one transaction, merged into the rows already
+    /// there: a peer without an access hash keeps the cached one, and a
+    /// flag the new row does not know (`None`) keeps the cached value.
     pub fn put_peers(&self, peers: &[Peer]) -> Result<(), SessionError> {
         self.write(|txn| {
             let mut table = txn.open_table(PEERS)?;
             for peer in peers {
-                table.insert(peer.dialog_id(), encode_peer(peer).as_slice())?;
+                let key = peer.dialog_id();
+                let old = match table.get(key)? {
+                    Some(v) => decode_peer(v.value()),
+                    None => None,
+                };
+                let merged = old.map_or(*peer, |old| merge_peer(old, *peer));
+                table.insert(key, encode_peer(&merged).as_slice())?;
+            }
+            Ok(())
+        })
+    }
+
+    /// What the update manager starts from: the common state, every
+    /// channel's pts, and the users whose access hash is cached.
+    pub fn stored_state(&self) -> Result<StoredState, SessionError> {
+        let mut known_users = Vec::new();
+        {
+            let txn = self.db.begin_read()?;
+            for row in txn.open_table(PEERS)?.iter()? {
+                let (_, v) = row?;
+                let peer = decode_peer(v.value()).ok_or(SessionError::Corrupt("peer"))?;
+                if matches!(peer.kind, PeerKind::User { .. }) && peer.access_hash.is_some() {
+                    known_users.push(peer.id);
+                }
+            }
+        }
+        Ok(StoredState {
+            common: self.update_state()?,
+            channels: self.channel_pts()?,
+            known_users,
+        })
+    }
+
+    /// Persists what [`UpdateManager::committed`](crate::UpdateManager::committed)
+    /// returned, in one transaction: a crash keeps all of it or none.
+    pub fn commit_state(&self, delta: &StateDelta) -> Result<(), SessionError> {
+        self.write(|txn| {
+            let mut table = txn.open_table(UPDATE_STATE)?;
+            for (k, v) in [
+                ("pts", delta.pts),
+                ("qts", delta.qts),
+                ("seq", delta.seq),
+                ("date", delta.date),
+            ] {
+                if let Some(v) = v {
+                    table.insert(k, v)?;
+                }
+            }
+            let mut channels = txn.open_table(CHANNEL_PTS)?;
+            for &(channel, pts) in &delta.channels {
+                channels.insert(channel, pts)?;
             }
             Ok(())
         })
@@ -464,6 +517,31 @@ fn untri(b: u8) -> Option<Option<bool>> {
         1 => Some(Some(false)),
         2 => Some(Some(true)),
         _ => None,
+    }
+}
+
+/// `new` over `old` for one dialog: unknown fields of `new` keep `old`'s.
+fn merge_peer(old: Peer, new: Peer) -> Peer {
+    let kind = match (old.kind, new.kind) {
+        (
+            PeerKind::User {
+                bot: ob,
+                is_self: os,
+            },
+            PeerKind::User { bot, is_self },
+        ) => PeerKind::User {
+            bot: bot.or(ob),
+            is_self: is_self.or(os),
+        },
+        (PeerKind::Channel { kind: ok }, PeerKind::Channel { kind }) => {
+            PeerKind::Channel { kind: kind.or(ok) }
+        }
+        (_, kind) => kind,
+    };
+    Peer {
+        id: new.id,
+        kind,
+        access_hash: new.access_hash.or(old.access_hash),
     }
 }
 
@@ -706,6 +784,81 @@ mod tests {
         assert_eq!(s.update_id().expect("update_id"), Some(1234));
         assert_eq!(s.login().expect("login"), Some(login));
         assert!(login.login_unix > 1_700_000_000);
+    }
+
+    /// A peer row without an access hash (or with an unknown flag) never
+    /// erases what the cache holds; a new hash replaces the old one.
+    #[test]
+    fn put_peers_merges_and_keeps_cached_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        let user = |bot, is_self, access_hash| Peer {
+            id: 7,
+            kind: PeerKind::User { bot, is_self },
+            access_hash,
+        };
+        let chan = |kind, access_hash| Peer {
+            id: 99,
+            kind: PeerKind::Channel { kind },
+            access_hash,
+        };
+        s.put_peers(&[
+            user(Some(true), Some(false), Some(11)),
+            chan(Some(ChannelKind::Broadcast), Some(5)),
+        ])
+        .expect("first");
+        s.put_peers(&[user(None, None, None), chan(None, None)])
+            .expect("hashless rows");
+        assert_eq!(
+            s.peer(7).expect("user"),
+            Some(user(Some(true), Some(false), Some(11)))
+        );
+        assert_eq!(
+            s.peer(-1_000_000_000_099).expect("channel"),
+            Some(chan(Some(ChannelKind::Broadcast), Some(5)))
+        );
+        s.put_peers(&[user(Some(false), None, Some(12))])
+            .expect("new hash");
+        assert_eq!(
+            s.peer(7).expect("user"),
+            Some(user(Some(false), Some(false), Some(12)))
+        );
+        let st = s.stored_state().expect("stored");
+        assert_eq!(st.known_users, vec![7]);
+    }
+
+    /// `commit_state` writes only the fields a delta names, plus its
+    /// channel rows, and `stored_state` reads them back.
+    #[test]
+    fn commit_state_applies_delta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        s.set_update_state(UpdateState {
+            pts: 1,
+            qts: 2,
+            seq: 3,
+            date: 4,
+        })
+        .expect("state");
+        s.commit_state(&StateDelta {
+            pts: Some(10),
+            seq: Some(30),
+            channels: vec![(5, 50), (6, 60)],
+            ..StateDelta::default()
+        })
+        .expect("commit");
+        let st = s.stored_state().expect("stored");
+        assert_eq!(
+            st.common,
+            UpdateState {
+                pts: 10,
+                qts: 2,
+                seq: 30,
+                date: 4
+            }
+        );
+        assert_eq!(st.channels, vec![(5, 50), (6, 60)]);
+        assert!(st.known_users.is_empty());
     }
 
     /// A directory and files that already exist with wider modes are
