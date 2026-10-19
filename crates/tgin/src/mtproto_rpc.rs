@@ -110,8 +110,7 @@ impl RpcAccount {
     ) -> Self {
         let max_rps = spec.max_rps;
         // `max_rps` per second, bursting to one second's worth.
-        let quota = Quota::new(max_rps, Duration::from_secs(1), max_rps)
-            .unwrap_or_else(|_| unreachable!("one second is a positive period"));
+        let quota = Quota::per_second(max_rps, max_rps);
         Self {
             name: name.to_owned(),
             clients: spec
@@ -253,7 +252,10 @@ async fn invoke(
         );
     }
     if let Err(denied) = account.limiter.acquire(&(), Instant::now(), Duration::ZERO) {
-        let secs = denied.retry_after.as_secs() + u64::from(denied.retry_after.subsec_nanos() > 0);
+        let secs = denied
+            .retry_after
+            .as_secs()
+            .saturating_add(u64::from(denied.retry_after.subsec_nanos() > 0));
         return with_retry_after(
             tgin_error(
                 StatusCode::TOO_MANY_REQUESTS,

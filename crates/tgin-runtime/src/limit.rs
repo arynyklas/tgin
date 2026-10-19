@@ -44,16 +44,29 @@ impl Quota {
     /// `per / count` is rounded up to the nanosecond: a quota is an upper
     /// bound, so rounding must never raise the rate.
     pub fn new(count: NonZeroU32, per: Duration, burst: NonZeroU32) -> Result<Quota, QuotaError> {
-        let interval = interval(count, per)?;
+        if per.is_zero() {
+            return Err(QuotaError::ZeroPeriod);
+        }
+        Ok(Quota::with_interval(interval(count, per), burst))
+    }
+
+    /// `count` requests per second, up to `burst` of them at once: a
+    /// [`Quota::new`] that cannot fail.
+    #[must_use]
+    pub fn per_second(count: NonZeroU32, burst: NonZeroU32) -> Quota {
+        Quota::with_interval(interval(count, Duration::from_secs(1)), burst)
+    }
+
+    fn with_interval(interval: Duration, burst: NonZeroU32) -> Quota {
         // A tolerance past `Duration::MAX` lets every request start at once,
         // which is what a burst that large means.
         let tolerance = interval
             .checked_mul(burst.get() - 1)
             .unwrap_or(Duration::MAX);
-        Ok(Quota {
+        Quota {
             interval,
             tolerance,
-        })
+        }
     }
 
     /// One GCRA step for a key whose TAT is `stored` (`None` for a key with
@@ -85,16 +98,13 @@ impl Quota {
 }
 
 /// `per / count`, rounded up to the nanosecond: a quota is an upper bound,
-/// so rounding must never raise the rate.
-fn interval(count: NonZeroU32, per: Duration) -> Result<Duration, QuotaError> {
-    if per.is_zero() {
-        return Err(QuotaError::ZeroPeriod);
-    }
+/// so rounding must never raise the rate. `per` is positive.
+fn interval(count: NonZeroU32, per: Duration) -> Duration {
     let floor = per / count.get();
-    Ok(match floor.checked_mul(count.get()) {
+    match floor.checked_mul(count.get()) {
         Some(exact) if exact == per => floor,
         _ => floor.saturating_add(Duration::from_nanos(1)),
-    })
+    }
 }
 
 /// A key's theoretical arrival time.
@@ -678,6 +688,16 @@ mod tests {
         let now = Instant::now();
         assert_eq!(delay(limiter.acquire(&1, now, ZERO)), Ok(ZERO));
         assert_eq!(delay(limiter.acquire(&1, now, ZERO)), denied(NS));
+    }
+
+    #[test]
+    fn per_second_is_new_over_one_second() {
+        for (count, burst) in [(1, 1), (3, 2), (20, 20)] {
+            assert_eq!(
+                Ok(Quota::per_second(nz(count), nz(burst))),
+                Quota::new(nz(count), Duration::from_secs(1), nz(burst))
+            );
+        }
     }
 
     #[test]
