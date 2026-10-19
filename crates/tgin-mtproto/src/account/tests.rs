@@ -24,6 +24,8 @@ struct Seen {
     ahead: Vec<i64>,
     /// The channels the store held as behind when the batch was offered.
     behind: Vec<i64>,
+    /// The cached peers of the batch's own `peers` when it was offered.
+    cached: usize,
 }
 
 /// Admits everything; panics the first `panics` times.
@@ -66,10 +68,21 @@ impl BatchSink for Sink {
             .iter()
             .map(|(c, _)| *c)
             .collect();
+        let cached = batch
+            .peers
+            .iter()
+            .filter(|p| {
+                store
+                    .peer(p.dialog_id())
+                    .expect("peer")
+                    .is_some_and(|c| c.access_hash.is_some())
+            })
+            .count();
         self.seen.lock().push(Seen {
             updates: batch.updates.len(),
             ahead: batch.ahead.clone(),
             behind,
+            cached,
         });
         if !batch.updates.is_empty() {
             ids.take(batch.updates.len(), store)?;
@@ -781,4 +794,38 @@ async fn a_release_right_after_a_refused_claim_wakes_it() {
         .await
         .expect("woken");
     assert!(registry.claim(USER, &second).is_ok(), "the user is free");
+}
+
+/// The peers of every batch of a call are durable before the first is
+/// admitted: a channel's access hash survives a crash at admission, so its
+/// catch-up can run after the restart.
+#[tokio::test(start_paused = true)]
+async fn peers_are_persisted_before_admission() {
+    let net = FakeNetwork::new();
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    let before = run.sink.seen().len();
+    let push = tl_bytes(&format!(
+        r#"{{"_":"updates","updates":[{}],"users":[{{"_":"user","id":"100","access_hash":"7"}}],"chats":[{{"_":"channel","id":"7","access_hash":"9","title":"c","photo":{{"_":"chatPhotoEmpty"}},"date":0}}],"date":1,"seq":0}}"#,
+        channel_post(7, 1, 5)
+    ));
+    assert!(net.push(push));
+    timeout(WAIT, async {
+        while run.sink.updates() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the post is admitted");
+    let seen = &run.sink.seen()[before..];
+    let with_peers: Vec<_> = seen
+        .iter()
+        .filter(|s| s.cached > 0 || s.updates > 0)
+        .collect();
+    assert!(
+        with_peers.iter().all(|s| s.cached == 2),
+        "both peers cached at admission: {seen:?}"
+    );
+    run.account.close().await;
 }

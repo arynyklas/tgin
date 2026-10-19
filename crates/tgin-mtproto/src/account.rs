@@ -1269,8 +1269,9 @@ impl Ingest<'_> {
         }
     }
 
-    /// One manager call's batches: their marks in one write, then each
-    /// admitted or refused, in order, and the state that gives persisted.
+    /// One manager call's batches: their marks and peers in one write,
+    /// then each admitted or refused, in order, and the state that gives
+    /// persisted.
     fn handle(&mut self, batches: &[Batch]) -> Result<(), End> {
         if batches.is_empty() {
             return Ok(());
@@ -1289,9 +1290,6 @@ impl Ingest<'_> {
             };
             let delta = match admission {
                 Admission::Admitted => {
-                    if !batch.peers.is_empty() {
-                        stored(self.store.put_peers(&batch.peers))?;
-                    }
                     let n = u64::try_from(batch.updates.len()).unwrap_or(u64::MAX);
                     ctx.shared.updates.fetch_add(n, Ordering::Relaxed);
                     self.manager.committed(batch.id)

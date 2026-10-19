@@ -351,19 +351,7 @@ impl SessionStore {
     /// there: a peer without an access hash keeps the cached one, and a
     /// flag the new row does not know (`None`) keeps the cached value.
     pub fn put_peers(&self, peers: &[Peer]) -> Result<(), SessionError> {
-        self.write(|txn| {
-            let mut table = txn.open_table(PEERS)?;
-            for peer in peers {
-                let key = peer.dialog_id();
-                let old = match table.get(key)? {
-                    Some(v) => decode_peer(v.value()),
-                    None => None,
-                };
-                let merged = old.map_or(*peer, |old| merge_peer(old, *peer));
-                table.insert(key, encode_peer(&merged).as_slice())?;
-            }
-            Ok(())
-        })
+        self.write(|txn| merge_peers(&mut txn.open_table(PEERS)?, peers))
     }
 
     /// What the update manager starts from: the common state, every
@@ -429,24 +417,31 @@ impl SessionStore {
         })
     }
 
-    /// Records the [`ahead`](crate::Batch::ahead) channels of `batches`
-    /// (every batch one update-manager call returned), each with its
-    /// batch's id as the mark, in one write, before any of them is
-    /// admitted: after a crash, they catch up at start. A row keeps its
-    /// highest mark, so marks and [`commit_state`](Self::commit_state) may
-    /// land in any order.
-    ///
-    /// A channel with no stored pts that a batch gives one (an unknown
-    /// channel's baseline: the state just before its first update) gets it
-    /// now: no update below a baseline is owed, and without it a crash
-    /// would leave the channel nothing to catch up from.
+    /// Persists what one update-manager call returned, in one write,
+    /// before any of its batches is admitted:
+    /// - the [`ahead`](crate::Batch::ahead) channels of `batches`, each
+    ///   with its batch's id as the mark: after a crash, they catch up at
+    ///   start. A row keeps its highest mark, so marks and
+    ///   [`commit_state`](Self::commit_state) may land in any order;
+    /// - an unknown channel's baseline (the state just before its first
+    ///   update), when a batch gives one to a channel with no stored pts:
+    ///   no update below it is owed, and without it a crash would leave the
+    ///   channel nothing to catch up from;
+    /// - the [`peers`](crate::Batch::peers) of every batch, merged as by
+    ///   [`put_peers`](Self::put_peers): a channel marked or adopted here
+    ///   has its access hash durable too, so its catch-up can run after a
+    ///   crash.
     pub fn mark_channels_behind(&self, batches: &[Batch]) -> Result<(), SessionError> {
-        if batches.iter().all(|b| b.ahead.is_empty()) {
+        if batches
+            .iter()
+            .all(|b| b.ahead.is_empty() && b.peers.is_empty())
+        {
             return Ok(());
         }
         self.write(|txn| {
             let mut behind = txn.open_table(CHANNELS_BEHIND)?;
             let mut pts = txn.open_table(CHANNEL_PTS)?;
+            let mut peers = txn.open_table(PEERS)?;
             for batch in batches {
                 for &channel in &batch.ahead {
                     let current = behind.get(channel)?.map(|g| g.value());
@@ -460,6 +455,7 @@ impl SessionStore {
                         pts.insert(channel, p)?;
                     }
                 }
+                merge_peers(&mut peers, &batch.peers)?;
             }
             Ok(())
         })
@@ -657,6 +653,24 @@ fn untri(b: u8) -> Option<Option<bool>> {
         2 => Some(Some(true)),
         _ => None,
     }
+}
+
+/// Merges `peers` into the open `peers` table (see
+/// [`SessionStore::put_peers`]).
+fn merge_peers(
+    table: &mut redb::Table<'_, i64, &'static [u8]>,
+    peers: &[Peer],
+) -> Result<(), SessionError> {
+    for peer in peers {
+        let key = peer.dialog_id();
+        let old = match table.get(key)? {
+            Some(v) => decode_peer(v.value()),
+            None => None,
+        };
+        let merged = old.map_or(*peer, |old| merge_peer(old, *peer));
+        table.insert(key, encode_peer(&merged).as_slice())?;
+    }
+    Ok(())
 }
 
 /// `new` over `old` for one dialog: unknown fields of `new` keep `old`'s.
@@ -993,6 +1007,27 @@ mod tests {
         assert_eq!(s.update_id().expect("update_id"), Some(1234));
         assert_eq!(s.login().expect("login"), Some(login));
         assert!(login.login_unix > 1_700_000_000);
+    }
+
+    /// A call's peers are written with its marks, even when no batch names
+    /// a channel ahead.
+    #[test]
+    fn marks_write_the_peers_of_every_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        let chan = Peer {
+            id: 99,
+            kind: PeerKind::Channel { kind: None },
+            access_hash: Some(5),
+        };
+        let mut first = marks(&[], 1, &[]);
+        let mut second = marks(&[], 2, &[]);
+        first[0].peers = vec![me(42)];
+        second[0].peers = vec![chan];
+        let call = [first[0].clone(), second[0].clone()];
+        s.mark_channels_behind(&call).expect("mark");
+        assert_eq!(s.peer(42).expect("user"), Some(me(42)));
+        assert_eq!(s.peer(chan.dialog_id()).expect("channel"), Some(chan));
     }
 
     /// A peer row without an access hash (or with an unknown flag) never
