@@ -58,6 +58,8 @@
 //! end is `logged_in` or `failed` with a `reason` (`wrong_account` when
 //! the account's phone is not the config's `phone`: that login is logged
 //! out again). A repeated `POST …/login` while one runs answers its state.
+//! A fifth wrong password or code ends the login (`password_attempts`,
+//! `code_attempts`).
 //! A QR login ends `failed` (`expired`) after 5 minutes unscanned, and any
 //! login after 5 minutes without the code or password it waits for;
 //! `DELETE …/login` ends one at once (`tgin admin login` sends it on

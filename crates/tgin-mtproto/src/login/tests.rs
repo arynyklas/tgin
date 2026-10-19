@@ -1084,3 +1084,70 @@ async fn code_and_password_waits_are_bounded() {
     );
     assert_eq!(started.elapsed(), INPUT_WAIT);
 }
+
+/// Wrong passwords and codes are spent on the real account: the fifth
+/// ends the login (`password_attempts`, `code_attempts`).
+#[tokio::test]
+async fn five_wrong_passwords_or_codes_end_the_login() {
+    let mut script = Vec::new();
+    for _ in 0..MAX_ATTEMPTS {
+        script.push((ids::GET_PASSWORD, Reply::Ok(account_password_srp())));
+        script.push((
+            ids::CHECK_PASSWORD,
+            Reply::Rpc(400, "PASSWORD_HASH_INVALID"),
+        ));
+    }
+    let (h, dial, _tmp) = begin(Method::Qr, None, two_fa(script)).await;
+    settled(&h).await;
+    for _ in 1..MAX_ATTEMPTS {
+        assert_eq!(
+            h.submit_password("wrong".into()).await,
+            Err(LoginError::PasswordInvalid)
+        );
+    }
+    assert_eq!(
+        h.submit_password("wrong".into()).await,
+        Ok(LoginState::Failed(LoginError::PasswordAttempts))
+    );
+    assert!(dial.done());
+    assert_eq!(LoginError::PasswordAttempts.code(), "password_attempts");
+
+    let wrong: Vec<_> = (1..MAX_ATTEMPTS)
+        .map(|_| (ids::SIGN_IN, Reply::Rpc(400, "PHONE_CODE_INVALID")))
+        .collect();
+    let (h, dial, _tmp) = after_code(Reply::Rpc(400, "PHONE_CODE_INVALID"), wrong).await;
+    settled(&h).await;
+    for _ in 1..MAX_ATTEMPTS {
+        assert_eq!(
+            h.submit_code("1".into()).await,
+            Err(LoginError::CodeInvalid)
+        );
+    }
+    assert_eq!(
+        h.submit_code("1".into()).await,
+        Ok(LoginState::Failed(LoginError::CodeAttempts))
+    );
+    assert!(dial.done());
+    assert_eq!(LoginError::CodeAttempts.code(), "code_attempts");
+}
+
+/// FLOOD_WAIT ends the login, with its seconds in the message.
+#[tokio::test]
+async fn flood_wait_keeps_its_seconds() {
+    let (h, _dial, _tmp) = begin(
+        Method::Qr,
+        None,
+        two_fa(vec![
+            (ids::GET_PASSWORD, Reply::Ok(account_password_srp())),
+            (ids::CHECK_PASSWORD, Reply::Rpc(420, "FLOOD_WAIT_86400")),
+        ]),
+    )
+    .await;
+    settled(&h).await;
+    h.submit_password("x".into()).await.expect("handed over");
+    let LoginState::Failed(e) = end(&h).await else {
+        panic!("not failed")
+    };
+    assert_eq!(e, LoginError::FloodWait { seconds: 86400 });
+    assert!(e.to_string().contains("86400"), "{e}");
+}

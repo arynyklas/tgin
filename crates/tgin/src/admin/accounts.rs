@@ -488,7 +488,8 @@ async fn submit<S: AccountsState>(
     match hand(h).await {
         Ok(next) => answer(name, &next),
         Err(e) => {
-            tracing::info!(
+            // A wrong password or code is spent on the real account.
+            tracing::warn!(
                 account = name,
                 reason = e.code(),
                 "account login: try again"

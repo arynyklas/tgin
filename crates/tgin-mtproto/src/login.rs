@@ -62,6 +62,8 @@ mod tests;
 pub const FIRST_DC: i32 = 2;
 /// The longest a QR token is shown before it is exported again.
 const MAX_TOKEN_TTL: i64 = 30;
+/// Wrong passwords, or wrong codes, that end a login.
+pub const MAX_ATTEMPTS: u32 = 5;
 /// The longest a QR login runs unscanned; then it ends `Failed(expired)`.
 pub const QR_LIFETIME: Duration = Duration::from_secs(300);
 /// The longest a login waits for a code or a password; then it ends
@@ -287,6 +289,12 @@ pub enum LoginError {
     /// `account.password` without what SRP needs, or with unsafe values.
     #[error("unusable 2FA parameters from Telegram: {0}")]
     PasswordParams(&'static str),
+    /// [`MAX_ATTEMPTS`] wrong 2FA passwords: the login ended.
+    #[error("too many wrong 2FA passwords; start the login again")]
+    PasswordAttempts,
+    /// [`MAX_ATTEMPTS`] wrong login codes: the login ended.
+    #[error("too many wrong login codes; start the login again")]
+    CodeAttempts,
     /// The QR was not scanned within [`QR_LIFETIME`], or no code or
     /// password came within [`INPUT_WAIT`].
     #[error("the login expired; start it again")]
@@ -335,6 +343,8 @@ impl LoginError {
             Self::MigrateLoop { .. } => "migrate_loop",
             Self::PasswordParams(_) => "password_params",
             Self::Expired => "expired",
+            Self::PasswordAttempts => "password_attempts",
+            Self::CodeAttempts => "code_attempts",
             Self::NoRandomness => "no_randomness",
             Self::WrongAccount => "wrong_account",
             Self::WrongAccountNotLoggedOut => "wrong_account_not_logged_out",
@@ -990,6 +1000,8 @@ pub async fn start<D: Dial>(
         params,
         state: state_tx,
         commands,
+        wrong_passwords: 0,
+        wrong_codes: 0,
     };
     let task = tokio::spawn(flow.run(begin));
     Ok(LoginHandle {
@@ -1089,6 +1101,9 @@ struct Flow<D: Dial> {
     params: LoginParams,
     state: watch::Sender<LoginState>,
     commands: mpsc::Receiver<Command>,
+    /// Wrong passwords and codes so far: each is spent on the real account.
+    wrong_passwords: u32,
+    wrong_codes: u32,
 }
 
 /// One connection of the flow, its pushes drained.
@@ -1264,6 +1279,27 @@ impl<D: Dial> Flow<D> {
                     let _ = command.reply.send(Err(LoginError::NotExpected));
                     continue;
                 }
+            };
+            let step = match step {
+                Err(LoginError::PasswordInvalid) => {
+                    self.wrong_passwords += 1;
+                    tracing::warn!(attempt = self.wrong_passwords, "login: wrong 2FA password");
+                    if self.wrong_passwords >= MAX_ATTEMPTS {
+                        Err(LoginError::PasswordAttempts)
+                    } else {
+                        Err(LoginError::PasswordInvalid)
+                    }
+                }
+                Err(LoginError::CodeInvalid) => {
+                    self.wrong_codes += 1;
+                    tracing::warn!(attempt = self.wrong_codes, "login: wrong login code");
+                    if self.wrong_codes >= MAX_ATTEMPTS {
+                        Err(LoginError::CodeAttempts)
+                    } else {
+                        Err(LoginError::CodeInvalid)
+                    }
+                }
+                step => step,
             };
             match step {
                 Err(e) if e.is_retryable() => {
