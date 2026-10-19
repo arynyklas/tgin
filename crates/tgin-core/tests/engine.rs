@@ -1844,23 +1844,26 @@ async fn rendered_built_once_and_only_for_tl_json_targets() {
 async fn batch_is_admitted_whole_or_not_at_all() {
     let h = Harness::new(ACCOUNT);
     let acct = h.engine.account_source("acct").expect("an account source");
-    let mut first = [
-        Counted::new("updateNewMessage", 1),
-        Counted::new("updateNewMessage", 2),
-    ];
+    let mut first: Vec<Counted> = (1..=3)
+        .map(|i| Counted::new("updateNewMessage", i))
+        .collect();
     assert_eq!(h.engine.admit_batch(acct, &mut first), Admit::Admitted);
-    // Room for one more, and the batch has two: neither is queued.
+    // `raw` is full; `r1` and `r2` have room: nothing is queued anywhere.
     let mut second = [
-        Counted::new("updateNewMessage", 3),
-        Counted::new("updateNewMessage", 4),
+        Counted::new("updateNewChannelMessage", 4),
+        Counted::new("updateNewMessage", 5),
     ];
     assert_eq!(h.engine.admit_batch(acct, &mut second), Admit::Backpressure);
-    assert_eq!(h.stats("raw").available, 2);
-    assert_eq!(h.stats("raw").reserved, 0, "every reservation released");
-    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [1, 2]);
-    assert_eq!(poll(&h.pull("raw"), "x", 3).await, Vec::<i64>::new());
+    assert_eq!(h.stats("raw").available, 3);
+    assert_eq!(h.stats("r1").available, 0, "not even where there was room");
+    for c in ["raw", "r1", "r2"] {
+        assert_eq!(h.stats(c).reserved, 0, "every reservation released");
+    }
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [1, 2, 3]);
+    assert_eq!(poll(&h.pull("raw"), "x", 4).await, Vec::<i64>::new());
     assert_eq!(h.engine.admit_batch(acct, &mut second), Admit::Admitted);
-    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [3, 4], "in batch order");
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [5]);
+    assert_eq!(poll(&h.pull("r1"), "x", 0).await, [4]);
 }
 
 /// A bot source, or a source no rule names, cannot purge an account's

@@ -379,34 +379,34 @@ async fn backpressure_drops_sequenced_without_commit_then_recovered() {
     let mut m = manager();
     let routes = h.pull_routes();
 
-    // Two of `feed`'s three places taken.
-    let a = pushed(&mut m, &[101, 102]);
+    // All three of `feed`'s places taken.
+    let a = pushed(&mut m, &[101, 102, 103]);
     assert_eq!(h.admit(&a), Admission::Admitted);
     let delta = m.committed(a.id).expect("a state to persist");
-    assert_eq!(delta.pts, Some(102));
+    assert_eq!(delta.pts, Some(103));
 
-    // A batch of two finds room for one: none of it is queued, and the
+    // A batch finds no room in `feed`: none of it is queued, and the
     // caller refuses it, so its state is never committed.
-    let b = pushed(&mut m, &[103, 104]);
+    let b = pushed(&mut m, &[104, 105]);
     assert_eq!(h.admit(&b), Admission::Refused);
-    assert_eq!(h.pending("feed"), 2, "nothing of the refused batch");
-    assert_eq!(h.pending("rendered"), 2, "nor in the consumer with room");
+    assert_eq!(h.pending("feed"), 3, "nothing of the refused batch");
+    assert_eq!(h.pending("rendered"), 3, "nor in the consumer with room");
     assert!(
         m.refused(b.id)
-            .is_none_or(|d| d.pts.is_none_or(|p| p <= 102))
+            .is_none_or(|d| d.pts.is_none_or(|p| p <= 103))
     );
     assert_eq!(m.next_action(), None, "not at once: the refetch backs off");
     tokio::time::advance(tgin_mtproto::updates::RETRY_MIN).await;
     assert!(
-        matches!(m.next_action(), Some(Fetch::GetDifference { pts: 102, .. })),
+        matches!(m.next_action(), Some(Fetch::GetDifference { pts: 103, .. })),
         "gap recovery asks from the committed pts"
     );
 
     // The consumers catch up; the difference brings the updates back.
     let (_, v) = get(&routes, "feed", PollPath::Account, "", Some("tok")).await;
     let first = ids(&v);
-    assert_eq!(first.len(), 2);
-    let offset = first[1] + 1;
+    assert_eq!(first.len(), 3);
+    let offset = first[2] + 1;
     let (_, v) = get(
         &routes,
         "feed",
@@ -429,15 +429,15 @@ async fn backpressure_drops_sequenced_without_commit_then_recovered() {
     assert!(ids(&v).is_empty());
     assert_eq!(h.pending("rendered"), 0);
 
-    let c = recovered(&mut m, &[103, 104]);
+    let c = recovered(&mut m, &[104, 105]);
     assert_eq!(c.updates.len(), 2);
     assert_eq!(h.admit(&c), Admission::Admitted);
-    assert_eq!(m.committed(c.id).expect("committed").pts, Some(104));
+    assert_eq!(m.committed(c.id).expect("committed").pts, Some(105));
     let (_, v) = get(&routes, "feed", PollPath::Account, "", Some("tok")).await;
     let again = ids(&v);
     assert_eq!(again.len(), 2);
     assert!(
-        again[0] > first[1] && again[0] < again[1],
+        again[0] > first[2] && again[0] < again[1],
         "{first:?} then {again:?}"
     );
     let texts: Vec<String> = v["result"]

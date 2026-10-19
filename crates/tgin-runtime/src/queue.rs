@@ -408,15 +408,17 @@ impl<T: Clone> LeaseQueue<T> {
     }
 
     /// Reserves room for every item of `sizes` at once, or for none: a
-    /// whole batch. It fits when the queue has room for all of it, never
-    /// evicting, whatever `on_full`. A batch that could never fit, larger
-    /// than `capacity` or `capacity_bytes` by itself, fits while the queue
-    /// is within its limits (stored and reserved items at most `capacity`,
-    /// their bytes at most `capacity_bytes`), so it never waits for an
-    /// empty queue; the queue then holds at most one batch over its limits,
-    /// and takes nothing more until it is back within them. An item larger
-    /// than `capacity_bytes` is
-    /// [`Full::TooLarge`]: the caller leaves such items out.
+    /// whole batch, never evicting, whatever `on_full`. It fits when the
+    /// queue has room for its first item, as [`try_reserve`] checks one:
+    /// stored and reserved items below `capacity`, and their bytes plus the
+    /// first item's at most `capacity_bytes`. The rest go in with it, so a
+    /// batch near or over the limits never waits for room it cannot get at
+    /// once; the queue then holds at most one batch over its limits, and
+    /// takes nothing more until it is back within them. An item larger than
+    /// `capacity_bytes` is [`Full::TooLarge`]: the caller leaves such items
+    /// out.
+    ///
+    /// [`try_reserve`]: Self::try_reserve
     pub fn try_reserve_all(&self, sizes: &[usize]) -> Result<Vec<Permit>, Full> {
         let inner = self.inner.lock();
         if sizes.iter().any(|&size| size > inner.cfg.capacity_bytes) {
@@ -424,17 +426,13 @@ impl<T: Clone> LeaseQueue<T> {
         }
         let (reserved_items, reserved_bytes) = self.reservations.load();
         let total: usize = sizes.iter().fold(0, |sum, &s| sum.saturating_add(s));
-        let items = inner.entries.len().saturating_add(reserved_items);
-        let bytes = inner.bytes.saturating_add(reserved_bytes);
-        let oversized = sizes.len() > inner.cfg.capacity || total > inner.cfg.capacity_bytes;
-        let within = items <= inner.cfg.capacity && bytes <= inner.cfg.capacity_bytes;
-        if !(oversized && within) {
-            if items.saturating_add(sizes.len()) > inner.cfg.capacity {
-                return Err(Full::Items);
-            }
-            if bytes.saturating_add(total) > inner.cfg.capacity_bytes {
-                return Err(Full::Bytes);
-            }
+        if let Some(&first) = sizes.first() {
+            inner.room(
+                (reserved_items, reserved_bytes),
+                inner.entries.len(),
+                inner.bytes,
+                first,
+            )?;
         }
         self.reservations
             .items
@@ -794,51 +792,60 @@ mod tests {
     }
 
     #[test]
-    fn reserve_all_is_all_or_nothing_and_overshoots_within_limits() {
+    fn reserve_all_takes_a_share_whose_first_item_fits() {
         let q = queue(config(3, 100));
-        // Fits: all granted.
+        // Room for the first: all granted, past the limit.
         let two = q.try_reserve_all(&[1, 1]).expect("room for two");
-        assert_eq!(q.stats().reserved, 2);
-        // Two more do not fit next to them: none granted. They could fit
-        // an emptier queue, so they wait.
-        assert_eq!(q.try_reserve_all(&[1, 1]).unwrap_err(), Full::Items);
-        assert_eq!(q.stats().reserved, 2);
-        // Larger than the queue, while it is within its limits (two of
-        // three reserved): granted, without waiting for it to empty.
         let five = q
             .try_reserve_all(&[1; 5])
-            .expect("a queue within its limits takes one oversized batch");
+            .expect("two of three taken: room for the first of five");
         assert_eq!(q.stats().reserved, 7);
         // Over its limits now: nothing more until it is back within them.
         assert_eq!(q.try_reserve(1).unwrap_err(), Full::Items);
         assert_eq!(q.try_reserve_all(&[1; 5]).unwrap_err(), Full::Items);
+        assert_eq!(q.stats().reserved, 7, "a refused share reserves nothing");
         drop(two);
         for (i, permit) in five.into_iter().enumerate() {
             q.commit(permit, "x", None, i64::try_from(i).expect("small"))
                 .expect("permit from this queue");
         }
         assert_eq!(q.stats().available, 5);
-        assert_eq!(q.try_reserve_all(&[1; 4]).unwrap_err(), Full::Items);
-        // By bytes alike: within its limits, an oversized share gets in.
+        assert_eq!(q.try_reserve_all(&[1]).unwrap_err(), Full::Items);
+        // A full queue: exactly `try_reserve`'s check for one item.
+        let q = queue(config(1, 10));
+        push(&q, "a", None, 1, 1);
+        assert_eq!(q.try_reserve_all(&[1]).unwrap_err(), Full::Items);
+        // Leased items count as stored.
+        assert_eq!(q.lease(&holder("h"), 1, Instant::now()).len(), 1);
+        assert_eq!(q.try_reserve_all(&[1, 1]).unwrap_err(), Full::Items);
+        // By bytes alike: the first item's bytes decide.
         let q = queue(config(10, 10));
         push(&q, "a", None, 1, 1);
-        let twelve = q.try_reserve_all(&[6, 6]).expect("within its limits");
+        let twelve = q.try_reserve_all(&[6, 6]).expect("room for the first 6");
         assert_eq!(q.try_reserve_all(&[6, 6]).unwrap_err(), Full::Bytes);
         drop(twelve);
         let q = queue(config(10, 10));
         push(&q, "a", None, 1, 9);
-        assert_eq!(
-            q.try_reserve_all(&[2]).unwrap_err(),
-            Full::Bytes,
-            "fits later"
-        );
+        assert_eq!(q.try_reserve_all(&[2]).unwrap_err(), Full::Bytes);
+        assert_eq!(q.try_reserve_all(&[1, 9]).map(|p| p.len()), Ok(2));
         assert_eq!(q.try_reserve_all(&[11]).unwrap_err(), Full::TooLarge);
-        // Leased items count as stored.
-        let q = queue(config(1, 10));
-        push(&q, "a", None, 1, 1);
-        assert_eq!(q.lease(&holder("h"), 1, Instant::now()).len(), 1);
-        assert_eq!(q.try_reserve_all(&[1]).unwrap_err(), Full::Items);
-        assert_eq!(q.try_reserve_all(&[1, 1]).map(|p| p.len()), Ok(2));
+        assert_eq!(q.try_reserve_all(&[]).map(|p| p.len()), Ok(0));
+    }
+
+    /// With steady occupancy, a share as large as the queue gets in: it
+    /// needs room for its first item only, not for all of it at once.
+    #[test]
+    fn reserve_all_takes_a_full_size_share_beside_steady_occupancy() {
+        let q = queue(config(100, 1 << 20));
+        for i in 0..10 {
+            push(&q, "steady", None, i, 1);
+        }
+        let share = q
+            .try_reserve_all(&[1; 100])
+            .expect("room for the first of a hundred");
+        assert_eq!(share.len(), 100);
+        assert_eq!(q.stats().reserved, 100);
+        assert_eq!(q.try_reserve(1).unwrap_err(), Full::Items);
     }
 
     #[test]
