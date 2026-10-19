@@ -3214,3 +3214,506 @@ bots:
         assert!(!text.contains(leaked), "{leaked} in {text}");
     }
 }
+
+/// Every config in the repository, as (path from the workspace root).
+/// `tests/smoke/real_telegram.yaml` is a template with placeholders, not a
+/// config.
+const REPO_CONFIGS: [&str; 12] = [
+    "tgin.yaml",
+    "examples/simple/config/tgin.yaml",
+    "examples/self-hosted/config/tgin.yaml",
+    "tests/e2e/tgin.yaml",
+    "tests/performance/cfgs/v1/longpoll-1.yaml",
+    "tests/performance/cfgs/v1/longpoll-3.yaml",
+    "tests/performance/cfgs/v1/webhook-1.yaml",
+    "tests/performance/cfgs/v1/webhook-3.yaml",
+    "crates/tgin-botapi/tests/fixtures/hot_path.yaml",
+    "crates/tgin-core/tests/fixtures/design.yaml",
+    "crates/tgin-core/tests/fixtures/full.yaml",
+    "crates/tgin-core/tests/fixtures/minimal.yaml",
+];
+
+/// An environment that gives every `${env:…}` and `${file:…}` reference in
+/// `text` a value of the shape its name suggests: a distinct bot token, a
+/// URL or a header-safe secret.
+fn stand_in_env(text: &str) -> MapEnv {
+    let mut env = MapEnv::default();
+    let mut offset = 0;
+    let mut n = 0;
+    while let Some(start) = text[offset..].find("${") {
+        let start = offset + start + 2;
+        let Some(end) = text[start..].find('}') else {
+            break;
+        };
+        let reference = &text[start..start + end];
+        offset = start + end;
+        n += 1;
+        if let Some(name) = reference.strip_prefix("env:") {
+            let value = if name.ends_with("URL") {
+                "https://api.telegram.org".to_owned()
+            } else if name.ends_with("TOKEN") && !name.contains("ADMIN") {
+                format!("{}:stand_in_{name}", 100_000 + n)
+            } else {
+                format!("stand_in_{n}")
+            };
+            env.vars.insert(name.to_owned(), value);
+        } else if let Some(file) = reference.strip_prefix("file:") {
+            env.files
+                .insert(PathBuf::from(file), format!("stand_in_{n}\n"));
+        }
+    }
+    env
+}
+
+/// A config without `accounts` loads as before: every config in the
+/// repository still loads, with exactly the warnings it had, and its
+/// `/v1/config` rendering gains no `accounts` or `render` key.
+#[test]
+fn v1_without_accounts_unchanged() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    const PLAIN_HTTP: &str = "sends bot tokens over plain http to a host that is not loopback";
+    // The warnings each config had before accounts existed, with counts.
+    let baseline: [(&str, &[(&str, usize)]); 6] = [
+        (
+            "examples/self-hosted/config/tgin.yaml",
+            &[("upstream `tba`", 1)],
+        ),
+        (
+            "tests/e2e/tgin.yaml",
+            &[("upstream `fake-local`", 1), ("upstream `api_url`", 8)],
+        ),
+        (
+            "tests/performance/cfgs/v1/longpoll-1.yaml",
+            &[("upstream `api_url`", 1)],
+        ),
+        (
+            "tests/performance/cfgs/v1/longpoll-3.yaml",
+            &[("upstream `api_url`", 1)],
+        ),
+        (
+            "tests/performance/cfgs/v1/webhook-1.yaml",
+            &[("upstream `api_url`", 1)],
+        ),
+        (
+            "tests/performance/cfgs/v1/webhook-3.yaml",
+            &[("upstream `api_url`", 1)],
+        ),
+    ];
+    for file in REPO_CONFIGS {
+        let text =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        // A relative origin, so that `${file:/…}` stays as written on
+        // Windows too.
+        let cfg = config::load(&text, Path::new(file), &stand_in_env(&text))
+            .unwrap_or_else(|errors| panic!("{file}:\n{}", render(&errors)));
+        let mut warnings: Vec<(String, usize)> = Vec::new();
+        for warning in &cfg.warnings {
+            match warnings.iter_mut().find(|(m, _)| *m == warning.message) {
+                Some((_, n)) => *n += 1,
+                None => warnings.push((warning.message.clone(), 1)),
+            }
+        }
+        let expected: Vec<(String, usize)> = baseline
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map_or(&[][..], |(_, w)| *w)
+            .iter()
+            .map(|(upstream, n)| (format!("{upstream} {PLAIN_HTTP}"), *n))
+            .collect();
+        assert_eq!(warnings, expected, "{file}");
+        let json = config::redacted_json(&cfg);
+        assert!(json.get("accounts").is_none(), "{file}: {json}");
+        for (name, consumer) in json["consumers"].as_object().into_iter().flatten() {
+            let kind = consumer.as_object().unwrap().values().next().unwrap();
+            assert!(kind.get("render").is_none(), "{file}: {name}: {json}");
+        }
+    }
+}
+
+/// One account, `main`, with one RPC client, `bot`, and `extra` spliced
+/// into the account.
+fn account_yaml(extra: &str) -> String {
+    format!(
+        r#"version: 1
+server: {{}}
+accounts:
+  main:
+    api_id: 12345
+    api_hash: "${{env:API_HASH}}"
+    session_dir: sessions/main
+    phone: "+15550001234"
+    rpc:
+      clients:
+        bot:
+          token: c1ient-t0ken-value
+          allow: ["messages.*"]
+{extra}consumers:
+  feed: {{ pull: {{ auth_token: pull-t0ken-value }} }}
+"#
+    )
+}
+
+fn api_env() -> MapEnv {
+    env(&[("API_HASH", "0123456789abcdef0123456789abcdef")])
+}
+
+fn load_account(yaml: &str) -> Result<Config, Vec<ConfigError>> {
+    config::load(yaml, Path::new("conf/tgin.yaml"), &api_env())
+}
+
+fn account_errors(yaml: &str) -> Vec<ConfigError> {
+    match load_account(yaml) {
+        Ok(_) => panic!("the config loaded:\n{yaml}"),
+        Err(errors) => errors,
+    }
+}
+
+#[test]
+fn accounts_parse_and_redact() {
+    let yaml = account_yaml(
+        r#"    routes:
+      - match: { constructors: [updateNewMessage], peer_ids: [-1001], user_ids: [7], commands: [start], text: { prefix: ["hi"] } }
+        to: [feed]
+      - to: [feed]
+"#,
+    );
+    let cfg = load_account(&yaml).unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
+    let [account] = &cfg.accounts[..] else {
+        panic!("{:?}", cfg.accounts);
+    };
+    assert_eq!(account.name, "main");
+    assert_eq!(account.api_id, 12345);
+    assert_eq!(
+        account.api_hash.expose(),
+        "0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(
+        account.phone.as_ref().map(|p| p.expose().as_str()),
+        Some("+15550001234")
+    );
+    // Relative to the config file's directory, made absolute.
+    let dir = account.session_dir.expose();
+    assert!(dir.is_absolute(), "{}", dir.display());
+    assert!(dir.ends_with("conf/sessions/main"), "{}", dir.display());
+    assert_eq!(account.rpc.max_rps, nz(20));
+    assert_eq!(account.rpc.flood_sleep_threshold, secs(10));
+    let [client] = &account.rpc.clients[..] else {
+        panic!("{:?}", account.rpc.clients);
+    };
+    assert_eq!(client.name, "bot");
+    assert_eq!(client.token.expose(), "c1ient-t0ken-value");
+    assert!(client.acl.allows("messages.sendMessage"));
+    assert!(!client.acl.allows("channels.joinChannel"));
+    // Account facts map onto the rule predicates.
+    let [rule, _] = &account.rules[..] else {
+        panic!("{:?}", account.rules);
+    };
+    assert_eq!(rule.predicates.update_types, ["updateNewMessage"]);
+    assert_eq!(rule.predicates.chat_ids, [-1001]);
+    assert_eq!(rule.predicates.user_ids, [7]);
+    assert_eq!(rule.predicates.commands, ["start"]);
+    assert_eq!(
+        rule.predicates.text,
+        Some(TextMatch::Prefix(vec!["hi".into()]))
+    );
+    assert_eq!(rule.targets, [TargetSpec::Consumer(ConsumerId(0))]);
+
+    let raw: config::RawConfig = parse_yaml(&yaml).unwrap();
+    for rendering in [
+        format!("{cfg:?}"),
+        config::redacted_json(&cfg).to_string(),
+        format!("{raw:?}"),
+    ] {
+        for leaked in [
+            "0123456789abcdef0123456789abcdef",
+            "15550001234",
+            "c1ient-t0ken-value",
+            "pull-t0ken-value",
+        ] {
+            assert!(!rendering.contains(leaked), "{leaked} in {rendering}");
+        }
+    }
+    let json = config::redacted_json(&cfg);
+    let main = &json["accounts"]["main"];
+    assert_eq!(main["api_hash"], "[redacted]");
+    assert_eq!(main["phone"], "[redacted]");
+    assert_eq!(main["rpc"]["clients"]["bot"]["token"], "[redacted]");
+    assert_eq!(main["api_id"], 12345);
+    assert_eq!(main["session_dir"], "sessions/main");
+}
+
+#[test]
+fn account_fields_required_and_closed() {
+    let yaml = "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h }\n";
+    let err = single_error(yaml);
+    assert_message(&err, "session_dir");
+    let yaml = "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, layers: [230] }\n";
+    let err = single_error(yaml);
+    assert_message(&err, "layers");
+    let yaml = "version: 1\naccounts:\n  main: { api_id: 0, api_hash: h, session_dir: s }\n";
+    let err = single_error(yaml);
+    assert_at(&err, "accounts.main.api_id", pos(yaml, "0,"));
+    let yaml = "version: 1\naccounts:\n  Main: { api_id: 1, api_hash: h, session_dir: s, rpc: { max_rps: 0, clients: { Bad: { token: t } } } }\n";
+    let errors = errors(yaml);
+    let text = render(&errors);
+    assert_eq!(errors.len(), 3, "{text}");
+    assert!(text.contains("invalid name `Main`"), "{text}");
+    assert!(text.contains("invalid name `Bad`"), "{text}");
+    assert!(text.contains("accounts.Main.rpc.max_rps"), "{text}");
+}
+
+#[test]
+fn session_dirs_unique_after_resolution() {
+    let yaml = r#"version: 1
+accounts:
+  a: { api_id: 1, api_hash: shared-hash, session_dir: sessions/a }
+  b: { api_id: 1, api_hash: shared-hash, session_dir: ./sessions/a/ }
+"#;
+    let err = single_error(yaml);
+    assert_at(&err, "accounts.b.session_dir", pos(yaml, "./sessions/a/"));
+    assert_message(&err, "account `a`");
+    assert!(err.hint.is_some(), "{err}");
+
+    // The developer's app pair is shared; only the directory must differ.
+    let cfg = loads(
+        r#"version: 1
+accounts:
+  a: { api_id: 1, api_hash: shared-hash, session_dir: sessions/a }
+  b: { api_id: 1, api_hash: shared-hash, session_dir: sessions/b }
+"#,
+    );
+    assert_eq!(cfg.accounts.len(), 2);
+    assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
+}
+
+#[test]
+fn account_name_not_a_bot_name() {
+    let yaml = r#"version: 1
+bots:
+  - { name: main, token: "1:t" }
+accounts:
+  main: { api_id: 1, api_hash: h, session_dir: s }
+"#;
+    let err = single_error(yaml);
+    assert_message(&err, "bot");
+    assert!(
+        err.at.as_ref().unwrap().path.starts_with("accounts.main"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rpc_client_tokens_unique_per_account() {
+    let yaml = r#"version: 1
+accounts:
+  main:
+    api_id: 1
+    api_hash: h
+    session_dir: s
+    rpc: { clients: { a: { token: same-t0ken }, b: { token: same-t0ken } } }
+"#;
+    let err = single_error(yaml);
+    assert_at(
+        &err,
+        "accounts.main.rpc.clients.b.token",
+        pos(yaml, "same-t0ken } }"),
+    );
+    assert!(!err.to_string().contains("same-t0ken"), "{err}");
+}
+
+#[test]
+fn rpc_glob_syntax() {
+    for good in [
+        "*",
+        "messages.*",
+        "messages.sendMessage",
+        "ping",
+        "invokeWithLayer",
+    ] {
+        let yaml = format!(
+            "version: 1\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: s, rpc: {{ clients: {{ c: {{ token: t, allow: [\"{good}\"], deny: [\"{good}\"] }} }} }} }}\n"
+        );
+        loads(&yaml);
+    }
+    for bad in [
+        "messages.send*",
+        "*.sendMessage",
+        "messages.",
+        ".x",
+        "a.b.c",
+        "messages.**",
+        "",
+        "mess ages.x",
+    ] {
+        let yaml = format!(
+            "version: 1\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: s, rpc: {{ clients: {{ c: {{ token: t, deny: [\"{bad}\"] }} }} }} }}\n"
+        );
+        let err = single_error(&yaml);
+        assert_eq!(
+            err.at.as_ref().unwrap().path,
+            "accounts.main.rpc.clients.c.deny[0]",
+            "{bad}: {err}"
+        );
+        assert!(err.hint.is_some(), "{err}");
+    }
+}
+
+#[test]
+fn auth_methods_need_exact_listing() {
+    let yaml = r#"version: 1
+accounts:
+  main:
+    api_id: 1
+    api_hash: h
+    session_dir: s
+    rpc:
+      clients:
+        wide: { token: t1, allow: ["*", "auth.*", "account.*"] }
+        exact: { token: t2, allow: ["messages.*", "account.updateProfile", "auth.logOut"], deny: ["messages.deleteHistory"] }
+"#;
+    let cfg = loads(yaml);
+    let clients = &cfg.accounts[0].rpc.clients;
+    let wide = &clients[0].acl;
+    assert!(wide.allows("messages.sendMessage"));
+    assert!(wide.allows("channels.joinChannel"));
+    for method in config::ACCOUNT_CHANGING {
+        let method = method
+            .strip_suffix('*')
+            .map_or(method.to_owned(), |ns| format!("{ns}anything"));
+        assert!(!wide.allows(&method), "{method}");
+    }
+    assert!(!wide.allows("auth.logOut"));
+    assert!(!wide.allows("account.updateProfile"));
+    assert!(!wide.allows("contacts.resetSaved"));
+    let exact = &clients[1].acl;
+    assert!(exact.allows("account.updateProfile"));
+    assert!(exact.allows("auth.logOut"));
+    assert!(!exact.allows("auth.resetAuthorizations"));
+    assert!(!exact.allows("account.deleteAccount"));
+    assert!(exact.allows("messages.sendMessage"));
+    // Deny wins.
+    assert!(!exact.allows("messages.deleteHistory"));
+    // Matching is exact and case-sensitive.
+    assert!(!exact.allows("Messages.sendMessage"));
+    assert!(!exact.allows("messages"));
+    assert!(!exact.allows("messages."));
+
+    let text = render(&cfg.warnings);
+    assert_eq!(cfg.warnings.len(), 2, "{text}");
+    // A glob over protected methods allows none of them.
+    let wide_warning = &cfg.warnings[0];
+    assert_eq!(wide_warning.severity, Severity::Warning);
+    assert_eq!(
+        wide_warning.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.wide.allow[1]"
+    );
+    assert_message(wide_warning, "`auth.*`");
+    assert!(wide_warning.hint.is_some(), "{wide_warning}");
+    // Exact listings work, and are named.
+    let exact_warning = cfg
+        .warnings
+        .iter()
+        .find(|w| w.at.as_ref().unwrap().path.contains(".exact."))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_message(exact_warning, "account.updateProfile");
+    assert_message(exact_warning, "auth.logOut");
+    // Two warnings: `account.*` in `wide` is reported with `auth.*`.
+    assert_message(wide_warning, "`account.*`");
+}
+
+#[test]
+fn deny_by_default() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t } } } }\n",
+    );
+    let acl = &cfg.accounts[0].rpc.clients[0].acl;
+    assert!(!acl.allows("messages.sendMessage"));
+    assert!(!acl.allows("help.getConfig"));
+}
+
+#[test]
+fn account_rules_validated() {
+    let yaml = account_yaml(
+        r#"    routes:
+      - match: { commands: ["bad command"] }
+        to: [nowhere]
+      - match: { constructors: [updateNewMessage] }
+        to: [feed]
+"#,
+    );
+    let errors = account_errors(&yaml);
+    let text = render(&errors);
+    assert_eq!(errors.len(), 2, "{text}");
+    assert_at(
+        &errors[0],
+        "accounts.main.routes[0].match.commands[0]",
+        pos(&yaml, "\"bad command\""),
+    );
+    assert_at(
+        &errors[1],
+        "accounts.main.routes[0].to[0]",
+        pos(&yaml, "nowhere"),
+    );
+    assert_message(&errors[1], "unknown consumer `nowhere`");
+
+    let cfg = load_account(&yaml.replace(
+        "      - match: { commands: [\"bad command\"] }\n        to: [nowhere]\n",
+        "",
+    ))
+    .unwrap_or_else(|errors| panic!("{}", render(&errors)));
+    // The last rule has a match, as for a bot.
+    assert_eq!(cfg.warnings.len(), 1, "{}", render(&cfg.warnings));
+    assert_message(&cfg.warnings[0], "last rule has a match");
+    assert_eq!(
+        cfg.warnings[0].at.as_ref().unwrap().path,
+        "accounts.main.routes"
+    );
+
+    // Bot facts are not account facts.
+    let yaml =
+        account_yaml("    routes:\n      - match: { chat_types: [private] }\n        to: [feed]\n");
+    let err = &account_errors(&yaml)[0];
+    assert_message(err, "chat_types");
+}
+
+#[test]
+fn render_requires_account_sources() {
+    let accounts = r#"accounts:
+  main:
+    api_id: 1
+    api_hash: h
+    session_dir: s
+    routes: [{ to: [acct] }]
+"#;
+    let yaml = |render: &str, bot_to: &str| {
+        format!(
+            "version: 1\nserver: {{}}\nbots:\n  - {{ name: b, token: \"1:t\", routes: [{{ to: [{bot_to}] }}] }}\n{accounts}consumers:\n  acct: {{ pull: {{ auth_token: a{render} }} }}\n  botc: {{ push: {{ endpoints: [{{ url: \"http://x\" }}]{render} }} }}\n"
+        )
+    };
+    // Account sources only: `tl_json` is allowed, and resolved.
+    let text = yaml("", "botc").replace("auth_token: a", "auth_token: a, render: tl_json");
+    let cfg = loads(&text);
+    let acct = cfg.consumers.iter().find(|c| c.name == "acct").unwrap();
+    assert_eq!(acct.render, config::Render::TlJson);
+    let botc = cfg.consumers.iter().find(|c| c.name == "botc").unwrap();
+    assert_eq!(botc.render, config::Render::Raw);
+    assert_eq!(
+        config::redacted_json(&cfg)["consumers"]["acct"]["pull"]["render"],
+        "tl_json"
+    );
+
+    // A bot source with `tl_json`.
+    let text = yaml(", render: tl_json", "botc")
+        .replace("auth_token: a, render: tl_json", "auth_token: a");
+    let err = single_error(&text);
+    assert_at(&err, "consumers.botc.push.render", pos(&text, "tl_json"));
+    assert_message(&err, "bot `b`");
+
+    // Bot and account sources in one consumer, whatever the render.
+    let text = yaml("", "acct");
+    let err = single_error(&text);
+    assert_message(&err, "consumer `acct`");
+    assert_message(&err, "bot `b`");
+    assert_message(&err, "account `main`");
+}

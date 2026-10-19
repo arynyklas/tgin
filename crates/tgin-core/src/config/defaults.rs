@@ -3,11 +3,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use indexmap::IndexMap;
+
 use super::model::{
     Admin, At, Balance, Breaker, ByteSize, ChatRate, Endpoint, Gateway, GlobalRate, GroupRate,
     HumanDuration, IpAllowlist, Log, LogFormat, LogLevel, LongPoll, OnFull, Ordering, Pull,
-    RateLimit, RateMode, Reload, Retry, Retry429, Runtime, Server, Template, Webhook, WebhookReply,
-    WebhookSecret, WorkerThreads,
+    RateLimit, RateMode, Reload, Render, Retry, Retry429, Rpc, Runtime, Server, Template, Webhook,
+    WebhookReply, WebhookSecret, WorkerThreads,
 };
 
 /// The Telegram Bot API.
@@ -229,6 +231,7 @@ impl Default for Pull {
             auth_token: None,
             aliases: Vec::new(),
             honor_drop_pending: false,
+            render: render(),
         }
     }
 }
@@ -249,6 +252,20 @@ impl Default for Breaker {
         Self {
             failure_threshold: At::new(5),
             open_for: duration(secs(30)),
+        }
+    }
+}
+
+pub(super) fn render() -> At<Render> {
+    At::new(Render::Raw)
+}
+
+impl Default for Rpc {
+    fn default() -> Self {
+        Self {
+            max_rps: At::new(20),
+            flood_sleep_threshold: duration(secs(10)),
+            clients: IndexMap::new(),
         }
     }
 }

@@ -19,6 +19,7 @@ use tgin_runtime::queue::{self, QueueConfig};
 use tgin_runtime::secret::Secret;
 use url::{Host, Url};
 
+use super::acl::{MethodAcl, MethodGlob};
 use super::defaults;
 use super::model::{self as raw, At, Name, RawConfig, SecretText, Template};
 use super::sensitive::{Masker, Sensitive, SensitivePath, SensitiveRoute, SensitiveUrl};
@@ -27,7 +28,9 @@ use crate::facts::ChatType;
 use crate::ids::{ConsumerId, SourceId};
 use crate::rules::{self, Predicates, RouteTable, RuleError, RuleSpec, TargetSpec};
 
-pub use super::model::{Balance, LogFormat, LogLevel, RateMode, UpstreamKind, WebhookReply};
+pub use super::model::{
+    Balance, LogFormat, LogLevel, RateMode, Render, UpstreamKind, WebhookReply,
+};
 
 /// A loaded, valid configuration. Its rules compile into a [`RouteTable`].
 ///
@@ -49,6 +52,8 @@ pub struct Config {
     /// [`Engine::source_id`](crate::engine::Engine::source_id), never by
     /// position here.
     pub bots: Vec<Bot>,
+    /// The user accounts, in file order.
+    pub accounts: Vec<Account>,
     /// Indexed by [`ConsumerId`].
     pub consumers: Vec<Consumer>,
     /// Problems that do not reject the config.
@@ -71,6 +76,7 @@ impl fmt::Debug for Config {
             .field("reload", &self.reload)
             .field("upstreams", &self.upstreams)
             .field("bots", &self.bots)
+            .field("accounts", &self.accounts)
             .field("consumers", &self.consumers)
             .field("warnings", &self.warnings)
             .finish_non_exhaustive()
@@ -134,6 +140,38 @@ pub struct Bot {
     pub gateway: Gateway,
     /// In order; the first match wins.
     pub rules: Vec<RuleSpec>,
+}
+
+/// A Telegram user account. `Debug` shows no secret: `api_hash`, `phone`
+/// and client tokens are [`Secret`]s, and `session_dir` is [`Sensitive`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    pub name: String,
+    pub api_id: i32,
+    pub api_hash: Secret<String>,
+    /// Absolute; no other account has it.
+    pub session_dir: SensitivePath,
+    pub phone: Option<Secret<String>>,
+    pub rpc: Rpc,
+    /// In order; the first match wins. An account's facts take the bot
+    /// predicates' places: the constructor is the update type and the
+    /// peer the chat.
+    pub rules: Vec<RuleSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rpc {
+    pub max_rps: NonZeroU32,
+    pub flood_sleep_threshold: Duration,
+    /// In file order; each token is unique within the account.
+    pub clients: Vec<RpcClient>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpcClient {
+    pub name: String,
+    pub token: Secret<String>,
+    pub acl: MethodAcl,
 }
 
 /// A Bot API server bots talk to.
@@ -357,6 +395,8 @@ pub struct Consumer {
     pub id: ConsumerId,
     pub name: String,
     pub kind: ConsumerKind,
+    /// Only [`Render::Raw`] for a consumer any bot feeds.
+    pub render: Render,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,6 +481,7 @@ pub(super) fn resolve(
     let consumers = r.consumers(&raw.consumers);
     let upstreams = r.upstreams(&raw);
     let bots = r.bots(&raw, &upstreams);
+    let accounts = r.accounts(&raw);
     let server = raw.server.as_ref().map(|server| r.server(server));
     let admin = Admin {
         listen: raw.admin.listen.iter().map(|a| a.value).collect(),
@@ -453,6 +494,7 @@ pub(super) fn resolve(
     };
     if r.diag.errors.is_empty() {
         r.compile_all(&raw, &bots);
+        r.compile_accounts(&raw, &accounts);
     }
     let masker = Masker::new(r.secrets);
     let mut config = Config {
@@ -477,6 +519,7 @@ pub(super) fn resolve(
         },
         upstreams,
         bots,
+        accounts,
         consumers,
         warnings: Vec::new(),
         raw,
@@ -517,6 +560,9 @@ fn mask(config: &mut Config) {
                 file.mask(redactor);
             }
         }
+    }
+    for account in &mut config.accounts {
+        account.session_dir.mask(redactor);
     }
     for consumer in &mut config.consumers {
         match &mut consumer.kind {
@@ -756,10 +802,15 @@ impl Resolver<'_> {
                 }
                 raw::Consumer::Push(push) => ConsumerKind::Push(self.push(&path, push)),
             };
+            let render = match &consumer.value {
+                raw::Consumer::Pull(pull) => pull.render.value,
+                raw::Consumer::Push(push) => push.render.value,
+            };
             out.push(Consumer {
                 id: ConsumerId(id),
                 name: name.as_str().to_owned(),
                 kind,
+                render,
             });
         }
         out
@@ -1147,6 +1198,169 @@ impl Resolver<'_> {
             }
         }
     }
+
+    /// Every account, with its session directory made absolute and unique,
+    /// and its clients' tokens unique within it. An account with an error
+    /// is left out; the error rejects the config.
+    fn accounts(&mut self, raw: &RawConfig) -> Vec<Account> {
+        let mut out = Vec::with_capacity(raw.accounts.len());
+        // Each session directory, absolute, with the first account that has
+        // it.
+        let mut dirs: HashMap<PathBuf, &str> = HashMap::new();
+        for (name, account) in &raw.accounts {
+            let path = format!("accounts.{}", name.as_str());
+            let a = &account.value;
+            let api_hash = self.secret(format!("{path}.api_hash"), &a.api_hash);
+            let phone = a
+                .phone
+                .as_ref()
+                .map(|phone| self.secret(format!("{path}.phone"), phone));
+            let session_dir = self.session_dir(&path, &a.session_dir);
+            if let Some(dir) = &session_dir {
+                match dirs.entry(dir.expose().clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(name.as_str());
+                    }
+                    // Never quotes the path, which may hold a secret.
+                    Entry::Occupied(first) => self.diag.errors.push(
+                        ConfigError::new(format!(
+                            "account `{}` already uses this session directory",
+                            first.get()
+                        ))
+                        .at(located(format!("{path}.session_dir"), a.session_dir.0.location))
+                        .hint("give each account its own `session_dir`: a session holds one account's auth key, and only one process may use it"),
+                    ),
+                }
+            }
+            let clients = self.rpc_clients(&path, &a.rpc);
+            let mut rules = Vec::with_capacity(a.routes.len());
+            for (j, route) in a.routes.iter().enumerate() {
+                let spec = account_rule_spec(&route.value, &raw.consumers);
+                self.compile_rule(&format!("{path}.routes[{j}]"), route.location, &spec);
+                rules.push(spec);
+            }
+            let (Some(api_hash), Some(session_dir), Some(phone), Some(max_rps)) = (
+                api_hash,
+                session_dir,
+                phone.map_or(Some(None), |phone| phone.map(Some)),
+                NonZeroU32::new(a.rpc.max_rps.value),
+            ) else {
+                continue;
+            };
+            out.push(Account {
+                name: name.as_str().to_owned(),
+                api_id: a.api_id.value,
+                api_hash,
+                session_dir,
+                phone,
+                rpc: Rpc {
+                    max_rps,
+                    flood_sleep_threshold: a.rpc.flood_sleep_threshold.value.get(),
+                    clients,
+                },
+                rules,
+            });
+        }
+        out
+    }
+
+    /// A `session_dir`, absolute: relative to the config file's directory,
+    /// and to the working directory below that, so that two spellings of
+    /// one directory compare equal.
+    fn session_dir(&mut self, path: &str, text: &Template) -> Option<SensitivePath> {
+        let dir_path = format!("{path}.session_dir");
+        let dir = self.file(&dir_path, text)?;
+        match std::path::absolute(dir.expose()) {
+            Ok(absolute) => Some(Sensitive::new(absolute, &text.0.value)),
+            Err(err) => {
+                // The error never holds the path.
+                self.diag.error(
+                    dir_path,
+                    text.0.location,
+                    format!("cannot make the directory absolute: {err}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// An account's clients, each token unique within the account. Globs
+    /// that validation rejected are left out.
+    fn rpc_clients(&mut self, path: &str, rpc: &raw::Rpc) -> Vec<RpcClient> {
+        let mut out = Vec::with_capacity(rpc.clients.len());
+        let mut tokens: HashMap<String, &str> = HashMap::new();
+        for (name, client) in &rpc.clients {
+            let token_path = format!("{path}.rpc.clients.{}.token", name.as_str());
+            let Some(token) = self.secret(token_path.clone(), &client.value.token) else {
+                continue;
+            };
+            match tokens.entry(token.expose().clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(name.as_str());
+                }
+                // Never quotes the value: it is the token.
+                Entry::Occupied(first) => {
+                    self.diag.errors.push(
+                        ConfigError::new(format!(
+                            "client `{}` already has this token",
+                            first.get()
+                        ))
+                        .at(located(token_path, client.value.token.0.location))
+                        .hint("the token identifies the client; give each client its own"),
+                    );
+                    continue;
+                }
+            }
+            let globs = |list: &[At<String>]| -> Vec<MethodGlob> {
+                list.iter()
+                    .filter_map(|glob| MethodGlob::parse(&glob.value))
+                    .collect()
+            };
+            out.push(RpcClient {
+                name: name.as_str().to_owned(),
+                token,
+                acl: MethodAcl {
+                    allow: globs(&client.value.allow),
+                    deny: globs(&client.value.deny),
+                },
+            });
+        }
+        out
+    }
+
+    /// Compiles every account's rules together, as the engine will, apart
+    /// from the bots'.
+    fn compile_accounts(&mut self, raw: &RawConfig, accounts: &[Account]) {
+        let rules: Vec<(SourceId, Vec<RuleSpec>)> = accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                Some((SourceId(u16::try_from(index).ok()?), account.rules.clone()))
+            })
+            .collect();
+        let Err(err) = RouteTable::compile(&rules, &[]) else {
+            return;
+        };
+        let message = rule_message(&err);
+        let rule = match &err {
+            RuleError::Invalid {
+                source_id, rule, ..
+            } => Some((usize::from(source_id.0), *rule)),
+            _ => None,
+        };
+        let (index, rule) = rule.unwrap_or((0, 0));
+        let (path, location) = raw.accounts.get_index(index).map_or_else(
+            || ("accounts".to_owned(), Location::UNKNOWN),
+            |(name, account)| {
+                let route = account.value.routes.get(rule);
+                (
+                    format!("accounts.{}.routes", name.as_str()),
+                    route.map_or(account.location, |route| route.location),
+                )
+            },
+        );
+        self.diag.error(path, location, message);
+    }
 }
 
 /// Whether `url`'s host is this machine: a loopback address or
@@ -1291,6 +1505,36 @@ fn target_spec(
                 weights,
             }
         }
+    }
+}
+
+/// An account rule as the engine runs it, on the bot predicates: the
+/// constructor in `update_types`, the peer in `chat_ids`. Stand-ins as in
+/// [`rule_spec`].
+fn account_rule_spec(
+    route: &raw::AccountRoute,
+    consumers: &IndexMap<Name, At<raw::Consumer>>,
+) -> RuleSpec {
+    let predicates = route
+        .r#match
+        .as_ref()
+        .map_or_else(Predicates::default, |m| Predicates {
+            update_types: m.constructors.clone(),
+            chat_ids: m.peer_ids.clone(),
+            chat_types: Vec::new(),
+            user_ids: m.user_ids.clone(),
+            commands: m
+                .commands
+                .iter()
+                .filter(|c| valid_command(&c.value))
+                .map(|c| c.value.clone())
+                .collect(),
+            text: m.text.as_ref().map(text_match),
+            callback_data: None,
+        });
+    RuleSpec {
+        predicates,
+        targets: route.to.iter().map(|t| target_spec(t, consumers)).collect(),
     }
 }
 

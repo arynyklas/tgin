@@ -1,5 +1,140 @@
 {
   "$defs": {
+    "Account": {
+      "additionalProperties": false,
+      "description": "One Telegram user account. Its name must differ from every bot's.",
+      "properties": {
+        "api_hash": {
+          "$ref": "#/$defs/Secret",
+          "description": "The app's `api_hash`, a secret."
+        },
+        "api_id": {
+          "description": "The `api_id` of your Telegram app (my.telegram.org). Accounts may\nshare one app.",
+          "format": "int32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "phone": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Secret"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The account's phone number, a secret: tgin checks the logged-in\naccount against it and never logs it."
+        },
+        "routes": {
+          "default": [],
+          "description": "Rules in order; the first match wins.",
+          "items": {
+            "$ref": "#/$defs/AccountRoute"
+          },
+          "type": "array"
+        },
+        "rpc": {
+          "$ref": "#/$defs/Rpc",
+          "default": {
+            "clients": {},
+            "flood_sleep_threshold": "10s",
+            "max_rps": 20
+          }
+        },
+        "session_dir": {
+          "description": "Where the account's session lives: its auth keys and update state.\nRequired, and one per account; a relative path resolves against the\nconfig file's directory. One tgin process holds it at a time, under\na lock that works within one OS only, so never share it across\nhosts, bind mounts or network filesystems. Supports `${env:…}` and\n`${file:…}`.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "api_id",
+        "api_hash",
+        "session_dir"
+      ],
+      "type": "object"
+    },
+    "AccountMatch": {
+      "additionalProperties": false,
+      "description": "Account rule predicates, on MTProto facts: values within a list are\nalternatives, fields must all hold, and an empty list matches anything.",
+      "properties": {
+        "commands": {
+          "default": [],
+          "description": "Commands, with or without the leading `/`: 1 to 32 ASCII letters,\ndigits or `_`, with no `@bot` suffix.",
+          "items": {
+            "pattern": "^/?[A-Za-z0-9_]{1,32}$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "constructors": {
+          "default": [],
+          "description": "Update constructors, such as `updateNewMessage`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "peer_ids": {
+          "default": [],
+          "description": "Peer ids: a user, chat or channel, in Bot API form (`-100…` for a\nchannel).",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextMatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Message text."
+        },
+        "user_ids": {
+          "default": [],
+          "description": "Sender user ids.",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "AccountRoute": {
+      "additionalProperties": false,
+      "description": "One routing rule of an account.",
+      "properties": {
+        "match": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountMatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the rule applies. Omitted, it matches every update."
+        },
+        "to": {
+          "description": "Where matching updates go; every entry receives the update.",
+          "items": {
+            "$ref": "#/$defs/Target"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "to"
+      ],
+      "type": "object"
+    },
     "Admin": {
       "additionalProperties": false,
       "description": "The admin HTTP server: health, metrics and the management API.",
@@ -707,6 +842,10 @@
         "ordering": {
           "$ref": "#/$defs/Ordering",
           "default": "none"
+        },
+        "render": {
+          "$ref": "#/$defs/Render",
+          "description": "How account updates are rendered; `tl_json` only for a consumer\nthat accounts alone feed."
         }
       },
       "type": "object"
@@ -770,6 +909,10 @@
         "ordering": {
           "$ref": "#/$defs/Ordering",
           "default": "none"
+        },
+        "render": {
+          "$ref": "#/$defs/Render",
+          "description": "How account updates are rendered; `tl_json` only for a consumer\nthat accounts alone feed."
         },
         "retry": {
           "$ref": "#/$defs/Retry",
@@ -882,6 +1025,21 @@
       },
       "type": "object"
     },
+    "Render": {
+      "description": "How a consumer receives account updates: the envelope alone (`raw`), or\nwith the update also rendered as TL-JSON (`tl_json`). `tl_json` needs a\nconsumer that only accounts feed.",
+      "oneOf": [
+        {
+          "const": "raw",
+          "description": "The envelope, with the update as Telegram's TL bytes.",
+          "type": "string"
+        },
+        {
+          "const": "tl_json",
+          "description": "The envelope, with the update also as TL-JSON.",
+          "type": "string"
+        }
+      ]
+    },
     "Retry": {
       "additionalProperties": false,
       "description": "Retries of failed deliveries.",
@@ -948,6 +1106,68 @@
       },
       "required": [
         "to"
+      ],
+      "type": "object"
+    },
+    "Rpc": {
+      "additionalProperties": false,
+      "description": "The MTProto RPC endpoint of one account.",
+      "properties": {
+        "clients": {
+          "additionalProperties": false,
+          "default": {},
+          "description": "Who may call the account, by name.",
+          "patternProperties": {
+            "^[a-z0-9][a-z0-9-]{0,62}$": {
+              "$ref": "#/$defs/RpcClient"
+            }
+          },
+          "type": "object"
+        },
+        "flood_sleep_threshold": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "A `FLOOD_WAIT` or `SLOWMODE_WAIT` up to this long is slept out and\nthe request retried; a longer one answers 429 with `Retry-After`."
+        },
+        "max_rps": {
+          "default": 20,
+          "description": "Most requests per second the account sends Telegram, over all\nclients.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RpcClient": {
+      "additionalProperties": false,
+      "description": "One downstream allowed to call the account.",
+      "properties": {
+        "allow": {
+          "default": [],
+          "description": "Methods the client may call: `*`, `<namespace>.*` such as\n`messages.*`, or a method name such as `messages.sendMessage`.\nEmpty, it may call none. `auth.*` and the other account-changing\nmethods are allowed only when listed by exact name.",
+          "items": {
+            "pattern": "^(\\*|[A-Za-z][A-Za-z0-9_]*\\.\\*|([A-Za-z][A-Za-z0-9_]*\\.)?[A-Za-z][A-Za-z0-9_]*)$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny": {
+          "default": [],
+          "description": "Methods the client may never call, with `allow`'s syntax; deny\nwins.",
+          "items": {
+            "pattern": "^(\\*|[A-Za-z][A-Za-z0-9_]*\\.\\*|([A-Za-z][A-Za-z0-9_]*\\.)?[A-Za-z][A-Za-z0-9_]*)$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "token": {
+          "$ref": "#/$defs/Secret",
+          "description": "The bearer token the client sends; unique within the account."
+        }
+      },
+      "required": [
+        "token"
       ],
       "type": "object"
     },
@@ -1375,8 +1595,18 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "The configuration file, version 1.\n\nOnly secrets (`token`, `secret_token`, `auth_token`, `admin.token`) and\nfields holding URLs or file paths expand `${env:NAME}` and `${file:PATH}`\nreferences; every other value is literal.",
+  "description": "The configuration file, version 1.\n\nOnly secrets (`token`, `secret_token`, `auth_token`, `admin.token`,\n`api_hash`, `phone`) and fields holding URLs or file paths expand\n`${env:NAME}` and `${file:PATH}` references; every other value is\nliteral.",
   "properties": {
+    "accounts": {
+      "additionalProperties": false,
+      "description": "The Telegram user accounts updates come from, by name, served over\nMTProto.",
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]{0,62}$": {
+          "$ref": "#/$defs/Account"
+        }
+      },
+      "type": "object"
+    },
     "admin": {
       "$ref": "#/$defs/Admin",
       "default": {

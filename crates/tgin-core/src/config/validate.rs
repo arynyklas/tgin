@@ -8,9 +8,10 @@ use serde_saphyr::Location;
 use tgin_runtime::config::{ConfigError, Located};
 use url::Url;
 
+use super::acl::{self, MethodGlob};
 use super::model::{
-    At, Bot, Consumer, Files, Gateway, HumanDuration, Ingress, IpAllowlist, Name, Push, RateMode,
-    RawConfig, Split, SplitStrategy, Target, Upstream, UpstreamKind,
+    Account, At, Bot, Consumer, Files, Gateway, HumanDuration, Ingress, IpAllowlist, Name, Push,
+    RateMode, RawConfig, Render, RpcClient, Split, SplitStrategy, Target, Upstream, UpstreamKind,
 };
 use super::resolve::{self, TELEGRAM_MAX_CONNECTIONS, WebhookRules};
 
@@ -143,6 +144,225 @@ pub(super) fn validate(raw: &RawConfig, diag: &mut Diagnostics) {
     consumers(raw, diag);
     upstreams(raw, diag);
     bots(raw, diag);
+    accounts(raw, diag);
+    sources(raw, diag);
+}
+
+fn accounts(raw: &RawConfig, diag: &mut Diagnostics) {
+    for (name, account) in &raw.accounts {
+        let path = format!("accounts.{}", name.as_str());
+        check_name(diag, &path, name.as_str(), account.location);
+        if let Some(i) = raw
+            .bots
+            .iter()
+            .position(|bot| bot.name.value.as_str() == name.as_str())
+        {
+            diag.errors.push(
+                ConfigError::new(format!("bots[{i}] is also named `{}`", name.as_str()))
+                    .at(located(&path, account.location))
+                    .hint("metrics and logs name a source by its name alone; give the account a name no bot has"),
+            );
+        }
+        self::account(raw, diag, &path, &account.value, account.location);
+    }
+}
+
+fn account(raw: &RawConfig, diag: &mut Diagnostics, path: &str, account: &Account, at: Location) {
+    if account.api_id.value < 1 {
+        diag.error(
+            format!("{path}.api_id"),
+            known(account.api_id.location, at),
+            "`api_id` must be a positive number, as my.telegram.org gives it",
+        );
+    }
+    at_least_one(diag, format!("{path}.rpc.max_rps"), &account.rpc.max_rps);
+    duration(
+        diag,
+        format!("{path}.rpc.flood_sleep_threshold"),
+        &account.rpc.flood_sleep_threshold,
+    );
+    for (client_name, client) in &account.rpc.clients {
+        let path = format!("{path}.rpc.clients.{}", client_name.as_str());
+        check_name(diag, &path, client_name.as_str(), client.location);
+        rpc_client(diag, &path, client_name.as_str(), &client.value);
+    }
+
+    let mut reached = Vec::new();
+    for (j, route) in account.routes.iter().enumerate() {
+        let path = format!("{path}.routes[{j}]");
+        if let Some(m) = &route.value.r#match {
+            commands(diag, &path, &m.commands);
+        }
+        targets(
+            diag,
+            &raw.consumers,
+            &route.value.to,
+            &format!("{path}.to"),
+            &mut reached,
+        );
+    }
+    if let Some(last) = account.routes.last()
+        && last.value.r#match.as_ref().is_some_and(|m| !m.is_empty())
+    {
+        diag.warning(
+            format!("{path}.routes"),
+            last.location,
+            "last rule has a match; unmatched updates are dropped",
+        );
+    }
+}
+
+/// A client's globs are valid, and allowing auth or account-changing
+/// methods ([`acl::ACCOUNT_CHANGING`]) is warned about: by exact name it
+/// works, and by glob it does not.
+fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient) {
+    for (field, list) in [("allow", &client.allow), ("deny", &client.deny)] {
+        for (k, glob) in list.iter().enumerate() {
+            if MethodGlob::parse(&glob.value).is_none() {
+                diag.errors.push(
+                    ConfigError::new(format!("invalid method glob `{}`", glob.value))
+                        .at(located(format!("{path}.{field}[{k}]"), glob.location))
+                        .hint("use `*`, a namespace such as `messages.*`, or a method name such as `messages.sendMessage`"),
+                );
+            }
+        }
+    }
+    // Globs that name a protected namespace, which allow none of it.
+    let mut useless: Vec<(usize, &At<String>)> = Vec::new();
+    // Protected methods listed exactly, which are allowed.
+    let mut exact: Vec<(usize, &At<String>)> = Vec::new();
+    for (k, glob) in client.allow.iter().enumerate() {
+        match MethodGlob::parse(&glob.value) {
+            Some(MethodGlob::Namespace(_))
+                if acl::ACCOUNT_CHANGING.contains(&glob.value.as_str()) =>
+            {
+                useless.push((k, glob));
+            }
+            Some(MethodGlob::Exact(method)) if acl::account_changing(&method) => {
+                exact.push((k, glob));
+            }
+            _ => {}
+        }
+    }
+    let list = |entries: &[(usize, &At<String>)], quote: bool| -> String {
+        entries
+            .iter()
+            .map(|(_, glob)| {
+                if quote {
+                    format!("`{}`", glob.value)
+                } else {
+                    glob.value.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some((k, first)) = useless.first() {
+        diag.warnings.push(
+            ConfigError::warning(format!(
+                "{} allow no method of client `{name}`: auth and account-changing methods are allowed only by exact name",
+                list(&useless, true)
+            ))
+            .at(located(format!("{path}.allow[{k}]"), first.location))
+            .hint("list each method the client needs, such as `auth.logOut`, or remove the glob"),
+        );
+    }
+    if let Some((k, first)) = exact.first() {
+        diag.warnings.push(
+            ConfigError::warning(format!(
+                "client `{name}` may call auth or account-changing methods: {}",
+                list(&exact, false)
+            ))
+            .at(located(format!("{path}.allow[{k}]"), first.location))
+            .hint("these can log the account out or change it; allow them only to a client trusted as much as the account itself"),
+        );
+    }
+}
+
+/// The consumers each target list reaches, by index.
+fn reach(consumers: &IndexMap<Name, At<Consumer>>, targets: &[At<Target>], out: &mut Vec<usize>) {
+    for target in targets {
+        match &target.value {
+            Target::Consumer(name) => out.extend(consumers.get_index_of(name.as_str())),
+            Target::All(children) => reach(consumers, children, out),
+            Target::Split(split) => reach(consumers, &split.among, out),
+        }
+    }
+}
+
+/// A consumer takes bot updates or account updates, never both, and
+/// renders TL-JSON only for accounts.
+fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
+    if raw.accounts.is_empty()
+        && raw
+            .consumers
+            .values()
+            .all(|c| render_of(&c.value).value == Render::Raw)
+    {
+        return;
+    }
+    let mut reached = Vec::new();
+    // The first bot and the first account feeding each consumer.
+    let mut bot_of: Vec<Option<&str>> = vec![None; raw.consumers.len()];
+    let mut account_of: Vec<Option<&str>> = vec![None; raw.consumers.len()];
+    for bot in &raw.bots {
+        reached.clear();
+        for route in &bot.routes {
+            reach(&raw.consumers, &route.value.to, &mut reached);
+        }
+        for &c in &reached {
+            bot_of[c].get_or_insert(bot.name.value.as_str());
+        }
+    }
+    for (name, account) in &raw.accounts {
+        reached.clear();
+        for route in &account.value.routes {
+            reach(&raw.consumers, &route.value.to, &mut reached);
+        }
+        for &c in &reached {
+            account_of[c].get_or_insert(name.as_str());
+        }
+    }
+    for (index, (name, consumer)) in raw.consumers.iter().enumerate() {
+        let path = format!("consumers.{}", name.as_str());
+        let Some(bot) = bot_of[index] else {
+            continue;
+        };
+        if let Some(account) = account_of[index] {
+            diag.errors.push(
+                ConfigError::new(format!(
+                    "consumer `{}` is fed by bot `{bot}` and account `{account}`; a consumer takes bot updates or account updates, never both",
+                    name.as_str()
+                ))
+                .at(located(&path, consumer.location))
+                .hint("route the account's updates to a consumer of their own"),
+            );
+        }
+        let render = render_of(&consumer.value);
+        if render.value == Render::TlJson {
+            let kind = match consumer.value {
+                Consumer::Pull(_) => "pull",
+                Consumer::Push(_) => "push",
+            };
+            diag.errors.push(
+                ConfigError::new(format!(
+                    "`render: tl_json` renders account updates, but bot `{bot}` routes to this consumer"
+                ))
+                .at(located(
+                    format!("{path}.{kind}.render"),
+                    known(render.location, consumer.location),
+                ))
+                .hint("bot updates are Bot API JSON already; use `render: raw`, or route only accounts here"),
+            );
+        }
+    }
+}
+
+fn render_of(consumer: &Consumer) -> &At<Render> {
+    match consumer {
+        Consumer::Pull(pull) => &pull.render,
+        Consumer::Push(push) => &push.render,
+    }
 }
 
 fn consumers(raw: &RawConfig, diag: &mut Diagnostics) {
