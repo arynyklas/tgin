@@ -1722,7 +1722,9 @@ mod login_framing {
             api_hash: "h".into(),
             phone: None,
         };
-        let h = login::start(store, FramedDial(Arc::clone(&script)), params, Method::Qr).unwrap();
+        let h = login::start(store, FramedDial(Arc::clone(&script)), params, Method::Qr)
+            .await
+            .unwrap();
         let export = tl::functions::auth::ExportLoginToken {
             api_id: 1,
             api_hash: "h".into(),

@@ -248,6 +248,8 @@ pub enum Reply {
     Rpc(i32, &'static str),
     /// Written, no answer ([`SenderError::NoAnswer`]).
     NoAnswer,
+    /// Never written ([`SenderError::NotSent`]).
+    NotSent,
     /// Transport −404 on a logged-in key.
     KeyRevoked,
 }
@@ -381,6 +383,7 @@ impl Link for ScriptedLink {
                     message: message.to_owned(),
                 }),
                 Reply::NoAnswer => Err(SenderError::NoAnswer),
+                Reply::NotSent => Err(SenderError::NotSent),
                 Reply::KeyRevoked => Err(SenderError::KeyRevoked),
             },
             // Off script: the request "was never sent".

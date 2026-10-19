@@ -483,24 +483,34 @@ async fn need_password<L: Link>(link: &L) -> Result<Step, LoginError> {
     Ok(Step::NeedPassword { hint: p.hint })
 }
 
-/// After `request` was written without an answer: did it log in?
-/// `users.getUsers([inputUserSelf])` on a fresh connection says.
-async fn probe<L: Link>(link: &L) -> Result<Step, LoginError> {
+/// Who the link's key is logged in as: `users.getUsers([inputUserSelf])`.
+/// `Ok(None)` when Telegram says the key has no login (401, or a key it no
+/// longer knows); a request that was never written is sent once more.
+async fn whoami<L: Link>(link: &L) -> Result<Option<Me>, Fail> {
     let request = tl::functions::users::GetUsers {
         id: vec![tl::enums::InputUser::UserSelf],
     };
-    match call(link, &request).await {
-        Ok(users) => users
-            .into_iter()
-            .next()
-            .and_then(Me::from_user)
-            .map(Step::Authorized)
-            .ok_or_else(|| LoginError::Sender(SenderError::NoAnswer.to_string())),
+    let mut answer = call(link, &request).await;
+    if matches!(answer, Err(Fail::Sender(SenderError::NotSent))) {
+        answer = call(link, &request).await;
+    }
+    match answer {
+        Ok(users) => Ok(users.into_iter().next().and_then(Me::from_user)),
+        Err(
+            Fail::Rpc { code: 401, .. }
+            | Fail::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown),
+        ) => Ok(None),
+        Err(f) => Err(f),
+    }
+}
+
+/// After a login-producing call was written without an answer: did it log
+/// in? [`whoami`] says [C: S3 F7].
+async fn probe<L: Link>(link: &L) -> Result<Step, LoginError> {
+    match whoami(link).await? {
+        Some(me) => Ok(Step::Authorized(me)),
         // Not logged in: the call had not been executed, or failed.
-        Err(Fail::Rpc { code: 401, .. }) => {
-            Err(LoginError::Sender(SenderError::NoAnswer.to_string()))
-        }
-        Err(f) => Err(f.into()),
+        None => Err(LoginError::Sender(SenderError::NoAnswer.to_string())),
     }
 }
 
@@ -539,8 +549,8 @@ async fn export<L: Link>(link: &L, api_id: i32, api_hash: &str) -> Result<Step, 
     };
     match call(link, &request).await {
         Ok(token) => login_token(token, false),
-        Err(f) if is_password_needed(&f) => need_password(link).await,
-        Err(f) => Err(f.into()),
+        // After a scan this export is what fetches the login: probe.
+        Err(f) => after_auth_failure(link, f).await,
     }
 }
 
@@ -766,6 +776,10 @@ pub enum StartError {
     /// A login is recorded: log out first.
     #[error("the account is logged in; log it out first")]
     LoggedIn,
+    /// A key from an unfinished login is stored, and Telegram did not say
+    /// whether it is logged in. Nothing was changed.
+    #[error("a key from an unfinished login could not be checked with Telegram: {0}")]
+    Unverified(String),
     #[error(transparent)]
     Storage(#[from] SessionError),
 }
@@ -871,11 +885,16 @@ impl LoginHandle {
     }
 }
 
-/// Starts a login on `store`, which it owns until the login ends. Refuses
-/// a logged-in session; otherwise resets it ([`SessionStore::reset_for_login`])
-/// and starts on [`FIRST_DC`] with a new key. Must run inside a Tokio
-/// runtime.
-pub fn start<D: Dial>(
+/// Starts a login on `store`, which it owns until the login ends. Must run
+/// inside a Tokio runtime.
+///
+/// A recorded login is refused ([`StartError::LoggedIn`]). A home key left
+/// without one (a login whose answer was lost, say) may still be logged
+/// in, so it is asked first ([`whoami`]): logged in, it goes through the
+/// identity gate and is recorded; unknown to Telegram, the session is reset
+/// and the login starts on [`FIRST_DC`] with a new key; no clear answer
+/// refuses ([`StartError::Unverified`]) and changes nothing.
+pub async fn start<D: Dial>(
     store: SessionStore,
     dial: D,
     params: LoginParams,
@@ -884,7 +903,24 @@ pub fn start<D: Dial>(
     if store.login()?.is_some() {
         return Err(StartError::LoggedIn);
     }
-    store.reset_for_login()?;
+    let begin = match leftover(&store)? {
+        None => Begin::Fresh(method),
+        Some((dc, key)) => match dial.dial(dc, Some(key), false).await {
+            Ok((link, pushes, _)) => {
+                let conn = Conn::new(link, pushes);
+                match whoami(&conn.link).await {
+                    Ok(Some(me)) => Begin::Recovered(conn, me),
+                    Ok(None) => Begin::Fresh(method),
+                    Err(f) => return Err(StartError::Unverified(LoginError::from(f).to_string())),
+                }
+            }
+            Err(SenderError::KeyRevoked | SenderError::KeyUnknown) => Begin::Fresh(method),
+            Err(e) => return Err(StartError::Unverified(e.to_string())),
+        },
+    };
+    if matches!(begin, Begin::Fresh(_)) {
+        store.reset_for_login()?;
+    }
     let (state_tx, state) = watch::channel(LoginState::Connecting);
     let (commands_tx, commands) = mpsc::channel(4);
     let flow = Flow {
@@ -894,12 +930,27 @@ pub fn start<D: Dial>(
         state: state_tx,
         commands,
     };
-    let task = tokio::spawn(flow.run(method));
+    let task = tokio::spawn(flow.run(begin));
     Ok(LoginHandle {
         state,
         commands: commands_tx,
         task: Some(task),
     })
+}
+
+/// The home DC and its key, when a key is stored.
+fn leftover(store: &SessionStore) -> Result<Option<(i32, AuthKey)>, SessionError> {
+    let Some(dc) = store.home_dc()? else {
+        return Ok(None);
+    };
+    Ok(store.auth_key(dc)?.map(|key| (dc, key)))
+}
+
+/// How a login's task begins.
+enum Begin<L> {
+    Fresh(Method),
+    /// A leftover key turned out to be logged in as `Me`.
+    Recovered(Conn<L>, Me),
 }
 
 /// Why a logout did not complete.
@@ -986,6 +1037,19 @@ struct Conn<L> {
     drain: JoinHandle<()>,
 }
 
+impl<L> Conn<L> {
+    /// `link`, its pushes drained on a task of their own.
+    fn new(link: L, pushes: Pushes) -> Self {
+        let scanned = Arc::new(Notify::new());
+        let drain = tokio::spawn(drain(pushes, Arc::clone(&scanned)));
+        Self {
+            link,
+            scanned,
+            drain,
+        }
+    }
+}
+
 impl<L> Drop for Conn<L> {
     fn drop(&mut self) {
         self.drain.abort();
@@ -999,9 +1063,13 @@ enum Wanted {
 }
 
 impl<D: Dial> Flow<D> {
-    async fn run(self, method: Method) {
+    async fn run(self, begin: Begin<D::Link>) {
         let mut flow = self;
-        let end = match flow.drive(method).await {
+        let ended = match begin {
+            Begin::Fresh(method) => flow.drive(method).await,
+            Begin::Recovered(conn, me) => flow.conclude(&conn.link, &me).await,
+        };
+        let end = match ended {
             Ok(state) => state,
             Err(e) => LoginState::Failed(e),
         };
@@ -1029,13 +1097,7 @@ impl<D: Dial> Flow<D> {
             .map_err(|e| LoginError::Sender(e.to_string()))?;
         let key = key.ok_or_else(|| LoginError::Sender("the connection made no key".to_owned()))?;
         self.store.set_home_key(dc, &key)?;
-        let scanned = Arc::new(Notify::new());
-        let drain = tokio::spawn(drain(pushes, Arc::clone(&scanned)));
-        Ok(Conn {
-            link,
-            scanned,
-            drain,
-        })
+        Ok(Conn::new(link, pushes))
     }
 
     async fn drive(&mut self, method: Method) -> Result<LoginState, LoginError> {

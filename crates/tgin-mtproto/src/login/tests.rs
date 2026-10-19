@@ -50,14 +50,16 @@ fn reopen(tmp: &TempDir) -> SessionStore {
 }
 
 /// Starts `method` and returns the handle, the dial and the session dir.
-fn begin(
+async fn begin(
     method: Method,
     phone: Option<&str>,
     script: Vec<(u32, Reply)>,
 ) -> (LoginHandle, ScriptedDial, TempDir) {
     let (tmp, store) = store();
     let dial = ScriptedDial::new(script);
-    let h = start(store, dial.clone(), params(phone), method).expect("start");
+    let h = start(store, dial.clone(), params(phone), method)
+        .await
+        .expect("start");
     (h, dial, tmp)
 }
 
@@ -73,7 +75,8 @@ async fn login_token_maps_to_qr() {
             ids::EXPORT_LOGIN_TOKEN,
             Reply::Ok(login_token(b"tok?", expires)),
         )],
-    );
+    )
+    .await;
     match settled(&h).await {
         LoginState::Qr { url, expires: e } => {
             assert_eq!(url.expose(), "tg://login?token=dG9rPw");
@@ -104,7 +107,8 @@ async fn scan_logs_in_and_other_pushes_are_dropped() {
                 Reply::Ok(login_token_success(77, None)),
             ),
         ],
-    );
+    )
+    .await;
     assert!(matches!(settled(&h).await, LoginState::Qr { .. }));
     for _ in 0..64 {
         push(&dial, updates_too_long()).await;
@@ -160,7 +164,8 @@ async fn token_is_renewed_before_it_expires() {
                 Reply::Ok(login_token(b"two", later())),
             ),
         ],
-    );
+    )
+    .await;
     let first = settled(&h).await;
     let second = timeout(Duration::from_secs(31), h.changed())
         .await
@@ -187,7 +192,8 @@ async fn migrate_to_imports_on_the_named_dc() {
                 Reply::Ok(login_token_success(1234, None)),
             ),
         ],
-    );
+    )
+    .await;
     assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 1234 });
     assert_eq!(dial.dials(), vec![(2, false), (4, false)]);
     assert_eq!(
@@ -229,7 +235,8 @@ async fn migrate_after_import_is_a_loop_error() {
                 Reply::Ok(login_token_migrate(5, b"b")),
             ),
         ],
-    );
+    )
+    .await;
     assert_eq!(
         end(&h).await,
         LoginState::Failed(LoginError::MigrateLoop { dc: 5 })
@@ -251,7 +258,8 @@ async fn import_without_answer_is_probed() {
             (ids::IMPORT_LOGIN_TOKEN, Reply::NoAnswer),
             (ids::GET_USERS, Reply::Ok(users(55, None))),
         ],
-    );
+    )
+    .await;
     assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 55 });
     assert!(dial.done());
 }
@@ -270,7 +278,8 @@ async fn session_password_needed_asks_for_the_password() {
             ),
             (ids::GET_PASSWORD, Reply::Ok(account_password())),
         ],
-    );
+    )
+    .await;
     assert_eq!(
         settled(&h).await,
         LoginState::NeedPassword {
@@ -307,7 +316,8 @@ async fn wrong_password_is_retryable_then_right_one_logs_in() {
             (ids::GET_PASSWORD, Reply::Ok(account_password_srp())),
             (ids::CHECK_PASSWORD, Reply::Ok(authorization(777, None))),
         ]),
-    );
+    )
+    .await;
     assert!(matches!(settled(&h).await, LoginState::NeedPassword { .. }));
     assert_eq!(
         h.submit_password("wrong".into()).await,
@@ -349,7 +359,8 @@ async fn check_password_without_answer_is_probed() {
                 (ids::CHECK_PASSWORD, Reply::NoAnswer),
                 (ids::GET_USERS, probe),
             ]),
-        );
+        )
+        .await;
         settled(&h).await;
         h.submit_password("pw".into()).await.expect("handed over");
         assert_eq!(end(&h).await, want);
@@ -378,7 +389,8 @@ async fn unusable_srp_parameters_end_typed() {
             Method::Qr,
             None,
             two_fa(vec![(ids::GET_PASSWORD, Reply::Ok(password))]),
-        );
+        )
+        .await;
         settled(&h).await;
         h.submit_password("x".into()).await.expect("handed over");
         assert_eq!(
@@ -408,7 +420,8 @@ async fn srp_at_256_bytes_runs() {
             ),
             (ids::CHECK_PASSWORD, Reply::Ok(authorization(3, None))),
         ]),
-    );
+    )
+    .await;
     settled(&h).await;
     assert_eq!(
         h.submit_password("x".into()).await,
@@ -431,7 +444,8 @@ async fn wrong_account_is_logged_out_and_not_recorded() {
             ),
             (ids::LOG_OUT, Reply::Ok(logged_out())),
         ],
-    );
+    )
+    .await;
     assert_eq!(end(&h).await, LoginState::Failed(LoginError::WrongAccount));
     assert!(dial.done(), "auth.logOut was sent");
     assert!(!dial.marked_logged_in());
@@ -457,12 +471,13 @@ async fn identity_gate_compares_digits() {
             ids::EXPORT_LOGIN_TOKEN,
             Reply::Ok(login_token_success(5, Some("88800000000"))),
         )],
-    );
+    )
+    .await;
     assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 5 });
 }
 
-#[test]
-fn logged_in_session_refuses_a_login() {
+#[tokio::test]
+async fn logged_in_session_refuses_a_login() {
     let (_tmp, store) = store();
     store.set_home_key(2, &AuthKey([1; 256])).expect("key");
     store
@@ -475,32 +490,142 @@ fn logged_in_session_refuses_a_login() {
             access_hash: None,
         })
         .expect("login");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let _guard = runtime.enter();
+    let dial = ScriptedDial::default();
     assert!(matches!(
-        start(store, ScriptedDial::default(), params(None), Method::Qr),
+        start(store, dial.clone(), params(None), Method::Qr).await,
         Err(StartError::LoggedIn)
     ));
+    assert!(dial.dials().is_empty());
 }
 
-/// A key left by an unfinished attempt is replaced: the login starts from
-/// a reset session.
+/// A home key left without a login marker may be logged in (its answer was
+/// lost): `start` asks Telegram before it resets anything [C: S3 F7].
+/// - logged in: the identity gate and the marker, no new key;
+/// - unknown to Telegram (401, −404): reset, and a fresh login;
+/// - no clear answer: refused, nothing changed.
 #[tokio::test]
-async fn a_new_login_resets_a_half_done_one() {
-    let (tmp, store) = store();
+async fn a_leftover_key_is_asked_before_the_reset() {
+    // Logged in after all: recorded on the old key, no new connection.
+    let (tmp, store) = self::store();
     store.set_home_key(4, &AuthKey([7; 256])).expect("key");
-    let dial = ScriptedDial::new(vec![(
-        ids::EXPORT_LOGIN_TOKEN,
-        Reply::Ok(login_token_success(8, None)),
-    )]);
-    let h = start(store, dial.clone(), params(None), Method::Qr).expect("start");
-    assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 8 });
+    let dial = ScriptedDial::new(vec![(ids::GET_USERS, Reply::Ok(users(31, None)))]);
+    let h = start(store, dial.clone(), params(None), Method::Qr)
+        .await
+        .expect("start");
+    assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 31 });
+    assert_eq!(dial.dials(), vec![(4, true)]);
+    assert!(dial.marked_logged_in());
     drop(h);
     let store = wait_reopen(&tmp).await;
-    assert_eq!(store.auth_key(4).expect("old key"), None);
-    assert_eq!(store.home_dc().expect("home"), Some(FIRST_DC));
+    assert_eq!(
+        store.login().expect("login").map(|l| l.self_user_id),
+        Some(31)
+    );
+    assert_eq!(store.auth_key(4).expect("key"), Some(AuthKey([7; 256])));
+
+    // Logged in as another account: the gate logs it out.
+    let (tmp, store) = self::store();
+    store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![
+        (ids::GET_USERS, Reply::Ok(users(32, Some("79990000000")))),
+        (ids::LOG_OUT, Reply::Ok(logged_out())),
+    ]);
+    let h = start(store, dial.clone(), params(Some(PHONE)), Method::Qr)
+        .await
+        .expect("start");
+    assert_eq!(end(&h).await, LoginState::Failed(LoginError::WrongAccount));
+    assert!(dial.done());
+    drop(h);
+    assert_eq!(wait_reopen(&tmp).await.home_dc().expect("home"), None);
+
+    // Unknown to Telegram: reset, then a fresh login on a new key.
+    for gone in [Reply::Rpc(401, "AUTH_KEY_UNREGISTERED"), Reply::KeyRevoked] {
+        let (tmp, store) = self::store();
+        store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+        let dial = ScriptedDial::new(vec![
+            (ids::GET_USERS, gone.clone()),
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_success(8, None)),
+            ),
+        ]);
+        let h = start(store, dial.clone(), params(None), Method::Qr)
+            .await
+            .expect("start");
+        assert_eq!(
+            end(&h).await,
+            LoginState::LoggedIn { user_id: 8 },
+            "{gone:?}"
+        );
+        assert_eq!(dial.dials(), vec![(4, true), (FIRST_DC, false)], "{gone:?}");
+        drop(h);
+        let store = wait_reopen(&tmp).await;
+        assert_eq!(store.auth_key(4).expect("old key"), None);
+        assert_eq!(store.home_dc().expect("home"), Some(FIRST_DC));
+    }
+
+    // No clear answer: refused, the key kept.
+    let (tmp, store) = self::store();
+    store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![(ids::GET_USERS, Reply::Rpc(500, "INTERNAL"))]);
+    assert!(matches!(
+        start(store, dial.clone(), params(None), Method::Qr).await,
+        Err(StartError::Unverified(_))
+    ));
+    let store = wait_reopen(&tmp).await;
+    assert_eq!(store.auth_key(4).expect("key"), Some(AuthKey([7; 256])));
+    assert_eq!(store.home_dc().expect("home"), Some(4));
+}
+
+/// The export after a scan is what fetches the login on the home DC: with
+/// no answer to it, the probe asks who is logged in [C: S3 F7].
+#[tokio::test]
+async fn export_after_scan_without_answer_is_probed() {
+    let (h, dial, _tmp) = begin(
+        Method::Qr,
+        None,
+        vec![
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token(b"t", later())),
+            ),
+            (ids::EXPORT_LOGIN_TOKEN, Reply::NoAnswer),
+            (ids::GET_USERS, Reply::Ok(users(44, None))),
+        ],
+    )
+    .await;
+    assert!(matches!(settled(&h).await, LoginState::Qr { .. }));
+    push(&dial, update_login_token()).await;
+    assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 44 });
+    assert!(dial.done());
+}
+
+/// A probe that was never written is sent once more.
+#[tokio::test]
+async fn probe_not_sent_is_sent_again_once() {
+    for (second, want) in [
+        (
+            Some(Reply::Ok(users(9, None))),
+            LoginState::LoggedIn { user_id: 9 },
+        ),
+        (
+            Some(Reply::NotSent),
+            LoginState::Failed(LoginError::Sender(SenderError::NotSent.to_string())),
+        ),
+    ] {
+        let mut script = vec![
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_migrate(4, b"a")),
+            ),
+            (ids::IMPORT_LOGIN_TOKEN, Reply::NoAnswer),
+            (ids::GET_USERS, Reply::NotSent),
+        ];
+        script.extend(second.map(|r| (ids::GET_USERS, r)));
+        let (h, dial, _tmp) = begin(Method::Qr, None, script).await;
+        assert_eq!(end(&h).await, want);
+        assert!(dial.done(), "exactly one resend");
+    }
 }
 
 /// `log_out`: `auth.logOut` on the home key, then the reset.
@@ -543,8 +668,8 @@ async fn log_out_outcomes() {
 
 // ---- the code flow (DECODE-ONLY; never run against the account) ----
 
-fn code_state(reply: Reply) -> (LoginHandle, ScriptedDial, TempDir) {
-    begin(Method::Code, Some(PHONE), vec![(ids::SEND_CODE, reply)])
+async fn code_state(reply: Reply) -> (LoginHandle, ScriptedDial, TempDir) {
+    begin(Method::Code, Some(PHONE), vec![(ids::SEND_CODE, reply)]).await
 }
 
 #[tokio::test]
@@ -594,7 +719,7 @@ async fn each_code_type_maps_to_code_sent() {
         ),
     ];
     for (name, bytes, want) in cases {
-        let (h, _dial, _tmp) = code_state(Reply::Ok(sent_code(&bytes)));
+        let (h, _dial, _tmp) = code_state(Reply::Ok(sent_code(&bytes))).await;
         assert_eq!(
             settled(&h).await,
             LoginState::CodeSent {
@@ -629,7 +754,7 @@ async fn email_and_payment_states_end_the_login() {
         (sent_code(&setup), LoginState::NeedEmailSetup),
         (payment, LoginState::PaymentRequired),
     ] {
-        let (h, _dial, _tmp) = code_state(Reply::Ok(reply));
+        let (h, _dial, _tmp) = code_state(Reply::Ok(reply)).await;
         assert_eq!(end(&h).await, want);
     }
 }
@@ -639,17 +764,20 @@ async fn sent_code_success_logs_in() {
     let bytes = Tl::ctor(0x2390_fe44)
         .raw(&authorization(555, Some("88800000000")))
         .done();
-    let (h, _dial, _tmp) = code_state(Reply::Ok(bytes));
+    let (h, _dial, _tmp) = code_state(Reply::Ok(bytes)).await;
     assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 555 });
 }
 
-fn after_code(sign_in: Reply, more: Vec<(u32, Reply)>) -> (LoginHandle, ScriptedDial, TempDir) {
+async fn after_code(
+    sign_in: Reply,
+    more: Vec<(u32, Reply)>,
+) -> (LoginHandle, ScriptedDial, TempDir) {
     let mut script = vec![
         (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
         (ids::SIGN_IN, sign_in),
     ];
     script.extend(more);
-    begin(Method::Code, Some(PHONE), script)
+    begin(Method::Code, Some(PHONE), script).await
 }
 
 #[tokio::test]
@@ -657,7 +785,8 @@ async fn code_errors_map() {
     let (h, dial, _tmp) = after_code(
         Reply::Rpc(400, "PHONE_CODE_INVALID"),
         vec![(ids::SIGN_IN, Reply::Rpc(400, "PHONE_CODE_EXPIRED"))],
-    );
+    )
+    .await;
     assert!(matches!(settled(&h).await, LoginState::CodeSent { .. }));
     assert_eq!(
         h.submit_code("1".into()).await,
@@ -681,7 +810,8 @@ async fn code_then_password_logs_in() {
                 Reply::Ok(authorization(777, Some("88800000000"))),
             ),
         ],
-    );
+    )
+    .await;
     settled(&h).await;
     assert_eq!(
         h.submit_code("12345".into()).await,
@@ -697,7 +827,7 @@ async fn code_then_password_logs_in() {
 
 #[tokio::test]
 async fn sign_up_required_and_truncated_replies_are_typed() {
-    let (h, _dial, _tmp) = after_code(Reply::Ok(sign_up_required()), vec![]);
+    let (h, _dial, _tmp) = after_code(Reply::Ok(sign_up_required()), vec![]).await;
     settled(&h).await;
     h.submit_code("1".into()).await.expect("handed over");
     assert_eq!(
@@ -706,13 +836,13 @@ async fn sign_up_required_and_truncated_replies_are_typed() {
     );
     let mut bytes = sent_code(&sms());
     bytes.truncate(10);
-    let (h, _dial, _tmp) = code_state(Reply::Ok(bytes));
+    let (h, _dial, _tmp) = code_state(Reply::Ok(bytes)).await;
     assert_eq!(end(&h).await, LoginState::Failed(LoginError::Decode));
 }
 
 #[tokio::test]
 async fn code_flow_needs_a_phone_and_inputs_must_fit_the_state() {
-    let (h, dial, _tmp) = begin(Method::Code, None, vec![]);
+    let (h, dial, _tmp) = begin(Method::Code, None, vec![]).await;
     assert_eq!(end(&h).await, LoginState::Failed(LoginError::NoPhone));
     assert!(dial.calls().is_empty());
 
@@ -723,7 +853,8 @@ async fn code_flow_needs_a_phone_and_inputs_must_fit_the_state() {
             ids::EXPORT_LOGIN_TOKEN,
             Reply::Ok(login_token(b"t", later())),
         )],
-    );
+    )
+    .await;
     settled(&h).await;
     assert_eq!(
         h.submit_password("x".into()).await,
@@ -775,7 +906,8 @@ async fn final_state_is_published_after_the_session_is_released() {
                 ids::EXPORT_LOGIN_TOKEN,
                 Reply::Ok(login_token_success(8, None)),
             )],
-        );
+        )
+        .await;
         assert_eq!(end(&h).await, LoginState::LoggedIn { user_id: 8 });
         let opened = SessionStore::open(tmp.path());
         assert!(
@@ -809,7 +941,8 @@ async fn wrong_account_logout_must_be_confirmed_before_the_reset() {
                 ),
                 (ids::LOG_OUT, reply.clone()),
             ],
-        );
+        )
+        .await;
         let want = if confirmed {
             LoginError::WrongAccount
         } else {

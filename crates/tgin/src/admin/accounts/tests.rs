@@ -31,9 +31,20 @@ impl AccountHandle for Fake {
         self.running.load(Ordering::SeqCst)
     }
 
-    fn start_login(&self, target: &Target, method: Method) -> Result<LoginHandle, Refusal> {
-        let store = SessionStore::open(&target.session_dir)?;
-        login::start(store, self.dial.clone(), target.params.clone(), method).map_err(start_refusal)
+    fn start_login(
+        &self,
+        target: &Target,
+        method: Method,
+    ) -> BoxFuture<'static, Result<LoginHandle, Refusal>> {
+        let dir = target.session_dir.clone();
+        let params = target.params.clone();
+        let dial = self.dial.clone();
+        Box::pin(async move {
+            let store = SessionStore::open(&dir)?;
+            login::start(store, dial, params, method)
+                .await
+                .map_err(start_refusal)
+        })
     }
 
     fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>> {
@@ -583,6 +594,8 @@ async fn session_free_right_after_the_login_ends() {
             None,
             vec![
                 (ids::EXPORT_LOGIN_TOKEN, Reply::Rpc(400, "API_ID_INVALID")),
+                // The failed login left its key: asked, unknown, reset.
+                (ids::GET_USERS, Reply::Rpc(401, "AUTH_KEY_UNREGISTERED")),
                 (
                     ids::EXPORT_LOGIN_TOKEN,
                     Reply::Ok(login_token_success(78, None)),
@@ -651,4 +664,29 @@ async fn account_routes_need_an_admin_token() {
         !s.dir.path().join("main").exists(),
         "the session was not opened"
     );
+}
+
+/// A leftover key Telegram gives no clear answer about: 409 `session
+/// unverified`, the key kept for a retry or `tgin admin logout`.
+#[tokio::test]
+async fn unverified_leftover_key_is_refused() {
+    let s = setup(None, vec![(ids::GET_USERS, Reply::Rpc(500, "INTERNAL"))]);
+    {
+        let store = SessionStore::open(&s.dir.path().join("main")).expect("open");
+        store
+            .set_home_key(2, &tgin_mtproto::AuthKey([1; 256]))
+            .expect("key");
+    }
+    let (status, body) = call(
+        &s.app,
+        "POST",
+        "/v1/accounts/main/login",
+        r#"{"method":"qr"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["error"], "session unverified");
+    let store = reopen(&s.dir).await;
+    assert_eq!(store.home_dc().expect("home"), Some(2));
 }

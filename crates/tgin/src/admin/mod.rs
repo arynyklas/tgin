@@ -66,7 +66,9 @@
 //! answer carries `Cache-Control: no-store`. Failures: 400 `invalid body`, 404 `unknown
 //! account`, 404 `no login`, 409 `account running` (both refuse while the
 //! account runs), 409 `logged in` (log out first), 409 `session held` (by
-//! another process), 409 `login in progress` (with the other method), 422
+//! another process), 409 `session unverified` (a key left by an unfinished
+//! login, which Telegram gave no clear answer about: try again, or log
+//! out), 409 `login in progress` (with the other method), 422
 //! with a `reason` for a wrong code or password (try again) or one the
 //! login does not wait for, 502 `logout unconfirmed` when Telegram did
 //! not confirm the logout (nothing is cleared).

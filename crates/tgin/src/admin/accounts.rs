@@ -23,7 +23,6 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::future::BoxFuture;
-use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::json;
 use tgin_mtproto::login::{
@@ -31,6 +30,7 @@ use tgin_mtproto::login::{
     TcpDial,
 };
 use tgin_mtproto::{InitParams, SessionError, SessionStore};
+use tokio::sync::Mutex;
 
 use super::{LoginStatus, LoginUrl};
 
@@ -54,6 +54,9 @@ pub(crate) enum Refusal {
     Held,
     /// Telegram did not confirm the logout; nothing was cleared.
     Unconfirmed,
+    /// A key from an unfinished login is stored, and Telegram did not say
+    /// whether it is logged in; nothing was changed.
+    Unverified,
     /// The session store failed.
     Store(SessionError),
 }
@@ -72,7 +75,11 @@ pub(crate) trait AccountHandle: Send + Sync + 'static {
     /// Whether the account runs. Login and logout refuse while it does.
     fn running(&self, account: &str) -> bool;
     /// Opens the account's session and starts a login on it.
-    fn start_login(&self, target: &Target, method: Method) -> Result<LoginHandle, Refusal>;
+    fn start_login(
+        &self,
+        target: &Target,
+        method: Method,
+    ) -> BoxFuture<'static, Result<LoginHandle, Refusal>>;
     /// `auth.logOut`, then the session cleared.
     fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>>;
 }
@@ -86,10 +93,20 @@ impl AccountHandle for Sessions {
         false
     }
 
-    fn start_login(&self, target: &Target, method: Method) -> Result<LoginHandle, Refusal> {
-        let store = SessionStore::open(&target.session_dir)?;
-        let dial = TcpDial::new(InitParams::new(target.params.api_id));
-        login::start(store, dial, target.params.clone(), method).map_err(start_refusal)
+    fn start_login(
+        &self,
+        target: &Target,
+        method: Method,
+    ) -> BoxFuture<'static, Result<LoginHandle, Refusal>> {
+        let dir = target.session_dir.clone();
+        let params = target.params.clone();
+        let dial = TcpDial::new(InitParams::new(params.api_id));
+        Box::pin(async move {
+            let store = SessionStore::open(&dir)?;
+            login::start(store, dial, params, method)
+                .await
+                .map_err(start_refusal)
+        })
     }
 
     fn log_out(&self, target: &Target) -> BoxFuture<'static, Result<(), Refusal>> {
@@ -105,6 +122,7 @@ impl AccountHandle for Sessions {
 pub(crate) fn start_refusal(e: StartError) -> Refusal {
     match e {
         StartError::LoggedIn => Refusal::LoggedIn,
+        StartError::Unverified(_) => Refusal::Unverified,
         StartError::Storage(e) => e.into(),
     }
 }
@@ -119,6 +137,8 @@ pub(crate) fn logout_refusal(e: LogoutError) -> Refusal {
 /// The logins in progress or ended, by account.
 pub(crate) struct Accounts {
     handle: Arc<dyn AccountHandle>,
+    /// A `tokio` mutex: starting a login may ask Telegram about a leftover
+    /// key while it holds the account's entry.
     logins: Mutex<HashMap<String, (Method, Arc<LoginHandle>)>>,
 }
 
@@ -130,8 +150,12 @@ impl Accounts {
         }
     }
 
-    fn login(&self, name: &str) -> Option<Arc<LoginHandle>> {
-        self.logins.lock().get(name).map(|(_, h)| Arc::clone(h))
+    async fn login(&self, name: &str) -> Option<Arc<LoginHandle>> {
+        self.logins
+            .lock()
+            .await
+            .get(name)
+            .map(|(_, h)| Arc::clone(h))
     }
 }
 
@@ -205,6 +229,14 @@ fn refused(account: &str, refusal: &Refusal) -> Response {
         Refusal::LoggedIn => error(StatusCode::CONFLICT, "logged in"),
         Refusal::Held => error(StatusCode::CONFLICT, "session held"),
         Refusal::Unconfirmed => error(StatusCode::BAD_GATEWAY, "logout unconfirmed"),
+        Refusal::Unverified => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "session unverified",
+                "description": "a key from an unfinished login is stored and Telegram did not say whether it is logged in; try again, or run `tgin admin logout <account> --yes`",
+            })),
+        )
+            .into_response(),
         Refusal::Store(e) => {
             tracing::warn!(account, error = %e, "account session store failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "session store failed")
@@ -284,7 +316,7 @@ async fn start<S: AccountsState>(
         return running();
     }
     let handle = {
-        let mut logins = accounts.logins.lock();
+        let mut logins = accounts.logins.lock().await;
         match logins.get(&name) {
             Some((m, h)) if !h.state().is_final() => {
                 if *m != method {
@@ -295,7 +327,7 @@ async fn start<S: AccountsState>(
             _ => {
                 // An ended login has released the session.
                 logins.remove(&name);
-                match accounts.handle.start_login(&target, method) {
+                match accounts.handle.start_login(&target, method).await {
                     Ok(h) => {
                         let h = Arc::new(h);
                         logins.insert(name.clone(), (method, Arc::clone(&h)));
@@ -320,7 +352,7 @@ async fn current<S: AccountsState>(
     if state.target(&name).is_none() {
         return unknown_account();
     }
-    match state.accounts().login(&name) {
+    match state.accounts().login(&name).await {
         Some(h) => login_status(&h.state()),
         None => no_login(),
     }
@@ -375,7 +407,7 @@ async fn submit<S: AccountsState>(
     if state.target(name).is_none() {
         return unknown_account();
     }
-    let Some(h) = state.accounts().login(name) else {
+    let Some(h) = state.accounts().login(name).await else {
         return no_login();
     };
     match hand(h).await {
@@ -408,7 +440,7 @@ async fn logout<S: AccountsState>(
         return running();
     }
     // A login in progress ends first, releasing the session.
-    let login = accounts.logins.lock().remove(&name);
+    let login = accounts.logins.lock().await.remove(&name);
     if let Some((_, h)) = login
         && let Ok(h) = Arc::try_unwrap(h)
     {
