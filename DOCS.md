@@ -645,12 +645,17 @@ An account logs in through the admin API, by QR or by a code, with `tgin admin l
 
 - **QR.** The answer is `{"state":"qr","url":"tg://login?token=…","expires":…}`; tgin renews the token by itself until it is scanned (in the account's app: Settings > Devices > Link Desktop Device).
 - **Code.** tgin sends a login code to the config's `phone` and answers `code_sent`; without a `phone` the code login fails (`no_phone`).
-- A cloud password then gives `need_password`. The end is `logged_in`, or `failed` with a `reason`.
-- **Identity gate.** With a `phone` in the config, a login by an account with another phone is logged out again and fails (`wrong_account`).
+- A cloud password then gives `need_password`. A login ends in one of these states:
+  - `logged_in`;
+  - `need_email_setup`: Telegram wants a login email first, which only an official app can add; add one there, then log in again;
+  - `need_email_code`: Telegram sent the code to the login email, which tgin does not support; log in by QR instead;
+  - `payment_required`: Telegram asks for a payment before it sends a code; log in by QR instead;
+  - `failed`, with a `reason`.
+- **Identity gate.** With a `phone` in the config, a login by an account with another phone is logged out again and fails (`wrong_account`). When Telegram does not confirm that logout, the login fails `wrong_account_not_logged_out`: the other account's key stays in the session, without a recorded login. Run `tgin admin logout <account> --yes` to log that key out and clear the session, then log in again.
 - **Lifetime and attempts.** An unscanned QR login ends `failed` (`expired`) after 5 minutes, and so does a login that waits 5 minutes for a code or password. A fifth wrong code or password ends the login (`code_attempts`, `password_attempts`). `DELETE …/login` ends a login at once (`tgin admin login` sends it on Ctrl+C), and a reload ends one whose account it removed or whose `session_dir` or `phone` it changed.
 - **A leftover key.** When a key is stored without a recorded login (a login whose answer was lost, say), the next login first asks Telegram about it, for up to 20 s. With a `phone` configured, a key still logged in goes through the identity gate and is adopted. Without a `phone`, nothing says it is the right account, so it is logged out (`auth.logOut`) and the login starts fresh: a crash between a scan and the end of the login then costs one more scan. No clear answer in time gives `409 session unverified` and changes nothing.
 - **Logout** calls `auth.logOut` and clears the session (keys, login, peers, update state; the directory stays). A running account is parked for it first: its ingest stops with everything admitted committed, its RPC calls get up to 10 s, and it releases the session. It then shows `logged_out`, or runs again on its key when Telegram did not confirm the logout (`502 logout unconfirmed`, nothing cleared).
-- Failures: `400 invalid body`, `404 unknown account`, `404 no login`, `409 account running` (a login while the account runs: log out first), `409 logout in progress`, `409 logged in`, `409 session held` (by another process), `409 session unverified`, `409 login in progress` (with the other method), `409 login starting`, `422` with a `reason` for a wrong code or password, `502 logout unconfirmed`.
+- Failures: `400 invalid body`, `403 admin.token required for account login`, `404 unknown account`, `404 no login`, `409 account running` (a login while the account runs: log out first), `409 logout in progress`, `409 logged in`, `409 session held` (by another process), `409 session unverified`, `409 login in progress` (with the other method), `409 login starting` (a second request while a login is starting), `409 login cancelled` (a DELETE or a reload cancelled a login that was still starting), `422` with an `error` and a `reason` for a wrong code or password (`code_invalid`, `password_invalid`: try again) or for a code or password the login is not waiting for (`not_expected`), `500 session store failed`, `502 logout unconfirmed`.
 
 An account starts once its login ends, without a restart.
 
@@ -664,14 +669,16 @@ One process holds a session directory at a time, under an OS file lock taken bef
 
 `GET /v1/accounts` (admin token) lists every configured account; no field is a secret.
 
-```json
+```console
+$ curl -s -H "Authorization: Bearer $(cat admin_token)" http://127.0.0.1:9090/v1/accounts
 {"accounts":[{"name":"main","state":"running","layer":230,"home_dc":2,
   "catching_up":{"common":false,"channels":0}}]}
 ```
 
-- `state`: `logged_out` (with `"login_in_progress": true` while a login of this process holds the session), `connecting`, `running`, `flood_wait` (Telegram refused the init call with a flood wait; `until` is when it connects again, in unix seconds), `frozen` (Telegram answered `FROZEN_*`: the account is read-only; it stays so until the account restarts, is logged out or needs a new login), `needs_login` (Telegram no longer accepts the authorization: log out and in again) or `failed`.
+- `state`: `logged_out` (with `"login_in_progress": true` while a login of this process holds the session), `connecting`, `running`, `flood_wait`, `frozen` (Telegram answered `FROZEN_*`: the account is read-only; it stays so until the account restarts, is logged out or needs a new login), `needs_login` (Telegram no longer accepts the authorization: log out and in again) or `failed`.
+- `flood_wait` has `until`, in unix seconds. It means one of two things. Telegram refused the main session's init call with a flood wait: the account is offline and connects again at `until`. Or Telegram asked for a flood wait on a catch-up call (`updates.getState`, `getDifference`): the account stays connected, receives live updates and serves RPC, and catch-up resumes at `until`.
 - `failed` carries a `reason` and `retrying`: `duplicate_account` and `init_refused` (Telegram refused the init call, `API_ID_INVALID` say) are not retried; `session_held`, `storage`, `connect` and `panicked` are, after a backoff from 1 s doubling to 60 s.
-- `home_dc` appears once the session was read; `catching_up` shows whether the common box and how many channels are catching up.
+- `home_dc` is `null` until the session was read; `catching_up` shows whether the common box and how many channels are catching up.
 
 **Duplicate accounts.** Two accounts of one process logged in as the same Telegram user would fight over one update stream. One of them runs and the other reports `failed{duplicate_account}`; which one is not specified. The other starts when the first gives the user up.
 
@@ -689,13 +696,19 @@ Every account update reaches a consumer as one JSON object, an **envelope**:
 | `update_id` | Strictly increasing per account, starting at 1, never repeated across restarts, and **not contiguous**: ids reserved by a run that stopped are skipped. Use it for `offset`; never compute the next id. |
 | `account` | The account's name. |
 | `layer` | The TL layer of `tl`, `users` and `chats`: the account's one layer. |
-| `constructor` | The update's constructor name, such as `updateNewMessage`. |
+| `constructor` | The update's constructor name, such as `updateNewMessage`. For an `updateShort` it names the wrapped update (`updateUserStatus`, say); the other short forms name themselves (`updateShortMessage`, `updateShortChatMessage`, `updateShortSentMessage`). |
 | `received_at` | When tgin admitted the update: wall-clock time, RFC 3339 UTC with milliseconds. Every update of one batch shares it, and it is not monotonic (it follows the system clock). |
-| `tl` | The update's own TL bytes. |
+| `tl` | The update's TL bytes: an `Update` object, except for Telegram's short forms (below). |
 | `users`, `chats` | The raw `Vector<User>` and `Vector<Chat>` of the push or difference the update came with. |
-| `update` | Only with `render: tl_json` on the consumer: the update as TL-JSON. |
+| `update` | Only with `render: tl_json` on the consumer: the update as TL-JSON. Left out when tgin's codec refuses the bytes (logged as `the update has no TL-JSON`). |
 
-`tl`, `users` and `chats` are standard base64 with padding. A pushed update is Telegram's bytes as received; an update from a catch-up (`getDifference`) is composed from the difference's message as `updateNewMessage`, `updateNewChannelMessage` or `updateNewEncryptedMessage`, with a `pts_count` of 0. A consumer takes bot updates or account updates, never both, and `render: tl_json` is allowed only on a consumer that accounts alone feed. Push consumers post the envelope with `X-Tgin-Source: <account>` and `X-Tgin-Update-Type: <constructor>`.
+`tl`, `users` and `chats` are standard base64 with padding.
+
+- **Pushed updates** are Telegram's bytes as received.
+- **Short forms** are delivered as Telegram's raw short `Updates` object, not as an `Update`: `tl` of an `updateShort` is the whole `updateShort` (its `date` included) while `constructor` names the update inside it, and `updateShortMessage`, `updateShortChatMessage` and `updateShortSentMessage` arrive as themselves. Parse `tl` as an `Updates` object when `constructor` is a short form, or when the object's constructor id is not the update's.
+- **Catch-up updates** (from `getDifference` or `getChannelDifference`) are composed from the difference's messages as `updateNewMessage`, `updateNewChannelMessage` or `updateNewEncryptedMessage`. The first two carry the difference's final `pts` (not the message's own) and a `pts_count` of 0; `updateNewEncryptedMessage` carries the difference's final `qts` and has no `pts_count`.
+
+A consumer takes bot updates or account updates, never both, and `render: tl_json` is allowed only on a consumer that accounts alone feed. Push consumers post the envelope with `X-Tgin-Source: <account>` and `X-Tgin-Update-Type: <constructor>`.
 
 ### Pull and push
 
@@ -722,15 +735,14 @@ Values in one list are alternatives; all given fields must hold.
 
 tgin keeps its own update state per account, by Telegram's [rules](https://core.telegram.org/api/updates): a **common box** (`pts`, `qts`) and one box per channel. It persists a box's state only after every batch up to the one that moved it is admitted, and catches up with `updates.getDifference` (the common box, at start and on a gap) and `updates.getChannelDifference` (a channel, on a gap in it, on `updateChannelTooLong`, or at start when the last run left it behind).
 
-- **At least once, for sequenced updates, to `backpressure` consumers.** Updates that carry a `pts` or `qts` are admitted to every target or to none. When a `backpressure` target is full, the batch is refused, the box rolls back to its last committed state and fetches the updates again after a backoff (1 s, doubling to 60 s, reset when the box next commits). Across a crash or restart the box resumes from its committed state, so its updates come back.
+- **At least once, for sequenced updates, to `backpressure` consumers, while the process lives.** Updates that carry a `pts` or `qts` are admitted to every target or to none. When a `backpressure` target is full, the batch is refused, the box rolls back to its last committed state and fetches the updates again after a backoff (1 s, doubling to 60 s, reset when the box next commits). A box commits as soon as its batch is queued, so across a crash or restart the replay brings back only updates that were received and not yet admitted.
+  - Queues stay in memory, as for bots ([Delivery semantics](#delivery-semantics)): envelopes still queued, leased or waiting for a push retry are lost when tgin crashes, is killed, or ends a shutdown drain before they are delivered, and no catch-up brings them back.
   - `on_full: drop_oldest` on an account's consumer is an explicit choice to lose updates when it is full.
   - Not covered: an envelope larger than a target's `capacity_bytes` (dropped for that target, `reason="oversized"`), and a push dead letter.
   - **Common box: at least once.** **Channel boxes: to be confirmed** against Telegram. For a channel there is one known crash window: from the moment a channel's push is received until the marks of the call that fed it are durable. Telegram treats such a push as delivered and only tgin knew the channel moved, so a quiet channel does not bring it back. Every other crash point replays it.
-- **Unsequenced updates** (no `pts`/`qts`: typing, status, read marks…) are best effort: those of a refused batch are not fetched again, and are counted in `tgin_mtproto_updates_dropped_total{reason="full"}`.
+- **Unsequenced updates** (no `pts`/`qts`: typing, user status, some read marks such as `updateReadChannelOutbox`…) are best effort: those of a refused batch are not fetched again, and are counted in `tgin_mtproto_updates_dropped_total{reason="full"}`.
 - **Not owed, by design:** an unknown channel's updates before its first one; a channel's updates before its fetch failed for good or its answer could not be decoded (its state starts again); what a `differenceTooLong` or `channelDifferenceTooLong` skips (Telegram cannot send it any more); a post lost with a connection whose session Telegram replaced, unless Telegram's `getDifference` signals that channel. An update tgin cannot decode is skipped and counted (`reason="undecodable"`).
 - **No dedup.** A replay may repeat updates already delivered, under new `update_id`s. Deduplicate on the update's own ids (a message's peer and id, say) if it matters.
-
-Queues stay in memory, as for bots ([Delivery semantics](#delivery-semantics)): what tgin holds when it stops is what the replay brings back.
 
 ### RPC endpoint
 
@@ -755,7 +767,7 @@ Queues stay in memory, as for bots ([Delivery semantics](#delivery-semantics)): 
 - `ACCOUNT_CHANGING`: `auth.*`, `account.*`, `contacts.acceptContact`, `contacts.addContact`, `contacts.deleteByPhones`, `contacts.deleteContacts`, `contacts.importContacts`, `contacts.updateContactNote`, `contacts.resetSaved`, `contacts.toggleTopPeers`, `photos.uploadProfilePhoto`, `photos.updateProfilePhoto`, `photos.deletePhotos`, `photos.uploadContactProfilePhoto`, `help.acceptTermsOfService`.
 - `ACCOUNT_READ_ONLY`, the `account.*` getters that `account.*` or `*` still grants: `account.getAccountTTL`, `account.getAuthorizations`, `account.getAutoDownloadSettings`, `account.getAutoSaveSettings`, `account.getBotBusinessConnection`, `account.getBusinessChatLinks`, `account.getChannelDefaultEmojiStatuses`, `account.getChannelRestrictedStatusEmojis`, `account.getChatThemes`, `account.getCollectibleEmojiStatuses`, `account.getConnectedBots`, `account.getContactSignUpNotification`, `account.getContentSettings`, `account.getDefaultBackgroundEmojis`, `account.getDefaultEmojiStatuses`, `account.getDefaultGroupPhotoEmojis`, `account.getDefaultProfilePhotoEmojis`, `account.getGlobalPrivacySettings`, `account.getMultiWallPapers`, `account.getNotifyExceptions`, `account.getNotifySettings`, `account.getPaidMessagesRevenue`, `account.getPrivacy`, `account.getReactionsNotifySettings`, `account.getRecentEmojiStatuses`, `account.getSavedMusicIds`, `account.getSavedRingtones`, `account.getTheme`, `account.getThemes`, `account.getUniqueGiftChatThemes`, `account.getWallPaper`, `account.getWallPapers`, `account.getWebAuthorizations`, `account.getWebBrowserSettings`. Getters left out on purpose (`account.getTmpPassword`, `account.getPassword`, `account.getPasswordSettings`, `account.getPasskeys`, the Passport getters) and any getter of a later layer stay exact-listing only.
 
-Before granting `account.*` or `*`, note that `account.getAuthorizations` and `account.getWebAuthorizations` show the account's sessions with their IP addresses, and that `messages.acceptUrlAuth` (a `messages.*` method) logs the account in to a website: a web authorization minted outside `auth.*`. Deny them when the client should not have that.
+Before granting `account.*` or `*`, note that `account.getAuthorizations` and `account.getWebAuthorizations` show the account's sessions with their IP addresses, and that `messages.acceptUrlAuth` (a `messages.*` method) logs the account in to a website: a web authorization minted outside `auth.*`. Before granting `contacts.*` or `*`, note that `contacts.block`, `contacts.unblock`, `contacts.setBlocked` (the block list), `contacts.editCloseFriends` and `contacts.resetTopPeerRating` change the account but are not in `ACCOUNT_CHANGING`, so a glob grants them. Deny them when the client should not have that.
 
 **Limits.** A client has at most 8 requests in flight (else `429 too_many_in_flight`). `rpc.max_rps` (default 20) bounds the requests the account writes to Telegram for all its clients: each call, each resend, each `*_MIGRATE` hop and a media session's export and import count.
 
@@ -789,13 +801,15 @@ Before granting `account.*` or `*`, note that `account.getAuthorizations` and `a
 | `503` | `media_session` | The media session could not be set up; not executed; `Retry-After: 1`. |
 | `503` | `account_unavailable` | The account is logged out or needs a new login. |
 
+Every `503` that carries `Retry-After` means the call was not executed and is safe to retry; later versions may add more such answers, so key on the status, not on the `error` word. `503 account_unavailable` has no `Retry-After`: it needs an operator.
+
 Request and answer bodies are never logged. The shutdown waits for calls in flight.
 
 ### One layer per account
 
 Telegram's TL schema changes with every layer, and one authorization serving several layers at once does not work reliably, so each account serves exactly one layer: the one tgin is built with, **230** in this release (the layer of the grammers crates tgin pins). Envelopes carry it in `layer`, `GET /v1/accounts` shows it, and RPC requests must name it in `X-Tgin-Layer`.
 
-A tgin release that upgrades grammers to a new layer changes the layer of every account at once. After such an upgrade: RPC clients that still send the old layer get `409 layer_mismatch` until they move to the new one; consumers get envelopes of the new layer, so check `layer` before parsing `tl`; and constructors the new layer changed parse differently. The release notes say when the layer changes.
+A tgin release that upgrades grammers to a new layer changes the layer of every account at once. Such an upgrade ships only in a minor release, never in a patch release, and the CHANGELOG says so: it is the one exception to the [compatibility rule](#admin-api-v1). After such an upgrade: RPC clients that still send the old layer get `409 layer_mismatch` until they move to the new one; consumers get envelopes of the new layer, so check `layer` before parsing `tl`; and constructors the new layer changed parse differently.
 
 ### Account metrics
 
@@ -930,7 +944,7 @@ $ tgin admin login <account>          # --code: a login code to the config's pho
 $ tgin admin logout <account> --yes
 ```
 
-`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. An unscanned QR expires after 5 minutes, as does a wait for a code or password; Ctrl+C ends the login on tgin too. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns), both refuse while the account runs, and the QR's URL, codes and passwords are never logged.
+`tgin admin login` logs a Telegram user account in through `POST /v1/accounts/{name}/login`: it draws the login QR in the terminal (scan it in the account's Telegram app: Settings > Devices > Link Desktop Device), draws a fresh one when Telegram renews the token, and asks for the 2FA password, without echo, when the account has one. An unscanned QR expires after 5 minutes, as does a wait for a code or password; Ctrl+C ends the login on tgin too. With a `phone` in the account's config, a login by another account is logged out again and fails (`wrong_account`). `tgin admin logout` calls `auth.logOut` and clears the session. Both need `admin.token` in the config (without it the account routes answer `403`, and loading the config warns). A login refuses while the account runs (`409 account running`); a logout parks a running account first ([Login](#login)). The QR's URL, codes and passwords are never logged. There is no listing command: `GET /v1/accounts` lists the accounts ([Account states](#account-states)).
 
 | Option | Environment | Meaning |
 |---|---|---|
