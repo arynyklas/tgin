@@ -669,3 +669,17 @@ fn an_unauthorized_main_answer_reports_a_gone_key() {
     );
     assert!(shared.key_gone.load(Ordering::SeqCst), "duplicated on home");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_cut_short_close_leaves_the_task_to_abort() {
+    let net = FakeNetwork::new();
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    assert!(
+        timeout(Duration::ZERO, run.account.close()).await.is_err(),
+        "cut short"
+    );
+    run.account.abort();
+    assert!(!run.account.close().await, "the abort ended it");
+}

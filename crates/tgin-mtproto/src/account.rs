@@ -65,7 +65,7 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Serializable as _};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -363,7 +363,9 @@ struct Inner {
     shared: Arc<Shared>,
     ingest: CancellationToken,
     close: CancellationToken,
-    task: Mutex<Option<JoinHandle<()>>>,
+    /// Behind an async lock: a close cut short leaves it in place.
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    abort: AbortHandle,
     rpc: Arc<RpcPort>,
     affected: Arc<AffectedPort>,
 }
@@ -419,7 +421,8 @@ impl Account {
             shared,
             ingest,
             close,
-            task: Mutex::new(Some(task)),
+            abort: task.abort_handle(),
+            task: tokio::sync::Mutex::new(Some(task)),
         }))
     }
 
@@ -487,23 +490,27 @@ impl Account {
         self.0.ingest.cancel();
     }
 
-    /// Stops the account and waits until it released its session.
-    pub async fn close(&self) {
+    /// Stops the account and waits until it released its session. True
+    /// when its task ended by itself, false when [`abort`](Self::abort)
+    /// ended it. A close cut short (a timeout) leaves the task reachable,
+    /// so a later `abort` still ends it.
+    pub async fn close(&self) -> bool {
         self.0.ingest.cancel();
         self.0.close.cancel();
-        let task = self.0.task.lock().take();
-        if let Some(task) = task {
-            let _ = task.await;
-        }
+        let mut task = self.0.task.lock().await;
+        let Some(handle) = task.as_mut() else {
+            return true;
+        };
+        let ended = handle.await.is_ok();
+        *task = None;
+        ended
     }
 
     /// Ends the account's task at once, without waiting.
     pub fn abort(&self) {
         self.0.ingest.cancel();
         self.0.close.cancel();
-        if let Some(task) = self.0.task.lock().take() {
-            task.abort();
-        }
+        self.0.abort.abort();
     }
 }
 
