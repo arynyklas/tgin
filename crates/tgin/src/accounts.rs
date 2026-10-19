@@ -76,6 +76,16 @@ pub(crate) struct AccountSources {
     running: Mutex<BTreeMap<String, Running>>,
     /// The shutdown stopped the accounts: nothing starts any more.
     stopped: AtomicBool,
+    /// Test seam: a parked account's restart waits here (`reached` is
+    /// notified, then it waits for `go`).
+    #[cfg(test)]
+    before_restart: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+/// What [`AccountSources::launch`] starts from.
+enum Launch<'a> {
+    Config(Box<config::Account>),
+    Listed { name: &'a str, old: &'a Account },
 }
 
 impl AccountSources {
@@ -96,6 +106,8 @@ impl AccountSources {
             board,
             running: Mutex::new(BTreeMap::new()),
             stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            before_restart: Mutex::new(None),
         }
     }
 
@@ -176,27 +188,33 @@ impl AccountSources {
     /// Starts the account of `config`, unless the shutdown stopped the
     /// accounts.
     fn start(&self, config: config::Account) {
-        self.start_as(config, None);
+        self.launch(Launch::Config(Box::new(config)));
     }
 
-    /// [`start`](Self::start); with `replacing`, only while that account is
-    /// still the one listed under the name.
-    fn start_as(&self, config: config::Account, replacing: Option<&Account>) {
-        let limiter = Arc::new(AccountLimiter::new(config.rpc.max_rps));
-        let account = {
+    /// Starts the account listed under `name` again, from the config listed
+    /// now, only while `old` is still the account listed: one lock covers
+    /// the check and the config read, so a reload in between is never
+    /// undone.
+    fn restart_listed(&self, name: &str, old: &Account) {
+        self.launch(Launch::Listed { name, old });
+    }
+
+    fn launch(&self, from: Launch<'_>) {
+        let (account, config, limiter) = {
             // Under the lock the shutdown stops the accounts with: an
             // account started here is stopped by it, or not started.
             let mut running = self.running.lock();
             if self.stopped.load(Ordering::SeqCst) {
                 return;
             }
-            if let Some(old) = replacing
-                && !running
-                    .get(&config.name)
-                    .is_some_and(|run| run.account.same(old))
-            {
-                return;
-            }
+            let config = match from {
+                Launch::Config(config) => *config,
+                Launch::Listed { name, old } => match running.get(name) {
+                    Some(run) if run.account.same(old) => run.config.clone(),
+                    _ => return,
+                },
+            };
+            let limiter = Arc::new(AccountLimiter::new(config.rpc.max_rps));
             let spec = AccountSpec {
                 name: config.name.clone(),
                 session_dir: config.session_dir.expose().clone(),
@@ -218,7 +236,7 @@ impl AccountSources {
                     parked: false,
                 },
             );
-            account
+            (account, config, limiter)
         };
         self.endpoint.insert(RpcAccount::new(
             &config.name,
@@ -269,12 +287,17 @@ impl AccountSources {
         };
         tracing::info!(account = %name, "the account is parked for a logout");
         account.park(PARK_RPC_WAIT).await;
-        // Started again only while it is still the account listed: a
-        // reload meanwhile removed or replaced it otherwise.
-        let config = self.running.lock().get(name).map(|run| run.config.clone());
-        if let Some(config) = config {
-            self.start_as(config, Some(&account));
+        #[cfg(test)]
+        {
+            let gate = self.before_restart.lock().clone();
+            if let Some((reached, go)) = gate {
+                reached.notify_one();
+                go.notified().await;
+            }
         }
+        // Started again only while it is still the account listed, from
+        // the config listed then: a reload meanwhile wins.
+        self.restart_listed(name, &account);
     }
 
     /// The session of account `name` changed outside it (a login or a
@@ -413,9 +436,13 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(600);
 
     fn config(dir: &Path, api_hash: &str, accounts: bool) -> Config {
+        config_with(dir, api_hash, accounts, "token-aaaaaaaaaaaaaaaa")
+    }
+
+    fn config_with(dir: &Path, api_hash: &str, accounts: bool, token: &str) -> Config {
         let yaml = if accounts {
             format!(
-                "version: 1\naccounts:\n  main:\n    api_id: 1\n    api_hash: {api_hash}\n    session_dir: '{}'\n",
+                "version: 1\naccounts:\n  main:\n    api_id: 1\n    api_hash: {api_hash}\n    session_dir: '{}'\n    rpc:\n      clients:\n        bot: {{ token: {token}, allow: [\"*\"] }}\n",
                 dir.join("main").display()
             )
         } else {
@@ -617,6 +644,39 @@ mod tests {
         assert!(now.same(&replaced), "the park did not restart over it");
         assert!(!parked);
         assert_eq!(cfg.api_hash.expose(), "h2");
+        until_running(&now).await;
+    }
+
+    /// A reload that lands while a parked account is about to start again
+    /// wins: the account starts from the config listed at the restart, so
+    /// a client token the reload revoked is not taken again.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_restarts_from_the_config_listed_at_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        logged_in(dir.path());
+        let cfg = config_with(dir.path(), "h", true, "token-aaaaaaaaaaaaaaaa");
+        let net = slow_telegram();
+        let sources = sources(&cfg, &net);
+        sources.apply(&cfg).await;
+        busy(&sources, &net).await;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let go = Arc::new(tokio::sync::Notify::new());
+        *sources.before_restart.lock() = Some((Arc::clone(&reached), Arc::clone(&go)));
+        let park = tokio::spawn(Arc::clone(&sources).park("main".to_owned()));
+        timeout(WAIT, reached.notified())
+            .await
+            .expect("about to restart");
+        let reloaded = config_with(dir.path(), "h", true, "token-bbbbbbbbbbbbbbbb");
+        sources.apply(&reloaded).await;
+        go.notify_one();
+        timeout(WAIT, park).await.expect("ends").expect("no panic");
+        let (now, cfg, parked) = account(&sources).expect("listed");
+        assert!(!parked);
+        assert_eq!(
+            cfg.rpc.clients[0].token.expose(),
+            "token-bbbbbbbbbbbbbbbb",
+            "the reload's config"
+        );
         until_running(&now).await;
     }
 }
