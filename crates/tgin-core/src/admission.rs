@@ -250,8 +250,9 @@ impl Engine {
     /// waits for room that cannot come; the target then holds at most one
     /// batch over its limits. Otherwise each routed update is queued in
     /// batch order for each of its targets, as [`Sink::admit`] queues one;
-    /// a `drop_oldest` target may still go without some.
-    /// [`Admit::Unroutable`] when no rule matches any update.
+    /// a `drop_oldest` target short of room keeps the batch's newest
+    /// updates, as it would one by one. [`Admit::Unroutable`] when no rule
+    /// matches any update.
     ///
     /// Payloads are built only for routed updates, and
     /// [`BatchUpdate::rendered`] only for those routed to a `render:
@@ -349,8 +350,9 @@ impl Engine {
                 }
             }
         }
-        // Then the `drop_oldest` targets.
-        for (i, r) in routed.iter().enumerate() {
+        // `drop_oldest` targets newest first, so one short of room keeps
+        // the batch's newest updates.
+        for (i, r) in routed.iter().enumerate().rev() {
             let update_id = updates[r.index].update_id();
             let targets = r
                 .targets

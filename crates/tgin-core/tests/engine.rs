@@ -1962,3 +1962,20 @@ async fn oversized_batch_admitted_into_an_empty_queue() {
     assert_eq!(h.engine.admit_batch(acct, &mut more), Admit::Admitted);
     assert_eq!(poll(&h.pull("raw"), "x", 0).await, [6, 7, 8, 9]);
 }
+
+/// A `drop_oldest` consumer short of room keeps a batch's newest updates,
+/// as it would admitting them one by one.
+#[tokio::test(start_paused = true)]
+async fn drop_oldest_keeps_a_batch_s_newest_updates() {
+    let yaml = ACCOUNT.replace(
+        "raw: { pull: { auth_token: t0, capacity: 3 } }",
+        "raw: { pull: { auth_token: t0, capacity: 2, on_full: drop_oldest } }",
+    );
+    let h = Harness::new(&yaml);
+    let acct = h.engine.account_source("acct").expect("an account source");
+    let mut batch: Vec<Counted> = (1..=5)
+        .map(|i| Counted::new("updateNewMessage", i))
+        .collect();
+    assert_eq!(h.engine.admit_batch(acct, &mut batch), Admit::Admitted);
+    assert_eq!(poll(&h.pull("raw"), "x", 0).await, [4, 5]);
+}
