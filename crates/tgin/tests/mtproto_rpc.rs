@@ -862,17 +862,28 @@ async fn body_bound_413() {
 // --- media sessions -------------------------------------------------------
 
 /// A session with scripted answers.
-#[derive(Default)]
 struct FakeSession {
     script: Mutex<VecDeque<Result<RpcOutcome, SenderError>>>,
     calls: Mutex<Vec<Bytes>>,
+    /// The first `gated` calls answer only once all of them are waiting.
+    gated: usize,
+    gate: tokio::sync::Barrier,
 }
 
 impl FakeSession {
     fn new(script: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>) -> Arc<Self> {
+        Self::gated(script, 0)
+    }
+
+    fn gated(
+        script: impl IntoIterator<Item = Result<RpcOutcome, SenderError>>,
+        gated: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             script: Mutex::new(script.into_iter().collect()),
             calls: Mutex::default(),
+            gated,
+            gate: tokio::sync::Barrier::new(gated.max(1)),
         })
     }
 
@@ -891,13 +902,22 @@ impl FakeSession {
 
 impl Session for FakeSession {
     fn invoke(&self, body: Bytes) -> BoxFuture<'_, Result<RpcOutcome, SenderError>> {
-        self.calls.lock().push(body);
+        let index = {
+            let mut calls = self.calls.lock();
+            calls.push(body);
+            calls.len() - 1
+        };
         let next = self
             .script
             .lock()
             .pop_front()
             .unwrap_or(Err(SenderError::NotSent));
-        Box::pin(async move { next })
+        Box::pin(async move {
+            if index < self.gated {
+                self.gate.wait().await;
+            }
+            next
+        })
     }
 }
 
@@ -1268,6 +1288,83 @@ async fn media_setup_has_a_deadline_and_a_backoff() {
     tokio::time::advance(Duration::from_secs(1)).await;
     let _ = tokio::time::timeout(Duration::from_millis(1), send(&m.app, tl(GET_FILE))).await;
     assert_eq!(m.connects.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn overlapping_key_refusals_evict_once() {
+    let unregistered = || {
+        Ok(RpcOutcome::Error {
+            code: 401,
+            message: "AUTH_KEY_UNREGISTERED".to_owned(),
+        })
+    };
+    let main = FakeSession::new([sender_ok(EXPORTED)]);
+    // Both calls on the stored key's session are refused together.
+    let media = FakeSession::gated(
+        [
+            unregistered(),
+            unregistered(),
+            sender_ok(IMPORTED),
+            sender_ok(FILE),
+            sender_ok(FILE),
+        ],
+        2,
+    );
+    let connects = Arc::new(Mutex::new(Vec::new()));
+    let connect = FakeConnect {
+        media: Arc::clone(&media),
+        connects: Arc::clone(&connects),
+        unreachable: Vec::new(),
+    };
+    let keys = Arc::new(FakeKeys::default());
+    keys.save(4, &AuthKey([3; 256])).expect("stored");
+    let sessions = AccountSessions::new(
+        Arc::clone(&main),
+        2,
+        LAYER,
+        connect,
+        Arc::clone(&keys),
+        Arc::new(AccountLimiter::new(NonZeroU32::new(100).expect("positive"))),
+    );
+    let body = Bytes::from(tl(GET_FILE));
+    let (a, b) = tokio::join!(
+        sessions.invoke(Route::Media(4), body.clone()),
+        sessions.invoke(Route::Media(4), body.clone()),
+    );
+    let file = RpcOutcome::Result(Bytes::from(tl(FILE)));
+    assert_eq!(a.expect("answered"), file);
+    assert_eq!(b.expect("answered"), file);
+    // One re-key: the second refusal resends on the new session, and the
+    // new key stays stored.
+    assert_eq!(*connects.lock(), vec![(4, true), (4, false)]);
+    assert_eq!(main.methods(), vec![tl_json(EXPORT_4)]);
+    assert_eq!(*keys.0.lock(), vec![(4, AuthKey([7; 256]))]);
+}
+
+#[tokio::test]
+async fn eviction_keeps_a_stored_key_that_is_not_the_refused_sessions() {
+    let keys = Arc::new(FakeKeys::default());
+    keys.save(4, &AuthKey([3; 256])).expect("stored");
+    let m = media_app(
+        [migrate(4), migrate(4)],
+        [
+            sender_ok(FILE),
+            Ok(RpcOutcome::Error {
+                code: 401,
+                message: "AUTH_KEY_UNREGISTERED".to_owned(),
+            }),
+            sender_ok(FILE),
+        ],
+        2,
+        Arc::clone(&keys),
+    );
+    assert_eq!(send(&m.app, tl(GET_FILE)).await.status, StatusCode::OK);
+    // The stored key changes under the ready session.
+    keys.remove(4).expect("removed");
+    keys.save(4, &AuthKey([9; 256])).expect("stored");
+    assert_eq!(send(&m.app, tl(GET_FILE)).await.status, StatusCode::OK);
+    assert_eq!(*m.connects.lock(), vec![(4, true), (4, true)]);
+    assert_eq!(*keys.0.lock(), vec![(4, AuthKey([9; 256]))]);
 }
 
 #[tokio::test]

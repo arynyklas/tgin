@@ -205,7 +205,8 @@ fn session_dead(e: &SenderError) -> bool {
 /// One DC's media session. `ready` is read without waiting on a setup
 /// in progress; `setup` serializes the setup of this DC only.
 struct Dc<S> {
-    ready: parking_lot::Mutex<Option<Arc<S>>>,
+    /// The authorized session and the key it uses.
+    ready: parking_lot::Mutex<Option<(Arc<S>, AuthKey)>>,
     setup: Mutex<Setup<S>>,
 }
 
@@ -280,11 +281,11 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
     /// Telegram's flood wait).
     async fn media(&self, dc: i32) -> Result<Arc<C::Session>, InvokeError> {
         let slot = self.dc(dc);
-        if let Some(session) = slot.ready.lock().clone() {
+        if let Some((session, _)) = slot.ready.lock().clone() {
             return Ok(session);
         }
         let mut setup = slot.setup.lock().await;
-        if let Some(session) = slot.ready.lock().clone() {
+        if let Some((session, _)) = slot.ready.lock().clone() {
             return Ok(session);
         }
         if let Some((until, failure)) = setup.failed
@@ -297,10 +298,10 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
             Err(_) => Err(failed(dc, "the setup timed out")),
         };
         match made {
-            Ok(session) => {
+            Ok((session, key)) => {
                 setup.failed = None;
                 setup.backoff = BACKOFF_FIRST;
-                *slot.ready.lock() = Some(Arc::clone(&session));
+                *slot.ready.lock() = Some((Arc::clone(&session), key));
                 Ok(session)
             }
             Err(e) => {
@@ -325,7 +326,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         &self,
         dc: i32,
         setup: &mut Setup<C::Session>,
-    ) -> Result<Arc<C::Session>, InvokeError> {
+    ) -> Result<(Arc<C::Session>, AuthKey), InvokeError> {
         let (session, key) = match setup.unauthorized.take() {
             Some(kept) => kept,
             None => {
@@ -335,14 +336,15 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
                     .map_err(|_| failed(dc, "the session store failed"))?;
                 let (session, new_key) = self
                     .connect
-                    .connect(dc, stored)
+                    .connect(dc, stored.clone())
                     .await
                     .map_err(|e| setup_error(dc, "connecting", &e))?;
                 let session = Arc::new(session);
-                let Some(key) = new_key else {
-                    return Ok(session);
-                };
-                (session, key)
+                match (new_key, stored) {
+                    (Some(key), _) => (session, key),
+                    (None, Some(stored)) => return Ok((session, stored)),
+                    (None, None) => return Err(failed(dc, "connecting made no key")),
+                }
             }
         };
         setup.unauthorized = Some((Arc::clone(&session), key.clone()));
@@ -361,17 +363,37 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
             .save(dc, &key)
             .map_err(|_| failed(dc, "the session store failed"))?;
         setup.unauthorized = None;
-        Ok(session)
+        Ok((session, key))
     }
 
-    /// Drops the media session to `dc` and its stored key.
-    async fn evict(&self, dc: i32) -> Result<(), InvokeError> {
+    /// Drops the media session to `dc` that Telegram refused, and its
+    /// stored key, unless another call already replaced it: then the ready
+    /// session, and the stored key, are a newer one and stay.
+    async fn evict(&self, dc: i32, refused: &Arc<C::Session>) -> Result<(), InvokeError> {
         let slot = self.dc(dc);
-        *slot.ready.lock() = None;
-        slot.setup.lock().await.unauthorized = None;
-        self.keys
-            .remove(dc)
-            .map_err(|_| failed(dc, "the session store failed"))
+        // Under the setup lock, so no setup stores a key between the check
+        // and the removal.
+        let _setup = slot.setup.lock().await;
+        let key = {
+            let mut ready = slot.ready.lock();
+            match ready.take() {
+                Some((session, key)) if Arc::ptr_eq(&session, refused) => key,
+                other => {
+                    *ready = other;
+                    return Ok(());
+                }
+            }
+        };
+        let stored = self
+            .keys
+            .load(dc)
+            .map_err(|_| failed(dc, "the session store failed"))?;
+        if stored.as_ref() == Some(&key) {
+            self.keys
+                .remove(dc)
+                .map_err(|_| failed(dc, "the session store failed"))?;
+        }
+        Ok(())
     }
 
     /// A call on the media session to `dc`. A key Telegram no longer
@@ -385,7 +407,7 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         if !key_gone(&outcome) {
             return Ok(outcome?);
         }
-        self.evict(dc).await?;
+        self.evict(dc, &media).await?;
         let media = self.media(dc).await?;
         charged(self.charge.as_ref())?;
         let outcome = media.invoke(body).await;
