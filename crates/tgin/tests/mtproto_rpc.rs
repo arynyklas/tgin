@@ -353,6 +353,7 @@ async fn authorization_methods_refused_even_when_listed() {
             MethodGlob::Exact("auth.exportAuthorization".to_owned()),
             MethodGlob::Exact("auth.acceptLoginToken".to_owned()),
             MethodGlob::Exact("bots.exportBotToken".to_owned()),
+            MethodGlob::Exact("phone.getGroupCallStreamRtmpUrl".to_owned()),
         ],
         deny: Vec::new(),
     };
@@ -366,6 +367,8 @@ async fn authorization_methods_refused_even_when_listed() {
         r#"{"_":"auth.acceptLoginToken","token":"AQID"}"#,
         // Returns, or with `revoke` rotates, a managed bot's token.
         r#"{"_":"bots.exportBotToken","bot":{"_":"inputUserSelf"},"revoke":false}"#,
+        // Returns, or with `revoke` rotates, a channel's RTMP stream key.
+        r#"{"_":"phone.getGroupCallStreamRtmpUrl","peer":{"_":"inputPeerSelf"},"revoke":false}"#,
     ] {
         let answer = send(&app, tl(body)).await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
