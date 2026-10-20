@@ -1115,9 +1115,6 @@ mod tests {
         );
     }
 
-    /// A commit reporting a channel caught up and a newer mark of that
-    /// channel (a later batch's) may be written in either order: the newer
-    /// mark stays. A mark lower than the row's is kept out.
     /// A dropped channel's stored pts and behind row are deleted, unless a
     /// batch at or after the drop has marked it since (it started again);
     /// the delta's own channel rows are written after the deletion.
@@ -1147,6 +1144,9 @@ mod tests {
         assert_eq!(st.behind, vec![(2, 3), (3, 7)]);
     }
 
+    /// A commit reporting a channel caught up and a newer mark of that
+    /// channel (a later batch's) may be written in either order: the newer
+    /// mark stays. A mark lower than the row's is kept out.
     #[test]
     fn caught_up_never_erases_a_newer_mark() {
         let tmp = tempfile::tempdir().expect("tempdir");
