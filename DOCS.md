@@ -675,7 +675,7 @@ $ curl -s -H "Authorization: Bearer $(cat admin_token)" http://127.0.0.1:9090/v1
   "catching_up":{"common":false,"channels":0}}]}
 ```
 
-- `state`: `logged_out` (with `"login_in_progress": true` while a login of this process holds the session), `connecting`, `running`, `flood_wait`, `frozen` (Telegram answered `FROZEN_*`: the account is read-only; it stays so until the account restarts, is logged out or needs a new login), `needs_login` (Telegram no longer accepts the authorization: log out and in again) or `failed`.
+- `state`: `logged_out` (with `"session_held_by": "login"` or `"logout"` while that operation of this process holds the session; the account starts once it ends), `connecting`, `running`, `flood_wait`, `frozen` (Telegram answered `FROZEN_*`: the account is read-only; it stays so until the account restarts, is logged out or needs a new login), `needs_login` (Telegram no longer accepts the authorization: log out and in again) or `failed`.
 - `flood_wait` has `until`, in unix seconds. It means one of two things. Telegram refused the main session's init call with a flood wait: the account is offline and connects again at `until`. Or Telegram asked for a flood wait on a catch-up call (`updates.getState`, `getDifference`): the account stays connected, receives live updates and serves RPC, and catch-up resumes at `until`.
 - `failed` carries a `reason` and `retrying`: `duplicate_account` and `init_refused` (Telegram refused the init call, `API_ID_INVALID` say) are not retried; `session_held`, `storage`, `connect` and `panicked` are, after a backoff from 1 s doubling to 60 s.
 - `home_dc` is `null` until the session was read; `catching_up` shows whether the common box and how many channels are catching up.

@@ -327,7 +327,7 @@ impl App {
             move |name| {
                 slot.get()
                     .and_then(Weak::upgrade)
-                    .is_some_and(|logins| logins.login_in_progress(name))
+                    .and_then(|logins| logins.session_held_by(name))
             }
         }));
         let account_sources = Arc::new(AccountSources::new(

@@ -484,7 +484,7 @@ async fn logged_out_account_starts_after_a_login_without_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let run = start_in("main", dir, &net, &registry);
     until(&run.account, |s| {
-        *s == AccountState::LoggedOut { login: false }
+        *s == AccountState::LoggedOut { held_by: None }
     })
     .await;
     assert!(net.dials().is_empty());
@@ -521,11 +521,13 @@ async fn a_login_in_progress_keeps_the_account_waiting() {
     let busy = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(Registry::with_logins({
         let busy = Arc::clone(&busy);
-        move |_| busy.load(Ordering::SeqCst)
+        move |_| busy.load(Ordering::SeqCst).then_some(SessionUse::Logout)
     }));
     let run = start(&net, &registry);
     until(&run.account, |s| {
-        *s == AccountState::LoggedOut { login: true }
+        *s == AccountState::LoggedOut {
+            held_by: Some(SessionUse::Logout),
+        }
     })
     .await;
     assert!(net.dials().is_empty());

@@ -80,44 +80,49 @@ async fn accounts_status(State(shared): State<Arc<Shared>>) -> axum::Json<Accoun
         .account_sources
         .statuses()
         .into_iter()
-        .map(|status| {
-            let (until, reason, retrying, login) = match &status.state {
-                AccountState::FloodWait { until } => (
-                    Some(
-                        until
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs()),
-                    ),
-                    None,
-                    None,
-                    false,
-                ),
-                AccountState::Failed(failure) => (
-                    None,
-                    Some(failure.as_str().to_owned()),
-                    Some(failure.retried()),
-                    false,
-                ),
-                AccountState::LoggedOut { login } => (None, None, None, *login),
-                _ => (None, None, None, false),
-            };
-            AccountStatus {
-                name: status.name.to_string(),
-                state: status.state.name().to_owned(),
-                until,
-                reason,
-                retrying,
-                login_in_progress: login,
-                layer: status.layer,
-                home_dc: status.home_dc,
-                catching_up: CatchingUp {
-                    common: status.catching_up.common,
-                    channels: status.catching_up.channels,
-                },
-            }
-        })
+        .map(account_status)
         .collect();
     axum::Json(AccountsStatus { accounts })
+}
+
+/// One account as `GET /v1/accounts` shows it.
+fn account_status(status: tgin_mtproto::account::AccountStatus) -> AccountStatus {
+    let (until, reason, retrying, held_by) = match &status.state {
+        AccountState::FloodWait { until } => (
+            Some(
+                until
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            None,
+            None,
+            None,
+        ),
+        AccountState::Failed(failure) => (
+            None,
+            Some(failure.as_str().to_owned()),
+            Some(failure.retried()),
+            None,
+        ),
+        AccountState::LoggedOut { held_by } => {
+            (None, None, None, held_by.map(|h| h.as_str().to_owned()))
+        }
+        _ => (None, None, None, None),
+    };
+    AccountStatus {
+        name: status.name.to_string(),
+        state: status.state.name().to_owned(),
+        until,
+        reason,
+        retrying,
+        session_held_by: held_by,
+        layer: status.layer,
+        home_dc: status.home_dc,
+        catching_up: CatchingUp {
+            common: status.catching_up.common,
+            channels: status.catching_up.channels,
+        },
+    }
 }
 
 /// Whether `headers` carry the admin token of the running config (so a
@@ -512,4 +517,40 @@ fn refused(shared: &Shared, err: &ApiError, more: &str) -> Response {
         "description": shared.redactor.load().redact(&text),
     });
     (StatusCode::BAD_GATEWAY, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tgin_mtproto::account::{AccountState, AccountStatus, SessionUse};
+
+    use super::account_status;
+
+    fn logged_out(held_by: Option<SessionUse>) -> AccountStatus {
+        AccountStatus {
+            name: Arc::from("main"),
+            state: AccountState::LoggedOut { held_by },
+            layer: 230,
+            home_dc: None,
+            catching_up: tgin_mtproto::CatchingUp::default(),
+            updates: 0,
+            dropped: tgin_mtproto::Dropped::default(),
+        }
+    }
+
+    /// A logged-out account names the operation that holds its session.
+    #[test]
+    fn accounts_name_what_holds_the_session() {
+        for (held_by, shown) in [
+            (Some(SessionUse::Login), Some("login")),
+            (Some(SessionUse::Logout), Some("logout")),
+            (None, None),
+        ] {
+            let json = serde_json::to_value(account_status(logged_out(held_by))).expect("json");
+            assert_eq!(json["state"], "logged_out");
+            assert_eq!(json.get("session_held_by").and_then(|v| v.as_str()), shown);
+            assert!(json.get("login_in_progress").is_none(), "{json}");
+        }
+    }
 }

@@ -218,13 +218,31 @@ impl Failure {
     }
 }
 
+/// An operation of this process that holds an account's session, so the
+/// account waits for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionUse {
+    Login,
+    Logout,
+}
+
+impl SessionUse {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Logout => "logout",
+        }
+    }
+}
+
 /// Where an account stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountState {
-    /// No login is recorded. `login`: a login of this process holds the
-    /// session; the account starts once it ends.
+    /// No login is recorded, or an operation of this process (`held_by`)
+    /// holds the session: the account starts once it ends.
     LoggedOut {
-        login: bool,
+        held_by: Option<SessionUse>,
     },
     /// Opening the session, or the main session is not connected.
     Connecting,
@@ -302,8 +320,9 @@ pub struct AccountStatus {
     pub dropped: Dropped,
 }
 
-/// Says whether a login of this process holds an account's session.
-type LoginCheck = Box<dyn Fn(&str) -> bool + Send + Sync>;
+/// Says which operation of this process, if any, holds an account's
+/// session.
+type LoginCheck = Box<dyn Fn(&str) -> Option<SessionUse> + Send + Sync>;
 
 /// The accounts of one process: which Telegram user each runs as, and
 /// which have a login under way.
@@ -319,7 +338,9 @@ impl Registry {
     /// `logins(account)` says whether a login of this process holds, or is
     /// about to hold, the account's session.
     #[must_use]
-    pub fn with_logins(logins: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+    pub fn with_logins(
+        logins: impl Fn(&str) -> Option<SessionUse> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             users: Mutex::new(HashMap::new()),
             logins: Some(Box::new(logins)),
@@ -365,8 +386,8 @@ impl Registry {
         }
     }
 
-    fn login_in_progress(&self, account: &str) -> bool {
-        self.logins.as_ref().is_some_and(|logins| logins(account))
+    fn held_by(&self, account: &str) -> Option<SessionUse> {
+        self.logins.as_ref().and_then(|logins| logins(account))
     }
 }
 
@@ -947,18 +968,22 @@ fn known(store: &SessionStore) -> Result<Known, SessionError> {
 async fn run(ctx: Arc<Ctx>) -> End {
     let shared = &ctx.shared;
     let name = &shared.name;
-    if ctx.registry.login_in_progress(name) {
-        shared.set_state(AccountState::LoggedOut { login: true });
+    if let Some(held_by) = ctx.registry.held_by(name) {
+        shared.set_state(AccountState::LoggedOut {
+            held_by: Some(held_by),
+        });
         return End::Wait;
     }
     shared.set_state(AccountState::Connecting);
     let store = match SessionStore::open(&ctx.dir) {
         Ok(store) => Arc::new(store),
-        Err(SessionError::Held { .. }) if ctx.registry.login_in_progress(name) => {
-            shared.set_state(AccountState::LoggedOut { login: true });
-            return End::Wait;
-        }
         Err(SessionError::Held { .. }) => {
+            if let Some(held_by) = ctx.registry.held_by(name) {
+                shared.set_state(AccountState::LoggedOut {
+                    held_by: Some(held_by),
+                });
+                return End::Wait;
+            }
             tracing::warn!(account = %name, "the account's session is held by another process");
             shared.set_state(AccountState::Failed(Failure::SessionHeld));
             return End::Retry;
@@ -970,7 +995,7 @@ async fn run(ctx: Arc<Ctx>) -> End {
         Ok(Known::LoggedOut) => {
             ctx.registry.release(name);
             shared.frozen.store(false, Ordering::Relaxed);
-            shared.set_state(AccountState::LoggedOut { login: false });
+            shared.set_state(AccountState::LoggedOut { held_by: None });
             return End::Wait;
         }
         Ok(Known::Broken) => return ctx.needs_login(),

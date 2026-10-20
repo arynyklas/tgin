@@ -217,9 +217,10 @@ pub struct AccountStatus {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrying: Option<bool>,
-    /// `logged_out`: a login of this process holds the session.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub login_in_progress: bool,
+    /// `logged_out`: the operation of this process that holds the
+    /// session, `login` or `logout`; the account starts once it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_held_by: Option<String>,
     /// The one layer the account serves.
     pub layer: i32,
     /// Once the session was read.

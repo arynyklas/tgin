@@ -36,6 +36,7 @@ use tgin_mtproto::{InitParams, SessionError, SessionStore};
 
 use super::{LoginStatus, LoginUrl};
 use crate::accounts::AccountSources;
+use tgin_mtproto::account::SessionUse;
 
 /// How long `POST …/login` waits for Telegram's first answer before it
 /// answers `connecting`.
@@ -269,16 +270,16 @@ impl Accounts {
         }
     }
 
-    /// Whether a login of the account `name` is starting or running: it
-    /// holds, or is about to hold, the account's session.
-    pub(crate) fn login_in_progress(&self, name: &str) -> bool {
-        self.logins
-            .lock()
-            .get(name)
-            .is_some_and(|entry| match entry {
-                Entry::Starting { .. } | Entry::LoggingOut { .. } => true,
-                Entry::Running(login) => !login.handle.state().is_final(),
-            })
+    /// Which operation of the account `name`, a login starting or running
+    /// or a logout, holds or is about to hold the account's session.
+    pub(crate) fn session_held_by(&self, name: &str) -> Option<SessionUse> {
+        self.logins.lock().get(name).and_then(|entry| match entry {
+            Entry::Starting { .. } => Some(SessionUse::Login),
+            Entry::Running(login) => {
+                (!login.handle.state().is_final()).then_some(SessionUse::Login)
+            }
+            Entry::LoggingOut { .. } => Some(SessionUse::Logout),
+        })
     }
 }
 

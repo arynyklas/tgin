@@ -1044,8 +1044,11 @@ async fn a_finished_login_wakes_its_account() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(s.state.accounts.login_in_progress("main"));
-    assert!(!s.state.accounts.login_in_progress("second"));
+    assert_eq!(
+        s.state.accounts.session_held_by("main"),
+        Some(SessionUse::Login)
+    );
+    assert_eq!(s.state.accounts.session_held_by("second"), None);
     assert!(s.fake.changed.lock().expect("changed").is_empty());
 
     assert!(s.fake.dial.push(update_login_token()));
@@ -1059,7 +1062,7 @@ async fn a_finished_login_wakes_its_account() {
     .await
     .expect("the account is told");
     assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
-    assert!(!s.state.accounts.login_in_progress("main"));
+    assert_eq!(s.state.accounts.session_held_by("main"), None);
 }
 
 /// A logged-in session on DC 2 for `main`.
@@ -1086,7 +1089,7 @@ async fn logout_parks_a_running_account() {
         assert_eq!(*s.fake.parked.lock().expect("parked"), ["main"]);
         assert_eq!(*s.fake.changed.lock().expect("changed"), ["main"]);
         assert!(s.fake.dial.done(), "auth.logOut was sent");
-        assert!(!s.state.accounts.login_in_progress("main"));
+        assert_eq!(s.state.accounts.session_held_by("main"), None);
     }
 }
 
@@ -1110,7 +1113,7 @@ async fn a_login_waits_for_a_logout() {
     .await
     .expect("the account is parked");
     assert!(
-        s.state.accounts.login_in_progress("main"),
+        s.state.accounts.session_held_by("main") == Some(SessionUse::Logout),
         "the account stays parked"
     );
     let (status, body) = call(
@@ -1163,7 +1166,7 @@ async fn a_logout_survives_a_phone_only_reload() {
         .reconcile(|name| (name == "main").then(|| changed.clone()))
         .await;
     assert!(
-        s.state.accounts.login_in_progress("main"),
+        s.state.accounts.session_held_by("main") == Some(SessionUse::Logout),
         "the account stays parked"
     );
     assert!(s.fake.changed.lock().expect("changed").is_empty());
