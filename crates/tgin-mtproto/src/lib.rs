@@ -22,6 +22,7 @@
 //! and RPC.
 
 pub mod account;
+mod authorization;
 mod dc;
 pub mod decode;
 pub mod envelope;

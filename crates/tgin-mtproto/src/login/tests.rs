@@ -1241,3 +1241,226 @@ async fn a_hanging_leftover_probe_is_bounded() {
     let store = wait_reopen(&tmp).await;
     assert_eq!(store.home_dc().expect("home"), Some(4));
 }
+
+/// The code login starts on DC 2. An account homed elsewhere answers
+/// `auth.sendCode` (or, later, `auth.signIn`) with `303 *_MIGRATE_X`: the
+/// login makes a new key on DC X, stores it as home, and sends the request
+/// once more there.
+#[tokio::test]
+async fn code_login_follows_a_migrate() {
+    for (name, send_reply) in [
+        ("phone", Reply::Rpc(303, "PHONE_MIGRATE_4")),
+        ("network", Reply::Rpc(303, "NETWORK_MIGRATE_4")),
+        ("user", Reply::Rpc(303, "USER_MIGRATE_4")),
+    ] {
+        let (h, dial, tmp) = begin(
+            Method::Code,
+            Some(PHONE),
+            vec![
+                (ids::SEND_CODE, send_reply),
+                (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+                (
+                    ids::SIGN_IN,
+                    Reply::Ok(authorization(51, Some("88800000000"))),
+                ),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(settled(&h).await, LoginState::CodeSent { .. }),
+            "{name}"
+        );
+        assert_eq!(
+            h.submit_code("12345".into()).await,
+            Ok(LoginState::LoggedIn { user_id: 51 }),
+            "{name}"
+        );
+        assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)], "{name}");
+        assert_eq!(
+            dial.calls(),
+            vec![
+                (FIRST_DC, ids::SEND_CODE),
+                (4, ids::SEND_CODE),
+                (4, ids::SIGN_IN)
+            ],
+            "{name}"
+        );
+        drop(h);
+        let store = wait_reopen(&tmp).await;
+        assert_eq!(store.home_dc().expect("home"), Some(4), "{name}");
+        assert!(store.login().expect("login").is_some(), "{name}");
+    }
+}
+
+/// `auth.signIn` moved to another DC is sent once more there; a wrong code
+/// on the new DC stays a retryable answer.
+#[tokio::test]
+async fn sign_in_follows_a_migrate() {
+    let (h, dial, tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+            (ids::SIGN_IN, Reply::Rpc(303, "USER_MIGRATE_5")),
+            (ids::SIGN_IN, Reply::Rpc(400, "PHONE_CODE_INVALID")),
+            (
+                ids::SIGN_IN,
+                Reply::Ok(authorization(52, Some("88800000000"))),
+            ),
+        ],
+    )
+    .await;
+    settled(&h).await;
+    assert_eq!(
+        h.submit_code("1".into()).await,
+        Err(LoginError::CodeInvalid)
+    );
+    assert_eq!(
+        h.submit_code("2".into()).await,
+        Ok(LoginState::LoggedIn { user_id: 52 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (5, false)]);
+    assert_eq!(
+        dial.calls(),
+        vec![
+            (FIRST_DC, ids::SEND_CODE),
+            (FIRST_DC, ids::SIGN_IN),
+            (5, ids::SIGN_IN),
+            (5, ids::SIGN_IN)
+        ]
+    );
+    drop(h);
+    assert_eq!(wait_reopen(&tmp).await.home_dc().expect("home"), Some(5));
+}
+
+/// A second move after the first is not followed: `MigrateLoop`.
+#[tokio::test]
+async fn code_login_follows_one_migrate_only() {
+    let (h, dial, _tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_4")),
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_5")),
+        ],
+    )
+    .await;
+    assert_eq!(
+        end(&h).await,
+        LoginState::Failed(LoginError::MigrateLoop { dc: 5 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)]);
+}
+
+/// `auth.signIn` moved again after `auth.sendCode` was moved: a loop, not
+/// followed; no third DC is dialled.
+#[tokio::test]
+async fn sign_in_moved_after_send_code_moved_is_a_loop() {
+    let (h, dial, _tmp) = begin(
+        Method::Code,
+        Some(PHONE),
+        vec![
+            (ids::SEND_CODE, Reply::Rpc(303, "PHONE_MIGRATE_4")),
+            (ids::SEND_CODE, Reply::Ok(sent_code(&sms()))),
+            (ids::SIGN_IN, Reply::Rpc(303, "USER_MIGRATE_5")),
+        ],
+    )
+    .await;
+    settled(&h).await;
+    h.submit_code("1".into()).await.expect("handed over");
+    assert_eq!(
+        end(&h).await,
+        LoginState::Failed(LoginError::MigrateLoop { dc: 5 })
+    );
+    assert_eq!(dial.dials(), vec![(FIRST_DC, false), (4, false)]);
+}
+
+/// A copied session directory: Telegram drops the key and answers 406
+/// `AUTH_KEY_DUPLICATED`, to `auth.logOut` or to the connection's init
+/// call. The authorization is gone, so the logout is confirmed and clears
+/// the session, and a new login can start; before, logout answered
+/// "unconfirmed" and login "logged in" for good.
+#[tokio::test]
+async fn log_out_accepts_a_duplicated_key() {
+    for reply in [
+        Reply::Rpc(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(401, "AUTH_KEY_UNREGISTERED"),
+        Reply::KeyUnknown,
+    ] {
+        let (_tmp, store) = store();
+        store.set_home_key(2, &AuthKey([1; 256])).expect("key");
+        store
+            .record_login(Peer {
+                id: 7,
+                kind: PeerKind::User {
+                    bot: Some(false),
+                    is_self: None,
+                },
+                access_hash: None,
+            })
+            .expect("login");
+        let dial = ScriptedDial::new(vec![(ids::LOG_OUT, reply.clone())]);
+        log_out(&store, &dial)
+            .await
+            .unwrap_or_else(|e| panic!("{reply:?}: {e}"));
+        assert_eq!(store.login().expect("login"), None, "{reply:?}");
+        assert_eq!(store.auth_key(2).expect("key"), None, "{reply:?}");
+        let dial = ScriptedDial::new(vec![(
+            ids::EXPORT_LOGIN_TOKEN,
+            Reply::Ok(login_token(b"t", later())),
+        )]);
+        let h = start(store, dial, params(None), Method::Qr)
+            .await
+            .unwrap_or_else(|e| panic!("{reply:?}: {e}"));
+        assert!(
+            matches!(settled(&h).await, LoginState::Qr { .. }),
+            "{reply:?}"
+        );
+    }
+    // A flood wait on the init call is not a lost authorization.
+    let (_tmp, store) = store();
+    store.set_home_key(2, &AuthKey([1; 256])).expect("key");
+    let dial = ScriptedDial::new(vec![(
+        ids::LOG_OUT,
+        Reply::InitRefused(420, "FLOOD_WAIT_9"),
+    )]);
+    assert!(log_out(&store, &dial).await.is_err());
+    assert!(store.auth_key(2).expect("key").is_some());
+}
+
+/// A leftover key Telegram answers with `AUTH_KEY_DUPLICATED` holds no
+/// login: the session is reset and a fresh login starts.
+#[tokio::test]
+async fn a_duplicated_leftover_key_starts_fresh() {
+    for gone in [
+        Reply::Rpc(406, "AUTH_KEY_DUPLICATED"),
+        Reply::InitRefused(406, "AUTH_KEY_DUPLICATED"),
+        Reply::Rpc(401, "SESSION_PASSWORD_NEEDED"),
+    ] {
+        let (tmp, store) = self::store();
+        store.set_home_key(4, &AuthKey([7; 256])).expect("key");
+        let dial = ScriptedDial::new(vec![
+            (ids::GET_USERS, gone.clone()),
+            (
+                ids::EXPORT_LOGIN_TOKEN,
+                Reply::Ok(login_token_success(8, None)),
+            ),
+        ]);
+        let h = start(store, dial.clone(), params(None), Method::Qr)
+            .await
+            .unwrap_or_else(|e| panic!("{gone:?}: {e}"));
+        assert_eq!(
+            end(&h).await,
+            LoginState::LoggedIn { user_id: 8 },
+            "{gone:?}"
+        );
+        assert_eq!(dial.dials(), vec![(4, true), (FIRST_DC, false)], "{gone:?}");
+        drop(h);
+        assert_eq!(
+            wait_reopen(&tmp).await.auth_key(4).expect("old key"),
+            None,
+            "{gone:?}"
+        );
+    }
+}

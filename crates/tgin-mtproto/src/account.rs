@@ -71,6 +71,7 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::authorization::gone as lost_authorization;
 use crate::decode::BoxKind;
 use crate::media::{AccountSessions, Connect, KeyStore, MediaConnected, Session};
 use crate::rpc::{
@@ -810,7 +811,7 @@ fn observe(shared: &Shared, route: Route, home: i32, outcome: &Result<RpcOutcome
         Route::Media(dc) => dc == home,
     };
     match outcome {
-        Err(InvokeError::Sender(SenderError::KeyRevoked | SenderError::KeyUnknown)) if main => {
+        Err(InvokeError::Sender(e)) if main && crate::authorization::sender_gone(e) => {
             shared.main_key_gone();
         }
         Ok(RpcOutcome::Error { code, message }) if main && lost_authorization(*code, message) => {
@@ -1142,13 +1143,6 @@ impl Ctx {
             .set_state(AccountState::Failed(Failure::Connect));
         End::Retry
     }
-}
-
-/// A 401 (`AUTH_KEY_UNREGISTERED`, `SESSION_REVOKED`…) or
-/// `AUTH_KEY_DUPLICATED`: the authorization is gone. `SESSION_PASSWORD_NEEDED`
-/// is a 401 of a login, never of a logged-in session.
-fn lost_authorization(code: i32, message: &str) -> bool {
-    (code == 401 && message != "SESSION_PASSWORD_NEEDED") || message == "AUTH_KEY_DUPLICATED"
 }
 
 /// Refusals of a channel's difference that say the account can no longer
