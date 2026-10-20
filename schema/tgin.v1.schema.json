@@ -1168,7 +1168,7 @@
         },
         "allow_paid_stars": {
           "default": false,
-          "description": "Let the client's requests set `allow_paid_stars`, which spends the\naccount's Stars on messages to peers that charge for them. Off, such\na request is refused with 403 `paid_stars_not_allowed`.",
+          "description": "Let the client's calls spend the account's Stars or TON. Off, a call\nis refused with 403 `paid_stars_not_allowed` when it sets\n`allow_paid_stars` (paying a recipient's price) or\n`allow_paid_floodskip` (paying to skip a flood wait) on the\nfunction's own fields, or holds anywhere a `suggestedPost` with a\n`price` or an `inputMediaStakeDice` (a TON bet).",
           "type": "boolean"
         },
         "deny": {

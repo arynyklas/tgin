@@ -601,9 +601,12 @@ pub struct RpcClient {
     #[serde(default)]
     #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
     pub deny: Vec<At<String>>,
-    /// Let the client's requests set `allow_paid_stars`, which spends the
-    /// account's Stars on messages to peers that charge for them. Off, such
-    /// a request is refused with 403 `paid_stars_not_allowed`.
+    /// Let the client's calls spend the account's Stars or TON. Off, a call
+    /// is refused with 403 `paid_stars_not_allowed` when it sets
+    /// `allow_paid_stars` (paying a recipient's price) or
+    /// `allow_paid_floodskip` (paying to skip a flood wait) on the
+    /// function's own fields, or holds anywhere a `suggestedPost` with a
+    /// `price` or an `inputMediaStakeDice` (a TON bet).
     #[serde(default = "defaults::allow_paid_stars")]
     #[schemars(extend("default" = false))]
     pub allow_paid_stars: At<bool>,

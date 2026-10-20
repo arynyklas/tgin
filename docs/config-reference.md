@@ -127,7 +127,7 @@ One downstream allowed to call the account.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `allow` | list of string (matching `^(\*\|[A-Za-z][A-Za-z0-9_]*\.\*\|([A-Za-z][A-Za-z0-9_]*\.)?[A-Za-z][A-Za-z0-9_]*)$`) | `[]` | Methods the client may call: `*`, `<namespace>.*` such as `messages.*`, or a method name such as `messages.sendMessage`. Empty, it may call none. A glob grants only methods of the reviewed namespaces (`account`, `channels`, `contacts`, `help`, `langpack`, `messages`, `phone`, `photos`, `stats`, `stickers`, `stories`, `upload`, `users`) that change nothing account-wide; every other method, such as `payments.*`, `auth.*` or `account.updateProfile`, is allowed only when listed by exact name. |
-| `allow_paid_stars` | boolean | `false` | Let the client's requests set `allow_paid_stars`, which spends the account's Stars on messages to peers that charge for them. Off, such a request is refused with 403 `paid_stars_not_allowed`. |
+| `allow_paid_stars` | boolean | `false` | Let the client's calls spend the account's Stars or TON. Off, a call is refused with 403 `paid_stars_not_allowed` when it sets `allow_paid_stars` (paying a recipient's price) or `allow_paid_floodskip` (paying to skip a flood wait) on the function's own fields, or holds anywhere a `suggestedPost` with a `price` or an `inputMediaStakeDice` (a TON bet). |
 | `deny` | list of string (matching `^(\*\|[A-Za-z][A-Za-z0-9_]*\.\*\|([A-Za-z][A-Za-z0-9_]*\.)?[A-Za-z][A-Za-z0-9_]*)$`) | `[]` | Methods the client may never call, with `allow`'s syntax; deny wins. |
 | `token` | [Secret](#secret) | **required** | The bearer token the client sends; unique within the account. |
 
