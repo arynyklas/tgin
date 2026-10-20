@@ -1421,7 +1421,8 @@ async fn refused_batch_without_updates_keeps_its_state() {
 
 /// A signal cuts a pending retry short: after a long cut the backoff is at
 /// 60 s, and the reconnect's `updatesTooLong` (or a channel's
-/// `updateChannelTooLong`) asks at once instead of waiting it out.
+/// `updateChannelTooLong`) asks at once instead of waiting it out. It does
+/// not reset the backoff; an answer does.
 #[tokio::test(start_paused = true)]
 async fn signal_cuts_a_pending_retry_short() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));
@@ -1439,21 +1440,36 @@ async fn signal_cuts_a_pending_retry_short() {
         matches!(m.next_action(), Some(Fetch::GetDifference { pts: 10, .. })),
         "at once"
     );
-    // The answer's backoff starts afresh on the next failure.
+    // The signal keeps the backoff: a failure right after it waits the
+    // full minute again. Only an answer resets it.
     let f = Fetch::GetDifference {
         pts: 10,
         qts: 5,
         date: 1,
     };
     m.fetch_failed(f);
-    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
-    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
-    nothing(&mut m, &batches);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(60));
+    advance(Duration::from_secs(60)).await;
+    let f = m.next_action().expect("the difference again");
+    assert!(matches!(f, Fetch::GetDifference { .. }));
+    let batches = m.feed_difference(b(difference_empty(1, 3)));
+    commit(&mut m, &batches);
+    m.feed_push(too_long());
+    let f = m.next_action().expect("asked");
+    assert!(matches!(f, Fetch::GetDifference { .. }));
+    m.fetch_failed(f);
+    assert_eq!(
+        m.deadline(),
+        Instant::now() + Duration::from_secs(1),
+        "the answer reset the backoff"
+    );
     advance(Duration::from_secs(1)).await;
     let f = m.next_action().expect("the difference again");
     assert!(matches!(f, Fetch::GetDifference { .. }));
     let batches = m.feed_difference(b(difference_empty(1, 3)));
     commit(&mut m, &batches);
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
 
     let f = m.next_action().expect("channel 1");
     assert_eq!(f, Fetch::GetChannelDifference { channel: 1, pts: 5 });
@@ -1469,12 +1485,13 @@ async fn signal_cuts_a_pending_retry_short() {
     assert_eq!(m.next_action(), Some(f), "the channel at once");
 }
 
-/// A path that drops every connection after its init call: each catch-up
-/// call fails, and each drop makes the sender push its connection-end
-/// signal. The signal asks for a difference but never cuts the backoff
-/// short, so the gaps between calls double up to 60 s instead of a call a
-/// second forever. Telegram's own `updatesTooLong`, on a live session,
-/// still cuts it short.
+/// A path that drops every connection after its init call: each new
+/// connection's `new_session_created` makes the sender push
+/// `updatesTooLong` while the catch-up call is in flight, the call then
+/// fails, and the drop makes the sender push its connection-end signal.
+/// Neither signal resets the backoff, so the gaps between calls double up
+/// to 60 s instead of a call a second forever. Telegram's own
+/// `updatesTooLong`, on a live session, still cuts a pending retry short.
 #[tokio::test(start_paused = true)]
 async fn dropped_connections_back_off_to_a_minute() {
     let mut m = started(stored(10, &[], &[5]));
@@ -1482,7 +1499,9 @@ async fn dropped_connections_back_off_to_a_minute() {
     let mut f = m.next_action().expect("the catch-up");
     let mut gaps = Vec::new();
     for _ in 0..9 {
-        // The call is lost with the connection, which then ends.
+        // The call's new connection reports a new session, then the call
+        // is lost with the connection, which then ends.
+        assert!(m.feed_push(too_long()).is_empty());
         m.fetch_failed(f);
         assert!(m.feed_push(connection_ended()).is_empty());
         assert_eq!(m.next_action(), None, "no call before the backoff");

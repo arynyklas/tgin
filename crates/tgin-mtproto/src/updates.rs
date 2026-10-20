@@ -736,9 +736,11 @@ impl UpdateManager {
         };
         if c.constructor == "updatesTooLong" {
             // A pending retry is cut short: the signal came on a live
-            // session, so the server is reachable again.
+            // session, so the server is reachable again. The backoff stays
+            // (an answer resets it): Telegram sends `new_session_created`
+            // on every new connection, so on a path that drops each one
+            // after its init call, resetting it would ask once a second.
             self.retry_at = None;
-            self.backoff = Duration::ZERO;
             self.want_difference();
             return Vec::new();
         }
