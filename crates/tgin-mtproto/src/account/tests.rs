@@ -934,3 +934,29 @@ async fn rpc_on_an_account_failed_for_good_is_unavailable() {
     );
     run.account.close().await;
 }
+
+/// A running account whose catch-up call fails shows `connecting` until a
+/// call reaches Telegram again.
+#[tokio::test(start_paused = true)]
+async fn a_failed_catch_up_shows_connecting() {
+    let net = FakeNetwork::new();
+    let mut differences = 0;
+    net.answer(move |call| match call.ctor() {
+        ids::GET_DIFFERENCE => {
+            differences += 1;
+            if differences == 2 {
+                Reply::NoAnswer
+            } else {
+                Reply::Ok(crate::testkit::difference_empty(1, 1))
+            }
+        }
+        _ => Reply::Rpc(400, "NOT_SCRIPTED"),
+    });
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    assert!(net.push(crate::testkit::updates_too_long()));
+    until(&run.account, |s| *s == AccountState::Connecting).await;
+    until(&run.account, running).await;
+    run.account.close().await;
+}
