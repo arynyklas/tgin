@@ -294,7 +294,7 @@ glob	contacts.getBirthdays
 glob	contacts.getBlocked
 glob	contacts.getContactIDs
 glob	contacts.getContacts
-glob	contacts.getLocated
+exact	contacts.getLocated
 glob	contacts.getSaved
 glob	contacts.getSponsoredPeers
 glob	contacts.getStatuses

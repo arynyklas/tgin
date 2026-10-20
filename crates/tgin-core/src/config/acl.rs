@@ -48,7 +48,7 @@ pub const GLOB_NAMESPACES: [&str; 13] = [
 ///
 /// A glob never allows these, `*` included: an operator lists each one
 /// exactly in a client's `allow`, and the loader warns about it.
-pub const ACCOUNT_CHANGING: [&str; 41] = [
+pub const ACCOUNT_CHANGING: [&str; 42] = [
     "account.*",
     // Sets the price of messages to the channel, in Stars.
     "channels.updatePaidMessagesPrice",
@@ -59,6 +59,8 @@ pub const ACCOUNT_CHANGING: [&str; 41] = [
     "contacts.deleteByPhones",
     "contacts.deleteContacts",
     "contacts.editCloseFriends",
+    // With `self_expires`, publishes the account's location.
+    "contacts.getLocated",
     "contacts.importContacts",
     "contacts.resetSaved",
     "contacts.resetTopPeerRating",

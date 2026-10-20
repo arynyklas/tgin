@@ -4130,3 +4130,11 @@ fn decline_url_auth_stays_glob_grantable() {
     assert!(!config::exact_only("messages.declineUrlAuth"));
     assert!(config::exact_only("messages.requestUrlAuth"));
 }
+
+/// `contacts.getLocated` with `self_expires` publishes the account's
+/// location, so only an exact entry grants it.
+#[test]
+fn get_located_needs_an_exact_entry() {
+    assert!(config::exact_only("contacts.getLocated"));
+    assert!(!config::exact_only("contacts.getContacts"));
+}
