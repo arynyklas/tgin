@@ -2,25 +2,31 @@
 //! endpoint treats it, against the reviewed classification in
 //! `tests/fixtures/acl-layer-230.txt`.
 //!
-//! - `refused`: never forwarded, whatever the allowlist says: the wrappers
-//!   (`initConnection`, `invoke*`), the update methods and the
-//!   authorization methods of `tgin-mtproto`'s `rpc.rs`.
+//! - `refused`: never forwarded, whatever the allowlist says
+//!   ([`always_refused`]: the authorization and update methods and the
+//!   `invoke*` wrappers); [`unwrap_request`] refuses each.
+//! - `stripped`: `initConnection` and `invokeWithLayer`, which
+//!   [`unwrap_request`] unwraps.
 //! - `exact`: granted only by an exact `allow` entry.
 //! - `glob`: a glob may grant it.
 //!
 //! A layer bump fails this test until the new classification is reviewed
 //! and the fixture renamed and rewritten. To print the classification the
 //! code gives now, into the fixture: `TGIN_WRITE_ACL_FIXTURE=1 cargo test
-//! -p tgin-core --test acl_layer`, then review the diff.
+//! -p tgin --test acl_layer`, then review the diff.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tgin_core::config::{self, ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, GLOB_NAMESPACES};
+use tgin_mtproto::rpc::{Refused, always_refused, function_id, unwrap_request};
 
 /// The layer the classification was reviewed for; the vendored schema
 /// must be this one.
-const LAYER: u32 = 230;
+const LAYER: i32 = 230;
+
+/// The wrappers [`unwrap_request`] unwraps rather than refuses.
+const STRIPPED: [&str; 2] = ["initConnection", "invokeWithLayer"];
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -57,35 +63,14 @@ fn functions() -> Vec<String> {
     out
 }
 
-/// The quoted names of the `const <name>: [&str; N] = [ … ];` in `text`.
-fn const_list(text: &str, name: &str) -> Vec<String> {
-    let start = text
-        .find(&format!("const {name}: [&str;"))
-        .unwrap_or_else(|| panic!("no `{name}` in rpc.rs"));
-    let body = &text[start..];
-    let body = &body[body.find("= [").expect("a list")..body.find("];").expect("its end")];
-    body.split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_owned)
-        .collect()
-}
-
-/// What `tgin-mtproto` refuses whatever the allowlist says.
-fn always_refused() -> Vec<String> {
-    let rpc = read(&workspace().join("crates/tgin-mtproto/src/rpc.rs"));
-    let mut out = const_list(&rpc, "AUTHORIZATION_METHODS");
-    out.extend(const_list(&rpc, "UPDATES_METHODS"));
-    out
-}
-
 fn classify(functions: &[String]) -> BTreeMap<String, &'static str> {
-    let refused = always_refused();
     functions
         .iter()
         .map(|method| {
-            let class = if refused.contains(method) || !method.contains('.') {
+            let class = if always_refused(method) {
                 "refused"
+            } else if STRIPPED.contains(&method.as_str()) {
+                "stripped"
             } else if config::exact_only(method) {
                 "exact"
             } else {
@@ -142,14 +127,56 @@ fn every_function_of_the_layer_is_classified_as_reviewed() {
     }
 }
 
-/// The wrappers are the only functions without a namespace, and the RPC
-/// endpoint unwraps or refuses each.
+/// The functions read from the schema file are the ones the RPC endpoint
+/// decodes, and the only ones without a namespace are the wrappers, each
+/// refused or stripped.
 #[test]
-fn functions_without_a_namespace_are_wrappers() {
-    for method in functions().iter().filter(|m| !m.contains('.')) {
+fn the_schema_file_is_the_endpoint_schema() {
+    for method in functions() {
+        assert!(function_id(&method).is_some(), "{method}");
+        if !method.contains('.') {
+            assert!(
+                always_refused(&method) || STRIPPED.contains(&method.as_str()),
+                "{method} has no namespace and is neither refused nor stripped"
+            );
+        }
+    }
+}
+
+/// `unwrap_request` refuses every function of the `refused` class from its
+/// id alone, whatever follows, and refuses none of the others for being
+/// one.
+#[test]
+fn unwrap_request_refuses_the_refused_class() {
+    let functions = functions();
+    let refused: Vec<&String> = functions.iter().filter(|m| always_refused(m)).collect();
+    assert!(refused.len() >= 20, "{refused:?}");
+    for method in refused {
+        let id = function_id(method).unwrap_or_else(|| panic!("{method} has no id"));
+        let body = id.to_le_bytes();
+        let answer = unwrap_request(&body, LAYER);
         assert!(
-            method == "initConnection" || method.starts_with("invoke"),
-            "{method} has no namespace and is not a wrapper"
+            matches!(
+                answer,
+                Err(Refused::AuthorizationMethod(name)
+                    | Refused::UpdatesMethod(name)
+                    | Refused::Wrapper(name)) if name == method
+            ),
+            "{method}: {answer:?}"
+        );
+    }
+    for method in functions.iter().filter(|m| !always_refused(m)) {
+        let id = function_id(method).unwrap_or_else(|| panic!("{method} has no id"));
+        let body = id.to_le_bytes();
+        let answer = unwrap_request(&body, LAYER);
+        assert!(
+            !matches!(
+                answer,
+                Err(Refused::AuthorizationMethod(_)
+                    | Refused::UpdatesMethod(_)
+                    | Refused::Wrapper(_))
+            ),
+            "{method}: {answer:?}"
         );
     }
 }
@@ -167,12 +194,6 @@ fn the_lists_name_functions_of_the_layer() {
             None => functions.iter().any(|f| f == entry),
         };
         assert!(found, "{entry} is not in layer {LAYER}");
-    }
-    for entry in always_refused() {
-        assert!(
-            functions.contains(&entry),
-            "{entry} is not in layer {LAYER}"
-        );
     }
     for namespace in GLOB_NAMESPACES {
         assert!(

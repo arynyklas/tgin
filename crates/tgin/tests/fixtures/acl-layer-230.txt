@@ -345,13 +345,13 @@ glob	help.getUserInfo
 glob	help.hidePromoData
 glob	help.saveAppLog
 glob	help.setBotUpdatesStatus
-refused	initConnection
+stripped	initConnection
 refused	invokeAfterMsg
 refused	invokeAfterMsgs
 refused	invokeWithApnsSecret
 refused	invokeWithBusinessConnection
 refused	invokeWithGooglePlayIntegrity
-refused	invokeWithLayer
+stripped	invokeWithLayer
 refused	invokeWithMessagesRange
 refused	invokeWithReCaptcha
 refused	invokeWithTakeout
