@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use tgin_core::config::{self, ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, GLOB_NAMESPACES};
+use tgin_core::config::{self, ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, GLOB_NAMESPACES, IRREVERSIBLE};
 use tgin_mtproto::rpc::{Refused, always_refused, function_id, unwrap_request};
 
 /// The layer the classification was reviewed for; the vendored schema
@@ -186,7 +186,11 @@ fn unwrap_request_refuses_the_refused_class() {
 #[test]
 fn the_lists_name_functions_of_the_layer() {
     let functions = functions();
-    for entry in ACCOUNT_CHANGING.iter().chain(&ACCOUNT_READ_ONLY) {
+    for entry in ACCOUNT_CHANGING
+        .iter()
+        .chain(&ACCOUNT_READ_ONLY)
+        .chain(&IRREVERSIBLE)
+    {
         let found = match entry.strip_suffix(".*") {
             Some(namespace) => functions
                 .iter()

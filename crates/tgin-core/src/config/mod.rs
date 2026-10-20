@@ -15,8 +15,8 @@ use std::time::Duration;
 use tgin_runtime::config::{ConfigError, Env, parse_yaml};
 
 pub use self::acl::{
-    ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, GLOB_NAMESPACES, MethodAcl, MethodGlob, account_changing,
-    exact_only, glob_namespace,
+    ACCOUNT_CHANGING, ACCOUNT_READ_ONLY, GLOB_NAMESPACES, IRREVERSIBLE, MethodAcl, MethodGlob,
+    account_changing, exact_only, glob_namespace,
 };
 pub use self::model::RawConfig;
 pub use self::resolve::{

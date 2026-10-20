@@ -13,8 +13,9 @@
 //!
 //! A client may call a method when an `allow` glob matches it and no `deny`
 //! glob does; with no `allow`, it may call nothing. A glob grants only
-//! methods of the [`GLOB_NAMESPACES`] that are not [`ACCOUNT_CHANGING`]
-//! (apart from [`ACCOUNT_READ_ONLY`]): every other method, whatever its
+//! methods of the [`GLOB_NAMESPACES`] that are neither [`ACCOUNT_CHANGING`]
+//! (apart from [`ACCOUNT_READ_ONLY`]) nor [`IRREVERSIBLE`]: every other
+//! method, whatever its
 //! namespace, is granted only by an `allow` entry that names it exactly
 //! ([`exact_only`]). A namespace a later layer adds is exact-only until it
 //! is reviewed.
@@ -121,6 +122,24 @@ pub const ACCOUNT_CHANGING: [&str; 53] = [
     "stories.toggleAllStoriesHidden",
 ];
 
+/// Methods of the [`GLOB_NAMESPACES`] that need an exact entry because they
+/// cannot be undone, or because they give a client nothing through tgin.
+pub const IRREVERSIBLE: [&str; 8] = [
+    // A channel's deletion, its usernames (collectible assets) and its
+    // conversion to a broadcast group cannot be undone.
+    "channels.convertToGigagroup",
+    "channels.deactivateAllUsernames",
+    "channels.deleteChannel",
+    "channels.toggleUsername",
+    "channels.updateUsername",
+    // A sticker set's deletion cannot be undone.
+    "stickers.deleteStickerSet",
+    // tgin cannot decrypt a secret chat, so a client gains nothing from
+    // opening one, and an account would accept one from anyone.
+    "messages.acceptEncryption",
+    "messages.requestEncryption",
+];
+
 /// The `account.get*` methods of layer 230 that only read settings, which
 /// `account.*` or `*` grants like any other method.
 ///
@@ -129,12 +148,13 @@ pub const ACCOUNT_CHANGING: [&str; 53] = [
 /// reviewed, and some getters are not harmless. Left out on purpose:
 /// `account.getTmpPassword` (creates a temporary password),
 /// `account.getPassword` and `account.getPasswordSettings` (2FA data),
-/// `account.getPasskeys`, and the Telegram Passport getters
+/// `account.getPasskeys`, the Telegram Passport getters
 /// `account.getAllSecureValues`, `account.getSecureValue` and
-/// `account.getAuthorizationForm`.
-pub const ACCOUNT_READ_ONLY: [&str; 34] = [
+/// `account.getAuthorizationForm`, and `account.getAuthorizations` and
+/// `account.getWebAuthorizations`, which list the account's sessions and
+/// the sites it is logged in to, with their IP addresses.
+pub const ACCOUNT_READ_ONLY: [&str; 32] = [
     "account.getAccountTTL",
-    "account.getAuthorizations",
     "account.getAutoDownloadSettings",
     "account.getAutoSaveSettings",
     "account.getBotBusinessConnection",
@@ -165,7 +185,6 @@ pub const ACCOUNT_READ_ONLY: [&str; 34] = [
     "account.getUniqueGiftChatThemes",
     "account.getWallPaper",
     "account.getWallPapers",
-    "account.getWebAuthorizations",
     "account.getWebBrowserSettings",
 ];
 
@@ -226,10 +245,12 @@ pub fn glob_namespace(namespace: &str) -> bool {
 
 /// Whether only an exact `allow` entry grants `method`: it has no
 /// namespace, its namespace is not one of [`GLOB_NAMESPACES`], or it is
-/// [`account_changing`]. Allocates nothing.
+/// [`account_changing`] or [`IRREVERSIBLE`]. Allocates nothing.
 pub fn exact_only(method: &str) -> bool {
     match method.split_once('.') {
-        Some((namespace, _)) => !glob_namespace(namespace) || account_changing(method),
+        Some((namespace, _)) => {
+            !glob_namespace(namespace) || account_changing(method) || IRREVERSIBLE.contains(&method)
+        }
         None => true,
     }
 }

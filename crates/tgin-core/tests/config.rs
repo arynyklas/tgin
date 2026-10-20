@@ -3603,7 +3603,14 @@ accounts:
     assert!(!exact.allows("messages."));
 
     let text = render(&cfg.warnings);
-    assert_eq!(cfg.warnings.len(), 2, "{text}");
+    // `*` in `wide` is warned about on its own.
+    assert_eq!(cfg.warnings.len(), 3, "{text}");
+    assert!(
+        cfg.warnings
+            .iter()
+            .any(|w| w.at.as_ref().unwrap().path == "accounts.main.rpc.clients.wide.allow[0]"),
+        "{text}"
+    );
     // A glob over protected methods allows none of them.
     let wide_warning = &cfg.warnings[0];
     assert_eq!(wide_warning.severity, Severity::Warning);
@@ -4195,4 +4202,97 @@ fn allow_paid_stars_warns() {
     ] {
         assert!(hint.contains(unlocked), "{unlocked} not in: {hint}");
     }
+}
+
+/// Methods that cannot be undone, that list the account's sessions with
+/// their IP addresses, or that open secret chats tgin cannot read.
+const IRREVERSIBLE_OR_EXPOSING: [&str; 10] = [
+    "account.getAuthorizations",
+    "account.getWebAuthorizations",
+    "channels.deleteChannel",
+    "channels.updateUsername",
+    "channels.toggleUsername",
+    "channels.deactivateAllUsernames",
+    "channels.convertToGigagroup",
+    "stickers.deleteStickerSet",
+    "messages.requestEncryption",
+    "messages.acceptEncryption",
+];
+
+/// Each is refused under `*` and its `<namespace>.*`, and allowed by its
+/// exact name unless denied.
+#[test]
+fn irreversible_and_exposing_methods_need_an_exact_entry() {
+    for method in IRREVERSIBLE_OR_EXPOSING {
+        assert!(config::exact_only(method), "{method}");
+        let namespace = method.split_once('.').unwrap().0;
+        let yaml = format!(
+            "version: 1\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: s, rpc: {{ clients: {{ star: {{ token: t1, allow: [\"*\"] }}, ns: {{ token: t2, allow: [\"{namespace}.*\"] }}, exact: {{ token: t3, allow: [{method}] }}, denied: {{ token: t4, allow: [{method}], deny: [\"{namespace}.*\"] }} }} }} }}\n"
+        );
+        let cfg = loads(&yaml);
+        let clients = &cfg.accounts[0].rpc.clients;
+        assert!(!clients[0].acl.allows(method), "* grants {method}");
+        assert!(
+            !clients[1].acl.allows(method),
+            "{namespace}.* grants {method}"
+        );
+        assert!(clients[2].acl.allows(method), "exact {method}");
+        assert!(!clients[3].acl.allows(method), "denied {method}");
+        // An exact grant is named in the exact-only warning.
+        let warning = cfg.warnings.iter().find(|w| {
+            w.at.as_ref()
+                .is_some_and(|at| at.path == "accounts.main.rpc.clients.exact.allow[0]")
+                && w.message.contains(method)
+        });
+        let warning = warning.unwrap_or_else(|| panic!("{method}: {}", render(&cfg.warnings)));
+        let hint = warning.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("secret chats"), "{hint}");
+        assert!(hint.contains("expose its sessions"), "{hint}");
+        assert!(hint.contains("not be undone"), "{hint}");
+    }
+}
+
+/// `account.*` no longer grants the two session listings, and still grants
+/// the other read-only getters.
+#[test]
+fn account_glob_keeps_the_harmless_getters() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"account.*\"] } } } }\n",
+    );
+    let acl = &cfg.accounts[0].rpc.clients[0].acl;
+    assert!(!acl.allows("account.getAuthorizations"));
+    assert!(!acl.allows("account.getWebAuthorizations"));
+    assert!(acl.allows("account.getPrivacy"));
+    assert!(acl.allows("account.getNotifySettings"));
+    assert_eq!(config::ACCOUNT_READ_ONLY.len(), 32);
+}
+
+/// `allow: ["*"]` draws a warning; `*` in `deny`, or a namespace glob,
+/// does not.
+#[test]
+fn star_allow_warns() {
+    let rpc_warnings = |allow: &str, deny: &str| -> Vec<ConfigError> {
+        let cfg = loads(&format!(
+            "version: 1\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: s, rpc: {{ clients: {{ c: {{ token: t, allow: {allow}, deny: {deny} }} }} }} }}\n"
+        ));
+        cfg.warnings
+            .into_iter()
+            .filter(|w| w.at.as_ref().is_some_and(|at| at.path.contains(".rpc.")))
+            .collect()
+    };
+    let warnings = rpc_warnings("[\"messages.*\", \"*\"]", "[]");
+    assert_eq!(warnings.len(), 1, "{}", render(&warnings));
+    let warning = &warnings[0];
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_eq!(
+        warning.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[1]"
+    );
+    assert_message(warning, "client `c`");
+    assert_message(warning, "every method a glob may grant");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("namespaces or methods"), "{hint}");
+
+    assert!(rpc_warnings("[\"messages.*\"]", "[\"*\"]").is_empty());
+    assert!(rpc_warnings("[\"messages.*\"]", "[]").is_empty());
 }

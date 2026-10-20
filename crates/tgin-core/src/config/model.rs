@@ -590,9 +590,11 @@ pub struct RpcClient {
     /// Empty, it may call none. A glob grants only methods of the reviewed
     /// namespaces (`account`, `channels`, `contacts`, `help`, `langpack`,
     /// `messages`, `phone`, `photos`, `stats`, `stickers`, `stories`,
-    /// `upload`, `users`) that change nothing account-wide; every other
-    /// method, such as `payments.*`, `auth.*` or `account.updateProfile`,
-    /// is allowed only when listed by exact name.
+    /// `upload`, `users`) that change nothing account-wide, less a reviewed
+    /// few that cannot be undone or that list the account's sessions; every
+    /// other method, such as `payments.*`, `auth.*`, `account.updateProfile`
+    /// or `channels.deleteChannel`, is allowed only when listed by exact
+    /// name. `*` draws a warning.
     #[serde(default)]
     #[schemars(inner(regex(pattern = METHOD_GLOB_PATTERN)))]
     pub allow: Vec<At<String>>,

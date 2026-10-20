@@ -23,7 +23,7 @@ exact	account.finishTakeoutSession
 glob	account.getAccountTTL
 exact	account.getAllSecureValues
 exact	account.getAuthorizationForm
-glob	account.getAuthorizations
+exact	account.getAuthorizations
 glob	account.getAutoDownloadSettings
 glob	account.getAutoSaveSettings
 glob	account.getBotBusinessConnection
@@ -59,7 +59,7 @@ exact	account.getTmpPassword
 glob	account.getUniqueGiftChatThemes
 glob	account.getWallPaper
 glob	account.getWallPapers
-glob	account.getWebAuthorizations
+exact	account.getWebAuthorizations
 glob	account.getWebBrowserSettings
 exact	account.initPasskeyRegistration
 exact	account.initTakeoutSession
@@ -206,10 +206,10 @@ exact	bots.updateStarRefProgram
 exact	bots.updateUserEmojiStatus
 glob	channels.checkSearchPostsFlood
 glob	channels.checkUsername
-glob	channels.convertToGigagroup
+exact	channels.convertToGigagroup
 glob	channels.createChannel
-glob	channels.deactivateAllUsernames
-glob	channels.deleteChannel
+exact	channels.deactivateAllUsernames
+exact	channels.deleteChannel
 glob	channels.deleteHistory
 glob	channels.deleteMessages
 glob	channels.deleteParticipantHistory
@@ -256,12 +256,12 @@ glob	channels.toggleParticipantsHidden
 glob	channels.togglePreHistoryHidden
 glob	channels.toggleSignatures
 glob	channels.toggleSlowMode
-glob	channels.toggleUsername
+exact	channels.toggleUsername
 glob	channels.toggleViewForumAsMessages
 glob	channels.updateColor
 glob	channels.updateEmojiStatus
 exact	channels.updatePaidMessagesPrice
-glob	channels.updateUsername
+exact	channels.updateUsername
 exact	chatlists.checkChatlistInvite
 exact	chatlists.deleteExportedInvite
 exact	chatlists.editExportedInvite
@@ -361,7 +361,7 @@ glob	langpack.getLangPack
 glob	langpack.getLanguage
 glob	langpack.getLanguages
 glob	langpack.getStrings
-glob	messages.acceptEncryption
+exact	messages.acceptEncryption
 exact	messages.acceptUrlAuth
 glob	messages.addChatUser
 glob	messages.addPollAnswer
@@ -545,7 +545,7 @@ glob	messages.reportSpam
 glob	messages.reportSponsoredMessage
 exact	messages.requestAppWebView
 exact	messages.requestChatJoinWebView
-glob	messages.requestEncryption
+exact	messages.requestEncryption
 exact	messages.requestMainWebView
 exact	messages.requestSimpleWebView
 exact	messages.requestUrlAuth
@@ -765,7 +765,7 @@ glob	stickers.changeSticker
 glob	stickers.changeStickerPosition
 glob	stickers.checkShortName
 glob	stickers.createStickerSet
-glob	stickers.deleteStickerSet
+exact	stickers.deleteStickerSet
 glob	stickers.removeStickerFromSet
 glob	stickers.renameStickerSet
 glob	stickers.replaceSticker

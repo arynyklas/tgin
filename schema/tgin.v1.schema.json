@@ -1159,7 +1159,7 @@
       "properties": {
         "allow": {
           "default": [],
-          "description": "Methods the client may call: `*`, `<namespace>.*` such as\n`messages.*`, or a method name such as `messages.sendMessage`.\nEmpty, it may call none. A glob grants only methods of the reviewed\nnamespaces (`account`, `channels`, `contacts`, `help`, `langpack`,\n`messages`, `phone`, `photos`, `stats`, `stickers`, `stories`,\n`upload`, `users`) that change nothing account-wide; every other\nmethod, such as `payments.*`, `auth.*` or `account.updateProfile`,\nis allowed only when listed by exact name.",
+          "description": "Methods the client may call: `*`, `<namespace>.*` such as\n`messages.*`, or a method name such as `messages.sendMessage`.\nEmpty, it may call none. A glob grants only methods of the reviewed\nnamespaces (`account`, `channels`, `contacts`, `help`, `langpack`,\n`messages`, `phone`, `photos`, `stats`, `stickers`, `stories`,\n`upload`, `users`) that change nothing account-wide, less a reviewed\nfew that cannot be undone or that list the account's sessions; every\nother method, such as `payments.*`, `auth.*`, `account.updateProfile`\nor `channels.deleteChannel`, is allowed only when listed by exact\nname. `*` draws a warning.",
           "items": {
             "pattern": "^(\\*|[A-Za-z][A-Za-z0-9_]*\\.\\*|([A-Za-z][A-Za-z0-9_]*\\.)?[A-Za-z][A-Za-z0-9_]*)$",
             "type": "string"

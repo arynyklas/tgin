@@ -289,6 +289,20 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             )),
         );
     }
+    if let Some((k, star)) = client
+        .allow
+        .iter()
+        .enumerate()
+        .find(|(_, glob)| glob.value == "*")
+    {
+        diag.warnings.push(
+            ConfigError::warning(format!(
+                "client `{name}` has `*` in `allow`, which grants every method a glob may grant"
+            ))
+            .at(located(format!("{path}.allow[{k}]"), star.location))
+            .hint("list the namespaces or methods the client needs, such as `messages.*` or `users.getUsers`"),
+        );
+    }
     if let Some((k, first)) = exact.first() {
         diag.warnings.push(
             ConfigError::warning(format!(
@@ -296,7 +310,7 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
                 list(&exact, false)
             ))
             .at(located(format!("{path}.allow[{k}]"), first.location))
-            .hint("these may move assets, log the account in or out, or change it account-wide; allow them only to a client trusted as much as the account itself"),
+            .hint("these may move assets, log the account in or out, change it account-wide, expose its sessions, open secret chats tgin cannot read, or not be undone; allow them only to a client trusted as much as the account itself"),
         );
     }
     if client.allow_paid_stars.value {

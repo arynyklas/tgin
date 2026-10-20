@@ -108,7 +108,11 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   methods of reviewed namespaces that change nothing account-wide; every
   other method, any namespace a later layer adds included, needs an exact
   `allow` entry, spending methods such as `payments.*`, `wallet.*` and
-  `messages.sendPaidReaction` among them. A call that agrees to pay
+  `messages.sendPaidReaction` among them, as are a channel's deletion,
+  usernames and conversion, `stickers.deleteStickerSet`, the secret-chat
+  methods and the session listings `account.getAuthorizations` and
+  `account.getWebAuthorizations`; the loader warns about `allow: ["*"]`.
+  A call that agrees to pay
   through a paid-call marker (`allow_paid_stars` or `allow_paid_floodskip`
   on the function, a priced `suggestedPost` or an `inputMediaStakeDice`
   anywhere in it) also needs the client's `allow_paid_stars: true` (403
