@@ -623,7 +623,9 @@ async fn paid_stars_need_the_clients_opt_in() {
 }
 
 /// Each body spends the account's Stars or TON without `allow_paid_stars`.
-const SPENDING: [&str; 5] = [
+const SPENDING: [&str; 6] = [
+    // Pays Stars to skip a flood wait.
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","allow_paid_floodskip":true}"#,
     // A suggested post offers a price, charged when the channel accepts.
     r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","suggested_post":{"_":"suggestedPost","price":{"_":"starsTonAmount","amount":"1000000000"}}}"#,
     r#"{"_":"messages.forwardMessages","from_peer":{"_":"inputPeerSelf"},"id":[1],"random_id":["1"],"to_peer":{"_":"inputPeerSelf"},"suggested_post":{"_":"suggestedPost","price":{"_":"starsAmount","amount":"5","nanos":0}}}"#,

@@ -122,7 +122,8 @@ pub struct Call<'a> {
     /// `parent_peer` or `peer`), if it names one.
     pub peer: Option<PeerId>,
     /// The call spends the account's Stars or TON: it sets
-    /// `allow_paid_stars` (it agrees to pay the recipient's price), offers a
+    /// `allow_paid_stars` (it agrees to pay the recipient's price) or
+    /// `allow_paid_floodskip` (to pay to skip a flood wait), offers a
     /// `suggestedPost` with a `price`, or holds an `inputMediaStakeDice`.
     /// Read from the schema, on every function and anywhere in the call.
     pub pays_stars: bool,
@@ -316,7 +317,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
                 if !present(&words, *flag) {
                     continue;
                 }
-                pays_stars |= p.name == PAID_STARS_FIELD;
+                pays_stars |= PAID_STARS_FIELDS.contains(&p.name);
                 writes_quick_replies |= QUICK_REPLY_FIELDS.contains(&p.name);
                 let start = r.pos;
                 pays_stars |= skip_spending(r, ty, 1)?;
@@ -373,8 +374,9 @@ fn target_field(ctor: &'static Ctor, channels: bool) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
-/// The field by which a call agrees to pay a recipient's price in Stars.
-const PAID_STARS_FIELD: &str = "allow_paid_stars";
+/// The fields by which a call agrees to pay Stars: a recipient's price
+/// (`allow_paid_stars`), or to skip a flood wait (`allow_paid_floodskip`).
+const PAID_STARS_FIELDS: [&str; 2] = ["allow_paid_stars", "allow_paid_floodskip"];
 
 /// Skips one value of `ty`, as [`Schema::skip_value`](crate::schema)
 /// does, and says whether it spends the account's Stars or TON anywhere

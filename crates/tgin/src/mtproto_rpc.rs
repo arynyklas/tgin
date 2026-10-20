@@ -17,7 +17,8 @@
 //! account's authorizations. The owner may lift the second refusal.
 //! A call that spends the account's Stars or TON gets 403
 //! `paid_stars_not_allowed` unless the client's `allow_paid_stars` is on:
-//! one that sets `allow_paid_stars` (it agrees to pay a recipient's price),
+//! one that sets `allow_paid_stars` (it agrees to pay a recipient's price)
+//! or `allow_paid_floodskip` (to pay to skip a flood wait),
 //! offers a suggested post with a `price`, or bets on an
 //! `inputMediaStakeDice`. A send or edit that carries
 //! `quick_reply_shortcut` or `quick_reply_shortcut_id` writes the
