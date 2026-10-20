@@ -459,3 +459,63 @@ async fn a_duplicate_runs_once_its_user_is_released() {
     }
     tgin.stop().await;
 }
+
+/// While a removed account's pull consumer still drains, its poll path
+/// stays served: its clients can fetch what it holds.
+#[tokio::test]
+async fn a_draining_account_consumer_keeps_its_poll_path() {
+    let net = FakeNetwork::new();
+    net.answer(|call| match call.ctor() {
+        ids::GET_DIFFERENCE => Reply::Ok(tgin_mtproto::testkit::difference(
+            &[tgin_mtproto::testkit::private_message(1, 100, "hi")],
+            11,
+            1,
+            1,
+        )),
+        _ => Reply::Ok(ANSWER.to_vec()),
+    });
+    let routed = format!(
+        "{}    routes: [{{ to: [inbox] }}]\nconsumers:\n  inbox: {{ pull: {{ auth_token: pull-secret-123 }} }}\n",
+        config(CLIENT_A, "")
+    );
+    let tgin = start(&routed, Some(net)).await;
+    tgin.until_state("running").await;
+    let url = format!(
+        "http://{}/c/inbox/mtproto/v1/getUpdates?timeout=0&limit=0",
+        tgin.data
+    );
+    let peek = || async {
+        tgin.http
+            .get(&url)
+            .bearer_auth("pull-secret-123")
+            .send()
+            .await
+            .expect("answered")
+            .status()
+            .as_u16()
+    };
+    timeout(PATIENCE, async {
+        while peek().await != 200 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("served");
+    // The account and its consumer go; the consumer still holds the update.
+    tgin.reload(&format!(
+        "version: 1\nruntime: {{ lame_duck: 0s, shutdown_grace: 1s }}\nreload: {{ watch: false }}\nserver: {{ listen: [\"127.0.0.1:0\"] }}\nadmin: {{ listen: [\"127.0.0.1:0\"], token: {ADMIN} }}\n"
+    ))
+    .await;
+    let response = tgin
+        .http
+        .get(format!(
+            "http://{}/c/inbox/mtproto/v1/getUpdates?timeout=0",
+            tgin.data
+        ))
+        .bearer_auth("pull-secret-123")
+        .send()
+        .await
+        .expect("answered");
+    assert_eq!(response.status(), 200, "still served while it drains");
+    tgin.stop().await;
+}

@@ -26,7 +26,7 @@ use tgin_botapi::gateway::{Gateway, errors};
 use tgin_botapi::pull::{PollPath, PullAuth, PullRoutes};
 use tgin_botapi::{DEFAULT_WEBHOOK_BODY_LIMIT, IpAllowlist, WebhookOptions};
 use tgin_core::config::{self, Config, ConsumerKind, Ingress, Server};
-use tgin_core::engine::Engine;
+use tgin_core::engine::{Engine, Feed};
 use tgin_runtime::http::{Via, refuse_loops};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
@@ -225,6 +225,15 @@ fn router(
     }
 
     let Served { auth, aliases } = served;
+    // The account poll path exists only while an account-fed consumer is
+    // served (one of the config, or a retired one still draining): a
+    // bot-only config answers that path exactly as it did before accounts.
+    let account_fed = !cfg.accounts.is_empty()
+        || auth.keys().any(|name| {
+            engine
+                .pull_consumer_fed(name)
+                .is_some_and(|(_, feed)| feed == Some(Feed::Account))
+        });
     let pull = Arc::new(PullRoutes::new(
         Arc::clone(engine),
         auth,
@@ -234,12 +243,14 @@ fn router(
         "/c/{consumer}/getUpdates",
         get(by_path).post(by_path).with_state(Arc::clone(&pull)),
     );
-    router = router.route(
-        "/c/{consumer}/mtproto/v1/getUpdates",
-        get(account_path)
-            .post(account_path)
-            .with_state(Arc::clone(&pull)),
-    );
+    if account_fed {
+        router = router.route(
+            "/c/{consumer}/mtproto/v1/getUpdates",
+            get(account_path)
+                .post(account_path)
+                .with_state(Arc::clone(&pull)),
+        );
+    }
     for (path, name) in aliases {
         router = router.route(&path, alias(&pull, name));
     }

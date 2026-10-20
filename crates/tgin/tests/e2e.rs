@@ -481,6 +481,38 @@ async fn pull_alias_path_serves_queue() {
     assert_eq!(app.outcome().await, Outcome::Clean);
 }
 
+/// A config without accounts answers the account poll path as it did
+/// before accounts existed: the gateway's 404, whatever the method, even
+/// for a pull consumer with a token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bot_only_config_does_not_route_the_account_poll_path() {
+    let telegram = telegram_with_hooked_bot().await;
+    let app = start(&hooked(
+        &telegram,
+        QUICK,
+        "[{ to: [workers] }]",
+        r#"  workers: { pull: { auth_token: pull-secret-123 } }"#,
+    ))
+    .await;
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::POST,
+        reqwest::Method::DELETE,
+    ] {
+        let response = app
+            .http
+            .request(method.clone(), app.url("/c/workers/mtproto/v1/getUpdates"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{method}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error_code"], 404, "{method}: {body}");
+    }
+    app.signal(SignalKind::Terminate).await;
+    assert_eq!(app.outcome().await, Outcome::Clean);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_auth_token_required() {
     let telegram = telegram_with_hooked_bot().await;
