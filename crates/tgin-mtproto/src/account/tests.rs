@@ -960,3 +960,37 @@ async fn a_failed_catch_up_shows_connecting() {
     until(&run.account, running).await;
     run.account.close().await;
 }
+
+/// Through the real ingest: a call whose batches name no channel ahead
+/// (a common-box message) still has its peers durable before admission.
+#[tokio::test(start_paused = true)]
+async fn peers_without_marks_are_persisted_before_admission() {
+    let net = FakeNetwork::new();
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, running).await;
+    let before = run.sink.seen().len();
+    let message = format!(
+        r#"{{"_":"updateNewMessage","message":{},"pts":11,"pts_count":1}}"#,
+        private_message(1, 100, "hi")
+    );
+    let push = tl_bytes(&format!(
+        r#"{{"_":"updates","updates":[{message}],"users":[{{"_":"user","id":"100","access_hash":"7"}}],"chats":[],"date":1,"seq":0}}"#
+    ));
+    assert!(net.push(push));
+    timeout(WAIT, async {
+        while run.sink.updates() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the message is admitted");
+    let seen = &run.sink.seen()[before..];
+    assert!(
+        seen.iter().all(|s| s.ahead.is_empty()),
+        "no channel: {seen:?}"
+    );
+    let admitted = seen.iter().find(|s| s.updates > 0).expect("admitted");
+    assert_eq!(admitted.cached, 1, "the user's hash is durable: {seen:?}");
+    run.account.close().await;
+}
