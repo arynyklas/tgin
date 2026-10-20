@@ -184,7 +184,9 @@ pub const AUTHORIZATION_METHODS: [&str; 10] = [
     "phone.getGroupCallStreamRtmpUrl",
 ];
 
-const UPDATES_METHODS: [&str; 3] = [
+/// Refused whatever a client's allowlist says: updates reach a client
+/// through a consumer, and only tgin's own session catches up.
+pub const UPDATES_METHODS: [&str; 3] = [
     "updates.getState",
     "updates.getDifference",
     "updates.getChannelDifference",
@@ -209,10 +211,14 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
                 rest = &rest[r.pos..];
             }
             "initConnection" => rest = &rest[query_start(&mut r, ctor)?..],
-            name if is_wrapper(ctor) => return Err(Refused::Wrapper(name)),
-            name if UPDATES_METHODS.contains(&name) => return Err(Refused::UpdatesMethod(name)),
-            name if AUTHORIZATION_METHODS.contains(&name) => {
-                return Err(Refused::AuthorizationMethod(name));
+            name if always_refused(name) => {
+                return Err(if is_wrapper(ctor) {
+                    Refused::Wrapper(name)
+                } else if UPDATES_METHODS.contains(&name) {
+                    Refused::UpdatesMethod(name)
+                } else {
+                    Refused::AuthorizationMethod(name)
+                });
             }
             method => {
                 let checked = check_call(&mut r, ctor)?;
@@ -227,6 +233,33 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
             }
         }
     }
+}
+
+/// Whether [`unwrap_request`] refuses a call to `method` whatever a
+/// client's allowlist says: [`AUTHORIZATION_METHODS`], [`UPDATES_METHODS`]
+/// and every `invoke*` wrapper but the two it strips (`initConnection`,
+/// and `invokeWithLayer` in the account's layer). It refuses such a call
+/// as soon as it has read the function's id.
+#[must_use]
+pub fn always_refused(method: &str) -> bool {
+    if AUTHORIZATION_METHODS.contains(&method) || UPDATES_METHODS.contains(&method) {
+        return true;
+    }
+    match API.ctor_by_name(method) {
+        Some(ctor) if ctor.ty.is_none() => {
+            is_wrapper(ctor) && !matches!(method, "initConnection" | "invokeWithLayer")
+        }
+        _ => false,
+    }
+}
+
+/// The constructor id of the api schema's function `method`; `None` for a
+/// name that is no function.
+#[must_use]
+pub fn function_id(method: &str) -> Option<u32> {
+    API.ctor_by_name(method)
+        .filter(|ctor| ctor.ty.is_none())
+        .map(|ctor| ctor.id)
 }
 
 /// A function whose result is its `query:!X`'s.

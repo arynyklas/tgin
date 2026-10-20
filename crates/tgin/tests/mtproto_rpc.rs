@@ -377,6 +377,54 @@ async fn authorization_methods_refused_even_when_listed() {
     assert!(account.calls().is_empty());
 }
 
+/// Every always-refused function, and only those, is refused by
+/// `unwrap_request` from its id alone, whatever follows.
+#[test]
+fn always_refused_is_what_unwrap_refuses() {
+    use tgin_mtproto::rpc::{
+        AUTHORIZATION_METHODS, Refused, UPDATES_METHODS, always_refused, function_id,
+        unwrap_request,
+    };
+    let wrappers = [
+        "invokeAfterMsg",
+        "invokeAfterMsgs",
+        "invokeWithoutUpdates",
+        "invokeWithMessagesRange",
+        "invokeWithTakeout",
+        "invokeWithBusinessConnection",
+        "invokeWithGooglePlayIntegrity",
+        "invokeWithApnsSecret",
+        "invokeWithReCaptcha",
+    ];
+    for name in AUTHORIZATION_METHODS
+        .iter()
+        .chain(&UPDATES_METHODS)
+        .chain(&wrappers)
+    {
+        assert!(always_refused(name), "{name}");
+        let id = function_id(name).unwrap_or_else(|| panic!("{name} is no function"));
+        let body = id.to_le_bytes();
+        let refused = unwrap_request(&body, LAYER);
+        assert!(
+            matches!(
+                refused,
+                Err(Refused::AuthorizationMethod(n) | Refused::UpdatesMethod(n) | Refused::Wrapper(n)) if n == *name
+            ),
+            "{name}: {refused:?}"
+        );
+    }
+    for name in [
+        "initConnection",
+        "invokeWithLayer",
+        "help.getConfig",
+        "messages.sendMessage",
+    ] {
+        assert!(!always_refused(name), "{name}");
+    }
+    assert_eq!(function_id("help.getConfig"), Some(0xc4f9_186b));
+    assert_eq!(function_id("nearestDc"), None);
+}
+
 #[tokio::test]
 async fn allowlist_deny_by_default() {
     let account = FakeAccount::new([ok(NEAREST)]);
