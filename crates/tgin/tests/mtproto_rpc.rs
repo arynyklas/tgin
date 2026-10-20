@@ -9,7 +9,11 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
 use parking_lot::Mutex;
-use tgin::mtproto_rpc::{AccountLimiter, RpcAccount, RpcEndpoint, router};
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::DescriptorEncoder;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::registry::Registry;
+use tgin::mtproto_rpc::{AccountLimiter, RpcAccount, RpcEndpoint, RpcMetrics, router};
 use tgin_core::config::{MethodAcl, MethodGlob, Rpc, RpcClient};
 use tgin_mtproto::decode::BoxKind;
 use tgin_mtproto::media::{AccountSessions, Connect, KeyStore, MediaConnected, Session};
@@ -109,8 +113,13 @@ fn rpc_config(max_rps: u32, acl: MethodAcl) -> Rpc {
             name: "bot".to_owned(),
             token: Secret::new(TOKEN.to_owned()),
             acl,
+            allow_paid_stars: false,
         }],
     }
+}
+
+fn paying_client(rpc: &mut Rpc) {
+    rpc.clients[0].allow_paid_stars = true;
 }
 
 fn allow_all() -> MethodAcl {
@@ -134,6 +143,37 @@ fn app_draining(
     let endpoint = RpcEndpoint::new(drain);
     endpoint.insert(RpcAccount::new("main", rpc, account, sink, limiter));
     router(Arc::new(endpoint))
+}
+
+/// The endpoint's `tgin_mtproto_rpc_*` series, as text.
+fn series(metrics: &Arc<RpcMetrics>) -> String {
+    #[derive(Debug)]
+    struct Series(Arc<RpcMetrics>);
+    impl Collector for Series {
+        fn encode(&self, mut encoder: DescriptorEncoder<'_>) -> std::fmt::Result {
+            self.0.encode(&mut encoder)
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register_collector(Box::new(Series(Arc::clone(metrics))));
+    let mut out = String::new();
+    encode(&mut out, &registry).expect("encoded");
+    out
+}
+
+/// An app on `account`, with its metrics.
+fn app_metered(account: Arc<dyn AccountRpc>, rpc: &Rpc) -> (Router, Arc<RpcMetrics>) {
+    let limiter = Arc::new(AccountLimiter::new(rpc.max_rps));
+    let endpoint = RpcEndpoint::new(CancellationToken::new());
+    endpoint.insert(RpcAccount::new(
+        "main",
+        rpc,
+        account,
+        Arc::<FakeSink>::default(),
+        limiter,
+    ));
+    let metrics = endpoint.metrics();
+    (router(Arc::new(endpoint)), metrics)
 }
 
 fn app(account: Arc<FakeAccount>) -> Router {
@@ -160,9 +200,10 @@ impl Answer {
 }
 
 async fn send_with(app: &Router, layer: &str, body: Vec<u8>, extra: &[(&str, &str)]) -> Answer {
-    let mut req = Request::post("/mtproto/v1/main/invoke")
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .header("x-tgin-layer", layer);
+    let mut req = Request::post("/mtproto/v1/main/invoke").header("x-tgin-layer", layer);
+    if !extra.iter().any(|(k, _)| *k == "authorization") {
+        req = req.header("authorization", format!("Bearer {TOKEN}"));
+    }
     if !extra.iter().any(|(k, _)| *k == "content-type") {
         req = req.header("content-type", "application/octet-stream");
     }
@@ -311,6 +352,8 @@ async fn authorization_methods_refused_even_when_listed() {
             MethodGlob::Any,
             MethodGlob::Exact("auth.exportAuthorization".to_owned()),
             MethodGlob::Exact("auth.acceptLoginToken".to_owned()),
+            MethodGlob::Exact("bots.exportBotToken".to_owned()),
+            MethodGlob::Exact("phone.getGroupCallStreamRtmpUrl".to_owned()),
         ],
         deny: Vec::new(),
     };
@@ -322,12 +365,64 @@ async fn authorization_methods_refused_even_when_listed() {
     for body in [
         r#"{"_":"auth.exportAuthorization","dc_id":4}"#,
         r#"{"_":"auth.acceptLoginToken","token":"AQID"}"#,
+        // Returns, or with `revoke` rotates, a managed bot's token.
+        r#"{"_":"bots.exportBotToken","bot":{"_":"inputUserSelf"},"revoke":false}"#,
+        // Returns, or with `revoke` rotates, a channel's RTMP stream key.
+        r#"{"_":"phone.getGroupCallStreamRtmpUrl","peer":{"_":"inputPeerSelf"},"revoke":false}"#,
     ] {
         let answer = send(&app, tl(body)).await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
         assert_eq!(answer.error(), "authorization_method");
     }
     assert!(account.calls().is_empty());
+}
+
+/// Every always-refused function, and only those, is refused by
+/// `unwrap_request` from its id alone, whatever follows.
+#[test]
+fn always_refused_is_what_unwrap_refuses() {
+    use tgin_mtproto::rpc::{
+        AUTHORIZATION_METHODS, Refused, UPDATES_METHODS, always_refused, function_id,
+        unwrap_request,
+    };
+    let wrappers = [
+        "invokeAfterMsg",
+        "invokeAfterMsgs",
+        "invokeWithoutUpdates",
+        "invokeWithMessagesRange",
+        "invokeWithTakeout",
+        "invokeWithBusinessConnection",
+        "invokeWithGooglePlayIntegrity",
+        "invokeWithApnsSecret",
+        "invokeWithReCaptcha",
+    ];
+    for name in AUTHORIZATION_METHODS
+        .iter()
+        .chain(&UPDATES_METHODS)
+        .chain(&wrappers)
+    {
+        assert!(always_refused(name), "{name}");
+        let id = function_id(name).unwrap_or_else(|| panic!("{name} is no function"));
+        let body = id.to_le_bytes();
+        let refused = unwrap_request(&body, LAYER);
+        assert!(
+            matches!(
+                refused,
+                Err(Refused::AuthorizationMethod(n) | Refused::UpdatesMethod(n) | Refused::Wrapper(n)) if n == *name
+            ),
+            "{name}: {refused:?}"
+        );
+    }
+    for name in [
+        "initConnection",
+        "invokeWithLayer",
+        "help.getConfig",
+        "messages.sendMessage",
+    ] {
+        assert!(!always_refused(name), "{name}");
+    }
+    assert_eq!(function_id("help.getConfig"), Some(0xc4f9_186b));
+    assert_eq!(function_id("nearestDc"), None);
 }
 
 #[tokio::test]
@@ -402,6 +497,29 @@ async fn wrong_token_401() {
     assert!(account.calls().is_empty());
 }
 
+#[tokio::test]
+async fn auth_scheme_and_media_types_ignore_case() {
+    let account = FakeAccount::new([ok(NEAREST), ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    let lower = format!("bearer {TOKEN}");
+    let raw = send_with(&app, "230", tl(GET_NEAREST), &[("authorization", &lower)]).await;
+    assert_eq!(raw.status, StatusCode::OK);
+    let json = send_with(
+        &app,
+        "230",
+        GET_NEAREST.as_bytes().to_vec(),
+        &[
+            ("authorization", &format!("BEARER {TOKEN}")),
+            ("content-type", "Application/JSON; charset=utf-8"),
+            ("accept", "APPLICATION/json"),
+        ],
+    )
+    .await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert_eq!(json.body, Bytes::from_static(NEAREST.as_bytes()));
+    assert_eq!(account.calls().len(), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn flood_below_threshold_slept_once() {
     let account = FakeAccount::new([err(420, "FLOOD_WAIT_5"), ok(NEAREST)]);
@@ -445,6 +563,253 @@ async fn flood_sleep_ends_on_drain() {
     assert_eq!(account.calls().len(), 1);
 }
 
+const SEND_A: &str = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerChannel","channel_id":"7","access_hash":"1"},"message":"hi","random_id":"1"}"#;
+const SEND_B: &str = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerChannel","channel_id":"8","access_hash":"1"},"message":"hi","random_id":"2"}"#;
+
+fn rate_limited_count(metrics: &Arc<RpcMetrics>) -> String {
+    series(metrics)
+        .lines()
+        .find(|l| {
+            l.starts_with(
+                r#"mtproto_rpc_total{account="main",client="bot",outcome="rate_limited"}"#,
+            )
+        })
+        .unwrap_or_default()
+        .rsplit(' ')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn paid_stars_need_the_clients_opt_in() {
+    let paid_send = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"hi","random_id":"1","allow_paid_stars":"5"}"#;
+    // Read from the schema: any function with the flag, not a list.
+    let paid_call = r#"{"_":"phone.sendGroupCallMessage","call":{"_":"inputGroupCall","id":"1","access_hash":"2"},"random_id":"3","message":{"_":"textWithEntities","text":"hi","entities":[]},"allow_paid_stars":"5"}"#;
+    let free_send = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"hi","random_id":"1"}"#;
+    let acl = MethodAcl {
+        allow: vec![
+            MethodGlob::Any,
+            MethodGlob::Exact("phone.sendGroupCallMessage".to_owned()),
+        ],
+        deny: Vec::new(),
+    };
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, acl.clone()),
+    );
+    for body in [paid_send, paid_call] {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(answer.error(), "paid_stars_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    assert_eq!(send(&app, tl(free_send)).await.status, StatusCode::OK);
+
+    let account = FakeAccount::new([ok(NEAREST), ok(NEAREST)]);
+    let mut rpc = rpc_config(100, acl);
+    paying_client(&mut rpc);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc,
+    );
+    for body in [paid_send, paid_call] {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK);
+    }
+    assert_eq!(account.calls().len(), 2);
+}
+
+/// Each body spends the account's Stars or TON without `allow_paid_stars`.
+const SPENDING: [&str; 6] = [
+    // Pays Stars to skip a flood wait.
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","allow_paid_floodskip":true}"#,
+    // A suggested post offers a price, charged when the channel accepts.
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","suggested_post":{"_":"suggestedPost","price":{"_":"starsTonAmount","amount":"1000000000"}}}"#,
+    r#"{"_":"messages.forwardMessages","from_peer":{"_":"inputPeerSelf"},"id":[1],"random_id":["1"],"to_peer":{"_":"inputPeerSelf"},"suggested_post":{"_":"suggestedPost","price":{"_":"starsAmount","amount":"5","nanos":0}}}"#,
+    // A stake dice bets TON.
+    r#"{"_":"messages.sendMedia","peer":{"_":"inputPeerSelf"},"media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="},"message":"","random_id":"1"}"#,
+    r#"{"_":"messages.sendMultiMedia","peer":{"_":"inputPeerSelf"},"multi_media":[{"_":"inputSingleMedia","media":{"_":"inputMediaDice","emoticon":"x"},"random_id":"1","message":""},{"_":"inputSingleMedia","media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="},"random_id":"2","message":""}]}"#,
+    r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="}}"#,
+];
+
+/// The same calls, with nothing that spends.
+const NOT_SPENDING: [&str; 3] = [
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","suggested_post":{"_":"suggestedPost","schedule_date":5}}"#,
+    r#"{"_":"messages.sendMedia","peer":{"_":"inputPeerSelf"},"media":{"_":"inputMediaDice","emoticon":"x"},"message":"","random_id":"1"}"#,
+    r#"{"_":"messages.sendMultiMedia","peer":{"_":"inputPeerSelf"},"multi_media":[{"_":"inputSingleMedia","media":{"_":"inputMediaDice","emoticon":"x"},"random_id":"1","message":""}]}"#,
+];
+
+#[tokio::test]
+async fn quick_reply_fields_need_the_exact_quick_reply_grant() {
+    let writes = [
+        r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","quick_reply_shortcut":{"_":"inputQuickReplyShortcut","shortcut":"hello"}}"#,
+        r#"{"_":"messages.forwardMessages","from_peer":{"_":"inputPeerSelf"},"id":[1],"random_id":["1"],"to_peer":{"_":"inputPeerSelf"},"quick_reply_shortcut":{"_":"inputQuickReplyShortcutId","shortcut_id":3}}"#,
+        r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"message":"x","quick_reply_shortcut_id":3}"#,
+    ];
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    for body in writes {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(answer.error(), "quick_replies_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    // Without the fields, the same methods are glob-granted.
+    let plain = r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"message":"x"}"#;
+    assert_eq!(send(&app, tl(plain)).await.status, StatusCode::OK);
+
+    // A deny still wins over the exact grant.
+    let quick = "messages.editQuickReplyShortcut".to_owned();
+    let denied = MethodAcl {
+        allow: vec![MethodGlob::Any, MethodGlob::Exact(quick.clone())],
+        deny: vec![MethodGlob::Exact(quick.clone())],
+    };
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, denied),
+    );
+    assert_eq!(
+        send(&app, tl(writes[2])).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    let account = FakeAccount::new((0..writes.len()).map(|_| ok(NEAREST)));
+    let granted = MethodAcl {
+        allow: vec![MethodGlob::Any, MethodGlob::Exact(quick)],
+        deny: Vec::new(),
+    };
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, granted),
+    );
+    for body in writes {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn suggested_post_price_and_stake_dice_need_the_opt_in() {
+    let account = FakeAccount::new((0..NOT_SPENDING.len()).map(|_| ok(NEAREST)));
+    let app = app(Arc::clone(&account));
+    for body in SPENDING {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(answer.error(), "paid_stars_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    for body in NOT_SPENDING {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+    let account = FakeAccount::new((0..SPENDING.len()).map(|_| ok(NEAREST)));
+    let mut rpc = rpc_config(100, allow_all());
+    paying_client(&mut rpc);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc,
+    );
+    for body in SPENDING {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn flood_wait_above_threshold_is_remembered_per_method() {
+    let account = FakeAccount::new([err(420, "FLOOD_WAIT_300"), ok(NEAREST), ok(NEAREST)]);
+    let (app, metrics) = app_metered(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        &rpc_config(100, allow_all()),
+    );
+    let first = send(&app, tl(SEND_A)).await;
+    assert_eq!(first.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.retry_after(), Some("300"));
+    tokio::time::advance(Duration::from_secs(100)).await;
+    // Answered here, for any peer, without calling Telegram.
+    for body in [SEND_A, SEND_B] {
+        let again = send(&app, tl(body)).await;
+        assert_eq!(again.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(again.retry_after(), Some("200"));
+        assert_eq!(again.body, Bytes::from(rpc_error_tl(420, "FLOOD_WAIT_200")));
+    }
+    assert_eq!(account.calls().len(), 1);
+    assert_eq!(rate_limited_count(&metrics), "2");
+    // Another method is not held back.
+    assert_eq!(send(&app, tl(GET_CONFIG)).await.status, StatusCode::OK);
+    // Once the wait is over, the method goes to Telegram again.
+    tokio::time::advance(Duration::from_secs(200)).await;
+    assert_eq!(send(&app, tl(SEND_A)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_wait_is_remembered_per_method_and_peer() {
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST), ok(NEAREST)]);
+    let (app, metrics) = app_metered(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        &rpc_config(100, allow_all()),
+    );
+    assert_eq!(send(&app, tl(SEND_A)).await.retry_after(), Some("30"));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let again = send(&app, tl(SEND_A)).await;
+    assert_eq!(again.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(again.retry_after(), Some("20"));
+    assert_eq!(
+        again.body,
+        Bytes::from(rpc_error_tl(420, "SLOWMODE_WAIT_20"))
+    );
+    assert_eq!(rate_limited_count(&metrics), "1");
+    // Another chat is not held back.
+    assert_eq!(send(&app, tl(SEND_B)).await.status, StatusCode::OK);
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert_eq!(send(&app, tl(SEND_A)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 3);
+}
+
+fn forward_to(channel: u8) -> String {
+    format!(
+        r#"{{"_":"messages.forwardMessages","from_peer":{{"_":"inputPeerSelf"}},"id":[1],"random_id":["1"],"to_peer":{{"_":"inputPeerChannel","channel_id":"{channel}","access_hash":"1"}}}}"#
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_on_a_forward_holds_only_the_target_chat() {
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    assert_eq!(
+        send(&app, tl(&forward_to(7))).await.retry_after(),
+        Some("30")
+    );
+    // Another chat is not held back; the slow one is.
+    assert_eq!(send(&app, tl(&forward_to(8))).await.status, StatusCode::OK);
+    let held = send(&app, tl(&forward_to(7))).await;
+    assert_eq!(held.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(held.retry_after(), Some("30"));
+    assert_eq!(account.calls().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_without_a_target_peer_is_not_remembered() {
+    let call = r#"{"_":"phone.sendGroupCallMessage","call":{"_":"inputGroupCall","id":"1","access_hash":"2"},"random_id":"3","message":{"_":"textWithEntities","text":"hi","entities":[]}}"#;
+    let acl = MethodAcl {
+        allow: vec![MethodGlob::Exact("phone.sendGroupCallMessage".to_owned())],
+        deny: Vec::new(),
+    };
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST)]);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, acl),
+    );
+    assert_eq!(send(&app, tl(call)).await.retry_after(), Some("30"));
+    assert_eq!(send(&app, tl(call)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn flood_above_threshold_429_retry_after() {
     let account = FakeAccount::new([err(420, "FLOOD_WAIT_60"), err(420, "SLOWMODE_WAIT_7")]);
@@ -455,6 +820,8 @@ async fn flood_above_threshold_429_retry_after() {
     assert_eq!(flood.retry_after(), Some("60"));
     assert_eq!(flood.body, Bytes::from(rpc_error_tl(420, "FLOOD_WAIT_60")));
     assert_eq!(start.elapsed(), Duration::ZERO);
+    // After the wait, the method goes to Telegram again.
+    tokio::time::advance(Duration::from_secs(60)).await;
     let slow = send(&app, tl(GET_CONFIG)).await;
     assert_eq!(slow.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(slow.retry_after(), Some("7"));

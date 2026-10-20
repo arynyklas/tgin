@@ -40,6 +40,10 @@ pub(super) fn local_mode() -> At<bool> {
     At::new(false)
 }
 
+pub(super) fn allow_paid_stars() -> At<bool> {
+    At::new(false)
+}
+
 pub(super) fn balance() -> Balance {
     Balance::RoundRobin
 }

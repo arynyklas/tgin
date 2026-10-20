@@ -15,6 +15,15 @@
 //! and the `auth.*` methods that mint or move an authorization of the
 //! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
 //! account's authorizations. The owner may lift the second refusal.
+//! A call that spends the account's Stars or TON gets 403
+//! `paid_stars_not_allowed` unless the client's `allow_paid_stars` is on:
+//! one that sets `allow_paid_stars` (it agrees to pay a recipient's price)
+//! or `allow_paid_floodskip` (to pay to skip a flood wait),
+//! offers a suggested post with a `price`, or bets on an
+//! `inputMediaStakeDice`. A send or edit that carries
+//! `quick_reply_shortcut` or `quick_reply_shortcut_id` writes the
+//! account's quick replies: 403 `quick_replies_not_allowed` unless the
+//! client's allowlist names `messages.editQuickReplyShortcut` exactly.
 //!
 //! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
 //! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]
@@ -23,8 +32,10 @@
 //! import.
 //!
 //! The pipeline: unwrap the call ([`tgin_mtproto::rpc::unwrap_request`]),
-//! the client's allowlist (deny wins; empty denies), the account's
-//! `max_rps` limiter, then [`tgin_mtproto::rpc::call`] on the account.
+//! the client's allowlist (deny wins; empty denies), its paid-Stars opt-in,
+//! the flood waits Telegram gave the account and that are not over (429
+//! with what is left, answered here), the account's `max_rps` limiter,
+//! then [`tgin_mtproto::rpc::call`] on the account.
 //!
 //! Answers:
 //! - Telegram's `rpc_result`: 200, its bytes as Telegram sent them.
@@ -72,7 +83,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use serde::Serialize;
 use tgin_core::config::{self, MethodAcl};
 use tgin_mtproto::SenderError;
-use tgin_mtproto::decode::BoxKind;
+use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::rpc::{
     AccountRpc, AffectedSink, Answer, Charge, ErrorClass, InvokeError, MediaFailure, Refused,
     classify, rpc_error_bytes, unwrap_request,
@@ -352,10 +363,15 @@ pub const MAX_CLIENT_IN_FLIGHT: usize = 8;
 /// between [`RpcAccount::new`] and the account's
 /// [`AccountSessions`](tgin_mtproto::media::AccountSessions). A reload
 /// sets a new rate in place ([`AccountLimiter::set_max_rps`]).
+///
+/// It also remembers the flood waits Telegram gave the account's RPC calls
+/// ([`FloodWaits`]), so that a client that retries early is answered here
+/// and the account does not call Telegram again before the wait is over.
 #[derive(Debug)]
 pub struct AccountLimiter {
     max_rps: AtomicU32,
     limiter: ArcSwap<KeyedLimiter<()>>,
+    waits: FloodWaits,
 }
 
 impl AccountLimiter {
@@ -365,6 +381,7 @@ impl AccountLimiter {
         Self {
             max_rps: AtomicU32::new(max_rps.get()),
             limiter: ArcSwap::from_pointee(limiter(max_rps)),
+            waits: FloodWaits::default(),
         }
     }
 
@@ -373,6 +390,99 @@ impl AccountLimiter {
         if self.max_rps.swap(max_rps.get(), Ordering::Relaxed) != max_rps.get() {
             self.limiter.store(Arc::new(limiter(max_rps)));
         }
+    }
+}
+
+/// The most flood waits one account remembers. Past it, the wait that
+/// ends first is forgotten.
+pub const MAX_REMEMBERED_WAITS: usize = 1024;
+
+/// What a remembered wait holds back: a method, after a `FLOOD_WAIT_X`, or
+/// a method in one chat, after a `SLOWMODE_WAIT_X`.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct WaitKey {
+    method: &'static str,
+    peer: Option<PeerId>,
+}
+
+/// The flood waits Telegram gave an account's RPC calls and that are not
+/// over yet: `FLOOD_WAIT_X` above `flood_sleep_threshold` (and one that
+/// came back after the sleep) per method, `SLOWMODE_WAIT_X` per method and
+/// chat. Until a wait ends, the call is answered here with 429 and what is
+/// left of it. Bounded by [`MAX_REMEMBERED_WAITS`]; ended waits are
+/// dropped.
+#[derive(Debug, Default)]
+struct FloodWaits(Mutex<HashMap<WaitKey, (Instant, ErrorClass)>>);
+
+impl FloodWaits {
+    /// The wait still holding back `method` (in `peer`), answered as
+    /// Telegram would with what is left of it in whole seconds, rounded up:
+    /// `FLOOD_WAIT_<left>` or `SLOWMODE_WAIT_<left>`.
+    fn held(&self, method: &'static str, peer: Option<PeerId>, now: Instant) -> Option<Answer> {
+        let mut waits = self.0.lock();
+        let mut held = None;
+        for key in [WaitKey { method, peer: None }, WaitKey { method, peer }] {
+            match waits.get(&key) {
+                Some(&(until, class)) if until > now => {
+                    let left = until - now;
+                    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+                    let secs = u32::try_from(secs).unwrap_or(u32::MAX);
+                    held = Some(match class {
+                        ErrorClass::SlowMode(_) => Answer::Error {
+                            code: 420,
+                            message: format!("SLOWMODE_WAIT_{secs}"),
+                            class: ErrorClass::SlowMode(secs),
+                        },
+                        _ => Answer::Error {
+                            code: 420,
+                            message: format!("FLOOD_WAIT_{secs}"),
+                            class: ErrorClass::FloodWait(secs),
+                        },
+                    });
+                }
+                Some(_) => {
+                    waits.remove(&key);
+                }
+                None => {}
+            }
+            if held.is_some() || peer.is_none() {
+                break;
+            }
+        }
+        held
+    }
+
+    /// Remembers `class` from Telegram's answer to `method` (in `peer`).
+    fn remember(
+        &self,
+        method: &'static str,
+        peer: Option<PeerId>,
+        class: ErrorClass,
+        now: Instant,
+    ) {
+        let (key, secs) = match class {
+            ErrorClass::FloodWait(x) => (WaitKey { method, peer: None }, x),
+            // Slow mode is per chat: without one, nothing to hold back.
+            ErrorClass::SlowMode(x) if peer.is_some() => (WaitKey { method, peer }, x),
+            _ => return,
+        };
+        if secs == 0 {
+            return;
+        }
+        let until = now + Duration::from_secs(u64::from(secs));
+        let mut waits = self.0.lock();
+        if waits.len() >= MAX_REMEMBERED_WAITS && !waits.contains_key(&key) {
+            waits.retain(|_, (until, _)| *until > now);
+            if waits.len() >= MAX_REMEMBERED_WAITS
+                && let Some(first) = waits
+                    .iter()
+                    .min_by_key(|(_, (until, _))| *until)
+                    .map(|(k, _)| *k)
+            {
+                waits.remove(&first);
+            }
+        }
+        waits.insert(key, (until, class));
     }
 }
 
@@ -406,6 +516,8 @@ struct Client {
     name: String,
     token: Secret<String>,
     acl: MethodAcl,
+    /// May set `allow_paid_stars`, which spends the account's Stars.
+    allow_paid_stars: bool,
     in_flight: Arc<Semaphore>,
     /// By [`Outcome`], once the endpoint serves the account.
     calls: Option<[Counter; Outcome::ALL.len()]>,
@@ -440,6 +552,7 @@ impl RpcAccount {
                     name: c.name.clone(),
                     token: c.token.clone(),
                     acl: c.acl.clone(),
+                    allow_paid_stars: c.allow_paid_stars,
                     in_flight: Arc::new(Semaphore::new(MAX_CLIENT_IN_FLIGHT)),
                     calls: None,
                 })
@@ -491,11 +604,26 @@ fn with_retry_after(mut response: Response, secs: u64) -> Response {
     response
 }
 
+/// Whether the header lists the `application/json` media type; media types
+/// are case-insensitive (RFC 9110 §8.3.1).
 fn wants_json(headers: &HeaderMap, name: header::HeaderName) -> bool {
+    const JSON: &[u8] = b"application/json";
+    headers.get(name).is_some_and(|v| {
+        v.as_bytes()
+            .windows(JSON.len())
+            .any(|w| w.eq_ignore_ascii_case(JSON))
+    })
+}
+
+/// The token after an `Authorization` scheme of `Bearer` in any case
+/// (RFC 9110 §11.1), as the other planes accept it; empty without one.
+fn bearer_token(headers: &HeaderMap) -> &[u8] {
+    const SCHEME: &[u8] = b"bearer ";
     headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("application/json"))
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.as_bytes().split_at_checked(SCHEME.len()))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
+        .map_or(&b""[..], |(_, token)| token)
 }
 
 /// Why a request body could not be read.
@@ -535,10 +663,7 @@ async fn invoke(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
-        .unwrap_or_default();
+    let bearer = bearer_token(&headers);
     // An unknown account is answered as a wrong token, after a comparison
     // of the same kind, so the answer does not tell which accounts exist.
     let Some(account) = endpoint.accounts.load().get(&account).cloned() else {
@@ -651,6 +776,32 @@ async fn serve(
             "the client's allowlist does not allow this method",
         ));
     }
+    // Quick replies are exact-only to write; a send or edit that files a
+    // message under one needs the same grant.
+    if call.writes_quick_replies && !client.acl.allows(QUICK_REPLY_GRANT) {
+        return refused(tgin_error(
+            StatusCode::FORBIDDEN,
+            "quick_replies_not_allowed",
+            "the call writes the account's quick replies, which needs messages.editQuickReplyShortcut by its exact name",
+        ));
+    }
+    if call.pays_stars && !client.allow_paid_stars {
+        return refused(tgin_error(
+            StatusCode::FORBIDDEN,
+            "paid_stars_not_allowed",
+            "the call spends the account's Stars or TON, and the client's allow_paid_stars is off",
+        ));
+    }
+    // A flood wait Telegram gave this call earlier and that is not over:
+    // answered here, the way Telegram would, without calling it again.
+    if let Some(answer) = account
+        .limiter
+        .waits
+        .held(method, call.peer, Instant::now())
+    {
+        let response = answer_response(answer, wants_json(headers, header::ACCEPT), method);
+        return (response, Outcome::RateLimited);
+    }
     if let Err(retry_after) = account.limiter.charge() {
         return (rate_limited(retry_after), Outcome::RateLimited);
     }
@@ -672,6 +823,12 @@ async fn serve(
     };
     if let Some(seconds) = &account.seconds {
         seconds.observe(started.elapsed().as_secs_f64());
+    }
+    if let Answer::Error { class, .. } = &answer {
+        account
+            .limiter
+            .waits
+            .remember(method, call.peer, *class, Instant::now());
     }
     let outcome = answer_outcome(&answer);
     let response = answer_response(answer, wants_json(headers, header::ACCEPT), method);
@@ -702,6 +859,10 @@ fn answer_outcome(answer: &Answer) -> Outcome {
         },
     }
 }
+
+/// The grant a call that writes quick replies needs; account-changing, so
+/// only an exact allow entry gives it.
+const QUICK_REPLY_GRANT: &str = "messages.editQuickReplyShortcut";
 
 /// What an unknown account's bearer is compared with.
 const UNKNOWN_ACCOUNT_TOKEN: &[u8] = b"tgin-unknown-account-0000000000000000";
@@ -909,5 +1070,61 @@ fn failure(e: &InvokeError) -> Response {
             "bad_request",
             "the request is not whole TL words or is too large",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEND: &str = "messages.sendMessage";
+
+    /// The seconds a held answer asks to wait.
+    fn left(waits: &FloodWaits, chat: i64, now: Instant) -> Option<u32> {
+        match waits.held(SEND, Some(PeerId::Channel(chat)), now) {
+            Some(Answer::Error {
+                class: ErrorClass::SlowMode(x),
+                ..
+            }) => Some(x),
+            _ => None,
+        }
+    }
+
+    fn slowmode(waits: &FloodWaits, chat: i64, secs: u32, now: Instant) {
+        waits.remember(
+            SEND,
+            Some(PeerId::Channel(chat)),
+            ErrorClass::SlowMode(secs),
+            now,
+        );
+    }
+
+    #[test]
+    fn remembered_waits_are_bounded_and_expire() {
+        let waits = FloodWaits::default();
+        let now = Instant::now();
+        let max = i64::try_from(MAX_REMEMBERED_WAITS).expect("small");
+        for chat in 0..max {
+            slowmode(&waits, chat, 10 + u32::try_from(chat).expect("small"), now);
+        }
+        assert_eq!(waits.0.lock().len(), MAX_REMEMBERED_WAITS);
+        // Full: the wait that ends first makes room.
+        slowmode(&waits, max, 5_000, now);
+        assert_eq!(waits.0.lock().len(), MAX_REMEMBERED_WAITS);
+        assert_eq!(left(&waits, 0, now), None);
+        assert_eq!(left(&waits, max, now), Some(5_000));
+        // Ended waits are dropped: once most have ended, a new one evicts
+        // none that is still running.
+        let later = now + Duration::from_secs(5_000 - 1);
+        slowmode(&waits, max + 1, 30, later);
+        assert_eq!(waits.0.lock().len(), 2);
+        assert_eq!(left(&waits, max, later), Some(1));
+        // A wait that has ended is forgotten when looked up.
+        let end = later + Duration::from_secs(30);
+        assert_eq!(left(&waits, max + 1, end), None);
+        assert!(!waits.0.lock().contains_key(&WaitKey {
+            method: SEND,
+            peer: Some(PeerId::Channel(max + 1)),
+        }));
     }
 }

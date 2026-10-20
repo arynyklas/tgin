@@ -1159,12 +1159,17 @@
       "properties": {
         "allow": {
           "default": [],
-          "description": "Methods the client may call: `*`, `<namespace>.*` such as\n`messages.*`, or a method name such as `messages.sendMessage`.\nEmpty, it may call none. `auth.*` and the other account-changing\nmethods are allowed only when listed by exact name.",
+          "description": "Methods the client may call: `*`, `<namespace>.*` such as\n`messages.*`, or a method name such as `messages.sendMessage`.\nEmpty, it may call none. A glob grants only methods of the reviewed\nnamespaces (`account`, `channels`, `contacts`, `help`, `langpack`,\n`messages`, `phone`, `photos`, `stats`, `stickers`, `stories`,\n`upload`, `users`) that change nothing account-wide; every other\nmethod, such as `payments.*`, `auth.*` or `account.updateProfile`,\nis allowed only when listed by exact name.",
           "items": {
             "pattern": "^(\\*|[A-Za-z][A-Za-z0-9_]*\\.\\*|([A-Za-z][A-Za-z0-9_]*\\.)?[A-Za-z][A-Za-z0-9_]*)$",
             "type": "string"
           },
           "type": "array"
+        },
+        "allow_paid_stars": {
+          "default": false,
+          "description": "Let the client's requests set `allow_paid_stars`, which spends the\naccount's Stars on messages to peers that charge for them. Off, such\na request is refused with 403 `paid_stars_not_allowed`.",
+          "type": "boolean"
         },
         "deny": {
           "default": [],

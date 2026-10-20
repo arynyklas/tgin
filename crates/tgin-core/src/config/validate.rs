@@ -221,9 +221,8 @@ fn account(raw: &RawConfig, diag: &mut Diagnostics, path: &str, account: &Accoun
     }
 }
 
-/// A client's globs are valid, and allowing auth or account-changing
-/// methods ([`acl::ACCOUNT_CHANGING`]) is warned about: by exact name it
-/// works, and by glob it does not.
+/// A client's globs are valid, and allowing [`acl::exact_only`] methods is
+/// warned about: by exact name it works, and by glob it does not.
 fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient) {
     for (field, list) in [("allow", &client.allow), ("deny", &client.deny)] {
         for (k, glob) in list.iter().enumerate() {
@@ -236,11 +235,10 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             }
         }
     }
-    // Globs over a protected namespace that grant nothing at all: none of
-    // its methods but the read-only getters may be granted by a glob, and
-    // this namespace has none (`auth.*`; `account.*` grants the getters).
+    // Globs over a namespace no glob may grant (`auth.*`, `payments.*`),
+    // which grant nothing at all.
     let mut useless: Vec<(usize, &At<String>)> = Vec::new();
-    // Protected methods listed exactly that no `deny` glob blocks, which
+    // Exact-only methods listed exactly that no `deny` glob blocks, which
     // the client may call.
     let mut exact: Vec<(usize, &At<String>)> = Vec::new();
     let deny: Vec<MethodGlob> = client
@@ -250,18 +248,11 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
         .collect();
     for (k, glob) in client.allow.iter().enumerate() {
         match MethodGlob::parse(&glob.value) {
-            Some(MethodGlob::Namespace(namespace))
-                if acl::ACCOUNT_CHANGING.contains(&glob.value.as_str())
-                    && !acl::ACCOUNT_READ_ONLY.iter().any(|getter| {
-                        getter
-                            .strip_prefix(namespace.as_str())
-                            .is_some_and(|rest| rest.starts_with('.'))
-                    }) =>
-            {
+            Some(MethodGlob::Namespace(namespace)) if !acl::glob_namespace(&namespace) => {
                 useless.push((k, glob));
             }
             Some(MethodGlob::Exact(method))
-                if acl::account_changing(&method) && !deny.iter().any(|d| d.matches(&method)) =>
+                if acl::exact_only(&method) && !deny.iter().any(|d| d.matches(&method)) =>
             {
                 exact.push((k, glob));
             }
@@ -282,23 +273,42 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             .join(", ")
     };
     if let Some((k, first)) = useless.first() {
+        let namespace = first
+            .value
+            .strip_suffix(".*")
+            .unwrap_or(first.value.as_str());
         diag.warnings.push(
             ConfigError::warning(format!(
-                "{} in client `{name}`'s `allow` grant nothing: auth and account-changing methods are allowed only by exact name",
+                "{} in client `{name}`'s `allow` grant nothing: a glob grants no method of these namespaces, only an exact entry does",
                 list(&useless, true)
             ))
             .at(located(format!("{path}.allow[{k}]"), first.location))
-            .hint("list each method the client needs by exact name, such as `auth.logOut`"),
+            .hint(format!(
+                "list each method the client needs by exact name, such as `{namespace}.<method>`; a glob grants methods of {} only",
+                acl::GLOB_NAMESPACES.join(", ")
+            )),
         );
     }
     if let Some((k, first)) = exact.first() {
         diag.warnings.push(
             ConfigError::warning(format!(
-                "client `{name}` may call auth or account-changing methods: {}",
+                "client `{name}` may call methods only an exact entry grants: {}",
                 list(&exact, false)
             ))
             .at(located(format!("{path}.allow[{k}]"), first.location))
-            .hint("these can log the account out or change it; allow them only to a client trusted as much as the account itself"),
+            .hint("these may move assets, log the account in or out, or change it account-wide; allow them only to a client trusted as much as the account itself"),
+        );
+    }
+    if client.allow_paid_stars.value {
+        diag.warnings.push(
+            ConfigError::warning(format!(
+                "client `{name}` may spend the account's Stars: its requests may set `allow_paid_stars`"
+            ))
+            .at(located(
+                format!("{path}.allow_paid_stars"),
+                client.allow_paid_stars.location,
+            ))
+            .hint("a request that sets it pays each peer's price per message from the account's balance; enable it only for a client trusted with that balance"),
         );
     }
 }

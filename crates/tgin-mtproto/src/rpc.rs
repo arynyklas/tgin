@@ -24,8 +24,8 @@ use tokio::time::{Instant, sleep_until};
 
 use bytes::Bytes;
 
-use crate::decode::BoxKind;
-use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, present};
+use crate::decode::{BoxKind, PeerId};
+use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, deeper, present};
 use crate::{RpcOutcome, SenderError, TlError};
 
 /// A boxed, sendable future: the trait methods below stay object safe.
@@ -118,6 +118,20 @@ pub struct Call<'a> {
     /// call targets (its `channel`, `parent_peer` or `peer`), else the
     /// common box.
     pub context: BoxKind,
+    /// The user, chat or channel the call targets (its `channel`,
+    /// `parent_peer` or `peer`), if it names one.
+    pub peer: Option<PeerId>,
+    /// The call spends the account's Stars or TON: it sets
+    /// `allow_paid_stars` (it agrees to pay the recipient's price) or
+    /// `allow_paid_floodskip` (to pay to skip a flood wait), offers a
+    /// `suggestedPost` with a `price`, or holds an `inputMediaStakeDice`.
+    /// Read from the schema, on every function and anywhere in the call.
+    pub pays_stars: bool,
+    /// The call writes the account's quick replies: a send that files its
+    /// message under a `quick_reply_shortcut`, or an edit of one by
+    /// `quick_reply_shortcut_id`. Quick replies hold the greeting and away
+    /// messages every new chat receives.
+    pub writes_quick_replies: bool,
 }
 
 /// Leaves out the body: it is account content.
@@ -127,6 +141,9 @@ impl fmt::Debug for Call<'_> {
             .field("method", &self.method)
             .field("body", &format_args!("<{} bytes>", self.body.len()))
             .field("context", &self.context)
+            .field("peer", &self.peer)
+            .field("pays_stars", &self.pays_stars)
+            .field("writes_quick_replies", &self.writes_quick_replies)
             .finish()
     }
 }
@@ -158,8 +175,11 @@ pub enum Refused {
 
 /// Refused whatever a client's allowlist says (the owner may
 /// overrule it): each mints or moves an authorization of the account, and
-/// tgin owns the account's authorizations.
-pub const AUTHORIZATION_METHODS: [&str; 8] = [
+/// tgin owns the account's authorizations. `bots.exportBotToken` hands
+/// out, or with `revoke` rotates, the token of a bot the account manages,
+/// and `phone.getGroupCallStreamRtmpUrl` the RTMP stream key of a channel
+/// the account streams to: credential exports of the same kind.
+pub const AUTHORIZATION_METHODS: [&str; 10] = [
     "auth.exportAuthorization",
     "auth.importAuthorization",
     "auth.acceptLoginToken",
@@ -168,9 +188,13 @@ pub const AUTHORIZATION_METHODS: [&str; 8] = [
     "auth.bindTempAuthKey",
     "auth.importBotAuthorization",
     "auth.importWebTokenAuthorization",
+    "bots.exportBotToken",
+    "phone.getGroupCallStreamRtmpUrl",
 ];
 
-const UPDATES_METHODS: [&str; 3] = [
+/// Refused whatever a client's allowlist says: updates reach a client
+/// through a consumer, and only tgin's own session catches up.
+pub const UPDATES_METHODS: [&str; 3] = [
     "updates.getState",
     "updates.getDifference",
     "updates.getChannelDifference",
@@ -195,22 +219,56 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
                 rest = &rest[r.pos..];
             }
             "initConnection" => rest = &rest[query_start(&mut r, ctor)?..],
-            name if is_wrapper(ctor) => return Err(Refused::Wrapper(name)),
-            name if UPDATES_METHODS.contains(&name) => return Err(Refused::UpdatesMethod(name)),
-            name if AUTHORIZATION_METHODS.contains(&name) => {
-                return Err(Refused::AuthorizationMethod(name));
+            name if always_refused(name) => {
+                return Err(if is_wrapper(ctor) {
+                    Refused::Wrapper(name)
+                } else if UPDATES_METHODS.contains(&name) {
+                    Refused::UpdatesMethod(name)
+                } else {
+                    Refused::AuthorizationMethod(name)
+                });
             }
             method => {
-                let context = check_call(&mut r, ctor)?;
+                let checked = check_call(&mut r, ctor)?;
                 r.finish()?;
                 return Ok(Call {
                     method,
                     body: rest,
-                    context,
+                    context: checked.context,
+                    peer: checked.peer,
+                    pays_stars: checked.pays_stars,
+                    writes_quick_replies: checked.writes_quick_replies,
                 });
             }
         }
     }
+}
+
+/// Whether [`unwrap_request`] refuses a call to `method` whatever a
+/// client's allowlist says: [`AUTHORIZATION_METHODS`], [`UPDATES_METHODS`]
+/// and every `invoke*` wrapper but the two it strips (`initConnection`,
+/// and `invokeWithLayer` in the account's layer). It refuses such a call
+/// as soon as it has read the function's id.
+#[must_use]
+pub fn always_refused(method: &str) -> bool {
+    if AUTHORIZATION_METHODS.contains(&method) || UPDATES_METHODS.contains(&method) {
+        return true;
+    }
+    match API.ctor_by_name(method) {
+        Some(ctor) if ctor.ty.is_none() => {
+            is_wrapper(ctor) && !matches!(method, "initConnection" | "invokeWithLayer")
+        }
+        _ => false,
+    }
+}
+
+/// The constructor id of the api schema's function `method`; `None` for a
+/// name that is no function.
+#[must_use]
+pub fn function_id(method: &str) -> Option<u32> {
+    API.ctor_by_name(method)
+        .filter(|ctor| ctor.ty.is_none())
+        .map(|ctor| ctor.id)
 }
 
 /// A function whose result is its `query:!X`'s.
@@ -237,24 +295,20 @@ fn query_start(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<usize, TlError
     Err(TlError::Eof { at: r.pos })
 }
 
-/// Checks a call's fields strictly; returns its update context:
-/// - a `channels.*` call: the channel its `channel` field names (none
-///   without one);
-/// - a call with a `parent_peer` field (`messages.deleteSavedHistory`): the
-///   channel it names, else the common box; its `peer` is then a saved
-///   dialog of the account's own Saved Messages;
-/// - any other call: the channel its `peer` names, else the common box.
-fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlError> {
+/// Checks a call's fields strictly; returns its update context: the channel
+/// its target field ([`target_field`]) names, else the common box (none
+/// for a `channels.*` call without one). With a `parent_peer` field
+/// (`messages.deleteSavedHistory`) the target is that, as `peer` is then a
+/// saved dialog of the account's own Saved Messages.
+///
+/// Also returns the peer that field names, and whether the call sets
+/// `allow_paid_stars`.
+fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlError> {
     let channels = ctor.name.starts_with("channels.");
-    let has_parent = ctor.params.iter().any(|p| p.name == "parent_peer");
-    let target = if channels {
-        "channel"
-    } else if has_parent {
-        "parent_peer"
-    } else {
-        "peer"
-    };
-    let mut channel = None;
+    let target = target_field(ctor, channels);
+    let mut peer = None;
+    let mut pays_stars = false;
+    let mut writes_quick_replies = false;
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -263,36 +317,148 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<BoxKind, TlErro
                 if !present(&words, *flag) {
                     continue;
                 }
+                pays_stars |= PAID_STARS_FIELDS.contains(&p.name);
+                writes_quick_replies |= QUICK_REPLY_FIELDS.contains(&p.name);
                 let start = r.pos;
-                API.skip_value(r, ty, 1)?;
-                if p.name == target {
-                    channel = channel_id(&r.buf[start..r.pos]);
+                pays_stars |= skip_spending(r, ty, 1)?;
+                if Some(p.name) == target {
+                    peer = peer_id(&r.buf[start..r.pos]);
                 }
             }
         }
     }
-    Ok(match channel {
-        Some(id) => BoxKind::Channel(id),
-        None if channels => BoxKind::None,
-        None => BoxKind::Common,
+    let context = match peer {
+        Some(PeerId::Channel(id)) => BoxKind::Channel(id),
+        _ if channels => BoxKind::None,
+        _ => BoxKind::Common,
+    };
+    Ok(Checked {
+        context,
+        peer,
+        pays_stars,
+        writes_quick_replies,
     })
 }
 
-/// The `channel_id` of an `inputChannel`, `inputChannelFromMessage`,
-/// `inputPeerChannel` or `inputPeerChannelFromMessage` (already checked);
-/// `None` for any other peer.
-fn channel_id(bytes: &[u8]) -> Option<i64> {
+/// Calls whose target chat is a field the general rule in
+/// [`target_field`] would not pick.
+const TARGET_FIELDS: [(&str, &str); 1] = [("messages.forwardMessages", "to_peer")];
+
+/// The field that names the chat a call targets: `channel` on a
+/// `channels.*` call, a listed field ([`TARGET_FIELDS`]), `parent_peer`
+/// when there is one, else `peer`, else the first `InputPeer` field whose
+/// name ends in `peer` and is no pagination cursor (`offset_peer`). `None`
+/// when the call names no chat.
+fn target_field(ctor: &'static Ctor, channels: bool) -> Option<&'static str> {
+    if channels {
+        return Some("channel");
+    }
+    if let Some(&(_, field)) = TARGET_FIELDS.iter().find(|(m, _)| *m == ctor.name) {
+        return Some(field);
+    }
+    let named = |name: &str| ctor.params.iter().any(|p| p.name == name);
+    if named("parent_peer") {
+        return Some("parent_peer");
+    }
+    if named("peer") {
+        return Some("peer");
+    }
+    ctor.params
+        .iter()
+        .find(|p| {
+            p.name.ends_with("peer")
+                && !p.name.starts_with("offset_")
+                && matches!(&p.kind, Kind::Field { ty: Ty::Boxed(t), .. }
+                    if API.type_def(*t).name == "InputPeer")
+        })
+        .map(|p| p.name)
+}
+
+/// The fields by which a call agrees to pay Stars: a recipient's price
+/// (`allow_paid_stars`), or to skip a flood wait (`allow_paid_floodskip`).
+const PAID_STARS_FIELDS: [&str; 2] = ["allow_paid_stars", "allow_paid_floodskip"];
+
+/// Skips one value of `ty`, as [`Schema::skip_value`](crate::schema)
+/// does, and says whether it spends the account's Stars or TON anywhere
+/// inside: a `suggestedPost` that offers a `price` (charged when the
+/// channel accepts the post), or an `inputMediaStakeDice` (a TON bet).
+fn skip_spending(r: &mut Reader<'_>, ty: &'static Ty, depth: u32) -> Result<bool, TlError> {
+    match ty {
+        Ty::Boxed(t) => spending_object(r, Some(*t), depth),
+        Ty::Any => spending_object(r, None, depth),
+        Ty::Bare(c) => spending_fields(r, API.ctor(*c), depth),
+        Ty::Vector(t) => {
+            r.vector_id()?;
+            spending_items(r, t, depth)
+        }
+        Ty::BareVector(t) => spending_items(r, t, depth),
+        _ => API.skip_value(r, ty, depth).map(|()| false),
+    }
+}
+
+fn spending_object(r: &mut Reader<'_>, want: Option<u16>, depth: u32) -> Result<bool, TlError> {
+    let ctor = API.read_ctor(r, want)?;
+    let stake = ctor.name == "inputMediaStakeDice";
+    Ok(spending_fields(r, ctor, depth)? || stake)
+}
+
+fn spending_fields(r: &mut Reader<'_>, ctor: &'static Ctor, depth: u32) -> Result<bool, TlError> {
+    let depth = deeper(depth)?;
+    let offer = ctor.name == "suggestedPost";
+    let mut spends = false;
+    let mut words = [0u32; MAX_FLAG_WORDS];
+    for p in ctor.params {
+        match &p.kind {
+            Kind::Flags { slot, known } => words[usize::from(*slot)] = r.flags(ctor, p, *known)?,
+            Kind::Field { ty, flag } => {
+                if present(&words, *flag) {
+                    spends |= offer && p.name == "price";
+                    spends |= skip_spending(r, ty, depth)?;
+                }
+            }
+        }
+    }
+    Ok(spends)
+}
+
+fn spending_items(r: &mut Reader<'_>, t: &'static Ty, depth: u32) -> Result<bool, TlError> {
+    let depth = deeper(depth)?;
+    let n = r.count(API.min_size(t))?;
+    let mut spends = false;
+    for _ in 0..n {
+        spends |= skip_spending(r, t, depth)?;
+    }
+    Ok(spends)
+}
+
+/// The fields by which a call writes the account's quick replies.
+const QUICK_REPLY_FIELDS: [&str; 2] = ["quick_reply_shortcut", "quick_reply_shortcut_id"];
+
+/// What [`check_call`] reads from a call's fields.
+struct Checked {
+    context: BoxKind,
+    peer: Option<PeerId>,
+    pays_stars: bool,
+    writes_quick_replies: bool,
+}
+
+/// The peer an `InputPeer` or `InputChannel` names (already checked):
+/// `inputChannel`, `inputChannelFromMessage`, `inputPeerChannel` and
+/// `inputPeerChannelFromMessage` a channel, `inputPeerChat` a chat,
+/// `inputPeerUser` and `inputPeerUserFromMessage` a user; `None` for any
+/// other (`inputPeerSelf`, `inputPeerEmpty`).
+fn peer_id(bytes: &[u8]) -> Option<PeerId> {
     let mut r = Reader::new(bytes);
     let ctor = API.read_ctor(&mut r, None).ok()?;
-    if !matches!(
-        ctor.name,
+    let (role, make): (Role, fn(i64) -> PeerId) = match ctor.name {
         "inputChannel"
-            | "inputChannelFromMessage"
-            | "inputPeerChannel"
-            | "inputPeerChannelFromMessage"
-    ) {
-        return None;
-    }
+        | "inputChannelFromMessage"
+        | "inputPeerChannel"
+        | "inputPeerChannelFromMessage" => (Role::ChannelId, PeerId::Channel),
+        "inputPeerChat" => (Role::ChatId, PeerId::Chat),
+        "inputPeerUser" | "inputPeerUserFromMessage" => (Role::UserId, PeerId::User),
+        _ => return None,
+    };
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -303,8 +469,8 @@ fn channel_id(bytes: &[u8]) -> Option<i64> {
                 if !present(&words, *flag) {
                     continue;
                 }
-                if p.role == Role::ChannelId {
-                    return r.i64().ok();
+                if p.role == role {
+                    return r.i64().ok().map(make);
                 }
                 API.skip_value(&mut r, ty, 1).ok()?;
             }
@@ -516,12 +682,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn target_field_names_the_chat_a_call_targets() {
+        let target = |name: &str| {
+            let ctor = API.ctor_by_name(name).expect("a function");
+            target_field(ctor, name.starts_with("channels."))
+        };
+        assert_eq!(target("channels.deleteMessages"), Some("channel"));
+        assert_eq!(target("messages.forwardMessages"), Some("to_peer"));
+        assert_eq!(target("messages.deleteSavedHistory"), Some("parent_peer"));
+        assert_eq!(target("messages.sendMessage"), Some("peer"));
+        assert_eq!(
+            target("payments.getPremiumGiftCodeOptions"),
+            Some("boost_peer")
+        );
+        // A pagination cursor is no target.
+        assert_eq!(target("messages.getDialogs"), None);
+        assert_eq!(target("help.getConfig"), None);
+    }
+
+    #[test]
     fn debug_prints_lengths_not_bytes() {
         let body = [0xab_u8; 12];
         let call = Call {
             method: "help.getConfig",
             body: &body,
             context: BoxKind::Common,
+            peer: None,
+            pays_stars: false,
+            writes_quick_replies: false,
         };
         let call = format!("{call:?}");
         assert!(

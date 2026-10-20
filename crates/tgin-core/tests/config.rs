@@ -3992,3 +3992,198 @@ fn accounts_without_admin_token_warn() {
     let cfg = load_account(&account_yaml("")).expect("loads");
     assert!(cfg.warnings.is_empty(), "{}", render(&cfg.warnings));
 }
+
+/// A glob grants only methods of the reviewed namespaces that change
+/// nothing account-wide; every other method needs an exact entry.
+#[test]
+fn glob_grants_only_reviewed_namespaces() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"*\", \"messages.*\", \"payments.*\", \"wallet.*\", \"futurens.*\"] }, e: { token: u, allow: [payments.getStarsStatus, messages.sendPaidReaction, futurens.doThing] } } } }\n",
+    );
+    let glob = &cfg.accounts[0].rpc.clients[0].acl;
+    let exact = &cfg.accounts[0].rpc.clients[1].acl;
+    for method in [
+        "messages.sendMessage",
+        "channels.joinChannel",
+        "upload.getFile",
+        "users.getUsers",
+    ] {
+        assert!(!config::exact_only(method), "{method}");
+        assert!(glob.allows(method), "{method}");
+    }
+    for method in [
+        "messages.sendPaidReaction",
+        "messages.setDefaultHistoryTTL",
+        "messages.setDefaultReaction",
+        "messages.requestWebView",
+        "messages.requestSimpleWebView",
+        "messages.requestAppWebView",
+        "messages.requestMainWebView",
+        "messages.requestChatJoinWebView",
+        "messages.prolongWebView",
+        "messages.checkUrlAuthMatchCode",
+        "messages.acceptUrlAuth",
+        "messages.requestUrlAuth",
+        "messages.toggleBotInAttachMenu",
+        "messages.updateDialogFilter",
+        "messages.toggleSuggestedPostApproval",
+        "channels.updatePaidMessagesPrice",
+        "contacts.block",
+        "contacts.setBlocked",
+        "contacts.editCloseFriends",
+        "stories.toggleAllStoriesHidden",
+        "payments.getStarsStatus",
+        "payments.sendStarsForm",
+        "wallet.getWallets",
+        "smsjobs.join",
+        "premium.applyBoost",
+        "bots.setBotInfo",
+        "fragment.getCollectibleInfo",
+        "auth.logOut",
+        "futurens.doThing",
+        "ping",
+    ] {
+        assert!(config::exact_only(method), "{method}");
+        assert!(!glob.allows(method), "{method}");
+    }
+    assert!(exact.allows("payments.getStarsStatus"));
+    assert!(exact.allows("messages.sendPaidReaction"));
+    assert!(exact.allows("futurens.doThing"));
+    assert!(!exact.allows("payments.sendStarsForm"));
+    for namespace in [
+        "payments", "wallet", "smsjobs", "premium", "bots", "fragment", "auth",
+    ] {
+        assert!(!config::glob_namespace(namespace), "{namespace}");
+    }
+}
+
+/// `allow_paid_stars` lets a client's requests spend Stars on paid
+/// messages; it is off unless set.
+#[test]
+fn allow_paid_stars_per_client() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1 }, b: { token: t2, allow_paid_stars: true } } } }\n",
+    );
+    let clients = &cfg.accounts[0].rpc.clients;
+    assert!(!clients[0].allow_paid_stars);
+    assert!(clients[1].allow_paid_stars);
+    let json = config::redacted_json(&cfg);
+    assert_eq!(
+        json["accounts"]["main"]["rpc"]["clients"]["b"]["allow_paid_stars"],
+        true
+    );
+    assert_eq!(
+        json["accounts"]["main"]["rpc"]["clients"]["a"]["allow_paid_stars"],
+        false
+    );
+    let err = single_error(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1, allow_paid_stars: yes please } } } }\n",
+    );
+    assert!(
+        err.at.as_ref().unwrap().path.contains("allow_paid_stars"),
+        "{err}"
+    );
+}
+
+/// The warnings follow the classes: a glob over a namespace no glob may
+/// grant says so and names the namespaces one may; an exact listing of
+/// any exact-only method is named, payments as much as auth.
+#[test]
+fn allowlist_warnings_follow_the_classes() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"messages.*\", \"payments.*\", \"wallet.*\", payments.getStarsStatus, messages.sendPaidReaction] } } } }\n",
+    );
+    let warnings: Vec<&ConfigError> = cfg
+        .warnings
+        .iter()
+        .filter(|w| w.at.as_ref().is_some_and(|at| at.path.contains(".rpc.")))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{}", render(&cfg.warnings));
+    let useless = warnings[0];
+    assert_eq!(
+        useless.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[1]"
+    );
+    assert_message(useless, "`payments.*`, `wallet.*`");
+    assert_message(useless, "grant nothing");
+    assert!(!useless.message.contains("account-changing"), "{useless}");
+    let hint = useless.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("payments.<method>"), "{hint}");
+    assert!(
+        hint.contains("messages") && hint.contains("upload"),
+        "{hint}"
+    );
+    let exact = warnings[1];
+    assert_eq!(
+        exact.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[3]"
+    );
+    assert_message(exact, "payments.getStarsStatus, messages.sendPaidReaction");
+    assert_message(exact, "only an exact entry grants");
+    let hint = exact.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("move assets"), "{hint}");
+}
+
+/// Declining a website login changes nothing, so a glob may grant it.
+#[test]
+fn decline_url_auth_stays_glob_grantable() {
+    assert!(!config::exact_only("messages.declineUrlAuth"));
+    assert!(config::exact_only("messages.requestUrlAuth"));
+}
+
+/// `contacts.getLocated` with `self_expires` publishes the account's
+/// location, so only an exact entry grants it.
+#[test]
+fn get_located_needs_an_exact_entry() {
+    assert!(config::exact_only("contacts.getLocated"));
+    assert!(!config::exact_only("contacts.getContacts"));
+}
+
+/// Methods that give other users control of the owner's chats, and the
+/// account-wide quick replies, need an exact entry.
+#[test]
+fn admin_rights_and_quick_replies_need_an_exact_entry() {
+    for method in [
+        "channels.editAdmin",
+        "messages.editChatAdmin",
+        "messages.editChatCreator",
+        "messages.checkQuickReplyShortcut",
+        "messages.deleteQuickReplyMessages",
+        "messages.deleteQuickReplyShortcut",
+        "messages.editQuickReplyShortcut",
+        "messages.getQuickReplies",
+        "messages.getQuickReplyMessages",
+        "messages.reorderQuickReplies",
+        "messages.sendQuickReplyMessages",
+        "account.updateBusinessAwayMessage",
+        "account.updateBusinessGreetingMessage",
+    ] {
+        assert!(config::exact_only(method), "{method}");
+    }
+    // Ordinary chat administration stays glob-grantable.
+    assert!(!config::exact_only("channels.editBanned"));
+    assert!(!config::exact_only("messages.editChatTitle"));
+}
+
+/// `allow_paid_stars: true` lets a client spend the account's Stars, so
+/// the loader names it, as it names exactly listed protected methods.
+#[test]
+fn allow_paid_stars_warns() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1 }, b: { token: t2, allow_paid_stars: true } } } }\n",
+    );
+    let warnings: Vec<&ConfigError> = cfg
+        .warnings
+        .iter()
+        .filter(|w| w.at.as_ref().is_some_and(|at| at.path.contains(".rpc.")))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{}", render(&cfg.warnings));
+    let warning = warnings[0];
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_eq!(
+        warning.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.b.allow_paid_stars"
+    );
+    assert_message(warning, "client `b` may spend the account's Stars");
+    assert!(warning.hint.is_some(), "{warning}");
+}
