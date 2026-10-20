@@ -74,6 +74,7 @@ use tokio_util::sync::CancellationToken;
 use crate::authorization::gone as lost_authorization;
 use crate::decode::BoxKind;
 use crate::media::{AccountSessions, Connect, KeyStore, MediaConnected, Session};
+use crate::retry::DEFAULT_FLOOD_WAIT;
 use crate::rpc::{
     AccountRpc, AffectedSink, BoxFuture, Charge, ErrorClass, InvokeError, Route, classify,
 };
@@ -99,8 +100,6 @@ pub use supervisor::{Account, Registry};
 #[cfg(test)]
 mod tests;
 
-/// A 420 without a number in its message.
-const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
 /// Messages of a channel difference per call (Telegram's most for users).
 const CHANNEL_DIFFERENCE_LIMIT: i32 = 100;
 /// `messages.affected*` pts waiting for the ingest; beyond it they are

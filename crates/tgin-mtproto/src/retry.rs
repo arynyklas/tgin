@@ -10,6 +10,9 @@
 
 use std::time::Duration;
 
+/// The wait for a 420 whose message names no number of seconds.
+pub const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
+
 /// Which wait an error message asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitKind {

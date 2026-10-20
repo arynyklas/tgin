@@ -2,7 +2,7 @@
 //! refusals and failures set (flood waits, 4xx refusals, backoff).
 
 use super::*;
-use crate::retry::Wait;
+use crate::retry::{DEFAULT_FLOOD_WAIT, Wait};
 
 /// What `initConnection` tells Telegram, and how the connection is used.
 #[derive(Clone)]
@@ -142,9 +142,6 @@ impl Shared {
         self.retry_at = Some(now + self.backoff.next());
     }
 }
-
-/// A 420 without a number in its message.
-const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
 
 /// The X of a 420 `…_X` message (`FLOOD_WAIT_30`).
 fn flood_wait(message: &str) -> Duration {
