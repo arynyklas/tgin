@@ -2,6 +2,7 @@
 //! park and close, and the registry of the process's accounts.
 
 use super::*;
+use crate::retry::Backoff;
 
 /// Says which operation of this process, if any, holds an account's
 /// session.
@@ -280,7 +281,9 @@ impl Drop for AbortOnDrop {
 }
 
 async fn supervise(ctx: Arc<Ctx>) {
-    let mut backoff = BACKOFF_FIRST;
+    // A restart waits 1 s, doubling to 60 s; a run longer than that resets
+    // it.
+    let mut backoff = Backoff::default();
     loop {
         if ctx.ingest.is_cancelled() {
             break;
@@ -294,16 +297,14 @@ async fn supervise(ctx: Arc<Ctx>) {
         let at = match end {
             End::Stopped => break,
             End::Retry => {
-                if started.elapsed() > BACKOFF_MAX {
-                    backoff = BACKOFF_FIRST;
+                if started.elapsed() > Backoff::MAX {
+                    backoff.reset();
                 }
-                let at = Instant::now() + backoff;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-                Some(at)
+                Some(Instant::now() + backoff.next())
             }
             End::Until(at) => Some(at),
             End::Wait => {
-                backoff = BACKOFF_FIRST;
+                backoff.reset();
                 None
             }
         };

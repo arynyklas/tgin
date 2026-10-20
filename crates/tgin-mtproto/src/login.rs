@@ -49,6 +49,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::authorization;
+use crate::retry::{Wait, WaitKind};
 use crate::{
     AuthKey, DcOption, InitParams, Peer, PeerKind, Pushes, RpcOutcome, Sender, SenderError,
     SessionError, SessionStore,
@@ -368,9 +369,12 @@ impl LoginError {
     }
 
     fn rpc(code: i32, message: &str) -> Self {
-        if let Some(seconds) = message.strip_prefix("FLOOD_WAIT_") {
+        if message.starts_with("FLOOD_WAIT_") {
+            let seconds = Wait::parse(message)
+                .filter(|w| w.kind == WaitKind::Flood)
+                .and_then(|w| u32::try_from(w.seconds).ok());
             return Self::FloodWait {
-                seconds: seconds.parse().unwrap_or(0),
+                seconds: seconds.unwrap_or(0),
             };
         }
         match message {

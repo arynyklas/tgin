@@ -99,10 +99,6 @@ pub use supervisor::{Account, Registry};
 #[cfg(test)]
 mod tests;
 
-/// The first wait before a failed account starts again; it doubles per
-/// failure up to [`BACKOFF_MAX`]. A run longer than that resets it.
-pub const BACKOFF_FIRST: Duration = Duration::from_secs(1);
-pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A 420 without a number in its message.
 const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
 /// Messages of a channel difference per call (Telegram's most for users).

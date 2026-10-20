@@ -25,6 +25,7 @@ use tokio::time::{Instant, sleep_until};
 use bytes::Bytes;
 
 use crate::decode::{BoxKind, PeerId};
+use crate::retry::{Wait, WaitKind};
 use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, deeper, present};
 use crate::{RpcOutcome, SenderError, TlError};
 
@@ -530,16 +531,14 @@ pub enum ErrorClass {
 /// Classifies an `rpc_error` by its code and message.
 #[must_use]
 pub fn classify(code: i32, message: &str) -> ErrorClass {
-    let wait = |prefix: &str| {
-        message
-            .strip_prefix(prefix)
-            .and_then(|x| x.parse::<u32>().ok())
-    };
-    if let Some(x) = wait("FLOOD_WAIT_").or_else(|| wait("FLOOD_PREMIUM_WAIT_")) {
-        return ErrorClass::FloodWait(x);
-    }
-    if let Some(x) = wait("SLOWMODE_WAIT_") {
-        return ErrorClass::SlowMode(x);
+    if let Some(wait) = Wait::parse(message)
+        && let Ok(x) = u32::try_from(wait.seconds)
+    {
+        match wait.kind {
+            WaitKind::Flood | WaitKind::PremiumFlood => return ErrorClass::FloodWait(x),
+            WaitKind::SlowMode => return ErrorClass::SlowMode(x),
+            WaitKind::Other => {}
+        }
     }
     if message.starts_with("FROZEN_") {
         return ErrorClass::Frozen;

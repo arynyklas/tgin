@@ -49,7 +49,7 @@ impl UpdateManager {
             ch.fetch = ChannelFetch::Idle;
             ch.again = false;
             ch.retry_at = None;
-            ch.backoff = Duration::ZERO;
+            ch.backoff.reset();
             ch.refused_until = None;
         }
         self.retrying.remove(&channel);
@@ -67,7 +67,7 @@ impl UpdateManager {
             return Vec::new();
         };
         self.in_flight = self.in_flight.saturating_sub(1);
-        ch.backoff = Duration::ZERO;
+        ch.backoff.reset();
         if epoch != ch.epoch {
             ch.fetch = ChannelFetch::Wanted;
             self.queue.push_back(channel);
@@ -278,7 +278,7 @@ impl UpdateManager {
                 // cut short: the server just showed it is reachable.
                 ChannelFetch::Wanted => {
                     if ch.retry_at.take().is_some() {
-                        ch.backoff = Duration::ZERO;
+                        ch.backoff.reset();
                         self.retrying.remove(&c);
                         self.queue.push_back(c);
                     }

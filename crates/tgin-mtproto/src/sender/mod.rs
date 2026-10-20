@@ -86,6 +86,7 @@ use grammers_tl_types::{self as tl, Identifiable as _, Serializable};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
+use crate::retry::Backoff;
 use crate::transport::{PacketReader, PacketWriter, TcpTransport, Transport, TransportError};
 use crate::updates::CONNECTION_ENDED;
 use crate::{AuthKey, DcOption};
@@ -367,7 +368,7 @@ impl Sender {
                 backlog: VecDeque::new(),
                 dead: None,
                 refused: None,
-                backoff: Duration::ZERO,
+                backoff: Backoff::default(),
                 retry_at: None,
             },
         };
@@ -439,7 +440,7 @@ struct Shared {
     refused: Option<(i32, String, Option<Instant>)>,
     /// The delay after the last transport −429, and when the next
     /// connection may open.
-    backoff: Duration,
+    backoff: Backoff,
     retry_at: Option<Instant>,
 }
 

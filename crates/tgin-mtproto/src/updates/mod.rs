@@ -82,6 +82,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::TlError;
 use crate::decode::{self, BoxKind, PeerId, UpdateFacts};
+use crate::retry::Backoff;
 use crate::session::{Peer, PeerKind, UpdateState};
 
 mod batch;
@@ -90,7 +91,7 @@ mod common;
 mod schedule;
 
 pub use batch::{Batch, UpdateBytes};
-use schedule::{later, next_backoff, wait_for};
+use schedule::{later, wait_for};
 
 /// How long a gap may stay open before the box fetches its difference;
 /// the missing updates may only be reordered (Telegram's 0.5 s).
@@ -102,8 +103,8 @@ pub const MAX_CHANNEL_FETCHES: usize = 4;
 /// A failed fetch, or the refetch of a refused batch, is asked again after
 /// this long, doubling per failure or refusal up to [`RETRY_MAX`] (as TDLib
 /// backs off getDifference).
-pub const RETRY_MIN: Duration = Duration::from_secs(1);
-pub const RETRY_MAX: Duration = Duration::from_secs(60);
+pub const RETRY_MIN: Duration = Backoff::FIRST;
+pub const RETRY_MAX: Duration = Backoff::MAX;
 /// What the sender pushes when a connection that finished its init call
 /// ends: the session's update stream may have a gap. Not TL (no schema
 /// constructor has this id), so it is never mistaken for Telegram's
@@ -306,10 +307,10 @@ struct Channel {
     again: bool,
     /// A failed fetch is asked again then (with `fetch` Wanted).
     retry_at: Option<Instant>,
-    backoff: Duration,
+    backoff: Backoff,
     /// The backoff of the refetch after a refusal: grows per refusal, and
     /// only a committed batch of the channel resets it.
-    refusals: Duration,
+    refusals: Backoff,
     /// A refused batch's refetch waits until then. Apart from `retry_at`:
     /// a signal that the server is reachable cuts a failed fetch's retry
     /// short, never a refusal's wait for a full consumer.
@@ -328,8 +329,8 @@ impl Channel {
             epoch: 0,
             again: false,
             retry_at: None,
-            backoff: Duration::ZERO,
-            refusals: Duration::ZERO,
+            backoff: Backoff::default(),
+            refusals: Backoff::default(),
             refused_until: None,
         }
     }
@@ -456,10 +457,10 @@ pub struct UpdateManager {
     retrying: BTreeSet<i64>,
     /// The common box's failed fetch is asked again then.
     retry_at: Option<Instant>,
-    backoff: Duration,
+    backoff: Backoff,
     /// The backoff of the refetch after a refusal: grows per refusal, and
     /// only a committed batch of the common box resets it.
-    refusals: Duration,
+    refusals: Backoff,
     /// The common box's refetch after a refusal waits until then; apart
     /// from `retry_at`, which `updatesTooLong` cuts short.
     refused_until: Option<Instant>,
@@ -546,8 +547,8 @@ impl UpdateManager {
             gapped: BTreeSet::new(),
             retrying: BTreeSet::new(),
             retry_at: None,
-            backoff: Duration::ZERO,
-            refusals: Duration::ZERO,
+            backoff: Backoff::default(),
+            refusals: Backoff::default(),
             refused_until: None,
             common_flood: None,
             channel_flood: None,
@@ -762,11 +763,11 @@ impl UpdateManager {
                 // The box takes batches again: its next refusal starts the
                 // backoff over.
                 if d.pts.is_some() || d.qts.is_some() || d.seq.is_some() || d.date.is_some() {
-                    self.refusals = Duration::ZERO;
+                    self.refusals.reset();
                 }
                 for (c, _) in &d.channels {
                     if let Some(ch) = self.channels.get_mut(c) {
-                        ch.refusals = Duration::ZERO;
+                        ch.refusals.reset();
                     }
                 }
                 self.committed.pts = d.pts.unwrap_or(self.committed.pts);
@@ -825,8 +826,8 @@ impl UpdateManager {
         let now = Instant::now();
         if p.common_epoch == Some(self.epoch) {
             self.epoch += 1;
-            self.refusals = next_backoff(self.refusals);
-            self.refused_until = Some(later(self.refused_until, now + self.refusals));
+            let wait = self.refusals.next();
+            self.refused_until = Some(later(self.refused_until, now + wait));
             self.pts = self.committed.pts;
             self.qts = self.committed.qts;
             self.seq = self.committed.seq;
@@ -854,8 +855,8 @@ impl UpdateManager {
             ch.epoch += 1;
             ch.pts = self.committed_channels.get(&c).copied();
             ch.deadline = None;
-            ch.refusals = next_backoff(ch.refusals);
-            ch.refused_until = Some(later(ch.refused_until, now + ch.refusals));
+            let wait = ch.refusals.next();
+            ch.refused_until = Some(later(ch.refused_until, now + wait));
             self.gapped.remove(&c);
             if ch.fetch == ChannelFetch::Idle && ch.pts.is_some() {
                 ch.fetch = ChannelFetch::Wanted;

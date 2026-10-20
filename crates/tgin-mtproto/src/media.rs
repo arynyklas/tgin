@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 
 use crate::authorization;
+use crate::retry::Backoff;
 use crate::rpc::{
     AccountRpc, BoxFuture, Charge, ErrorClass, InvokeError, MediaFailure, Route, charged, classify,
 };
@@ -137,11 +138,6 @@ fn setup_error(dc: i32, what: &'static str, e: &SenderError) -> InvokeError {
 /// The longest a media session's setup may take: connecting (10 s), the
 /// key exchange (30 s), the export and the import.
 pub const SETUP_DEADLINE: Duration = Duration::from_secs(60);
-/// The first and the longest wait after a failed setup before a DC is
-/// tried again; it doubles in between.
-const BACKOFF_FIRST: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
-
 /// Whether a media sender's own failure leaves it unusable: Telegram does
 /// not know its key (transport −404), refused its init call for good (not
 /// a 420 flood wait), or it refused the request as malformed.
@@ -168,7 +164,8 @@ struct Setup<S> {
     unauthorized: Option<(Arc<S>, AuthKey)>,
     /// After a failure: no setup before `until`; answered with `failure`.
     failed: Option<(Instant, MediaFailure)>,
-    backoff: Duration,
+    /// The wait after a failed setup before the DC is tried again.
+    backoff: Backoff,
 }
 
 impl<S> Default for Dc<S> {
@@ -178,7 +175,7 @@ impl<S> Default for Dc<S> {
             setup: Mutex::new(Setup {
                 unauthorized: None,
                 failed: None,
-                backoff: BACKOFF_FIRST,
+                backoff: Backoff::default(),
             }),
         }
     }
@@ -251,20 +248,20 @@ impl<M: Session, C: Connect, K: KeyStore> AccountSessions<M, C, K> {
         match made {
             Ok((session, key)) => {
                 setup.failed = None;
-                setup.backoff = BACKOFF_FIRST;
+                setup.backoff.reset();
                 *slot.ready.lock() = Some((Arc::clone(&session), key));
                 Ok(session)
             }
             Err(e) => {
                 if let InvokeError::Media { failure, .. } = e {
+                    let backoff = setup.backoff.next();
                     let wait = match failure {
                         MediaFailure::FloodWait { seconds, .. } => {
-                            Duration::from_secs(u64::from(seconds)).max(setup.backoff)
+                            Duration::from_secs(u64::from(seconds)).max(backoff)
                         }
-                        MediaFailure::Failed { .. } => setup.backoff,
+                        MediaFailure::Failed { .. } => backoff,
                     };
                     setup.failed = Some((Instant::now() + wait, failure));
-                    setup.backoff = (setup.backoff * 2).min(BACKOFF_MAX);
                 }
                 Err(e)
             }

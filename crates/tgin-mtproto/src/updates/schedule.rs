@@ -16,16 +16,6 @@ pub(super) fn later(pending: Option<Instant>, at: Instant) -> Instant {
     pending.map_or(at, |p| p.max(at))
 }
 
-/// The next retry delay after `prev`: [`RETRY_MIN`], then doubling up to
-/// [`RETRY_MAX`].
-pub(super) fn next_backoff(prev: Duration) -> Duration {
-    if prev.is_zero() {
-        RETRY_MIN
-    } else {
-        (prev * 2).min(RETRY_MAX)
-    }
-}
-
 impl UpdateManager {
     /// The next call to run, if one is due. Call again after each answer
     /// and by [`deadline`](Self::deadline).
@@ -232,8 +222,7 @@ impl UpdateManager {
                     return;
                 }
                 self.fetch = want;
-                self.backoff = next_backoff(self.backoff);
-                self.retry_at = Some(now + self.backoff);
+                self.retry_at = Some(now + self.backoff.next());
             }
             Fetch::GetChannelDifference { channel, .. } => {
                 if let Some(ch) = self.channels.get_mut(&channel)
@@ -245,8 +234,7 @@ impl UpdateManager {
                         self.queue.push_back(channel);
                         return;
                     }
-                    ch.backoff = next_backoff(ch.backoff);
-                    ch.retry_at = Some(now + ch.backoff);
+                    ch.retry_at = Some(now + ch.backoff.next());
                     self.retrying.insert(channel);
                 }
             }

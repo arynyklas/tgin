@@ -10,7 +10,7 @@ impl UpdateManager {
         let CommonFetch::State { epoch } = self.fetch else {
             return Vec::new();
         };
-        self.backoff = Duration::ZERO;
+        self.backoff.reset();
         if epoch != self.epoch {
             self.fetch = self.resync();
             return Vec::new();
@@ -52,7 +52,7 @@ impl UpdateManager {
         let CommonFetch::Difference { epoch } = self.fetch else {
             return Vec::new();
         };
-        self.backoff = Duration::ZERO;
+        self.backoff.reset();
         if epoch != self.epoch {
             // Asked before a refused batch rolled the state back.
             self.fetch = self.resync();

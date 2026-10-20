@@ -2,6 +2,7 @@
 //! refusals and failures set (flood waits, 4xx refusals, backoff).
 
 use super::*;
+use crate::retry::Wait;
 
 /// What `initConnection` tells Telegram, and how the connection is used.
 #[derive(Clone)]
@@ -114,7 +115,7 @@ impl Shared {
     /// never loop.
     pub(super) fn learn(&mut self, cause: &Cause, init_done: bool, now: Instant) {
         if init_done {
-            self.backoff = Duration::ZERO;
+            self.backoff.reset();
             self.retry_at = None;
         }
         match cause {
@@ -138,23 +139,14 @@ impl Shared {
 
     /// Delays the next connection: 1 s, doubling to 60 s.
     pub(super) fn back_off(&mut self, now: Instant) {
-        self.backoff = (self.backoff * 2).clamp(MIN_BACKOFF, MAX_BACKOFF);
-        self.retry_at = Some(now + self.backoff);
+        self.retry_at = Some(now + self.backoff.next());
     }
 }
-
-const MIN_BACKOFF: Duration = Duration::from_secs(1);
-
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// A 420 without a number in its message.
 const DEFAULT_FLOOD_WAIT: Duration = Duration::from_secs(60);
 
 /// The X of a 420 `…_X` message (`FLOOD_WAIT_30`).
 fn flood_wait(message: &str) -> Duration {
-    message
-        .rsplit('_')
-        .next()
-        .and_then(|secs| secs.parse().ok())
-        .map_or(DEFAULT_FLOOD_WAIT, Duration::from_secs)
+    Wait::parse(message).map_or(DEFAULT_FLOOD_WAIT, |w| Duration::from_secs(w.seconds))
 }
