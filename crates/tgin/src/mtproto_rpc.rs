@@ -902,7 +902,7 @@ fn failure(e: &InvokeError) -> Response {
         SenderError::KeyRevoked | SenderError::KeyUnknown => tgin_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "account_unavailable",
-            "the account needs a new login",
+            "the account cannot call Telegram until an operator acts: it is logged out, needs a new login, or failed for good (see GET /v1/accounts)",
         ),
         SenderError::BadRequest => tgin_error(
             StatusCode::BAD_REQUEST,

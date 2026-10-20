@@ -362,6 +362,16 @@ async fn same_user_twice_fails_second() {
     assert!(second_net.dials().is_empty(), "the second never connects");
     assert!(second.sink.seen().is_empty(), "nor receives anything");
     assert!(!second.account.state().active());
+    // Its RPC callers are told it is unavailable, not to retry at once.
+    let call = second
+        .account
+        .rpc()
+        .invoke(Route::Main, Bytes::from_static(&[0; 4]))
+        .await;
+    assert!(
+        matches!(call, Err(InvokeError::Sender(SenderError::KeyRevoked))),
+        "{call:?}"
+    );
     assert_eq!(first.account.state(), AccountState::Running);
     // The first one gone, the second takes the user.
     first.account.close().await;
@@ -880,5 +890,47 @@ async fn a_cached_user_is_looked_up_in_the_session() {
     .await
     .expect("delivered");
     assert_eq!(differences(), asked, "no difference asked for a known user");
+    run.account.close().await;
+}
+
+/// An account that failed for good answers RPC callers as unavailable;
+/// one that is only reconnecting answers "not sent", safe to retry.
+#[tokio::test(start_paused = true)]
+async fn rpc_on_an_account_failed_for_good_is_unavailable() {
+    let net = FakeNetwork::new();
+    net.answer(|_| Reply::InitRefused(400, "API_ID_INVALID"));
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, |s| {
+        *s == AccountState::Failed(Failure::InitRefused)
+    })
+    .await;
+    let call = run
+        .account
+        .rpc()
+        .invoke(Route::Main, Bytes::from_static(&[0; 4]))
+        .await;
+    assert!(
+        matches!(call, Err(InvokeError::Sender(SenderError::KeyRevoked))),
+        "{call:?}"
+    );
+    run.account.close().await;
+
+    let net = FakeNetwork::new();
+    net.connects(vec![Reply::NotSent; 3]);
+    let run = start(&net, &registry);
+    until(&run.account, |s| {
+        *s == AccountState::Failed(Failure::Connect)
+    })
+    .await;
+    let call = run
+        .account
+        .rpc()
+        .invoke(Route::Main, Bytes::from_static(&[0; 4]))
+        .await;
+    assert!(
+        matches!(call, Err(InvokeError::Sender(SenderError::NotSent))),
+        "{call:?}"
+    );
     run.account.close().await;
 }

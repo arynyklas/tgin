@@ -783,11 +783,11 @@ impl AccountRpc for RpcPort {
         Box::pin(async move {
             let sessions = self.shared.sessions.read().clone();
             let Some(sessions) = sessions else {
-                let needs_login = matches!(
-                    *self.shared.state.borrow(),
-                    AccountState::NeedsLogin | AccountState::LoggedOut { .. }
-                );
-                return Err(InvokeError::Sender(if needs_login {
+                // An account that will not take its session again on its
+                // own (logged out, needing a login, failed for good) is
+                // unavailable; one on its way back is only not there yet.
+                let unavailable = !self.shared.state.borrow().active();
+                return Err(InvokeError::Sender(if unavailable {
                     SenderError::KeyRevoked
                 } else {
                     SenderError::NotSent
