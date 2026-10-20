@@ -48,7 +48,7 @@ use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tgin_mtproto::account::{Account, AccountSpec, AccountState, Registry, TcpNetwork};
-use tgin_mtproto::decode::{BoxKind, PeerId};
+use tgin_mtproto::decode::{BoxKind, PeerId, channel_dialog_id};
 use tgin_mtproto::rpc::{ErrorClass, Route, classify};
 use tgin_mtproto::{
     Admission, Batch, BatchSink, ChannelKind, IdsError, InitParams, Peer, PeerKind, RpcOutcome,
@@ -249,8 +249,6 @@ struct Gate {
 
 const GATE_USER: &str = "TGIN_GATE_USER";
 const GATE_CHANNEL: &str = "TGIN_GATE_CHANNEL";
-/// The Bot API offset of a channel's id (`-100…`).
-const CHANNEL_OFFSET: i64 = 1_000_000_000_000;
 
 impl Gate {
     fn load(file: &Path) -> Result<Self, AnyError> {
@@ -268,7 +266,7 @@ impl Gate {
             user: read(GATE_USER)?,
             channel: read(GATE_CHANNEL)?,
         };
-        if gate.user <= 0 || gate.channel > -CHANNEL_OFFSET {
+        if gate.user <= 0 || gate.channel > channel_dialog_id(0) {
             return Err(format!(
                 "{GATE_USER} must be a user id and {GATE_CHANNEL} a channel's Bot API id (-100…)"
             )
@@ -292,9 +290,10 @@ fn test_channel() -> i64 {
     gate().channel
 }
 
-/// The test channel's bare id.
+/// The test channel's bare id. The `-100…` mapping is its own inverse:
+/// applied to a Bot API id, it gives the bare one back.
 fn test_channel_id() -> i64 {
-    -CHANNEL_OFFSET - gate().channel
+    channel_dialog_id(gate().channel)
 }
 
 /// The test bot's token. Never printed, in part or whole.
