@@ -790,7 +790,7 @@ tgin keeps its own update state per account, by Telegram's [rules](https://core.
 
 The full classification of layer 230 is checked by a test against `crates/tgin/tests/fixtures/acl-layer-230.txt`.
 
-**Paid calls.** A call that spends the account's Stars or TON is refused with `403 paid_stars_not_allowed` unless the client sets `allow_paid_stars: true` (default `false`; the loader warns about a client that sets it). tgin reads the call through the schema: it spends when the function sets its `allow_paid_stars` field (paying a peer's price per message) or its `allow_paid_floodskip` field (paying to skip a flood wait), or when it holds, anywhere inside, a `suggestedPost` with a `price` or an `inputMediaStakeDice`. The rule is stricter than needed in one case: `messages.saveDraft` with a priced suggested post is refused too, though a draft spends nothing.
+**Paid calls.** `allow_paid_stars` gates only calls that agree to pay through one of four markers, which tgin reads through the schema: the function's own `allow_paid_stars` field (paying a peer's price per message) or `allow_paid_floodskip` field (paying to skip a flood wait), or, anywhere in the call, a `suggestedPost` with a `price` or an `inputMediaStakeDice`. Such a call is refused with `403 paid_stars_not_allowed` unless the client sets `allow_paid_stars: true` (default `false`; the loader warns about a client that sets it). Other methods that spend the account's Stars, TON or money, such as `messages.sendPaidReaction`, `payments.sendStarsForm`, `payments.sendPaymentForm`, `payments.transferStarGift` and `wallet.sendTransfer`, carry no such marker: they are gated only by exact listing, as exact-only methods, and `allow_paid_stars` neither grants nor blocks them. The rule is stricter than needed in one case: `messages.saveDraft` with a priced suggested post is refused too, though a draft spends nothing.
 
 **Quick replies.** A send or edit that carries `quick_reply_shortcut` or `quick_reply_shortcut_id` writes the account's quick replies (Telegram Business greetings and away messages every new chat gets). It is refused with `403 quick_replies_not_allowed` unless the client's `allow` names `messages.editQuickReplyShortcut` exactly.
 
@@ -802,9 +802,10 @@ The full classification of layer 230 is checked by a test against `crates/tgin/t
 
 **Remembered flood waits.** tgin remembers the waits Telegram gave each account's calls: a `FLOOD_WAIT_X` it did not sleep out, per method, and a `SLOWMODE_WAIT_X` per method and target chat. Until a wait ends, a call it holds back is answered locally with `429`, `Retry-After` and a Telegram-shaped `FLOOD_WAIT_<left>` or `SLOWMODE_WAIT_<left>`, counted as `rate_limited`, and never reaches Telegram, so a client that retries early does not hit Telegram again. Mind that:
 
-- the waits live in memory: a reload that only changes the account's `rpc` settings keeps them, while a restart of tgin, or a relaunch of the account (a reload that changes its `api_id`, `api_hash` or `session_dir`), forgets them, so a client may then reach Telegram before a wait ends; at most 1024 per account are kept (past that, the one that ends first goes);
+- the waits live in memory: a reload that only changes the account's `rpc` settings keeps them, while a restart of tgin or any relaunch of the account, such as a reload that changes its `api_id`, `api_hash` or `session_dir`, or a logout of a running account, forgets them, so a client may then reach Telegram before a wait ends; at most 1024 per account are kept (past that, the one that ends first goes);
 - they are per account, not per client: one client's wait holds that method back for every client of the account;
-- they are per method: a sibling method (another send method for the same chat, say) is not held back, though Telegram may answer it with the same wait.
+- they are per method: a sibling method (another send method for the same chat, say) is not held back, though Telegram may answer it with the same wait;
+- a `SLOWMODE_WAIT_X` on a call with no target chat is not remembered.
 
 **Answers.** Telegram's answers keep their bytes (TL, or TL-JSON when asked); tgin's own errors are JSON `{"error","description"}`.
 
@@ -818,7 +819,7 @@ The full classification of layer 230 is checked by a test against `crates/tgin/t
 | `401` | `unauthorized` | No or wrong client token, or an unknown account. |
 | `403` | `method_not_allowed` | The client's allowlist does not allow the method. |
 | `403` | `updates_method`, `authorization_method` | An always-refused method. |
-| `403` | `paid_stars_not_allowed` | The call spends Stars or TON and the client's `allow_paid_stars` is off. |
+| `403` | `paid_stars_not_allowed` | The call agrees to pay through one of the four [paid-call markers](#rpc-endpoint) and the client's `allow_paid_stars` is off. |
 | `403` | `quick_replies_not_allowed` | The call writes quick replies and the client lacks the exact `messages.editQuickReplyShortcut` grant. |
 | `403` | Telegram's `rpc_error` | `FROZEN_*`: the account is frozen. |
 | `408` | `body_timeout` | The body did not arrive within 30 s. |
@@ -1044,7 +1045,7 @@ Logs go to stdout, as `text` or `json` lines (`log.format`, fixed at start). `lo
 | Pull consumers | Optional `auth_token` per consumer, as a bearer token. Without it, anyone who can reach the data plane can take the consumer's updates. |
 | Account pull consumers | `auth_token` required; the account path answers `401` without it. |
 | Account login routes | `admin.token`, always, also on loopback; its holder can log the account in and out ([Login](#login)). |
-| MTProto RPC endpoint | A client `token` per downstream, with a method allowlist: globs reach only reviewed namespaces, every other method needs an exact entry, and paid calls need `allow_paid_stars`. A client allowed exact-only methods is trusted as much as the account ([RPC endpoint](#rpc-endpoint)). |
+| MTProto RPC endpoint | A client `token` per downstream, with a method allowlist: globs reach only reviewed namespaces, every other method (spending methods such as `payments.*` and `wallet.*` included) needs an exact entry, and a call that agrees to pay through a paid-call marker needs `allow_paid_stars`. A client allowed exact-only methods is trusted as much as the account ([RPC endpoint](#rpc-endpoint)). |
 | Session directory | Holds the account's auth keys: anyone who reads it can act as the account ([Session directory](#session-directory)). |
 | Webhook ingress | `secret_token` (`auto` by default) checked before the body is read; optional `ip_allowlist`; `trusted_proxies` decides whose `X-Forwarded-For` counts. |
 | Bot API gateway | The bot token in the path, compared in constant time with every configured bot's token; an unknown token gets `401` and nothing goes to the Bot API server. Its holder acts as the bot, polls the pull consumers the bot routes to, downloads the bot's own files, and, with `accept_set_webhook`, chooses where a push consumer posts ([trust model](#setwebhook-capture)); with `allow_local_files` on a server other than the Telegram cloud, it may read the server's disk ([`file:` references](#local-mode-and-file-references)). |
@@ -1058,7 +1059,7 @@ Every token compare runs in constant time.
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` (Ctrl+C, Ctrl+Break, closing the console or a system shutdown on Windows) starts the shutdown, as does every source failing for good (never while the config has a Telegram account: an account that cannot run waits for a login, it does not fail for good). tgin then:
+`SIGTERM` or `SIGINT` (Ctrl+C, Ctrl+Break, closing the console or a system shutdown on Windows) starts the shutdown, as does every source failing for good (never while the config has a Telegram account: an account that cannot run waits for a login or a reload, so tgin stays up for it). tgin then:
 
 1. **Stops being ready.** `/readyz` answers `503`, reloads are refused.
 2. **Lame duck** (`runtime.lame_duck`, 5 s; skipped without a `server` block). Everything keeps working, so load balancers can take tgin out of rotation.
@@ -1071,7 +1072,7 @@ With the defaults the whole shutdown takes at most about 22 s; set the orchestra
 
 A second `SIGTERM`/`SIGINT` (or Ctrl+C, Ctrl+Break) during the shutdown stops at once with exit code 130, losing what is pending. When the shutdown began because every source failed, the first signal is only logged and a second one forces the exit. A signal while tgin is still starting stops what has started and exits 0. Closing the console on Windows, which kills the process about 5 s later, skips the lame duck and caps the drain at 4 s.
 
-**Every source failing.** A long-poll source fails for good when its Bot API server rejects the token: `401`, `403` or `404` from a `cloud` upstream, `403` from a `local` one (whose `401` and `404` are retried, see [Webhooks from a local server](#webhooks-from-a-local-server)). When every bot with an ingress uses long poll, all of their sources have failed, no bot is [parked](#moving-a-bot-between-servers) and the config has no Telegram account, tgin shuts down as above and exits with code 2. A webhook bot never fails this way, so a config with one never exits 2. Nor does a config with an account: an account that cannot run waits for a login rather than failing for good, so tgin keeps running for it, its RPC endpoint and its consumers.
+**Every source failing.** A long-poll source fails for good when its Bot API server rejects the token: `401`, `403` or `404` from a `cloud` upstream, `403` from a `local` one (whose `401` and `404` are retried, see [Webhooks from a local server](#webhooks-from-a-local-server)). When every bot with an ingress uses long poll, all of their sources have failed, no bot is [parked](#moving-a-bot-between-servers) and the config has no Telegram account, tgin shuts down as above and exits with code 2. A webhook bot never fails this way, so a config with one never exits 2. Nor does a config with an account: an account that cannot run waits for a login or a reload, so tgin stays up for it.
 
 ## Deployment
 

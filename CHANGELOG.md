@@ -107,8 +107,12 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   `phone.getGroupCallStreamRtmpUrl` are always refused. Globs grant only
   methods of reviewed namespaces that change nothing account-wide; every
   other method, any namespace a later layer adds included, needs an exact
-  `allow` entry. A call that spends Stars or TON needs the client's
-  `allow_paid_stars: true` (403 `paid_stars_not_allowed`), and one that
+  `allow` entry, spending methods such as `payments.*`, `wallet.*` and
+  `messages.sendPaidReaction` among them. A call that agrees to pay
+  through a paid-call marker (`allow_paid_stars` or `allow_paid_floodskip`
+  on the function, a priced `suggestedPost` or an `inputMediaStakeDice`
+  anywhere in it) also needs the client's `allow_paid_stars: true` (403
+  `paid_stars_not_allowed`), and one that
   writes quick replies the exact `messages.editQuickReplyShortcut` grant
   (403 `quick_replies_not_allowed`). Flood waits up to
   `flood_sleep_threshold` are slept out once, longer ones answer `429`
