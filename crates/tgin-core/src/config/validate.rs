@@ -302,13 +302,13 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
     if client.allow_paid_stars.value {
         diag.warnings.push(
             ConfigError::warning(format!(
-                "client `{name}` may spend the account's Stars: its requests may set `allow_paid_stars`"
+                "client `{name}` may spend the account's Stars or TON: calls that agree to pay are let through"
             ))
             .at(located(
                 format!("{path}.allow_paid_stars"),
                 client.allow_paid_stars.location,
             ))
-            .hint("a request that sets it pays each peer's price per message from the account's balance; enable it only for a client trusted with that balance"),
+            .hint("it unlocks calls that set `allow_paid_stars` or `allow_paid_floodskip` on the function, or hold a `suggestedPost` with a `price` or an `inputMediaStakeDice` anywhere, paid from the account's balance; other methods that spend are gated only by exact listing in `allow`. Enable it only for a client trusted with that balance"),
         );
     }
 }

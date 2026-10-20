@@ -4184,6 +4184,15 @@ fn allow_paid_stars_warns() {
         warning.at.as_ref().unwrap().path,
         "accounts.main.rpc.clients.b.allow_paid_stars"
     );
-    assert_message(warning, "client `b` may spend the account's Stars");
-    assert!(warning.hint.is_some(), "{warning}");
+    assert_message(warning, "client `b` may spend the account's Stars or TON");
+    let hint = warning.hint.as_deref().unwrap_or_default();
+    for unlocked in [
+        "`allow_paid_stars`",
+        "`allow_paid_floodskip`",
+        "`suggestedPost` with a `price`",
+        "`inputMediaStakeDice`",
+        "exact listing",
+    ] {
+        assert!(hint.contains(unlocked), "{unlocked} not in: {hint}");
+    }
 }
