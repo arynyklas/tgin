@@ -775,9 +775,12 @@ async fn set_webhook_captures_runtime_endpoint() {
         tgin.post_json(&set, &request).await,
         (200, ok_true(Some("Webhook is already set")))
     );
-    tgin.assert_metric(
+    // The mock records a push before tgin reads its answer and counts it.
+    wait_metric(
+        &tgin,
         r#"tgin_delivery_attempts_total{consumer="hooks",endpoint="runtime",outcome="delivered"} 2"#,
-    );
+    )
+    .await;
 
     // Refused like Telegram refuses them; the endpoint stays.
     for (body, description) in [
