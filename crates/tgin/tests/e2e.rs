@@ -31,6 +31,8 @@ const OTHER_TOKEN: &str = "987654321:BBBBanotherSecretTokenValue_-xyz";
 const HOOK_SECRET: &str = "hook-secret-value";
 const SECRET_HEADER: &str = "x-telegram-bot-api-secret-token";
 /// Fast shutdown: no lame duck, a short grace.
+/// How often the app checks whether every source failed for good.
+const SOURCES_CHECK: Duration = Duration::from_secs(1);
 const QUICK: &str = "runtime: { lame_duck: 0s, shutdown_grace: 2s }";
 
 fn update(id: i64, text: &str) -> String {
@@ -778,9 +780,38 @@ async fn an_account_keeps_tgin_running_when_every_bot_fails() {
         "{QUICK}\naccounts:\n  main: {{ api_id: 1, api_hash: h, session_dir: sessions/main }}"
     );
     let (_telegram, app) = failing_sources(&runtime).await;
-    // Without the account, tgin exits within a second or two (see
-    // `all_sources_failed_exits_2`): wait past three of its checks.
-    tokio::time::sleep(Duration::from_millis(3500)).await;
+    // Both bots failed for good, as the admin plane reports.
+    let failed = |status: &Value| {
+        ["source:first", "source:second"].iter().all(|name| {
+            status["tasks"].as_array().is_some_and(|tasks| {
+                tasks
+                    .iter()
+                    .any(|t| t["name"] == *name && t["state"] == "failed")
+            })
+        })
+    };
+    timeout(PATIENCE, async {
+        loop {
+            let status: Value = app
+                .http
+                .get(format!("http://{}/v1/status", app.admin))
+                .send()
+                .await
+                .expect("answered")
+                .json()
+                .await
+                .expect("json");
+            if failed(&status) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both sources fail");
+    // Two of the app's checks for every source failing (once a second)
+    // later, it still runs.
+    tokio::time::sleep(SOURCES_CHECK * 2 + Duration::from_millis(200)).await;
     assert!(!app.run.is_finished(), "tgin shut down");
     app.signal(SignalKind::Terminate).await;
     assert_eq!(app.outcome().await, Outcome::Clean);
