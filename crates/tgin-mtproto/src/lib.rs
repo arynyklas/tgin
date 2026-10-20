@@ -30,7 +30,7 @@ mod error;
 mod lock;
 pub mod login;
 pub mod media;
-pub mod retry;
+pub(crate) mod retry;
 pub mod rpc;
 pub mod schema;
 mod sender;
