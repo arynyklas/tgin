@@ -287,26 +287,17 @@ fn query_start(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<usize, TlError
     Err(TlError::Eof { at: r.pos })
 }
 
-/// Checks a call's fields strictly; returns its update context:
-/// - a `channels.*` call: the channel its `channel` field names (none
-///   without one);
-/// - a call with a `parent_peer` field (`messages.deleteSavedHistory`): the
-///   channel it names, else the common box; its `peer` is then a saved
-///   dialog of the account's own Saved Messages;
-/// - any other call: the channel its `peer` names, else the common box.
+/// Checks a call's fields strictly; returns its update context: the channel
+/// its target field ([`target_field`]) names, else the common box (none
+/// for a `channels.*` call without one). With a `parent_peer` field
+/// (`messages.deleteSavedHistory`) the target is that, as `peer` is then a
+/// saved dialog of the account's own Saved Messages.
 ///
 /// Also returns the peer that field names, and whether the call sets
 /// `allow_paid_stars`.
 fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlError> {
     let channels = ctor.name.starts_with("channels.");
-    let has_parent = ctor.params.iter().any(|p| p.name == "parent_peer");
-    let target = if channels {
-        "channel"
-    } else if has_parent {
-        "parent_peer"
-    } else {
-        "peer"
-    };
+    let target = target_field(ctor, channels);
     let mut peer = None;
     let mut pays_stars = false;
     let mut words = [0u32; MAX_FLAG_WORDS];
@@ -320,7 +311,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
                 pays_stars |= p.name == PAID_STARS_FIELD;
                 let start = r.pos;
                 pays_stars |= skip_spending(r, ty, 1)?;
-                if p.name == target {
+                if Some(p.name) == target {
                     peer = peer_id(&r.buf[start..r.pos]);
                 }
             }
@@ -336,6 +327,40 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
         peer,
         pays_stars,
     })
+}
+
+/// Calls whose target chat is a field the general rule in
+/// [`target_field`] would not pick.
+const TARGET_FIELDS: [(&str, &str); 1] = [("messages.forwardMessages", "to_peer")];
+
+/// The field that names the chat a call targets: `channel` on a
+/// `channels.*` call, a listed field ([`TARGET_FIELDS`]), `parent_peer`
+/// when there is one, else `peer`, else the first `InputPeer` field whose
+/// name ends in `peer` and is no pagination cursor (`offset_peer`). `None`
+/// when the call names no chat.
+fn target_field(ctor: &'static Ctor, channels: bool) -> Option<&'static str> {
+    if channels {
+        return Some("channel");
+    }
+    if let Some(&(_, field)) = TARGET_FIELDS.iter().find(|(m, _)| *m == ctor.name) {
+        return Some(field);
+    }
+    let named = |name: &str| ctor.params.iter().any(|p| p.name == name);
+    if named("parent_peer") {
+        return Some("parent_peer");
+    }
+    if named("peer") {
+        return Some("peer");
+    }
+    ctor.params
+        .iter()
+        .find(|p| {
+            p.name.ends_with("peer")
+                && !p.name.starts_with("offset_")
+                && matches!(&p.kind, Kind::Field { ty: Ty::Boxed(t), .. }
+                    if API.type_def(*t).name == "InputPeer")
+        })
+        .map(|p| p.name)
 }
 
 /// The field by which a call agrees to pay a recipient's price in Stars.
@@ -639,6 +664,25 @@ pub fn rpc_error_bytes(code: i32, message: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_field_names_the_chat_a_call_targets() {
+        let target = |name: &str| {
+            let ctor = API.ctor_by_name(name).expect("a function");
+            target_field(ctor, name.starts_with("channels."))
+        };
+        assert_eq!(target("channels.deleteMessages"), Some("channel"));
+        assert_eq!(target("messages.forwardMessages"), Some("to_peer"));
+        assert_eq!(target("messages.deleteSavedHistory"), Some("parent_peer"));
+        assert_eq!(target("messages.sendMessage"), Some("peer"));
+        assert_eq!(
+            target("payments.getPremiumGiftCodeOptions"),
+            Some("boost_peer")
+        );
+        // A pagination cursor is no target.
+        assert_eq!(target("messages.getDialogs"), None);
+        assert_eq!(target("help.getConfig"), None);
+    }
 
     #[test]
     fn debug_prints_lengths_not_bytes() {

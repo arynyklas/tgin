@@ -718,6 +718,46 @@ async fn slowmode_wait_is_remembered_per_method_and_peer() {
     assert_eq!(account.calls().len(), 3);
 }
 
+fn forward_to(channel: u8) -> String {
+    format!(
+        r#"{{"_":"messages.forwardMessages","from_peer":{{"_":"inputPeerSelf"}},"id":[1],"random_id":["1"],"to_peer":{{"_":"inputPeerChannel","channel_id":"{channel}","access_hash":"1"}}}}"#
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_on_a_forward_holds_only_the_target_chat() {
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    assert_eq!(
+        send(&app, tl(&forward_to(7))).await.retry_after(),
+        Some("30")
+    );
+    // Another chat is not held back; the slow one is.
+    assert_eq!(send(&app, tl(&forward_to(8))).await.status, StatusCode::OK);
+    let held = send(&app, tl(&forward_to(7))).await;
+    assert_eq!(held.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(held.retry_after(), Some("30"));
+    assert_eq!(account.calls().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slowmode_without_a_target_peer_is_not_remembered() {
+    let call = r#"{"_":"phone.sendGroupCallMessage","call":{"_":"inputGroupCall","id":"1","access_hash":"2"},"random_id":"3","message":{"_":"textWithEntities","text":"hi","entities":[]}}"#;
+    let acl = MethodAcl {
+        allow: vec![MethodGlob::Exact("phone.sendGroupCallMessage".to_owned())],
+        deny: Vec::new(),
+    };
+    let account = FakeAccount::new([err(420, "SLOWMODE_WAIT_30"), ok(NEAREST)]);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, acl),
+    );
+    assert_eq!(send(&app, tl(call)).await.retry_after(), Some("30"));
+    assert_eq!(send(&app, tl(call)).await.status, StatusCode::OK);
+    assert_eq!(account.calls().len(), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn flood_above_threshold_429_retry_after() {
     let account = FakeAccount::new([err(420, "FLOOD_WAIT_60"), err(420, "SLOWMODE_WAIT_7")]);

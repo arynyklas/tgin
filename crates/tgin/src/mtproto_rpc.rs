@@ -452,7 +452,8 @@ impl FloodWaits {
     ) {
         let (key, secs) = match class {
             ErrorClass::FloodWait(x) => (WaitKey { method, peer: None }, x),
-            ErrorClass::SlowMode(x) => (WaitKey { method, peer }, x),
+            // Slow mode is per chat: without one, nothing to hold back.
+            ErrorClass::SlowMode(x) if peer.is_some() => (WaitKey { method, peer }, x),
             _ => return,
         };
         if secs == 0 {
