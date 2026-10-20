@@ -82,13 +82,13 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use serde::Serialize;
 use tgin_core::config::{self, MethodAcl};
-use tgin_mtproto::SenderError;
 use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::rpc::{
     AccountRpc, AffectedSink, Answer, Charge, ErrorClass, InvokeError, MediaFailure, Refused,
     classify, rpc_error_bytes, unwrap_request,
 };
 use tgin_mtproto::schema::{API, MTPROTO};
+use tgin_mtproto::{SenderError, authorization};
 use tgin_runtime::limit::{KeyedLimiter, Quota};
 use tgin_runtime::secret::{Secret, secret_eq};
 use tokio::sync::Semaphore;
@@ -864,6 +864,9 @@ fn answer_outcome(answer: &Answer) -> Outcome {
 /// only an exact allow entry gives it.
 const QUICK_REPLY_GRANT: &str = "messages.editQuickReplyShortcut";
 
+/// The description of 503 `account_unavailable`.
+const ACCOUNT_UNAVAILABLE: &str = "the account cannot call Telegram until an operator acts: it is logged out, needs a new login, or failed for good (see GET /v1/accounts)";
+
 /// What an unknown account's bearer is compared with.
 const UNKNOWN_ACCOUNT_TOKEN: &[u8] = b"tgin-unknown-account-0000000000000000";
 
@@ -1023,6 +1026,15 @@ fn failure(e: &InvokeError) -> Response {
             return unavailable("media_session", &format!("{e}; the call was not executed"));
         }
     };
+    // Telegram dropped the key's authorization (−404, or an init refused
+    // with 401 or AUTH_KEY_DUPLICATED): only an operator brings it back.
+    if authorization::sender_gone(e) {
+        return tgin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "account_unavailable",
+            ACCOUNT_UNAVAILABLE,
+        );
+    }
     match e {
         SenderError::NoAnswer => tgin_error(
             StatusCode::BAD_GATEWAY,
@@ -1063,7 +1075,7 @@ fn failure(e: &InvokeError) -> Response {
         SenderError::KeyRevoked | SenderError::KeyUnknown => tgin_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "account_unavailable",
-            "the account cannot call Telegram until an operator acts: it is logged out, needs a new login, or failed for good (see GET /v1/accounts)",
+            ACCOUNT_UNAVAILABLE,
         ),
         SenderError::BadRequest => tgin_error(
             StatusCode::BAD_REQUEST,

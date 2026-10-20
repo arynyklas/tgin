@@ -885,6 +885,34 @@ async fn init_refused_420_is_429_else_502() {
 }
 
 #[tokio::test]
+async fn every_lost_authorization_answers_account_unavailable() {
+    let refused = |code: i32, message: &str| {
+        Err(InvokeError::Sender(SenderError::InitRefused {
+            code,
+            message: message.to_owned(),
+        }))
+    };
+    let account = FakeAccount::new([
+        Err(InvokeError::Sender(SenderError::KeyRevoked)),
+        Err(InvokeError::Sender(SenderError::KeyUnknown)),
+        refused(406, "AUTH_KEY_DUPLICATED"),
+        refused(401, "AUTH_KEY_UNREGISTERED"),
+        refused(401, "SESSION_REVOKED"),
+    ]);
+    let app = app(Arc::clone(&account));
+    for _ in 0..5 {
+        let answer = send(&app, tl(GET_CONFIG)).await;
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.error(), "account_unavailable");
+        assert_eq!(answer.retry_after(), None);
+    }
+    // An init refusal that leaves the authorization in place stays 502.
+    let account = FakeAccount::new([refused(401, "SESSION_PASSWORD_NEEDED")]);
+    let waiting = self::app(Arc::clone(&account));
+    assert_eq!(send(&waiting, tl(GET_CONFIG)).await.error(), "init_refused");
+}
+
+#[tokio::test]
 async fn frozen_403() {
     let account = FakeAccount::new([err(420, "FROZEN_METHOD_INVALID")]);
     let app = app(Arc::clone(&account));

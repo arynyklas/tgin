@@ -24,7 +24,8 @@ pub(crate) fn gone(code: i32, message: &str) -> bool {
 
 /// A sender's failure says the key's authorization is gone: transport
 /// −404, or an init call refused with such an error.
-pub(crate) fn sender_gone(e: &SenderError) -> bool {
+#[must_use]
+pub fn sender_gone(e: &SenderError) -> bool {
     match e {
         SenderError::KeyRevoked | SenderError::KeyUnknown => true,
         SenderError::InitRefused { code, message } => gone(*code, message),
