@@ -48,17 +48,26 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   RPC calls get up to 10 s, and it releases its session), then it shows
   `logged_out`, or runs again on its key when Telegram did not confirm the
   logout. With a `phone` in the config, a login by another account is
-  logged out again (`wrong_account`).
+  logged out again (`wrong_account`). A code login follows Telegram to the
+  account's DC (`PHONE_MIGRATE`, `NETWORK_MIGRATE`, `USER_MIGRATE`).
+  `tgin admin login` refuses plain `http` to a host other than loopback
+  (exit code 64) unless `--insecure-http` is given, since the code and the
+  2FA password would cross the network in clear text.
 - Logged-in accounts run: each holds its session on its home DC, catches
   up with `getDifference` (channels only when they show a gap), hands its
   updates to consumers and serves `POST /mtproto/v1/{account}/invoke`. A
   panic restarts the account after 1 s, doubling to 60 s; an account that
-  loses its authorization goes `needs_login`, and of two accounts logged in
+  loses its authorization (a 401, a transport −404, or
+  `AUTH_KEY_DUPLICATED` when a copied session directory was used from two
+  places) goes `needs_login`, and of two accounts logged in
   as the same user one runs and the other goes `failed`
   (`duplicate_account`) until the first gives the user up. Telegram's
   flood waits on catch-up calls are waited out (`flood_wait`). An account starts
-  once a login of it ends, without a restart. `GET /v1/accounts` gives
-  each account's state, layer, home DC and the boxes catching up;
+  once a login of it ends, without a restart. A configured account keeps
+  tgin running when every bot has failed for good. `GET /v1/accounts` gives
+  each account's state (with `session_held_by: login|logout` while one
+  holds a logged-out account's session), layer, home DC and the boxes
+  catching up;
   `tgin_mtproto_account_state`, `tgin_mtproto_updates_total`,
   `tgin_mtproto_updates_dropped_total`, `tgin_mtproto_rpc_total` and
   `tgin_mtproto_rpc_seconds` count them (no series without accounts). A
@@ -68,14 +77,17 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 - `accounts` in the config: Telegram user accounts by name, each with
   `api_id` (`${env:…}` and `${file:…}` allowed), `api_hash`, a
   `session_dir` of its own, an optional `phone`, `rpc` (`max_rps`,
-  `flood_sleep_threshold`, `clients` with a token and `allow`/`deny`
-  method globs) and `routes`. Account rules match `constructors`,
+  `flood_sleep_threshold`, `clients` with a token, `allow`/`deny` method
+  globs and `allow_paid_stars`, off by default and warned about when on)
+  and `routes`. Account rules match `constructors`,
   `peer_ids` (Bot API form), `user_ids`, `commands` (unsuffixed only) and
   `text`, and target consumers like bot rules.
 - Account updates reach consumers as envelope v1: JSON with `update_id`
-  (strictly increasing per account, never repeated, not contiguous),
-  `account`, `layer`, `constructor`, `received_at` and the update's TL,
-  users and chats in base64; `render: tl_json` adds the update as TL-JSON.
+  (strictly increasing per account, never repeated, not contiguous, unique
+  per `session_dir`), `account`, `layer`, `constructor`, `received_at` and
+  the update's TL, users and chats in base64 (the entities Telegram sent
+  with the update's container or difference slice; rely only on those the
+  update references); `render: tl_json` adds the update as TL-JSON.
   A pull consumer an account feeds is served on
   `/c/<consumer>/mtproto/v1/getUpdates` and needs `auth_token`; a consumer
   takes bot updates or account updates, never both, and a reload that
@@ -90,11 +102,24 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 - `POST /mtproto/v1/{account}/invoke` runs one raw-TL (or TL-JSON) call as
   the account for an RPC client: `X-Tgin-Layer` must be the account's
   layer (230); `invokeWithLayer` and `initConnection` are stripped, other
-  wrappers refused; the update methods and the `auth.*` methods that mint
-  or move an authorization are always refused; account-changing methods
-  need an exact `allow` entry. Flood waits up to `flood_sleep_threshold`
-  are slept out once, longer ones answer `429` with `Retry-After`; a call
-  written without an answer gets `502 no_answer` and is never resent.
+  wrappers refused; the update methods, the `auth.*` methods that mint or
+  move an authorization, `bots.exportBotToken` and
+  `phone.getGroupCallStreamRtmpUrl` are always refused. Globs grant only
+  methods of reviewed namespaces that change nothing account-wide; every
+  other method, any namespace a later layer adds included, needs an exact
+  `allow` entry, spending methods such as `payments.*`, `wallet.*` and
+  `messages.sendPaidReaction` among them. A call that agrees to pay
+  through a paid-call marker (`allow_paid_stars` or `allow_paid_floodskip`
+  on the function, a priced `suggestedPost` or an `inputMediaStakeDice`
+  anywhere in it) also needs the client's `allow_paid_stars: true` (403
+  `paid_stars_not_allowed`), and one that
+  writes quick replies the exact `messages.editQuickReplyShortcut` grant
+  (403 `quick_replies_not_allowed`). Flood waits up to
+  `flood_sleep_threshold` are slept out once, longer ones answer `429`
+  with `Retry-After`, and tgin remembers them per method (slow mode per
+  method and chat), answering early retries itself until they end. A call
+  written without an answer gets `502 no_answer` and is never resent; an
+  account that cannot call answers `503 account_unavailable`.
 - `examples/mtproto`: a Telethon adapter for the RPC endpoint and an
   account's pull consumer.
 - Self-hosted Bot API servers: `upstreams` names Bot API servers (`kind:
