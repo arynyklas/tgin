@@ -1,6 +1,5 @@
 //! Test-only: a seeded, schema-driven generator of valid TL for any
-//! constructor, and grammers' typed (de)serializers as the oracle (ported
-//! from the M3 spike's `tl_roundtrip.rs`).
+//! constructor, and grammers' typed (de)serializers as the oracle.
 //!
 //! The generator writes valid TL straight from the schema. grammers turns
 //! those bytes into its typed value and back ("typed bytes"); the property

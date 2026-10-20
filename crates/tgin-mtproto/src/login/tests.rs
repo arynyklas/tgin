@@ -1,5 +1,5 @@
-//! The login flows over scripted TL bytes (DECODE-ONLY: ported from the
-//! spike's `login.rs` and `code_login.rs` tests) and the store they write.
+//! The login flows over scripted TL bytes (DECODE-ONLY) and the store
+//! they write.
 //! The MTP-framed run over a real [`Sender`] is in `sender/tests.rs`.
 
 use std::time::Duration;

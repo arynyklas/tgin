@@ -20,7 +20,7 @@
 //!   the login may have happened: the flow asks `users.getUsers([inputUserSelf])`
 //!   on a fresh connection before it reports anything.
 //!
-//! The spike's local QR page and its delivery through a bot are not part of
+//! A local QR page and delivery of the QR through a bot are not part of
 //! tgin: the QR reaches the operator through the admin API and `tgin admin
 //! login` only.
 //!

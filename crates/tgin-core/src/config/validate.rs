@@ -415,7 +415,7 @@ fn sources(raw: &RawConfig, diag: &mut Diagnostics) {
                     .hint("give an account's push consumer its `endpoints`, and remove `accept_set_webhook`"),
                 );
             }
-            // D16: no bot token authorizes an account's pull routes.
+            // No bot token authorizes an account's pull routes.
             if let (Some(account), Consumer::Pull(pull)) = (account_of[index], &consumer.value)
                 && pull.auth_token.is_none()
             {

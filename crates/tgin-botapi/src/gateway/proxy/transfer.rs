@@ -159,7 +159,7 @@ pub(super) async fn await_headers<F: Future>(
 }
 
 /// The downstream's request body, made `Sync` for `reqwest::Body::wrap`,
-/// which keeps its exact length (C§3.2), stamping progress on every frame
+/// which keeps its exact length, stamping progress on every frame
 /// and marking its end: after the frame past which it has no more (hyper
 /// stops at the announced length without polling for the end), at its
 /// end, or, for an empty body, when hyper first asks whether it has ended.
@@ -267,7 +267,7 @@ impl Tally {
     }
 }
 
-/// Telegram's response body, streamed with its exact length (C§3.3); an
+/// Telegram's response body, streamed with its exact length; an
 /// error after `idle` without a frame, which aborts the client's
 /// connection.
 pub(super) struct Download {

@@ -51,9 +51,9 @@ struct Framework {
     name: &'static str,
     poll_token: &'static str,
     hook_token: &'static str,
-    /// Its uploads use `Transfer-Encoding: chunked` (F§2.5).
+    /// Its uploads use `Transfer-Encoding: chunked`.
     chunked_upload: bool,
-    /// It confirms the last offset when it stops (F§2.2); aiogram does not,
+    /// It confirms the last offset when it stops; aiogram does not,
     /// so a redelivery of the last update is tolerated for it.
     confirms_on_stop: bool,
     /// Its webhook bot registers with setWebhook on the scoped base; else

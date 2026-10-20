@@ -27,7 +27,7 @@
 //!
 //! Secrets (defaults under `~/.tgin-secrets`): `--api-env`
 //! (`TELEGRAM_API_ID`), `--token-file` (the test bot's token),
-//! `--account-env` (`TGIN_SPIKE_PHONE`, for `whoami`). The account's user
+//! `--account-env` (`TGIN_GATE_PHONE`, for `whoami`). The account's user
 //! id and the test channel come from `TGIN_GATE_USER` and
 //! `TGIN_GATE_CHANNEL` (Bot API id), from the environment or else
 //! `--gate-env` (`m3-gate.env`); they are never in the repository.
@@ -174,7 +174,6 @@ struct Paths {
     token_file: PathBuf,
     account_env: PathBuf,
     gate_env: PathBuf,
-    secrets: PathBuf,
 }
 
 impl Paths {
@@ -191,7 +190,6 @@ impl Paths {
             token_file: args.path("token-file", || secrets.join("bot-token")),
             account_env: args.path("account-env", || secrets.join("m3-account.env")),
             gate_env: args.path("gate-env", || secrets.join("m3-gate.env")),
-            secrets,
         })
     }
 
@@ -703,7 +701,11 @@ async fn send_probes(bot: Bot, prefix: String, n: usize, every: Duration, sent: 
 // import
 
 fn import(args: &Args, paths: &Paths) -> Result<(), AnyError> {
-    let from = args.path("from", || paths.secrets.join("m3-spike").join("session"));
+    // A one-off copy from an older session store: there is no default source.
+    let from = PathBuf::from(
+        args.get("from")
+            .ok_or("import needs --from DIR, the session directory to copy from")?,
+    );
     if !from.join("session.redb").is_file() {
         return Err(format!("{} holds no session.redb", from.display()).into());
     }
@@ -803,7 +805,7 @@ fn import(args: &Args, paths: &Paths) -> Result<(), AnyError> {
 
 async fn whoami(_args: &Args, paths: &Paths) -> Result<ExitCode, AnyError> {
     let api_id = paths.api_id()?;
-    let phone = env_value(&paths.account_env, "TGIN_SPIKE_PHONE")?;
+    let phone = env_value(&paths.account_env, "TGIN_GATE_PHONE")?;
     let digits = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>();
     let started = Instant::now();
     let account = start_account(paths, api_id, Arc::new(CountSink::default()));

@@ -3894,7 +3894,7 @@ fn api_id_interpolates() {
     assert_eq!(cfg.accounts[0].api_id, 777);
 }
 
-/// D16: a pull consumer an account feeds needs `auth_token`.
+/// A pull consumer an account feeds needs `auth_token`.
 #[test]
 fn account_pull_consumer_needs_auth_token() {
     let yaml = r#"version: 1

@@ -2,11 +2,11 @@
 //!
 //! Opens tgin's [`Sender`] on production DC 2 with a scratch auth key that
 //! never logs in, then calls `help.getNearestDc` and `help.getConfig`
-//! (the M3 spike's connect check, on tgin's own sender). The first run makes the key
+//! (a basic reachability check, on tgin's own sender). The first run makes the key
 //! and stores it in the scratch session; later runs reuse it, which also
 //! exercises `bad_server_salt` (a stored key starts without a salt).
 //!
-//! - Scratch session: `$TGIN_M3P2_SCRATCH`, else `{temp}/tgin-m3p2`. The
+//! - Scratch session: `$TGIN_CONNECT_SCRATCH`, else `{temp}/tgin-connect-check`. The
 //!   check refuses a session with a login.
 //! - `TELEGRAM_API_ID` for `initConnection` comes from `$TGIN_API_ENV`, else
 //!   `~/.tgin-secrets/telegram-api.env`. It is never printed.
@@ -35,8 +35,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), AnyError> {
-    let dir = std::env::var_os("TGIN_M3P2_SCRATCH")
-        .map_or_else(|| std::env::temp_dir().join("tgin-m3p2"), PathBuf::from);
+    let dir = std::env::var_os("TGIN_CONNECT_SCRATCH").map_or_else(
+        || std::env::temp_dir().join("tgin-connect-check"),
+        PathBuf::from,
+    );
     let api_env = match std::env::var_os("TGIN_API_ENV") {
         Some(path) => PathBuf::from(path),
         None => home()?.join(".tgin-secrets").join("telegram-api.env"),
@@ -61,7 +63,7 @@ async fn run() -> Result<(), AnyError> {
     );
 
     let mut init = InitParams::new(api_id);
-    init.device_model = "tgin M3 connect check".to_owned();
+    init.device_model = "tgin connect check".to_owned();
     let started = Instant::now();
     // No update calls here: the pushes are dropped, so they are discarded.
     let (sender, pushes, new_key) = Sender::connect(dc, key, init).await?;

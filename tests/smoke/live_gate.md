@@ -48,7 +48,7 @@ The test bot is the bot whose token is in `bot-token`.
 | Session | `C:/Users/user/.tgin-secrets/m3-account/session` (the directory `m3-account` has no inherited ACL: the user, SYSTEM and Administrators only) |
 | api id | `C:/Users/user/.tgin-secrets/telegram-api.env` (`TELEGRAM_API_ID`) |
 | Bot token | `C:/Users/user/.tgin-secrets/bot-token` |
-| Phone (for `whoami`) | `C:/Users/user/.tgin-secrets/m3-account.env` (`TGIN_SPIKE_PHONE`) |
+| Phone (for `whoami`) | `C:/Users/user/.tgin-secrets/m3-account.env` (`TGIN_GATE_PHONE`) |
 | Identifiers | `C:/Users/user/.tgin-secrets/m3-gate.env` (`TGIN_GATE_USER`, `TGIN_GATE_CHANNEL`) |
 | Host check output | `%TEMP%/tgin-live-gate/<check>/` (journals and the account's logs; counts, tags and ids of the two test chats only) |
 
@@ -63,7 +63,7 @@ set G=target\release\examples\live_gate.exe
 
 | Check | Command | PASS |
 |---|---|---|
-| Import | `%G% import` (from `…/m3-spike/session`; refuses a target that already holds an authorization) | the rows read back identical |
+| Import | `%G% import --from DIR` (a one-off copy from an older session store; refuses a target that already holds an authorization) | the rows read back identical |
 | Who am I | `%G% whoami` | `user_id` = `TGIN_GATE_USER`, phone matches, `home_dc=2`, `layer=230` |
 | Kill runs | `%G% kill-runs --runs 5` (`--first-run N` to number a later batch) | every probe admitted at least once, in both boxes |
 | Backpressure | `%G% backpressure` (40 probes) | every probe recovered; dropped `full` grows by exactly the refused unsequenced updates |

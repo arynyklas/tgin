@@ -1,6 +1,6 @@
-# Design §12 example config with the M2 gateway, setWebhook-capture and
+# A complete example config with the gateway, setWebhook-capture and
 # webhook-reply fields written out:
-# - `data_dir` and `accounts` (with `support-workers`, which only an account feeds) removed (M3)
+# - no `data_dir` or `accounts` (nor `support-workers`, which only an account feeds)
 # - `allowed_updates: all` replaced by an explicit list (the v1 model takes a list)
 # - `callback_data: { prefix: "pay:" }` written as a list (the v1 model takes a list)
 # - a `hooks` push consumer that receives its endpoint from `setWebhook`

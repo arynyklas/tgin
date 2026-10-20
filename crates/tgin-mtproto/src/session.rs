@@ -31,7 +31,8 @@ const AUTH_KEYS: TableDefinition<i32, &[u8]> = TableDefinition::new("auth_keys")
 const HOME_DC: TableDefinition<&str, i32> = TableDefinition::new("home_dc");
 /// Bot API dialog id → encoded [`Peer`] (see `encode_peer`).
 const PEERS: TableDefinition<i64, &[u8]> = TableDefinition::new("peers");
-/// `"pts" | "qts" | "seq" | "date"` → value. The spike's name, kept.
+/// `"pts" | "qts" | "seq" | "date"` → value. The table name is fixed so
+/// an existing store's rows stay readable.
 const UPDATE_STATE: TableDefinition<&str, i32> = TableDefinition::new("update_state");
 /// Bare channel id → channel pts.
 const CHANNEL_PTS: TableDefinition<i64, i32> = TableDefinition::new("channel_pts");
@@ -689,7 +690,8 @@ fn merge_peer(old: Peer, new: Peer) -> Peer {
 }
 
 /// `tag(1) id(8) has_auth(1) auth(8) bot(1) is_self(1) kind(1)`,
-/// little-endian; the spike's encoding.
+/// little-endian. The encoding is fixed so an existing store's rows stay
+/// readable.
 fn encode_peer(p: &Peer) -> [u8; 21] {
     let (tag, bot, is_self, kind) = match p.kind {
         PeerKind::User { bot, is_self } => (0u8, bot, is_self, 0u8),
