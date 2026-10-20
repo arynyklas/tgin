@@ -4083,3 +4083,42 @@ fn allow_paid_stars_per_client() {
         "{err}"
     );
 }
+
+/// The warnings follow the classes: a glob over a namespace no glob may
+/// grant says so and names the namespaces one may; an exact listing of
+/// any exact-only method is named, payments as much as auth.
+#[test]
+fn allowlist_warnings_follow_the_classes() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { c: { token: t, allow: [\"messages.*\", \"payments.*\", \"wallet.*\", payments.getStarsStatus, messages.sendPaidReaction] } } } }\n",
+    );
+    let warnings: Vec<&ConfigError> = cfg
+        .warnings
+        .iter()
+        .filter(|w| w.at.as_ref().is_some_and(|at| at.path.contains(".rpc.")))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{}", render(&cfg.warnings));
+    let useless = warnings[0];
+    assert_eq!(
+        useless.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[1]"
+    );
+    assert_message(useless, "`payments.*`, `wallet.*`");
+    assert_message(useless, "grant nothing");
+    assert!(!useless.message.contains("account-changing"), "{useless}");
+    let hint = useless.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("payments.<method>"), "{hint}");
+    assert!(
+        hint.contains("messages") && hint.contains("upload"),
+        "{hint}"
+    );
+    let exact = warnings[1];
+    assert_eq!(
+        exact.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.c.allow[3]"
+    );
+    assert_message(exact, "payments.getStarsStatus, messages.sendPaidReaction");
+    assert_message(exact, "only an exact entry grants");
+    let hint = exact.hint.as_deref().unwrap_or_default();
+    assert!(hint.contains("move assets"), "{hint}");
+}

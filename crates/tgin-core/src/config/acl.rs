@@ -25,21 +25,19 @@
 /// `bots`, `payments`, `wallet`, `premium`, `fragment` or `smsjobs`, moves
 /// assets, logs in, or is unreviewed, and needs exact listing.
 pub const GLOB_NAMESPACES: [&str; 13] = [
-    // Settings and profile; a glob grants only the getters of
-    // `ACCOUNT_READ_ONLY`, as `account.*` is account-changing.
-    "account",  // Channels and supergroups the account uses or administers.
-    "channels", // Contacts, less the address-book and block-list changes below.
-    "contacts", // Configuration and app information.
-    "help",     // Localization strings.
-    "langpack", // Chats and messages, less the methods below.
-    "messages", // Calls and group calls.
-    "phone",    // Profile photos, less the account's own and contacts' photo changes.
-    "photos",   // Channel and message statistics, read-only.
-    "stats",    // Sticker sets the account creates and edits.
-    "stickers", // Stories, less the account-wide toggle below.
-    "stories",  // File upload and download.
-    "upload",   // User profiles, read-only.
-    "users",
+    "account",  // Settings; a glob grants only `ACCOUNT_READ_ONLY`'s getters.
+    "channels", // Channels and supergroups the account uses or administers.
+    "contacts", // Contacts, less the address-book and block-list changes.
+    "help",     // Configuration and app information.
+    "langpack", // Localization strings.
+    "messages", // Chats and messages, less the methods of `ACCOUNT_CHANGING`.
+    "phone",    // Calls and group calls.
+    "photos",   // Profile photos, less the own and contacts' photo changes.
+    "stats",    // Channel and message statistics, read-only.
+    "stickers", // Sticker sets the account creates and edits.
+    "stories",  // Stories, less the account-wide toggle.
+    "upload",   // File upload and download.
+    "users",    // User profiles, read-only.
 ];
 
 /// Methods of the [`GLOB_NAMESPACES`] that move assets or change the
