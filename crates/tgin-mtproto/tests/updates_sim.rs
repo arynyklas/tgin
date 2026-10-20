@@ -26,15 +26,22 @@
 //! - two channels are quiet (nothing after the main phase reveals what
 //!   they missed).
 //!
-//! The caller writes the marks of all batches a call returned in one write,
-//! then admits them. A kill point sits before that write, too.
+//! The caller is modelled as the account does it: it writes the marks of
+//! all batches a call returned, with their baselines and the call's peers
+//! (users and channels with their access hashes), in one write, then admits
+//! them. A kill point sits before that write, too. A channel fetch needs
+//! the channel's cached access hash; without one it fails for good and the
+//! channel's state is dropped.
 //!
 //! What is not owed: what Telegram cannot bring back (what a too-long
 //! answer skips that the client never got, what precedes a fresh account's
-//! first state, a channel's updates before the first one admitted when it
-//! was not known at start), counted only once the manager took the answer;
-//! and the stated exception (a kill before a call's marks are durable: what
-//! those channels missed so far).
+//! first state, a channel's updates before its first durable baseline or
+//! first admitted update when it was not known at start), counted only once
+//! the manager took the answer; a channel's updates before its fetch failed
+//! for good, when Telegram never sent its entity; and the one crash window
+//! (a kill before a call's marks are durable: what those channels got and
+//! had not admitted). A channel whose entity came in a call whose write
+//! completed must never miss its access hash.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -42,7 +49,9 @@ use bytes::Bytes;
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use tgin_mtproto::decode::{BoxKind, PeerId};
 use tgin_mtproto::tl_json::from_json;
-use tgin_mtproto::updates::{GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES, RETRY_MIN};
+use tgin_mtproto::updates::{
+    CONNECTION_ENDED, GAP_HOLD, IDLE_DIFFERENCE, MAX_CHANNEL_FETCHES, RETRY_MIN,
+};
 use tgin_mtproto::{Batch, Fetch, PeerKind, StateDelta, StoredState, UpdateManager, UpdateState};
 use tokio::time::{Duration, Instant, advance};
 
@@ -328,6 +337,7 @@ fn commit(m: &mut UpdateManager, batches: &[Batch]) -> StateDelta {
             out.date = d.date.or(out.date);
             out.channels.extend(d.channels);
             out.caught_up.extend(d.caught_up);
+            out.forgotten.extend(d.forgotten);
         }
     }
     out
@@ -1411,7 +1421,8 @@ async fn refused_batch_without_updates_keeps_its_state() {
 
 /// A signal cuts a pending retry short: after a long cut the backoff is at
 /// 60 s, and the reconnect's `updatesTooLong` (or a channel's
-/// `updateChannelTooLong`) asks at once instead of waiting it out.
+/// `updateChannelTooLong`) asks at once instead of waiting it out. It does
+/// not reset the backoff; an answer does.
 #[tokio::test(start_paused = true)]
 async fn signal_cuts_a_pending_retry_short() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));
@@ -1429,21 +1440,36 @@ async fn signal_cuts_a_pending_retry_short() {
         matches!(m.next_action(), Some(Fetch::GetDifference { pts: 10, .. })),
         "at once"
     );
-    // The answer's backoff starts afresh on the next failure.
+    // The signal keeps the backoff: a failure right after it waits the
+    // full minute again. Only an answer resets it.
     let f = Fetch::GetDifference {
         pts: 10,
         qts: 5,
         date: 1,
     };
     m.fetch_failed(f);
-    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(1));
-    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
-    nothing(&mut m, &batches);
+    assert_eq!(m.deadline(), Instant::now() + Duration::from_secs(60));
+    advance(Duration::from_secs(60)).await;
+    let f = m.next_action().expect("the difference again");
+    assert!(matches!(f, Fetch::GetDifference { .. }));
+    let batches = m.feed_difference(b(difference_empty(1, 3)));
+    commit(&mut m, &batches);
+    m.feed_push(too_long());
+    let f = m.next_action().expect("asked");
+    assert!(matches!(f, Fetch::GetDifference { .. }));
+    m.fetch_failed(f);
+    assert_eq!(
+        m.deadline(),
+        Instant::now() + Duration::from_secs(1),
+        "the answer reset the backoff"
+    );
     advance(Duration::from_secs(1)).await;
     let f = m.next_action().expect("the difference again");
     assert!(matches!(f, Fetch::GetDifference { .. }));
     let batches = m.feed_difference(b(difference_empty(1, 3)));
     commit(&mut m, &batches);
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
 
     let f = m.next_action().expect("channel 1");
     assert_eq!(f, Fetch::GetChannelDifference { channel: 1, pts: 5 });
@@ -1457,6 +1483,110 @@ async fn signal_cuts_a_pending_retry_short() {
     let batches = m.feed_push(b(short(&channel_too_long(1, None))));
     nothing(&mut m, &batches);
     assert_eq!(m.next_action(), Some(f), "the channel at once");
+}
+
+/// A path that drops every connection after its init call: each new
+/// connection's `new_session_created` makes the sender push
+/// `updatesTooLong` while the catch-up call is in flight, the call then
+/// fails, and the drop makes the sender push its connection-end signal.
+/// Neither signal resets the backoff, so the gaps between calls double up
+/// to 60 s instead of a call a second forever. Telegram's own
+/// `updatesTooLong`, on a live session, still cuts a pending retry short.
+#[tokio::test(start_paused = true)]
+async fn dropped_connections_back_off_to_a_minute() {
+    let mut m = started(stored(10, &[], &[5]));
+    assert!(m.feed_push(connection_ended()).is_empty());
+    let mut f = m.next_action().expect("the catch-up");
+    let mut gaps = Vec::new();
+    for _ in 0..9 {
+        // The call's new connection reports a new session, then the call
+        // is lost with the connection, which then ends.
+        assert!(m.feed_push(too_long()).is_empty());
+        m.fetch_failed(f);
+        assert!(m.feed_push(connection_ended()).is_empty());
+        assert_eq!(m.next_action(), None, "no call before the backoff");
+        let asked = Instant::now();
+        advance(m.deadline().saturating_duration_since(asked)).await;
+        f = m.next_action().expect("asked again");
+        assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
+        gaps.push((Instant::now() - asked).as_secs());
+    }
+    assert_eq!(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    m.fetch_failed(f);
+    assert!(m.feed_push(too_long()).is_empty());
+    assert!(
+        matches!(m.next_action(), Some(Fetch::GetDifference { .. })),
+        "a live session's signal asks at once"
+    );
+}
+
+/// A channel the account can no longer read is forgotten: the next
+/// committed delta tells the caller to delete its stored pts and behind
+/// row, so it is not loaded again at every start.
+#[tokio::test(start_paused = true)]
+async fn forgotten_channel_rows_are_deleted_in_the_next_commit() {
+    let mut m = started(stored(10, &[(1, 5), (2, 5)], &[5]));
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 6, 1);
+    let batches = m.feed_push(b(updates(&[post], NONE, NONE, 2, 0)));
+    let marked = batches
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked")
+        .id;
+    m.forget_channel(1);
+    let d = commit(&mut m, &batches);
+    assert_eq!(d.forgotten, vec![(1, marked + 1)]);
+    assert!(d.channels.iter().all(|&(c, _)| c != 1), "{d:?}");
+    // Reported once.
+    let other = new_channel_message(&message(2, PeerId::Channel(2), "q"), 6, 1);
+    let batches = m.feed_push(b(updates(&[other], NONE, NONE, 2, 0)));
+    assert!(commit(&mut m, &batches).forgotten.is_empty());
+}
+
+/// A channel abandoned when its fetch failed for good (for example, no
+/// access hash to ask with) drops its stored rows too, so its behind mark
+/// is cleared instead of lingering. Its held update starts it again, with
+/// a new mark the deletion leaves alone.
+#[tokio::test(start_paused = true)]
+async fn abandoned_channel_clears_its_rows() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    let first = nothing(&mut m, &batches);
+    assert_eq!(first, vec![1]);
+    let f = m.next_action().expect("channel 1");
+    assert!(matches!(f, Fetch::GetChannelDifference { channel: 1, .. }));
+    let batches = m.fetch_failed_permanently(f);
+    assert!(batches.is_empty());
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 9, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&post), NONE, NONE, 2, 0)));
+    let again = batches
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked again")
+        .id;
+    let d = commit(&mut m, &batches);
+    let (c, bound) = d.forgotten[0];
+    assert_eq!(c, 1);
+    assert!(bound <= again, "the new start's mark survives the deletion");
+    assert_eq!(d.channels, vec![(1, 8), (1, 9)]);
+    assert_eq!(all_updates(&batches), vec![b(post)]);
+}
+
+/// A batch of the abandoned state committed after the abandon does not
+/// write that state back: the stored pts it would restore was just
+/// dropped.
+#[tokio::test(start_paused = true)]
+async fn abandoned_state_is_not_written_back() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 6, 1);
+    let pending = m.feed_push(b(updates(&[post], NONE, NONE, 2, 0)));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    let f = m.next_action().expect("channel 1");
+    assert!(m.fetch_failed_permanently(f).is_empty());
+    let d = commit(&mut m, &pending);
+    assert!(d.channels.is_empty(), "{d:?}");
+    assert_eq!(d.forgotten.len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1478,6 +1608,12 @@ async fn affected_pts_advance_the_box() {
 
 fn too_long() -> Bytes {
     b(T::new(UPDATES_TOO_LONG).done())
+}
+
+/// The sender's signal that a connection which finished its init call
+/// ended.
+fn connection_ended() -> Bytes {
+    Bytes::from_static(CONNECTION_ENDED)
 }
 
 /// After a reconnect the sender pushes two synthetic `updatesTooLong` (the
@@ -1888,6 +2024,8 @@ struct Persisted {
     common: UpdateState,
     channels: BTreeMap<i64, i32>,
     known: BTreeSet<i64>,
+    /// Channels whose access hash is cached: a channel fetch needs one.
+    channel_peers: BTreeSet<i64>,
     /// The batches' `ahead` channels and marks, until a delta says caught
     /// up (as `SessionStore` does: the highest mark stays).
     behind: BTreeMap<i64, u64>,
@@ -1908,12 +2046,39 @@ impl Persisted {
         self.common.qts = d.qts.unwrap_or(self.common.qts);
         self.common.seq = d.seq.unwrap_or(self.common.seq);
         self.common.date = d.date.unwrap_or(self.common.date);
+        // As `SessionStore::commit_state`: a dropped channel's rows first,
+        // unless a later batch has marked it since.
+        for &(c, bound) in &d.forgotten {
+            if self.behind.get(&c).is_none_or(|&m| m < bound) {
+                self.behind.remove(&c);
+                self.channels.remove(&c);
+            }
+        }
         for &(c, p) in &d.channels {
             self.channels.insert(c, p);
         }
         for &(c, g) in &d.caught_up {
             if self.behind.get(&c).is_some_and(|&m| m <= g) {
                 self.behind.remove(&c);
+            }
+        }
+    }
+
+    /// As `SessionStore::put_peers`: users and channels with an access
+    /// hash.
+    fn peers(&mut self, batch: &Batch) {
+        for p in &batch.peers {
+            if p.access_hash.is_none() {
+                continue;
+            }
+            match p.kind {
+                PeerKind::User { .. } => {
+                    self.known.insert(p.id);
+                }
+                PeerKind::Channel { .. } => {
+                    self.channel_peers.insert(p.id);
+                }
+                PeerKind::Chat => {}
             }
         }
     }
@@ -2022,6 +2187,12 @@ struct Sim<'a> {
     kill_at: Option<u64>,
     killable: bool,
     kills: u32,
+    /// Channels whose access hash a correct caller has made durable: it
+    /// came in a call's batches whose mark write completed. Unlike
+    /// `persisted`, this is not where the caller writes peers but where it
+    /// must: a fetch that finds no peer for such a channel loses updates
+    /// the claim owes.
+    peer_sent: HashSet<i64>,
 }
 
 impl<'a> Sim<'a> {
@@ -2030,13 +2201,17 @@ impl<'a> Sim<'a> {
             common: s.initial.common,
             channels: s.initial.channels.iter().copied().collect(),
             known: s.initial.known_users.iter().copied().collect(),
+            // The channels known at start came with their access hashes.
+            channel_peers: s.initial.channels.iter().map(|&(c, _)| c).collect(),
             behind: BTreeMap::new(),
         };
+        let peer_sent = persisted.channel_peers.iter().copied().collect();
         Self {
             s,
             rng: Rng(s.seed ^ 0x5eed),
             m: UpdateManager::new(s.initial.clone()),
             persisted,
+            peer_sent,
             net: VecDeque::new(),
             in_flight: VecDeque::new(),
             received: HashSet::new(),
@@ -2089,7 +2264,8 @@ impl<'a> Sim<'a> {
             .iter()
             .flat_map(|b| b.ahead.iter().copied())
             .collect();
-        if !ahead.is_empty() && self.tick() {
+        let writes = !ahead.is_empty() || batches.iter().any(|b| !b.peers.is_empty());
+        if writes && self.tick() {
             // Killed before the marks were durable: the stated window.
             // What those channels got and had not admitted is lost; what is
             // on the way or never sent stays owed (the server's signal
@@ -2112,7 +2288,26 @@ impl<'a> Sim<'a> {
         let epoch = self.epoch;
         let chan_epochs = self.chan_epochs.clone();
         for batch in &batches {
+            // One write with the marks: the call's peers.
+            self.persisted.peers(batch);
+            self.peer_sent.extend(
+                batch
+                    .peers
+                    .iter()
+                    .filter(|p| {
+                        matches!(p.kind, PeerKind::Channel { .. }) && p.access_hash.is_some()
+                    })
+                    .map(|p| p.id),
+            );
+            let had: BTreeSet<i64> = self.persisted.channels.keys().copied().collect();
             self.persisted.mark(batch);
+            // A baseline made durable here: everything after it is owed,
+            // admitted yet or not (the crash window closes with this write).
+            for (&c, &p) in &self.persisted.channels {
+                if !had.contains(&c) {
+                    self.first_admitted.entry(c).or_insert(p);
+                }
+            }
         }
         for batch in batches {
             if self.tick() {
@@ -2164,6 +2359,21 @@ impl<'a> Sim<'a> {
                 return;
             }
         }
+    }
+
+    /// The manager drops `channel`'s state by design (its fetch failed for
+    /// good): what it missed so far is not owed, and it is unknown again
+    /// (owed from its next admitted update on).
+    fn abandoned(&mut self, channel: i64) {
+        self.reset.insert(channel);
+        self.first_admitted.remove(&channel);
+        self.exempt.extend(
+            self.s.events[..self.done]
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.kind == Kind::Chan(channel))
+                .map(|(i, _)| i),
+        );
     }
 
     /// Whether the manager has rolled the call's box back since it asked.
@@ -2251,11 +2461,6 @@ impl<'a> Sim<'a> {
                 }
             }
         }
-        for p in &batch.peers {
-            if matches!(p.kind, PeerKind::User { .. }) && p.access_hash.is_some() {
-                self.persisted.known.insert(p.id);
-            }
-        }
     }
 
     /// The server event an update is, by its message bytes.
@@ -2274,6 +2479,20 @@ impl<'a> Sim<'a> {
 
     fn pump(&mut self) {
         while let Some(f) = self.m.next_action() {
+            // As the caller: a channel fetch needs the channel's access
+            // hash; without one it fails for good.
+            if let Fetch::GetChannelDifference { channel, .. } = f
+                && !self.persisted.channel_peers.contains(&channel)
+            {
+                if !self.peer_sent.contains(&channel) {
+                    // Telegram never sent this channel's entity: its state is
+                    // dropped by design.
+                    self.abandoned(channel);
+                }
+                let batches = self.m.fetch_failed_permanently(f);
+                self.take(batches);
+                continue;
+            }
             let early = self.rng.chance(50).then(|| self.compute(f));
             let chan_epoch = match f {
                 Fetch::GetChannelDifference { channel, .. } => {
@@ -2614,19 +2833,7 @@ impl<'a> Sim<'a> {
                             if let Fetch::GetChannelDifference { channel, .. } = f
                                 && !stale
                             {
-                                // The channel's state is dropped by design:
-                                // what it missed so far is not owed, and it
-                                // is unknown again (owed from its next
-                                // admitted update on).
-                                self.reset.insert(channel);
-                                self.first_admitted.remove(&channel);
-                                self.exempt.extend(
-                                    self.s.events[..self.done]
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, e)| e.kind == Kind::Chan(channel))
-                                        .map(|(i, _)| i),
-                                );
+                                self.abandoned(channel);
                             }
                             let batches = self.m.fetch_failed_permanently(f);
                             self.take(batches);
@@ -2876,9 +3083,13 @@ async fn too_long_keeps_a_refusal_backoff() {
     advance(RETRY_MIN).await;
     let f = m.next_action().expect("the refetch");
     assert!(matches!(f, Fetch::GetDifference { pts: 10, .. }));
-    // A failed fetch's retry is cut short as before.
+    // A failed fetch's retry is cut short by Telegram's `updatesTooLong`,
+    // which comes on a live session, but not by the sender's
+    // connection-end signal.
     m.fetch_failed(f);
     assert_eq!(m.next_action(), None);
+    assert!(m.feed_push(connection_ended()).is_empty());
+    assert_eq!(m.next_action(), None, "a dropped connection waits it out");
     assert!(m.feed_push(too_long()).is_empty());
     assert!(matches!(
         m.next_action(),

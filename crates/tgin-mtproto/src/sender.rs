@@ -32,12 +32,14 @@
 //! connection until the next `invoke`, which opens a fresh one. Pushes
 //! therefore stop until then. So on a main session, whenever a connection
 //! that completed its init call ends (except on −404 and when the sender
-//! is dropped) and whenever Telegram reports `new_session_created`, the
-//! sender pushes a synthetic `updatesTooLong`: the update manager then
-//! calls `getDifference`, which reconnects and re-subscribes the session.
-//! That is the only signal: a connection that fails before its init call
-//! completes pushes nothing, so a caller whose catch-up call fails must
-//! retry it itself.
+//! is dropped) the sender pushes [`CONNECTION_ENDED`], and whenever
+//! Telegram reports `new_session_created` a synthetic `updatesTooLong`:
+//! the update manager then calls `getDifference`, which reconnects and
+//! re-subscribes the session. The two differ because only the second
+//! shows the server is reachable (it may cut a backed-off retry short).
+//! Those are the only signals: a connection that fails before its init
+//! call completes pushes nothing, so a caller whose catch-up call fails
+//! must retry it itself.
 //!
 //! Every connection opens with the sender's own init call,
 //! `invokeWithLayer(layer, initConnection(…, help.getNearestDc))`; no
@@ -85,6 +87,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use crate::transport::{PacketReader, PacketWriter, TcpTransport, Transport, TransportError};
+use crate::updates::CONNECTION_ENDED;
 use crate::{AuthKey, DcOption};
 
 #[cfg(test)]
@@ -561,10 +564,16 @@ struct Shared {
 }
 
 impl Shared {
-    /// The session's update stream may have a gap: tell the update
-    /// manager, on main sessions.
+    /// The session's update stream may have a gap (`new_session_created`,
+    /// on a live connection): tell the update manager, on main sessions.
     fn session_lost(&mut self) {
         self.push(Bytes::from_static(&UPDATES_TOO_LONG));
+    }
+
+    /// A connection that finished its init call ended: its pushes may be
+    /// lost. Tell the update manager, on main sessions.
+    fn connection_ended(&mut self) {
+        self.push(Bytes::from_static(CONNECTION_ENDED));
     }
 
     /// One update container for the update manager, on main sessions.
@@ -912,7 +921,7 @@ impl<T: Transport> Actor<T> {
         // A connection that never finished its init call never had pushes
         // to lose; a new session's own `new_session_created` signals it.
         if gone.is_none() && init_done && !matches!(cause, Cause::Shutdown) {
-            st.session_lost();
+            st.connection_ended();
         }
         conn.end(writer.is_flushed(), gone, &cause);
         matches!(cause, Cause::Shutdown)

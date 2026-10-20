@@ -387,12 +387,22 @@ impl SessionStore {
                 }
             }
             let mut channels = txn.open_table(CHANNEL_PTS)?;
+            let mut behind = txn.open_table(CHANNELS_BEHIND)?;
+            // A dropped channel's rows go first (the delta's own rows are
+            // newer), unless a later batch has marked the channel since: it
+            // started again, and its rows are that start's.
+            for &(channel, bound) in &delta.forgotten {
+                let mark = behind.get(channel)?.map(|g| g.value());
+                if mark.is_none_or(|g| g < bound) {
+                    behind.remove(channel)?;
+                    channels.remove(channel)?;
+                }
+            }
             for &(channel, pts) in &delta.channels {
                 channels.insert(channel, pts)?;
             }
             // A row marked again since (a higher mark) stays: the delta
             // and a newer mark may be written in either order.
-            let mut behind = txn.open_table(CHANNELS_BEHIND)?;
             for &(channel, mark) in &delta.caught_up {
                 let current = behind.get(channel)?.map(|g| g.value());
                 if current.is_some_and(|g| g <= mark) {
@@ -1108,6 +1118,35 @@ mod tests {
     /// A commit reporting a channel caught up and a newer mark of that
     /// channel (a later batch's) may be written in either order: the newer
     /// mark stays. A mark lower than the row's is kept out.
+    /// A dropped channel's stored pts and behind row are deleted, unless a
+    /// batch at or after the drop has marked it since (it started again);
+    /// the delta's own channel rows are written after the deletion.
+    #[test]
+    fn forgotten_channels_lose_their_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = SessionStore::open(tmp.path()).expect("open");
+        s.commit_state(&StateDelta {
+            channels: vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            ..StateDelta::default()
+        })
+        .expect("rows");
+        s.mark_channels_behind(&marks(&[1, 2], 3, &[]))
+            .expect("mark");
+        s.mark_channels_behind(&marks(&[3], 7, &[]))
+            .expect("newer mark");
+        s.commit_state(&StateDelta {
+            forgotten: vec![(1, 5), (3, 5), (4, 5)],
+            channels: vec![(4, 41)],
+            ..StateDelta::default()
+        })
+        .expect("forget");
+        let st = s.stored_state().expect("stored");
+        // 1: marked before the drop, gone. 3: marked again after it, kept.
+        // 4: no mark, gone, then the delta's own newer row.
+        assert_eq!(st.channels, vec![(2, 20), (3, 30), (4, 41)]);
+        assert_eq!(st.behind, vec![(2, 3), (3, 7)]);
+    }
+
     #[test]
     fn caught_up_never_erases_a_newer_mark() {
         let tmp = tempfile::tempdir().expect("tempdir");

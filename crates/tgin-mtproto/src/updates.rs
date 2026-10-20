@@ -4,8 +4,9 @@
 //! It is a pure state machine over bytes. It does no I/O: pushes and fetch
 //! answers go in, batches and fetch actions come out. The caller
 //! - feeds every push ([`feed_push`](UpdateManager::feed_push)), including
-//!   the `Updates` answers the sender copies into the push stream and the
-//!   synthetic `updatesTooLong` it adds when a connection ends;
+//!   the `Updates` answers the sender copies into the push stream, its
+//!   synthetic `updatesTooLong` on `new_session_created`, and its
+//!   [`CONNECTION_ENDED`] signal when a connection ends;
 //! - runs each [`Fetch`] from [`next_action`](UpdateManager::next_action)
 //!   on the ingest session and feeds the answer back, or reports
 //!   [`fetch_failed`](UpdateManager::fetch_failed) (asked again after a
@@ -95,6 +96,11 @@ pub const MAX_CHANNEL_FETCHES: usize = 4;
 /// backs off getDifference).
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
 pub const RETRY_MAX: Duration = Duration::from_secs(60);
+/// What the sender pushes when a connection that finished its init call
+/// ends: the session's update stream may have a gap. Not TL (no schema
+/// constructor has this id), so it is never mistaken for Telegram's
+/// `updatesTooLong`, which comes on a live session.
+pub const CONNECTION_ENDED: &[u8] = b"\0end";
 /// Held (out-of-order) updates per box. Beyond it, a sequenced update is
 /// dropped from memory; the box's state has not moved past it, so the
 /// difference brings it back.
@@ -143,6 +149,11 @@ pub struct StateDelta {
     /// clears (the id of the batch that marked it): a row marked again
     /// since, by a later batch, stays.
     pub caught_up: Vec<(i64, u64)>,
+    /// Channels whose state was dropped (no longer readable, or abandoned
+    /// after a fetch failed for good), each with the first batch id after
+    /// the drop: delete their stored pts and behind row, unless a batch at
+    /// or after that id has marked the channel since (it started again).
+    pub forgotten: Vec<(i64, u64)>,
 }
 
 impl StateDelta {
@@ -154,6 +165,7 @@ impl StateDelta {
             && self.date.is_none()
             && self.channels.is_empty()
             && self.caught_up.is_empty()
+            && self.forgotten.is_empty()
     }
 
     fn set_channel(&mut self, channel: i64, pts: i32) {
@@ -176,6 +188,12 @@ impl StateDelta {
             match self.caught_up.iter_mut().find(|(k, _)| *k == c) {
                 Some(row) => row.1 = row.1.max(g),
                 None => self.caught_up.push((c, g)),
+            }
+        }
+        for (c, g) in later.forgotten {
+            match self.forgotten.iter_mut().find(|(k, _)| *k == c) {
+                Some(row) => row.1 = row.1.max(g),
+                None => self.forgotten.push((c, g)),
             }
         }
     }
@@ -601,6 +619,8 @@ pub struct UpdateManager {
     startup: Vec<i64>,
     /// Channels caught up, with their marks, for the next committed delta.
     caught_up: Vec<(i64, u64)>,
+    /// Channels whose state was dropped, for the next committed delta.
+    forgotten: Vec<(i64, u64)>,
 }
 
 impl UpdateManager {
@@ -662,6 +682,7 @@ impl UpdateManager {
             startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
             caught_up,
+            forgotten: Vec::new(),
             known_users: state.known_users.into_iter().collect(),
             user_lookup: None,
             committed: common,
@@ -703,20 +724,31 @@ impl UpdateManager {
         }
     }
 
-    /// One push: a boxed `Updates` object.
+    /// One push: a boxed `Updates` object, or the sender's
+    /// [`CONNECTION_ENDED`] signal.
     ///
-    /// `updatesTooLong` (Telegram's, or the sender's synthetic one after a
-    /// dropped connection or `new_session_created`) starts a common
-    /// `updates.getDifference`, and is never lost:
+    /// `updatesTooLong` (Telegram's, or the sender's after
+    /// `new_session_created`) and [`CONNECTION_ENDED`] start a common
+    /// `updates.getDifference`, and are never lost:
     /// - while one is pending (not yet asked), more join it, so a
-    ///   reconnect's two signals run one chain;
+    ///   reconnect's signals run one chain;
     /// - while a call is in flight, exactly one more difference follows
     ///   the chain's end, since that call may predate the signal.
+    ///
+    /// `updatesTooLong` also cuts a pending retry short: it came on a live
+    /// session, so the server is reachable. [`CONNECTION_ENDED`] does not:
+    /// the connection that sent it is gone, and on a path that drops every
+    /// connection after its init call, cutting the retry short would ask
+    /// once a second forever instead of backing off.
     ///
     /// A call lost with the connection comes back through
     /// [`fetch_failed`](Self::fetch_failed).
     pub fn feed_push(&mut self, container: Bytes) -> Vec<Batch> {
         self.idle_at = Instant::now() + IDLE_DIFFERENCE;
+        if container.as_ref() == CONNECTION_ENDED {
+            self.want_difference();
+            return Vec::new();
+        }
         let c = match decode::container(&container) {
             Ok(c) => c,
             Err(e) => {
@@ -725,12 +757,12 @@ impl UpdateManager {
             }
         };
         if c.constructor == "updatesTooLong" {
-            // A pending retry is cut short: the signal (Telegram's, or the
-            // sender's on a new connection) shows the server is reachable
-            // again. The sender sends one per connection end or new
-            // session, so this cannot loop.
+            // A pending retry is cut short: the signal came on a live
+            // session, so the server is reachable again. The backoff stays
+            // (an answer resets it): Telegram sends `new_session_created`
+            // on every new connection, so on a path that drops each one
+            // after its init call, resetting it would ask once a second.
             self.retry_at = None;
-            self.backoff = Duration::ZERO;
             self.want_difference();
             return Vec::new();
         }
@@ -1082,7 +1114,9 @@ impl UpdateManager {
     }
 
     /// Stops tracking a channel the account can no longer read (e.g.
-    /// `CHANNEL_PRIVATE`): its state and held updates are dropped.
+    /// `CHANNEL_PRIVATE`): its state and held updates are dropped, and the
+    /// next committed delta tells the caller to delete its stored rows
+    /// ([`StateDelta::forgotten`]), so it is not loaded at every start.
     pub fn forget_channel(&mut self, channel: i64) {
         if let Some(ch) = self.channels.remove(&channel)
             && matches!(ch.fetch, ChannelFetch::InFlight { .. })
@@ -1091,19 +1125,35 @@ impl UpdateManager {
         }
         self.gapped.remove(&channel);
         self.retrying.remove(&channel);
+        self.drop_stored(channel);
+    }
+
+    /// Forgets a channel's committed state and its behind mark, here and,
+    /// through the next committed delta, in the store.
+    fn drop_stored(&mut self, channel: i64) {
         self.committed_channels.remove(&channel);
         self.startup.retain(|&c| c != channel);
-        if let Some(g) = self.ahead.remove(&channel) {
-            self.caught_up.push((channel, g));
+        self.ahead.remove(&channel);
+        self.ahead_new.retain(|&c| c != channel);
+        self.caught_up.retain(|&(c, _)| c != channel);
+        // Every mark so far is a lower batch id; a later one is not.
+        let bound = self.next_id;
+        match self.forgotten.iter_mut().find(|(c, _)| *c == channel) {
+            Some(row) => row.1 = bound,
+            None => self.forgotten.push((channel, bound)),
         }
     }
 
     /// Drops a channel's state, so no difference is fetched from it again
     /// (an undecodable or permanently failed fetch, its call no longer in
-    /// flight): its next update starts it again, and its held updates are
-    /// delivered from there.
+    /// flight, e.g. no access hash to ask with): its next update starts it
+    /// again, and its held updates are delivered from there. Its stored
+    /// rows go too, so a quiet channel is not left behind for good.
     fn abandon_channel(&mut self, channel: i64) -> Vec<Batch> {
+        self.drop_stored(channel);
         if let Some(ch) = self.channels.get_mut(&channel) {
+            // Pending batches of the dropped state no longer commit it.
+            ch.epoch += 1;
             ch.pts = None;
             ch.fetch = ChannelFetch::Idle;
             ch.again = false;
@@ -1444,6 +1494,7 @@ impl UpdateManager {
             self.ahead.remove(c);
         }
         delta.caught_up = caught_up;
+        delta.forgotten = std::mem::take(&mut self.forgotten);
         (!delta.is_empty()).then_some(delta)
     }
 
@@ -2124,5 +2175,24 @@ fn facts_of(h: &Held) -> UpdateFacts<'_> {
             text: None,
             command: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONNECTION_ENDED;
+    use crate::schema::{API, MTPROTO};
+
+    /// The connection-end signal is no TL object of either schema, so no
+    /// push from Telegram can be mistaken for it, nor it for one.
+    #[test]
+    fn connection_ended_is_not_tl() {
+        let id = CONNECTION_ENDED
+            .first_chunk::<4>()
+            .map(|b| u32::from_le_bytes(*b))
+            .expect("four bytes");
+        assert!(API.ctor_by_id(id).is_none());
+        assert!(MTPROTO.ctor_by_id(id).is_none());
+        assert!(crate::decode::container(CONNECTION_ENDED).is_err());
     }
 }
