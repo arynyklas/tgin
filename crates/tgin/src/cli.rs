@@ -127,6 +127,11 @@ enum AdminCommand {
         /// Log in with a code sent to the config's `phone` instead of a QR.
         #[arg(long)]
         code: bool,
+        /// Log in over plain http to a host that is not loopback: the login
+        /// code, the 2FA password and the QR's token then cross the
+        /// network in clear text.
+        #[arg(long)]
+        insecure_http: bool,
     },
     /// Log a Telegram account out (`auth.logOut`) and clear its session.
     Logout {
@@ -214,7 +219,15 @@ where
                 AdminCommand::Drain { name } => Action::Drain(name),
                 AdminCommand::Purge { name } => Action::Purge(name),
                 AdminCommand::Health => Action::Health,
-                AdminCommand::Login { account, code } => Action::Login { account, code },
+                AdminCommand::Login {
+                    account,
+                    code,
+                    insecure_http,
+                } => Action::Login {
+                    account,
+                    code,
+                    insecure_http,
+                },
                 AdminCommand::Logout { account, yes } => Action::AccountLogout { account, yes },
                 AdminCommand::Bot(bot) => {
                     let (how, args) = match bot {
@@ -553,14 +566,24 @@ mod tests {
             action(&["admin", "login", "main"]),
             Action::Login {
                 account: "main".into(),
-                code: false
+                code: false,
+                insecure_http: false,
             }
         );
         assert_eq!(
             action(&["admin", "login", "main", "--code"]),
             Action::Login {
                 account: "main".into(),
-                code: true
+                code: true,
+                insecure_http: false,
+            }
+        );
+        assert_eq!(
+            action(&["admin", "login", "main", "--insecure-http"]),
+            Action::Login {
+                account: "main".into(),
+                code: false,
+                insecure_http: true,
             }
         );
         assert_eq!(

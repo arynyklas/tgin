@@ -60,6 +60,8 @@ pub enum Action {
     Login {
         account: String,
         code: bool,
+        /// Allow plain http to a host that is not loopback.
+        insecure_http: bool,
     },
     /// `logout`: logs the account out and clears its session; without
     /// `yes`, only says what would happen.
@@ -67,6 +69,19 @@ pub enum Action {
         account: String,
         yes: bool,
     },
+}
+
+/// Whether `url` is plain http to a host that is not loopback.
+fn cleartext_to_remote(url: &Url) -> bool {
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+        Some(url::Host::Domain(name)) => !name.eq_ignore_ascii_case("localhost"),
+        None => true,
+    }
 }
 
 /// Parses `--url`: an `http` or `https` URL.
@@ -213,7 +228,19 @@ fn client_options(connect: Duration, total: Option<Duration>) -> ClientOptions {
 }
 
 async fn execute(command: &Command, token: Option<&str>) -> u8 {
-    if let Action::Login { account, code } = &command.action {
+    if let Action::Login {
+        account,
+        code,
+        insecure_http,
+    } = &command.action
+    {
+        if !*insecure_http && cleartext_to_remote(&command.url) {
+            eprintln!(
+                "tgin admin login: refusing to log in over plain http to {}: the login code, the 2FA password and the QR's token would cross the network in clear text. Reach the admin plane over loopback (an SSH tunnel, kubectl port-forward) or through a TLS proxy, or pass --insecure-http.",
+                command.url.origin().ascii_serialization()
+            );
+            return exit::USAGE;
+        }
         let mut api = HttpLogin {
             client: http::client(&client_options(REQUEST_TIMEOUT, Some(LOGIN_TIMEOUT))),
             base: command.url.clone(),
@@ -954,6 +981,30 @@ mod tests {
         );
         assert!(parse_url("ftp://host").is_err());
         assert!(parse_url("not a url").is_err());
+    }
+
+    #[test]
+    fn plain_http_login_only_over_loopback() {
+        let remote = |u: &str| cleartext_to_remote(&Url::parse(u).expect("url"));
+        for local in [
+            "http://127.0.0.1:9090",
+            "http://127.8.0.1:9090",
+            "http://[::1]:9090",
+            "http://localhost:9090",
+            "http://LOCALHOST:9090",
+            "https://admin.example:9090",
+            "https://10.0.0.5:9090",
+        ] {
+            assert!(!remote(local), "{local}");
+        }
+        for far in [
+            "http://10.0.0.5:9090",
+            "http://admin.example:9090",
+            "http://[2001:db8::1]:9090",
+            "http://0.0.0.0:9090",
+        ] {
+            assert!(remote(far), "{far}");
+        }
     }
 
     #[test]

@@ -940,7 +940,7 @@ $ tgin admin consumers
 $ tgin admin pause <consumer>     # also: resume, drain, purge
 $ tgin admin health
 $ tgin admin bot logout <bot> --yes   # also: bot close; --timeout 1m
-$ tgin admin login <account>          # --code: a login code to the config's phone
+$ tgin admin login <account>          # --code: a login code to the config's phone; plain http only to loopback unless --insecure-http
 $ tgin admin logout <account> --yes
 ```
 

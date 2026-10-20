@@ -4602,3 +4602,37 @@ async fn left_counts_what_is_held_when_the_server_is_called() {
     assert_eq!(moved.json()["left"], 0);
     tgin.stop().await;
 }
+
+/// `tgin admin login` refuses plain http to a host that is not loopback
+/// before it sends anything: the code and the 2FA password would cross the
+/// network in clear text. `--insecure-http` lets it try.
+#[tokio::test]
+async fn login_refuses_plain_http_to_a_remote_host() {
+    // `.invalid` never resolves: the allowed run fails fast, without a
+    // network.
+    let refused = output(binary(&[
+        "admin",
+        "--url",
+        "http://tgin-admin.invalid:9090",
+        "login",
+        "main",
+    ]))
+    .await;
+    assert_eq!(refused.code, Some(64), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("--insecure-http"),
+        "{}",
+        refused.stderr
+    );
+    let allowed = output(binary(&[
+        "admin",
+        "--url",
+        "http://tgin-admin.invalid:9090",
+        "login",
+        "main",
+        "--insecure-http",
+    ]))
+    .await;
+    assert_ne!(allowed.code, Some(64), "{}", allowed.stderr);
+    assert!(!allowed.stderr.contains("refusing"), "{}", allowed.stderr);
+}
