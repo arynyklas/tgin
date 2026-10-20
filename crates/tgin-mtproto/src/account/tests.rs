@@ -341,6 +341,8 @@ async fn frozen_answer_is_frozen() {
         .rpc()
         .invoke(Route::Main, Bytes::from_static(&[0; 4]))
         .await;
+    // Shown at the ingest's next turn, at once: not at a later catch-up.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(run.account.state(), AccountState::Frozen);
     assert!(run.account.state().active());
     run.account.close().await;
@@ -652,7 +654,7 @@ async fn a_new_login_clears_frozen() {
     until(&run.account, running).await;
     let rpc = run.account.rpc();
     let _ = rpc.invoke(Route::Main, Bytes::from_static(&[0; 4])).await;
-    assert_eq!(run.account.state(), AccountState::Frozen);
+    until(&run.account, |s| *s == AccountState::Frozen).await;
     let _ = rpc.invoke(Route::Main, Bytes::from_static(&[0; 4])).await;
     until(&run.account, |s| *s == AccountState::NeedsLogin).await;
     run.account.wake();
@@ -992,5 +994,42 @@ async fn peers_without_marks_are_persisted_before_admission() {
     );
     let admitted = seen.iter().find(|s| s.updates > 0).expect("admitted");
     assert_eq!(admitted.cached, 1, "the user's hash is durable: {seen:?}");
+    run.account.close().await;
+}
+
+/// A frozen answer to an RPC call during a catch-up flood wait leaves the
+/// state on `flood_wait`, without a flip to `frozen` and back; once the
+/// wait ends the account shows `frozen`.
+#[tokio::test(start_paused = true)]
+async fn a_frozen_answer_during_a_flood_wait_does_not_flip_the_state() {
+    let net = FakeNetwork::new();
+    let mut first = true;
+    net.answer(move |call| match call.ctor() {
+        ids::GET_DIFFERENCE if std::mem::take(&mut first) => Reply::Rpc(420, "FLOOD_WAIT_30"),
+        ids::GET_DIFFERENCE => Reply::Ok(crate::testkit::difference_empty(1, 1)),
+        _ => Reply::Rpc(420, "FROZEN_METHOD_INVALID"),
+    });
+    let registry = Arc::new(Registry::default());
+    let run = start(&net, &registry);
+    until(&run.account, |s| {
+        matches!(s, AccountState::FloodWait { .. })
+    })
+    .await;
+    let mut states = run.account.watch();
+    states.mark_unchanged();
+    for _ in 0..3 {
+        let _ = run
+            .account
+            .rpc()
+            .invoke(Route::Main, Bytes::from_static(&[0; 4]))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !states.has_changed().expect("alive"),
+        "still flood_wait, never frozen in between: {:?}",
+        run.account.state()
+    );
+    until(&run.account, |s| *s == AccountState::Frozen).await;
     run.account.close().await;
 }

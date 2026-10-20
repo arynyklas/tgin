@@ -683,13 +683,8 @@ impl Shared {
         }
     }
 
-    fn froze(&self) {
-        self.mark_frozen();
-        self.set_state(AccountState::Frozen);
-    }
-
-    /// Records that Telegram reports the account frozen; the state shows
-    /// it at the next [`connected`](Self::connected).
+    /// Records that Telegram reports the account frozen; the ingest's next
+    /// turn shows it (a flood wait first, while it lasts).
     fn mark_frozen(&self) {
         if !self.frozen.swap(true, Ordering::Relaxed) {
             tracing::warn!(account = %self.name, "Telegram reports the account frozen: it is read-only");
@@ -823,7 +818,10 @@ fn observe(shared: &Shared, route: Route, home: i32, outcome: &Result<RpcOutcome
         Ok(RpcOutcome::Error { code, message })
             if classify(*code, message) == ErrorClass::Frozen =>
         {
-            shared.froze();
+            // The ingest decides the state: woken, it shows `frozen` unless
+            // a flood wait holds.
+            shared.mark_frozen();
+            shared.signal.notify_one();
         }
         _ => {}
     }
@@ -1071,6 +1069,7 @@ async fn run(ctx: Arc<Ctx>) -> End {
             dropped: Dropped::default(),
             flood: None,
             reached: None,
+            frozen: shared.frozen.load(Ordering::Relaxed),
         };
         ingest.run(conn.pushes, &mut affected).await
     };
@@ -1176,6 +1175,8 @@ struct Ingest<'a> {
     /// Whether this turn's catch-up answers reached Telegram, for
     /// [`publish`](Self::publish).
     reached: Option<bool>,
+    /// The account's frozen flag as [`publish`](Self::publish) last saw it.
+    frozen: bool,
 }
 
 impl Ingest<'_> {
@@ -1377,10 +1378,14 @@ impl Ingest<'_> {
                 self.reached = Some(true);
             }
         }
+        let frozen = shared.frozen.load(Ordering::Relaxed);
+        let newly_frozen = frozen && !std::mem::replace(&mut self.frozen, frozen);
         match (self.flood, self.reached.take()) {
             (Some((_, until)), _) => shared.set_state(AccountState::FloodWait { until }),
             (None, Some(true)) => shared.connected(),
             (None, Some(false)) => shared.set_state(AccountState::Connecting),
+            // An RPC answer reported the account frozen: Telegram answered.
+            (None, None) if newly_frozen => shared.connected(),
             (None, None) => {}
         }
     }
