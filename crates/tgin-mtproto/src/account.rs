@@ -17,10 +17,11 @@
 //! 4. feeds every push to the [`UpdateManager`], runs its fetches
 //!    (`updates.getState`, `getDifference`, `getChannelDifference`, on the
 //!    main session only) and sleeps until its [`deadline`](UpdateManager::deadline);
-//! 5. hands each call's batches to the [`BatchSink`]: first the marks of
-//!    all of them in one write ([`SessionStore::mark_channels_behind`]),
-//!    then, in order, `admit`, and the state `committed` or `refused`
-//!    returns, persisted; the batch's peers are merged on admission.
+//! 5. hands each call's batches to the [`BatchSink`]: first the marks and
+//!    the peers of all of them in one write
+//!    ([`SessionStore::mark_channels_behind`]), then, in order, `admit`,
+//!    and the state `committed` or `refused` returns, persisted (the only
+//!    write after admission).
 //!
 //! A connection that drops, or a `new_session_created`, makes the sender
 //! push `updatesTooLong`; the manager answers it with `getDifference`,

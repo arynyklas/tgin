@@ -5,9 +5,10 @@
 //! [`SessionStore`] and [`UpdateManager`](crate::UpdateManager). For each
 //! [`Batch`] the manager returns, in the order returned (that is, batch
 //! order), it:
-//! 1. persists [`Batch::ahead`] with
-//!    [`SessionStore::mark_channels_behind`] (the marks of all batches of
-//!    one manager call in one write), before admitting any of them;
+//! 1. persists [`Batch::ahead`] and [`Batch::peers`] with
+//!    [`SessionStore::mark_channels_behind`] (the marks and peers of all
+//!    batches of one manager call in one write), before admitting any of
+//!    them; only the state (step 3) is written after admission;
 //! 2. calls [`BatchSink::admit`] with the account's [`UpdateIds`] and the
 //!    same store;
 //!    An `Err` ([`IdsError`]) is a storage failure: the id mark could not

@@ -1170,7 +1170,8 @@ async fn kill_runs(args: &Args, paths: &Paths) -> Result<ExitCode, AnyError> {
     let dir = paths.out_dir("kill-runs")?;
     let bot = Bot::new(&paths.token()?)?;
     let window = commit_time(&dir)?;
-    // put_peers and commit_state: two writes after admission.
+    // commit_state is the one write after admission (the peers go with the
+    // marks, before it); 2.5 × its median leaves room for a slow write.
     let window = window * 5 / 2;
     say(format!(
         "kill-runs: {runs} runs × {probes} probes (private chat and test channel, alternating, 1/s); in-commit timer uniform in [0, {} µs) (2.5 × the median state write on this disk)",
