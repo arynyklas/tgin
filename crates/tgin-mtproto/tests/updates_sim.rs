@@ -330,6 +330,7 @@ fn commit(m: &mut UpdateManager, batches: &[Batch]) -> StateDelta {
             out.date = d.date.or(out.date);
             out.channels.extend(d.channels);
             out.caught_up.extend(d.caught_up);
+            out.forgotten.extend(d.forgotten);
         }
     }
     out
@@ -1493,6 +1494,75 @@ async fn dropped_connections_back_off_to_a_minute() {
     );
 }
 
+/// A channel the account can no longer read is forgotten: the next
+/// committed delta tells the caller to delete its stored pts and behind
+/// row, so it is not loaded again at every start.
+#[tokio::test(start_paused = true)]
+async fn forgotten_channel_rows_are_deleted_in_the_next_commit() {
+    let mut m = started(stored(10, &[(1, 5), (2, 5)], &[5]));
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 6, 1);
+    let batches = m.feed_push(b(updates(&[post], NONE, NONE, 2, 0)));
+    let marked = batches
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked")
+        .id;
+    m.forget_channel(1);
+    let d = commit(&mut m, &batches);
+    assert_eq!(d.forgotten, vec![(1, marked + 1)]);
+    assert!(d.channels.iter().all(|&(c, _)| c != 1), "{d:?}");
+    // Reported once.
+    let other = new_channel_message(&message(2, PeerId::Channel(2), "q"), 6, 1);
+    let batches = m.feed_push(b(updates(&[other], NONE, NONE, 2, 0)));
+    assert!(commit(&mut m, &batches).forgotten.is_empty());
+}
+
+/// A channel abandoned when its fetch failed for good (for example, no
+/// access hash to ask with) drops its stored rows too, so its behind mark
+/// is cleared instead of lingering. Its held update starts it again, with
+/// a new mark the deletion leaves alone.
+#[tokio::test(start_paused = true)]
+async fn abandoned_channel_clears_its_rows() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    let first = nothing(&mut m, &batches);
+    assert_eq!(first, vec![1]);
+    let f = m.next_action().expect("channel 1");
+    assert!(matches!(f, Fetch::GetChannelDifference { channel: 1, .. }));
+    let batches = m.fetch_failed_permanently(f);
+    assert!(batches.is_empty());
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 9, 1);
+    let batches = m.feed_push(b(updates(std::slice::from_ref(&post), NONE, NONE, 2, 0)));
+    let again = batches
+        .iter()
+        .find(|b| !b.ahead.is_empty())
+        .expect("marked again")
+        .id;
+    let d = commit(&mut m, &batches);
+    let (c, bound) = d.forgotten[0];
+    assert_eq!(c, 1);
+    assert!(bound <= again, "the new start's mark survives the deletion");
+    assert_eq!(d.channels, vec![(1, 8), (1, 9)]);
+    assert_eq!(all_updates(&batches), vec![b(post)]);
+}
+
+/// A batch of the abandoned state committed after the abandon does not
+/// write that state back: the stored pts it would restore was just
+/// dropped.
+#[tokio::test(start_paused = true)]
+async fn abandoned_state_is_not_written_back() {
+    let mut m = started(stored(10, &[(1, 5)], &[5]));
+    let post = new_channel_message(&message(1, PeerId::Channel(1), "p"), 6, 1);
+    let pending = m.feed_push(b(updates(&[post], NONE, NONE, 2, 0)));
+    let batches = m.feed_push(b(short(&channel_too_long(1, None))));
+    nothing(&mut m, &batches);
+    let f = m.next_action().expect("channel 1");
+    assert!(m.fetch_failed_permanently(f).is_empty());
+    let d = commit(&mut m, &pending);
+    assert!(d.channels.is_empty(), "{d:?}");
+    assert_eq!(d.forgotten.len(), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn affected_pts_advance_the_box() {
     let mut m = started(stored(10, &[(1, 5)], &[5]));
@@ -1948,6 +2018,14 @@ impl Persisted {
         self.common.qts = d.qts.unwrap_or(self.common.qts);
         self.common.seq = d.seq.unwrap_or(self.common.seq);
         self.common.date = d.date.unwrap_or(self.common.date);
+        // As `SessionStore::commit_state`: a dropped channel's rows first,
+        // unless a later batch has marked it since.
+        for &(c, bound) in &d.forgotten {
+            if self.behind.get(&c).is_none_or(|&m| m < bound) {
+                self.behind.remove(&c);
+                self.channels.remove(&c);
+            }
+        }
         for &(c, p) in &d.channels {
             self.channels.insert(c, p);
         }

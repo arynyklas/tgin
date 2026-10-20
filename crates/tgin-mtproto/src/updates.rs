@@ -147,6 +147,11 @@ pub struct StateDelta {
     /// clears (the id of the batch that marked it): a row marked again
     /// since, by a later batch, stays.
     pub caught_up: Vec<(i64, u64)>,
+    /// Channels whose state was dropped (no longer readable, or abandoned
+    /// after a fetch failed for good), each with the first batch id after
+    /// the drop: delete their stored pts and behind row, unless a batch at
+    /// or after that id has marked the channel since (it started again).
+    pub forgotten: Vec<(i64, u64)>,
 }
 
 impl StateDelta {
@@ -158,6 +163,7 @@ impl StateDelta {
             && self.date.is_none()
             && self.channels.is_empty()
             && self.caught_up.is_empty()
+            && self.forgotten.is_empty()
     }
 
     fn set_channel(&mut self, channel: i64, pts: i32) {
@@ -180,6 +186,12 @@ impl StateDelta {
             match self.caught_up.iter_mut().find(|(k, _)| *k == c) {
                 Some(row) => row.1 = row.1.max(g),
                 None => self.caught_up.push((c, g)),
+            }
+        }
+        for (c, g) in later.forgotten {
+            match self.forgotten.iter_mut().find(|(k, _)| *k == c) {
+                Some(row) => row.1 = row.1.max(g),
+                None => self.forgotten.push((c, g)),
             }
         }
     }
@@ -595,6 +607,8 @@ pub struct UpdateManager {
     startup: Vec<i64>,
     /// Channels caught up, with their marks, for the next committed delta.
     caught_up: Vec<(i64, u64)>,
+    /// Channels whose state was dropped, for the next committed delta.
+    forgotten: Vec<(i64, u64)>,
 }
 
 impl UpdateManager {
@@ -656,6 +670,7 @@ impl UpdateManager {
             startup: startup.into_iter().map(|(c, _)| c).collect(),
             ahead_new: Vec::new(),
             caught_up,
+            forgotten: Vec::new(),
             known_users: state.known_users.into_iter().collect(),
             committed: common,
             committed_channels: state.channels.into_iter().collect(),
@@ -1075,7 +1090,9 @@ impl UpdateManager {
     }
 
     /// Stops tracking a channel the account can no longer read (e.g.
-    /// `CHANNEL_PRIVATE`): its state and held updates are dropped.
+    /// `CHANNEL_PRIVATE`): its state and held updates are dropped, and the
+    /// next committed delta tells the caller to delete its stored rows
+    /// ([`StateDelta::forgotten`]), so it is not loaded at every start.
     pub fn forget_channel(&mut self, channel: i64) {
         if let Some(ch) = self.channels.remove(&channel)
             && matches!(ch.fetch, ChannelFetch::InFlight { .. })
@@ -1084,19 +1101,35 @@ impl UpdateManager {
         }
         self.gapped.remove(&channel);
         self.retrying.remove(&channel);
+        self.drop_stored(channel);
+    }
+
+    /// Forgets a channel's committed state and its behind mark, here and,
+    /// through the next committed delta, in the store.
+    fn drop_stored(&mut self, channel: i64) {
         self.committed_channels.remove(&channel);
         self.startup.retain(|&c| c != channel);
-        if let Some(g) = self.ahead.remove(&channel) {
-            self.caught_up.push((channel, g));
+        self.ahead.remove(&channel);
+        self.ahead_new.retain(|&c| c != channel);
+        self.caught_up.retain(|&(c, _)| c != channel);
+        // Every mark so far is a lower batch id; a later one is not.
+        let bound = self.next_id;
+        match self.forgotten.iter_mut().find(|(c, _)| *c == channel) {
+            Some(row) => row.1 = bound,
+            None => self.forgotten.push((channel, bound)),
         }
     }
 
     /// Drops a channel's state, so no difference is fetched from it again
     /// (an undecodable or permanently failed fetch, its call no longer in
-    /// flight): its next update starts it again, and its held updates are
-    /// delivered from there.
+    /// flight, e.g. no access hash to ask with): its next update starts it
+    /// again, and its held updates are delivered from there. Its stored
+    /// rows go too, so a quiet channel is not left behind for good.
     fn abandon_channel(&mut self, channel: i64) -> Vec<Batch> {
+        self.drop_stored(channel);
         if let Some(ch) = self.channels.get_mut(&channel) {
+            // Pending batches of the dropped state no longer commit it.
+            ch.epoch += 1;
             ch.pts = None;
             ch.fetch = ChannelFetch::Idle;
             ch.again = false;
@@ -1437,6 +1470,7 @@ impl UpdateManager {
             self.ahead.remove(c);
         }
         delta.caught_up = caught_up;
+        delta.forgotten = std::mem::take(&mut self.forgotten);
         (!delta.is_empty()).then_some(delta)
     }
 
