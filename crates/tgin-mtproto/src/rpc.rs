@@ -126,6 +126,11 @@ pub struct Call<'a> {
     /// `suggestedPost` with a `price`, or holds an `inputMediaStakeDice`.
     /// Read from the schema, on every function and anywhere in the call.
     pub pays_stars: bool,
+    /// The call writes the account's quick replies: a send that files its
+    /// message under a `quick_reply_shortcut`, or an edit of one by
+    /// `quick_reply_shortcut_id`. Quick replies hold the greeting and away
+    /// messages every new chat receives.
+    pub writes_quick_replies: bool,
 }
 
 /// Leaves out the body: it is account content.
@@ -137,6 +142,7 @@ impl fmt::Debug for Call<'_> {
             .field("context", &self.context)
             .field("peer", &self.peer)
             .field("pays_stars", &self.pays_stars)
+            .field("writes_quick_replies", &self.writes_quick_replies)
             .finish()
     }
 }
@@ -230,6 +236,7 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
                     context: checked.context,
                     peer: checked.peer,
                     pays_stars: checked.pays_stars,
+                    writes_quick_replies: checked.writes_quick_replies,
                 });
             }
         }
@@ -300,6 +307,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
     let target = target_field(ctor, channels);
     let mut peer = None;
     let mut pays_stars = false;
+    let mut writes_quick_replies = false;
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -309,6 +317,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
                     continue;
                 }
                 pays_stars |= p.name == PAID_STARS_FIELD;
+                writes_quick_replies |= QUICK_REPLY_FIELDS.contains(&p.name);
                 let start = r.pos;
                 pays_stars |= skip_spending(r, ty, 1)?;
                 if Some(p.name) == target {
@@ -326,6 +335,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
         context,
         peer,
         pays_stars,
+        writes_quick_replies,
     })
 }
 
@@ -419,11 +429,15 @@ fn spending_items(r: &mut Reader<'_>, t: &'static Ty, depth: u32) -> Result<bool
     Ok(spends)
 }
 
+/// The fields by which a call writes the account's quick replies.
+const QUICK_REPLY_FIELDS: [&str; 2] = ["quick_reply_shortcut", "quick_reply_shortcut_id"];
+
 /// What [`check_call`] reads from a call's fields.
 struct Checked {
     context: BoxKind,
     peer: Option<PeerId>,
     pays_stars: bool,
+    writes_quick_replies: bool,
 }
 
 /// The peer an `InputPeer` or `InputChannel` names (already checked):
@@ -693,6 +707,7 @@ mod tests {
             context: BoxKind::Common,
             peer: None,
             pays_stars: false,
+            writes_quick_replies: false,
         };
         let call = format!("{call:?}");
         assert!(

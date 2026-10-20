@@ -19,7 +19,10 @@
 //! `paid_stars_not_allowed` unless the client's `allow_paid_stars` is on:
 //! one that sets `allow_paid_stars` (it agrees to pay a recipient's price),
 //! offers a suggested post with a `price`, or bets on an
-//! `inputMediaStakeDice`.
+//! `inputMediaStakeDice`. A send or edit that carries
+//! `quick_reply_shortcut` or `quick_reply_shortcut_id` writes the
+//! account's quick replies: 403 `quick_replies_not_allowed` unless the
+//! client's allowlist names `messages.editQuickReplyShortcut` exactly.
 //!
 //! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
 //! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]
@@ -766,6 +769,15 @@ async fn serve(
             "the client's allowlist does not allow this method",
         ));
     }
+    // Quick replies are exact-only to write; a send or edit that files a
+    // message under one needs the same grant.
+    if call.writes_quick_replies && !client.acl.allows(QUICK_REPLY_GRANT) {
+        return refused(tgin_error(
+            StatusCode::FORBIDDEN,
+            "quick_replies_not_allowed",
+            "the call writes the account's quick replies, which needs messages.editQuickReplyShortcut by its exact name",
+        ));
+    }
     if call.pays_stars && !client.allow_paid_stars {
         return refused(tgin_error(
             StatusCode::FORBIDDEN,
@@ -840,6 +852,10 @@ fn answer_outcome(answer: &Answer) -> Outcome {
         },
     }
 }
+
+/// The grant a call that writes quick replies needs; account-changing, so
+/// only an exact allow entry gives it.
+const QUICK_REPLY_GRANT: &str = "messages.editQuickReplyShortcut";
 
 /// What an unknown account's bearer is compared with.
 const UNKNOWN_ACCOUNT_TOKEN: &[u8] = b"tgin-unknown-account-0000000000000000";

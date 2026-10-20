@@ -641,6 +641,56 @@ const NOT_SPENDING: [&str; 3] = [
 ];
 
 #[tokio::test]
+async fn quick_reply_fields_need_the_exact_quick_reply_grant() {
+    let writes = [
+        r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","quick_reply_shortcut":{"_":"inputQuickReplyShortcut","shortcut":"hello"}}"#,
+        r#"{"_":"messages.forwardMessages","from_peer":{"_":"inputPeerSelf"},"id":[1],"random_id":["1"],"to_peer":{"_":"inputPeerSelf"},"quick_reply_shortcut":{"_":"inputQuickReplyShortcutId","shortcut_id":3}}"#,
+        r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"message":"x","quick_reply_shortcut_id":3}"#,
+    ];
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app(Arc::clone(&account));
+    for body in writes {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(answer.error(), "quick_replies_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    // Without the fields, the same methods are glob-granted.
+    let plain = r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"message":"x"}"#;
+    assert_eq!(send(&app, tl(plain)).await.status, StatusCode::OK);
+
+    // A deny still wins over the exact grant.
+    let quick = "messages.editQuickReplyShortcut".to_owned();
+    let denied = MethodAcl {
+        allow: vec![MethodGlob::Any, MethodGlob::Exact(quick.clone())],
+        deny: vec![MethodGlob::Exact(quick.clone())],
+    };
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, denied),
+    );
+    assert_eq!(
+        send(&app, tl(writes[2])).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    let account = FakeAccount::new((0..writes.len()).map(|_| ok(NEAREST)));
+    let granted = MethodAcl {
+        allow: vec![MethodGlob::Any, MethodGlob::Exact(quick)],
+        deny: Vec::new(),
+    };
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, granted),
+    );
+    for body in writes {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
 async fn suggested_post_price_and_stake_dice_need_the_opt_in() {
     let account = FakeAccount::new((0..NOT_SPENDING.len()).map(|_| ok(NEAREST)));
     let app = app(Arc::clone(&account));
