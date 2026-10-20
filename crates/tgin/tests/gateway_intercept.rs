@@ -1328,6 +1328,21 @@ async fn wait_token(tgin: &Tgin, token: &str) {
     }
 }
 
+/// Waits until the reload has restarted `token`'s webhook source. Its
+/// `getMe` follows the rebuild of the webhook route; between the old
+/// source's stop and that rebuild, the old route answers updates `503`.
+async fn wait_source_restarted(telegram: &MockServer, token: &str) {
+    let get_me = format!("/bot{token}/getMe");
+    let started = Instant::now();
+    while !upstream_paths(telegram).await.contains(&get_me) {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the source never restarted with the token"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Opens `POST path` with a JSON `body` and sends only its first 4 bytes.
 /// The head asks `Expect: 100-continue`, and the `100 Continue` is read
 /// before any body byte: hyper writes it only once the handler polls the
@@ -1423,6 +1438,7 @@ async fn stalled_old_token_set_webhook_changes_nothing_after_rotation() {
     let rotated = yaml.replace(TOKEN, NEW_TOKEN);
     tgin.reload(&rotated, 2).await;
     wait_token(&tgin, NEW_TOKEN).await;
+    wait_source_restarted(&telegram, NEW_TOKEN).await;
     let info = format!("/c/hooks/bot{NEW_TOKEN}/getWebhookInfo");
     assert_eq!(
         tgin.get(&info).await.1["result"]["url"],
