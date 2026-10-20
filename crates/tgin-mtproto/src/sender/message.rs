@@ -2,21 +2,12 @@
 //! salts, resends and the answers matched to requests.
 
 use super::*;
+use crate::time::now_unix;
 
 /// msg_ids from the local clock plus Telegram's offset, strictly rising.
 pub(super) struct Clock {
     pub(super) offset: i32,
     pub(super) last: i64,
-}
-
-pub(super) fn now_unix() -> (i64, u32) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    (
-        i64::try_from(now.as_secs()).unwrap_or(0),
-        now.subsec_nanos(),
-    )
 }
 
 impl Clock {

@@ -38,7 +38,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -50,6 +50,7 @@ use tokio::time::Instant;
 
 use crate::authorization;
 use crate::retry::{Wait, WaitKind};
+use crate::time::now_unix;
 use crate::{
     AuthKey, DcOption, InitParams, Peer, PeerKind, Pushes, RpcOutcome, Sender, SenderError,
     SessionError, SessionStore,
@@ -1201,12 +1202,6 @@ fn is_login_token(push: &[u8]) -> bool {
     }
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
 /// The login's task.
 struct Flow<D: Dial> {
     store: SessionStore,
@@ -1327,7 +1322,7 @@ impl<D: Dial> Flow<D> {
                         url: LoginUrl::new(&token),
                         expires,
                     });
-                    let ttl = (i64::from(expires) - now_unix()).clamp(1, MAX_TOKEN_TTL);
+                    let ttl = (i64::from(expires) - now_unix().0).clamp(1, MAX_TOKEN_TTL);
                     let renew = Instant::now() + Duration::from_secs(ttl.unsigned_abs());
                     let scanned = self.wait_scan(&conn.scanned, renew.min(qr_deadline)).await;
                     if !scanned && Instant::now() >= qr_deadline {

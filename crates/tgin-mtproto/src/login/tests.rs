@@ -33,7 +33,7 @@ fn params(phone: Option<&str>) -> LoginParams {
 
 /// Telegram's `expires`, ten minutes ahead.
 fn later() -> i32 {
-    i32::try_from(now_unix() + 600).expect("i32 time")
+    i32::try_from(now_unix().0 + 600).expect("i32 time")
 }
 
 async fn settled(h: &LoginHandle) -> LoginState {

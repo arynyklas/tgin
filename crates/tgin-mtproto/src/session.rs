@@ -14,13 +14,13 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::SessionError;
 use crate::decode::PeerId;
 use crate::lock::{DirLock, lock_dir};
+use crate::time::now_unix;
 use crate::updates::{Batch, StateDelta, StoredState};
 
 /// DC id → `ipv4(4) port(2) ipv6(16) port(2)`, ports little-endian.
@@ -165,7 +165,7 @@ impl SessionStore {
             let mut meta = txn.open_table(META)?;
             if meta.get("schema")?.is_none() {
                 meta.insert("schema", SCHEMA_VERSION)?;
-                meta.insert("created_unix", now_unix().to_le_bytes().as_slice())?;
+                meta.insert("created_unix", now_unix().0.to_le_bytes().as_slice())?;
             }
         }
         txn.commit()?;
@@ -274,7 +274,7 @@ impl SessionStore {
         };
         let login = Login {
             self_user_id: me.id,
-            login_unix: now_unix(),
+            login_unix: now_unix().0,
         };
         let me = Peer {
             kind: PeerKind::User {
@@ -605,12 +605,6 @@ fn restrict(path: &Path, mode: u32) -> Result<(), SessionError> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path, _mode: u32) -> Result<(), SessionError> {
     Ok(())
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn encode_addr(a: &DcAddr) -> [u8; 24] {

@@ -79,7 +79,7 @@ use std::fmt;
 use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use grammers_tl_types::{self as tl, Identifiable as _, Serializable};
@@ -95,10 +95,10 @@ mod connection;
 mod init;
 mod message;
 
+#[cfg(test)]
+use crate::time::now_unix;
 pub use init::InitParams;
 use message::Clock;
-#[cfg(test)]
-use message::now_unix;
 
 #[cfg(test)]
 mod tests;

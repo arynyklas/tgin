@@ -40,6 +40,7 @@ mod sink;
 mod testgen;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+mod time;
 pub mod tl_json;
 mod transport;
 pub mod updates;
