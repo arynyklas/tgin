@@ -213,7 +213,7 @@ glob	channels.deleteChannel
 glob	channels.deleteHistory
 glob	channels.deleteMessages
 glob	channels.deleteParticipantHistory
-glob	channels.editAdmin
+exact	channels.editAdmin
 glob	channels.editBanned
 glob	channels.editLocation
 glob	channels.editPhoto
@@ -369,7 +369,7 @@ glob	messages.appendTodoList
 glob	messages.checkChatInvite
 glob	messages.checkHistoryImport
 glob	messages.checkHistoryImportPeer
-glob	messages.checkQuickReplyShortcut
+exact	messages.checkQuickReplyShortcut
 exact	messages.checkUrlAuthMatchCode
 exact	messages.clearAllDrafts
 glob	messages.clearRecentReactions
@@ -390,16 +390,16 @@ glob	messages.deleteParticipantReaction
 glob	messages.deleteParticipantReactions
 exact	messages.deletePhoneCallHistory
 glob	messages.deletePollAnswer
-glob	messages.deleteQuickReplyMessages
-glob	messages.deleteQuickReplyShortcut
+exact	messages.deleteQuickReplyMessages
+exact	messages.deleteQuickReplyShortcut
 glob	messages.deleteRevokedExportedChatInvites
 glob	messages.deleteSavedHistory
 glob	messages.deleteScheduledMessages
 glob	messages.deleteTopicHistory
 glob	messages.discardEncryption
 glob	messages.editChatAbout
-glob	messages.editChatAdmin
-glob	messages.editChatCreator
+exact	messages.editChatAdmin
+exact	messages.editChatCreator
 glob	messages.editChatDefaultBannedRights
 glob	messages.editChatParticipantRank
 glob	messages.editChatPhoto
@@ -409,7 +409,7 @@ glob	messages.editFactCheck
 glob	messages.editForumTopic
 glob	messages.editInlineBotMessage
 glob	messages.editMessage
-glob	messages.editQuickReplyShortcut
+exact	messages.editQuickReplyShortcut
 glob	messages.exportChatInvite
 glob	messages.faveSticker
 glob	messages.forwardMessages
@@ -481,8 +481,8 @@ glob	messages.getPinnedSavedDialogs
 glob	messages.getPollResults
 glob	messages.getPollVotes
 glob	messages.getPreparedInlineMessage
-glob	messages.getQuickReplies
-glob	messages.getQuickReplyMessages
+exact	messages.getQuickReplies
+exact	messages.getQuickReplyMessages
 glob	messages.getRecentLocations
 glob	messages.getRecentReactions
 glob	messages.getRecentStickers
@@ -533,7 +533,7 @@ glob	messages.receivedQueue
 glob	messages.reorderPinnedDialogs
 glob	messages.reorderPinnedForumTopics
 glob	messages.reorderPinnedSavedDialogs
-glob	messages.reorderQuickReplies
+exact	messages.reorderQuickReplies
 glob	messages.reorderStickerSets
 glob	messages.report
 glob	messages.reportEncryptedSpam
@@ -571,7 +571,7 @@ glob	messages.sendMedia
 glob	messages.sendMessage
 glob	messages.sendMultiMedia
 exact	messages.sendPaidReaction
-glob	messages.sendQuickReplyMessages
+exact	messages.sendQuickReplyMessages
 glob	messages.sendReaction
 glob	messages.sendScheduledMessages
 glob	messages.sendScreenshotNotification

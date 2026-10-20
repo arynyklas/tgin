@@ -4138,3 +4138,29 @@ fn get_located_needs_an_exact_entry() {
     assert!(config::exact_only("contacts.getLocated"));
     assert!(!config::exact_only("contacts.getContacts"));
 }
+
+/// Methods that give other users control of the owner's chats, and the
+/// account-wide quick replies, need an exact entry.
+#[test]
+fn admin_rights_and_quick_replies_need_an_exact_entry() {
+    for method in [
+        "channels.editAdmin",
+        "messages.editChatAdmin",
+        "messages.editChatCreator",
+        "messages.checkQuickReplyShortcut",
+        "messages.deleteQuickReplyMessages",
+        "messages.deleteQuickReplyShortcut",
+        "messages.editQuickReplyShortcut",
+        "messages.getQuickReplies",
+        "messages.getQuickReplyMessages",
+        "messages.reorderQuickReplies",
+        "messages.sendQuickReplyMessages",
+        "account.updateBusinessAwayMessage",
+        "account.updateBusinessGreetingMessage",
+    ] {
+        assert!(config::exact_only(method), "{method}");
+    }
+    // Ordinary chat administration stays glob-grantable.
+    assert!(!config::exact_only("channels.editBanned"));
+    assert!(!config::exact_only("messages.editChatTitle"));
+}

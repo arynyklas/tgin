@@ -48,8 +48,11 @@ pub const GLOB_NAMESPACES: [&str; 13] = [
 ///
 /// A glob never allows these, `*` included: an operator lists each one
 /// exactly in a client's `allow`, and the loader warns about it.
-pub const ACCOUNT_CHANGING: [&str; 42] = [
+pub const ACCOUNT_CHANGING: [&str; 53] = [
     "account.*",
+    // Gives another user admin rights in, or ownership of, the owner's
+    // chats.
+    "channels.editAdmin",
     // Sets the price of messages to the channel, in Stars.
     "channels.updatePaidMessagesPrice",
     "contacts.acceptContact",
@@ -69,31 +72,46 @@ pub const ACCOUNT_CHANGING: [&str; 42] = [
     "contacts.unblock",
     "contacts.updateContactNote",
     "help.acceptTermsOfService",
-    // Logs the account in to a website.
+    // Logs the account in to a website, or asks to; a login can complete
+    // on `requestUrlAuth`'s answer, with no further call.
     "messages.acceptUrlAuth",
     "messages.checkUrlAuthMatchCode",
+    "messages.requestUrlAuth",
+    // Account-wide deletes.
     "messages.clearAllDrafts",
     "messages.deletePhoneCallHistory",
+    // Give another user admin rights in, or ownership of, the owner's
+    // chats.
+    "messages.editChatAdmin",
+    "messages.editChatCreator",
+    // The account's quick replies, a Telegram Business feature: shared by
+    // every chat, and sent as the account.
+    "messages.checkQuickReplyShortcut",
+    "messages.deleteQuickReplyMessages",
+    "messages.deleteQuickReplyShortcut",
+    "messages.editQuickReplyShortcut",
+    "messages.getQuickReplies",
+    "messages.getQuickReplyMessages",
+    "messages.reorderQuickReplies",
+    "messages.sendQuickReplyMessages",
     // Web views hand a bot the account's identity, and may pay.
     "messages.prolongWebView",
     "messages.requestAppWebView",
     "messages.requestChatJoinWebView",
     "messages.requestMainWebView",
     "messages.requestSimpleWebView",
-    // Asks to log the account in to a website; the login completes on the
-    // answer, with no further call.
-    "messages.requestUrlAuth",
     "messages.requestWebView",
     // Spends Stars.
     "messages.sendPaidReaction",
+    // Account-wide defaults.
     "messages.setDefaultHistoryTTL",
     "messages.setDefaultReaction",
     // Installs a bot in the attachment menu, with write access.
     "messages.toggleBotInAttachMenu",
-    // Chat folders.
-    "messages.toggleDialogFilterTags",
     // Approves a paid suggested post, which moves its price.
     "messages.toggleSuggestedPostApproval",
+    // Chat folders.
+    "messages.toggleDialogFilterTags",
     "messages.updateDialogFilter",
     "messages.updateDialogFiltersOrder",
     "photos.deletePhotos",
