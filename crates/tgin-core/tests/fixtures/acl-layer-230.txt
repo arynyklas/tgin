@@ -548,7 +548,7 @@ exact	messages.requestChatJoinWebView
 glob	messages.requestEncryption
 exact	messages.requestMainWebView
 exact	messages.requestSimpleWebView
-glob	messages.requestUrlAuth
+exact	messages.requestUrlAuth
 exact	messages.requestWebView
 glob	messages.saveDefaultSendAs
 glob	messages.saveDraft
@@ -712,7 +712,7 @@ glob	phone.getGroupCallChainBlocks
 glob	phone.getGroupCallJoinAs
 glob	phone.getGroupCallStars
 glob	phone.getGroupCallStreamChannels
-glob	phone.getGroupCallStreamRtmpUrl
+refused	phone.getGroupCallStreamRtmpUrl
 glob	phone.getGroupParticipants
 glob	phone.inviteConferenceCallParticipant
 glob	phone.inviteToGroupCall

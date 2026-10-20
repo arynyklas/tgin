@@ -4023,6 +4023,7 @@ fn glob_grants_only_reviewed_namespaces() {
         "messages.prolongWebView",
         "messages.checkUrlAuthMatchCode",
         "messages.acceptUrlAuth",
+        "messages.requestUrlAuth",
         "messages.toggleBotInAttachMenu",
         "messages.updateDialogFilter",
         "messages.toggleSuggestedPostApproval",
@@ -4121,4 +4122,11 @@ fn allowlist_warnings_follow_the_classes() {
     assert_message(exact, "only an exact entry grants");
     let hint = exact.hint.as_deref().unwrap_or_default();
     assert!(hint.contains("move assets"), "{hint}");
+}
+
+/// Declining a website login changes nothing, so a glob may grant it.
+#[test]
+fn decline_url_auth_stays_glob_grantable() {
+    assert!(!config::exact_only("messages.declineUrlAuth"));
+    assert!(config::exact_only("messages.requestUrlAuth"));
 }

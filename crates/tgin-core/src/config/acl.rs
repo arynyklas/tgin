@@ -48,7 +48,7 @@ pub const GLOB_NAMESPACES: [&str; 13] = [
 ///
 /// A glob never allows these, `*` included: an operator lists each one
 /// exactly in a client's `allow`, and the loader warns about it.
-pub const ACCOUNT_CHANGING: [&str; 40] = [
+pub const ACCOUNT_CHANGING: [&str; 41] = [
     "account.*",
     // Sets the price of messages to the channel, in Stars.
     "channels.updatePaidMessagesPrice",
@@ -78,6 +78,9 @@ pub const ACCOUNT_CHANGING: [&str; 40] = [
     "messages.requestChatJoinWebView",
     "messages.requestMainWebView",
     "messages.requestSimpleWebView",
+    // Asks to log the account in to a website; the login completes on the
+    // answer, with no further call.
+    "messages.requestUrlAuth",
     "messages.requestWebView",
     // Spends Stars.
     "messages.sendPaidReaction",
