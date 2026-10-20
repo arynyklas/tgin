@@ -15,9 +15,11 @@
 //! and the `auth.*` methods that mint or move an authorization of the
 //! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
 //! account's authorizations. The owner may lift the second refusal.
-//! A call that sets `allow_paid_stars` (it agrees to pay a recipient's
-//! price in Stars) gets 403 `paid_stars_not_allowed` unless the client's
-//! `allow_paid_stars` is on.
+//! A call that spends the account's Stars or TON gets 403
+//! `paid_stars_not_allowed` unless the client's `allow_paid_stars` is on:
+//! one that sets `allow_paid_stars` (it agrees to pay a recipient's price),
+//! offers a suggested post with a `price`, or bets on an
+//! `inputMediaStakeDice`.
 //!
 //! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
 //! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]
@@ -767,7 +769,7 @@ async fn serve(
         return refused(tgin_error(
             StatusCode::FORBIDDEN,
             "paid_stars_not_allowed",
-            "the call sets allow_paid_stars, and the client may not spend the account's Stars",
+            "the call spends the account's Stars or TON, and the client's allow_paid_stars is off",
         ));
     }
     // A flood wait Telegram gave this call earlier and that is not over:

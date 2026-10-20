@@ -622,6 +622,50 @@ async fn paid_stars_need_the_clients_opt_in() {
     assert_eq!(account.calls().len(), 2);
 }
 
+/// Each body spends the account's Stars or TON without `allow_paid_stars`.
+const SPENDING: [&str; 5] = [
+    // A suggested post offers a price, charged when the channel accepts.
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","suggested_post":{"_":"suggestedPost","price":{"_":"starsTonAmount","amount":"1000000000"}}}"#,
+    r#"{"_":"messages.forwardMessages","from_peer":{"_":"inputPeerSelf"},"id":[1],"random_id":["1"],"to_peer":{"_":"inputPeerSelf"},"suggested_post":{"_":"suggestedPost","price":{"_":"starsAmount","amount":"5","nanos":0}}}"#,
+    // A stake dice bets TON.
+    r#"{"_":"messages.sendMedia","peer":{"_":"inputPeerSelf"},"media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="},"message":"","random_id":"1"}"#,
+    r#"{"_":"messages.sendMultiMedia","peer":{"_":"inputPeerSelf"},"multi_media":[{"_":"inputSingleMedia","media":{"_":"inputMediaDice","emoticon":"x"},"random_id":"1","message":""},{"_":"inputSingleMedia","media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="},"random_id":"2","message":""}]}"#,
+    r#"{"_":"messages.editMessage","peer":{"_":"inputPeerSelf"},"id":1,"media":{"_":"inputMediaStakeDice","game_hash":"g","ton_amount":"1000","client_seed":"AQ=="}}"#,
+];
+
+/// The same calls, with nothing that spends.
+const NOT_SPENDING: [&str; 3] = [
+    r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"x","random_id":"1","suggested_post":{"_":"suggestedPost","schedule_date":5}}"#,
+    r#"{"_":"messages.sendMedia","peer":{"_":"inputPeerSelf"},"media":{"_":"inputMediaDice","emoticon":"x"},"message":"","random_id":"1"}"#,
+    r#"{"_":"messages.sendMultiMedia","peer":{"_":"inputPeerSelf"},"multi_media":[{"_":"inputSingleMedia","media":{"_":"inputMediaDice","emoticon":"x"},"random_id":"1","message":""}]}"#,
+];
+
+#[tokio::test]
+async fn suggested_post_price_and_stake_dice_need_the_opt_in() {
+    let account = FakeAccount::new((0..NOT_SPENDING.len()).map(|_| ok(NEAREST)));
+    let app = app(Arc::clone(&account));
+    for body in SPENDING {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(answer.error(), "paid_stars_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    for body in NOT_SPENDING {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+    let account = FakeAccount::new((0..SPENDING.len()).map(|_| ok(NEAREST)));
+    let mut rpc = rpc_config(100, allow_all());
+    paying_client(&mut rpc);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc,
+    );
+    for body in SPENDING {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK, "{body}");
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn flood_wait_above_threshold_is_remembered_per_method() {
     let account = FakeAccount::new([err(420, "FLOOD_WAIT_300"), ok(NEAREST), ok(NEAREST)]);

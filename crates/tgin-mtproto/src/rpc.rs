@@ -25,7 +25,7 @@ use tokio::time::{Instant, sleep_until};
 use bytes::Bytes;
 
 use crate::decode::{BoxKind, PeerId};
-use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, present};
+use crate::schema::{API, Ctor, Kind, MAX_FLAG_WORDS, Reader, Role, Ty, deeper, present};
 use crate::{RpcOutcome, SenderError, TlError};
 
 /// A boxed, sendable future: the trait methods below stay object safe.
@@ -121,9 +121,10 @@ pub struct Call<'a> {
     /// The user, chat or channel the call targets (its `channel`,
     /// `parent_peer` or `peer`), if it names one.
     pub peer: Option<PeerId>,
-    /// The call sets its `allow_paid_stars` flag: it agrees to pay the
-    /// recipient's price in Stars. Read from the schema, for every function
-    /// that has the flag.
+    /// The call spends the account's Stars or TON: it sets
+    /// `allow_paid_stars` (it agrees to pay the recipient's price), offers a
+    /// `suggestedPost` with a `price`, or holds an `inputMediaStakeDice`.
+    /// Read from the schema, on every function and anywhere in the call.
     pub pays_stars: bool,
 }
 
@@ -318,7 +319,7 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
                 }
                 pays_stars |= p.name == PAID_STARS_FIELD;
                 let start = r.pos;
-                API.skip_value(r, ty, 1)?;
+                pays_stars |= skip_spending(r, ty, 1)?;
                 if p.name == target {
                     peer = peer_id(&r.buf[start..r.pos]);
                 }
@@ -339,6 +340,59 @@ fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlErro
 
 /// The field by which a call agrees to pay a recipient's price in Stars.
 const PAID_STARS_FIELD: &str = "allow_paid_stars";
+
+/// Skips one value of `ty`, as [`Schema::skip_value`](crate::schema)
+/// does, and says whether it spends the account's Stars or TON anywhere
+/// inside: a `suggestedPost` that offers a `price` (charged when the
+/// channel accepts the post), or an `inputMediaStakeDice` (a TON bet).
+fn skip_spending(r: &mut Reader<'_>, ty: &'static Ty, depth: u32) -> Result<bool, TlError> {
+    match ty {
+        Ty::Boxed(t) => spending_object(r, Some(*t), depth),
+        Ty::Any => spending_object(r, None, depth),
+        Ty::Bare(c) => spending_fields(r, API.ctor(*c), depth),
+        Ty::Vector(t) => {
+            r.vector_id()?;
+            spending_items(r, t, depth)
+        }
+        Ty::BareVector(t) => spending_items(r, t, depth),
+        _ => API.skip_value(r, ty, depth).map(|()| false),
+    }
+}
+
+fn spending_object(r: &mut Reader<'_>, want: Option<u16>, depth: u32) -> Result<bool, TlError> {
+    let ctor = API.read_ctor(r, want)?;
+    let stake = ctor.name == "inputMediaStakeDice";
+    Ok(spending_fields(r, ctor, depth)? || stake)
+}
+
+fn spending_fields(r: &mut Reader<'_>, ctor: &'static Ctor, depth: u32) -> Result<bool, TlError> {
+    let depth = deeper(depth)?;
+    let offer = ctor.name == "suggestedPost";
+    let mut spends = false;
+    let mut words = [0u32; MAX_FLAG_WORDS];
+    for p in ctor.params {
+        match &p.kind {
+            Kind::Flags { slot, known } => words[usize::from(*slot)] = r.flags(ctor, p, *known)?,
+            Kind::Field { ty, flag } => {
+                if present(&words, *flag) {
+                    spends |= offer && p.name == "price";
+                    spends |= skip_spending(r, ty, depth)?;
+                }
+            }
+        }
+    }
+    Ok(spends)
+}
+
+fn spending_items(r: &mut Reader<'_>, t: &'static Ty, depth: u32) -> Result<bool, TlError> {
+    let depth = deeper(depth)?;
+    let n = r.count(API.min_size(t))?;
+    let mut spends = false;
+    for _ in 0..n {
+        spends |= skip_spending(r, t, depth)?;
+    }
+    Ok(spends)
+}
 
 /// What [`check_call`] reads from a call's fields.
 struct Checked {
