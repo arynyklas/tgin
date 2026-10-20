@@ -26,15 +26,22 @@
 //! - two channels are quiet (nothing after the main phase reveals what
 //!   they missed).
 //!
-//! The caller writes the marks of all batches a call returned in one write,
-//! then admits them. A kill point sits before that write, too.
+//! The caller is modelled as the account does it: it writes the marks of
+//! all batches a call returned, with their baselines and the call's peers
+//! (users and channels with their access hashes), in one write, then admits
+//! them. A kill point sits before that write, too. A channel fetch needs
+//! the channel's cached access hash; without one it fails for good and the
+//! channel's state is dropped.
 //!
 //! What is not owed: what Telegram cannot bring back (what a too-long
 //! answer skips that the client never got, what precedes a fresh account's
-//! first state, a channel's updates before the first one admitted when it
-//! was not known at start), counted only once the manager took the answer;
-//! and the stated exception (a kill before a call's marks are durable: what
-//! those channels missed so far).
+//! first state, a channel's updates before its first durable baseline or
+//! first admitted update when it was not known at start), counted only once
+//! the manager took the answer; a channel's updates before its fetch failed
+//! for good, when Telegram never sent its entity; and the one crash window
+//! (a kill before a call's marks are durable: what those channels got and
+//! had not admitted). A channel whose entity came in a call whose write
+//! completed must never miss its access hash.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -1998,6 +2005,8 @@ struct Persisted {
     common: UpdateState,
     channels: BTreeMap<i64, i32>,
     known: BTreeSet<i64>,
+    /// Channels whose access hash is cached: a channel fetch needs one.
+    channel_peers: BTreeSet<i64>,
     /// The batches' `ahead` channels and marks, until a delta says caught
     /// up (as `SessionStore` does: the highest mark stays).
     behind: BTreeMap<i64, u64>,
@@ -2032,6 +2041,25 @@ impl Persisted {
         for &(c, g) in &d.caught_up {
             if self.behind.get(&c).is_some_and(|&m| m <= g) {
                 self.behind.remove(&c);
+            }
+        }
+    }
+
+    /// As `SessionStore::put_peers`: users and channels with an access
+    /// hash.
+    fn peers(&mut self, batch: &Batch) {
+        for p in &batch.peers {
+            if p.access_hash.is_none() {
+                continue;
+            }
+            match p.kind {
+                PeerKind::User { .. } => {
+                    self.known.insert(p.id);
+                }
+                PeerKind::Channel { .. } => {
+                    self.channel_peers.insert(p.id);
+                }
+                PeerKind::Chat => {}
             }
         }
     }
@@ -2140,6 +2168,12 @@ struct Sim<'a> {
     kill_at: Option<u64>,
     killable: bool,
     kills: u32,
+    /// Channels whose access hash a correct caller has made durable: it
+    /// came in a call's batches whose mark write completed. Unlike
+    /// `persisted`, this is not where the caller writes peers but where it
+    /// must: a fetch that finds no peer for such a channel loses updates
+    /// the claim owes.
+    peer_sent: HashSet<i64>,
 }
 
 impl<'a> Sim<'a> {
@@ -2148,13 +2182,17 @@ impl<'a> Sim<'a> {
             common: s.initial.common,
             channels: s.initial.channels.iter().copied().collect(),
             known: s.initial.known_users.iter().copied().collect(),
+            // The channels known at start came with their access hashes.
+            channel_peers: s.initial.channels.iter().map(|&(c, _)| c).collect(),
             behind: BTreeMap::new(),
         };
+        let peer_sent = persisted.channel_peers.iter().copied().collect();
         Self {
             s,
             rng: Rng(s.seed ^ 0x5eed),
             m: UpdateManager::new(s.initial.clone()),
             persisted,
+            peer_sent,
             net: VecDeque::new(),
             in_flight: VecDeque::new(),
             received: HashSet::new(),
@@ -2207,7 +2245,8 @@ impl<'a> Sim<'a> {
             .iter()
             .flat_map(|b| b.ahead.iter().copied())
             .collect();
-        if !ahead.is_empty() && self.tick() {
+        let writes = !ahead.is_empty() || batches.iter().any(|b| !b.peers.is_empty());
+        if writes && self.tick() {
             // Killed before the marks were durable: the stated window.
             // What those channels got and had not admitted is lost; what is
             // on the way or never sent stays owed (the server's signal
@@ -2230,7 +2269,26 @@ impl<'a> Sim<'a> {
         let epoch = self.epoch;
         let chan_epochs = self.chan_epochs.clone();
         for batch in &batches {
+            // One write with the marks: the call's peers.
+            self.persisted.peers(batch);
+            self.peer_sent.extend(
+                batch
+                    .peers
+                    .iter()
+                    .filter(|p| {
+                        matches!(p.kind, PeerKind::Channel { .. }) && p.access_hash.is_some()
+                    })
+                    .map(|p| p.id),
+            );
+            let had: BTreeSet<i64> = self.persisted.channels.keys().copied().collect();
             self.persisted.mark(batch);
+            // A baseline made durable here: everything after it is owed,
+            // admitted yet or not (the crash window closes with this write).
+            for (&c, &p) in &self.persisted.channels {
+                if !had.contains(&c) {
+                    self.first_admitted.entry(c).or_insert(p);
+                }
+            }
         }
         for batch in batches {
             if self.tick() {
@@ -2282,6 +2340,21 @@ impl<'a> Sim<'a> {
                 return;
             }
         }
+    }
+
+    /// The manager drops `channel`'s state by design (its fetch failed for
+    /// good): what it missed so far is not owed, and it is unknown again
+    /// (owed from its next admitted update on).
+    fn abandoned(&mut self, channel: i64) {
+        self.reset.insert(channel);
+        self.first_admitted.remove(&channel);
+        self.exempt.extend(
+            self.s.events[..self.done]
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.kind == Kind::Chan(channel))
+                .map(|(i, _)| i),
+        );
     }
 
     /// Whether the manager has rolled the call's box back since it asked.
@@ -2369,11 +2442,6 @@ impl<'a> Sim<'a> {
                 }
             }
         }
-        for p in &batch.peers {
-            if matches!(p.kind, PeerKind::User { .. }) && p.access_hash.is_some() {
-                self.persisted.known.insert(p.id);
-            }
-        }
     }
 
     /// The server event an update is, by its message bytes.
@@ -2392,6 +2460,20 @@ impl<'a> Sim<'a> {
 
     fn pump(&mut self) {
         while let Some(f) = self.m.next_action() {
+            // As the caller: a channel fetch needs the channel's access
+            // hash; without one it fails for good.
+            if let Fetch::GetChannelDifference { channel, .. } = f
+                && !self.persisted.channel_peers.contains(&channel)
+            {
+                if !self.peer_sent.contains(&channel) {
+                    // Telegram never sent this channel's entity: its state is
+                    // dropped by design.
+                    self.abandoned(channel);
+                }
+                let batches = self.m.fetch_failed_permanently(f);
+                self.take(batches);
+                continue;
+            }
             let early = self.rng.chance(50).then(|| self.compute(f));
             let chan_epoch = match f {
                 Fetch::GetChannelDifference { channel, .. } => {
@@ -2732,19 +2814,7 @@ impl<'a> Sim<'a> {
                             if let Fetch::GetChannelDifference { channel, .. } = f
                                 && !stale
                             {
-                                // The channel's state is dropped by design:
-                                // what it missed so far is not owed, and it
-                                // is unknown again (owed from its next
-                                // admitted update on).
-                                self.reset.insert(channel);
-                                self.first_admitted.remove(&channel);
-                                self.exempt.extend(
-                                    self.s.events[..self.done]
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, e)| e.kind == Kind::Chan(channel))
-                                        .map(|(i, _)| i),
-                                );
+                                self.abandoned(channel);
                             }
                             let batches = self.m.fetch_failed_permanently(f);
                             self.take(batches);
