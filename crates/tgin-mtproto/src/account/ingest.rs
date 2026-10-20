@@ -15,24 +15,47 @@ type Fetched = (Fetch, Result<RpcOutcome, SenderError>);
 
 /// One run's ingest: the manager, its fetches and the batches it gives.
 pub(super) struct Ingest<'a> {
-    pub(super) ctx: &'a Ctx,
-    pub(super) store: &'a SessionStore,
-    pub(super) session: Arc<dyn Session>,
-    pub(super) manager: UpdateManager,
-    pub(super) ids: UpdateIds,
-    pub(super) fetches: JoinSet<Fetched>,
+    ctx: &'a Ctx,
+    store: &'a SessionStore,
+    session: Arc<dyn Session>,
+    manager: UpdateManager,
+    ids: UpdateIds,
+    fetches: JoinSet<Fetched>,
     /// What [`UpdateManager::dropped`] said last.
-    pub(super) dropped: Dropped,
+    dropped: Dropped,
     /// What [`UpdateManager::flood_wait`] said last.
-    pub(super) flood: Option<(Instant, SystemTime)>,
+    flood: Option<(Instant, SystemTime)>,
     /// Whether this turn's catch-up answers reached Telegram, for
     /// [`publish`](Self::publish).
-    pub(super) reached: Option<bool>,
+    reached: Option<bool>,
     /// The account's frozen flag as [`publish`](Self::publish) last saw it.
-    pub(super) frozen: bool,
+    frozen: bool,
 }
 
-impl Ingest<'_> {
+impl<'a> Ingest<'a> {
+    /// An ingest of `manager`'s account, on `session`, persisting to
+    /// `store`.
+    pub(super) fn new(
+        ctx: &'a Ctx,
+        store: &'a SessionStore,
+        session: Arc<dyn Session>,
+        manager: UpdateManager,
+        ids: UpdateIds,
+    ) -> Self {
+        Self {
+            ctx,
+            store,
+            session,
+            manager,
+            ids,
+            fetches: JoinSet::new(),
+            dropped: Dropped::default(),
+            flood: None,
+            reached: None,
+            frozen: ctx.shared.frozen.load(Ordering::Relaxed),
+        }
+    }
+
     pub(super) async fn run(
         &mut self,
         mut pushes: Pushes,

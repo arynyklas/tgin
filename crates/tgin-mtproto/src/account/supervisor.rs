@@ -456,28 +456,18 @@ async fn run(ctx: Arc<Ctx>) -> End {
     tracing::info!(account = %name, dc, "account session open");
     let end = {
         let mut affected = ctx.affected.lock().await;
-        let mut ingest = Ingest {
-            ctx: &ctx,
-            store: &store,
-            session: conn.session,
-            manager: UpdateManager::new(state).with_user_lookup({
-                // Weak: a manager that outlives the run never holds the
-                // session. A failed lookup counts as unknown, which only
-                // asks one difference more.
-                let store = Arc::downgrade(&store);
-                move |user| {
-                    store
-                        .upgrade()
-                        .is_some_and(|store| store.user_known(user).unwrap_or(false))
-                }
-            }),
-            ids,
-            fetches: JoinSet::new(),
-            dropped: Dropped::default(),
-            flood: None,
-            reached: None,
-            frozen: shared.frozen.load(Ordering::Relaxed),
-        };
+        let manager = UpdateManager::new(state).with_user_lookup({
+            // Weak: a manager that outlives the run never holds the
+            // session. A failed lookup counts as unknown, which only
+            // asks one difference more.
+            let store = Arc::downgrade(&store);
+            move |user| {
+                store
+                    .upgrade()
+                    .is_some_and(|store| store.user_known(user).unwrap_or(false))
+            }
+        });
+        let mut ingest = Ingest::new(&ctx, &store, conn.session, manager, ids);
         ingest.run(conn.pushes, &mut affected).await
     };
     if end == End::Stopped {
@@ -488,64 +478,4 @@ async fn run(ctx: Arc<Ctx>) -> End {
     }
     shared.disconnected();
     end
-}
-
-impl Ctx {
-    pub(super) fn storage_failed(&self, e: &SessionError) -> End {
-        tracing::error!(account = %self.shared.name, error = %e, "the account's session store failed");
-        self.shared
-            .set_state(AccountState::Failed(Failure::Storage));
-        End::Retry
-    }
-
-    pub(super) fn needs_login(&self) -> End {
-        tracing::warn!(account = %self.shared.name, "Telegram no longer accepts the account's authorization; log it out and in again");
-        self.registry.release(&self.shared.name);
-        // A new login may be another account, or the same one unfrozen.
-        self.shared.frozen.store(false, Ordering::Relaxed);
-        self.shared.set_state(AccountState::NeedsLogin);
-        End::Wait
-    }
-
-    /// The main session failed for good, or for a while.
-    fn main_failed(&self, e: &SenderError) -> End {
-        match e {
-            SenderError::KeyRevoked | SenderError::KeyUnknown => self.needs_login(),
-            SenderError::InitRefused { code, message } => self.init_refused(*code, message),
-            e => {
-                tracing::warn!(account = %self.shared.name, error = %e, "the account could not reach Telegram");
-                self.shared
-                    .set_state(AccountState::Failed(Failure::Connect));
-                End::Retry
-            }
-        }
-    }
-
-    pub(super) fn init_refused(&self, code: i32, message: &str) -> End {
-        let name = &self.shared.name;
-        if code == 420 {
-            let wait = match classify(code, message) {
-                ErrorClass::FloodWait(x) => Duration::from_secs(u64::from(x)),
-                _ => DEFAULT_FLOOD_WAIT,
-            };
-            tracing::warn!(account = %name, seconds = wait.as_secs(), "Telegram asks the account to wait before it connects");
-            self.shared.set_state(AccountState::FloodWait {
-                until: SystemTime::now() + wait,
-            });
-            return End::Until(Instant::now() + wait);
-        }
-        if lost_authorization(code, message) {
-            return self.needs_login();
-        }
-        if (400..500).contains(&code) {
-            tracing::error!(account = %name, code, error = message, "Telegram refused the account's session");
-            self.shared
-                .set_state(AccountState::Failed(Failure::InitRefused));
-            return End::Wait;
-        }
-        tracing::warn!(account = %name, code, error = message, "Telegram could not open the account's session");
-        self.shared
-            .set_state(AccountState::Failed(Failure::Connect));
-        End::Retry
-    }
 }
