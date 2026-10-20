@@ -299,6 +299,18 @@ fn rpc_client(diag: &mut Diagnostics, path: &str, name: &str, client: &RpcClient
             .hint("these may move assets, log the account in or out, or change it account-wide; allow them only to a client trusted as much as the account itself"),
         );
     }
+    if client.allow_paid_stars.value {
+        diag.warnings.push(
+            ConfigError::warning(format!(
+                "client `{name}` may spend the account's Stars: its requests may set `allow_paid_stars`"
+            ))
+            .at(located(
+                format!("{path}.allow_paid_stars"),
+                client.allow_paid_stars.location,
+            ))
+            .hint("a request that sets it pays each peer's price per message from the account's balance; enable it only for a client trusted with that balance"),
+        );
+    }
 }
 
 /// The consumers each target list reaches, as (index, location, path).

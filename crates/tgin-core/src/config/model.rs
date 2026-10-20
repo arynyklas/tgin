@@ -604,8 +604,9 @@ pub struct RpcClient {
     /// Let the client's requests set `allow_paid_stars`, which spends the
     /// account's Stars on messages to peers that charge for them. Off, such
     /// a request is refused with 403 `paid_stars_not_allowed`.
-    #[serde(default)]
-    pub allow_paid_stars: bool,
+    #[serde(default = "defaults::allow_paid_stars")]
+    #[schemars(extend("default" = false))]
+    pub allow_paid_stars: At<bool>,
 }
 
 /// What an RPC `allow` or `deny` entry may be; `validate` checks the same

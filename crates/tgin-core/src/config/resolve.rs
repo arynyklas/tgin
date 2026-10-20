@@ -1375,7 +1375,7 @@ impl Resolver<'_> {
                     allow: globs(&client.value.allow),
                     deny: globs(&client.value.deny),
                 },
-                allow_paid_stars: client.value.allow_paid_stars,
+                allow_paid_stars: client.value.allow_paid_stars.value,
             });
         }
         out

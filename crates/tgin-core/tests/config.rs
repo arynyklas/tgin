@@ -4164,3 +4164,26 @@ fn admin_rights_and_quick_replies_need_an_exact_entry() {
     assert!(!config::exact_only("channels.editBanned"));
     assert!(!config::exact_only("messages.editChatTitle"));
 }
+
+/// `allow_paid_stars: true` lets a client spend the account's Stars, so
+/// the loader names it, as it names exactly listed protected methods.
+#[test]
+fn allow_paid_stars_warns() {
+    let cfg = loads(
+        "version: 1\naccounts:\n  main: { api_id: 1, api_hash: h, session_dir: s, rpc: { clients: { a: { token: t1 }, b: { token: t2, allow_paid_stars: true } } } }\n",
+    );
+    let warnings: Vec<&ConfigError> = cfg
+        .warnings
+        .iter()
+        .filter(|w| w.at.as_ref().is_some_and(|at| at.path.contains(".rpc.")))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{}", render(&cfg.warnings));
+    let warning = warnings[0];
+    assert_eq!(warning.severity, Severity::Warning);
+    assert_eq!(
+        warning.at.as_ref().unwrap().path,
+        "accounts.main.rpc.clients.b.allow_paid_stars"
+    );
+    assert_message(warning, "client `b` may spend the account's Stars");
+    assert!(warning.hint.is_some(), "{warning}");
+}
