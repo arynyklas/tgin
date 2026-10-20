@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::SessionError;
+use crate::decode::PeerId;
 use crate::lock::{DirLock, lock_dir};
 use crate::updates::{Batch, StateDelta, StoredState};
 
@@ -99,11 +100,12 @@ impl Peer {
     /// The Bot API dialog id the `peers` table is keyed by.
     #[must_use]
     pub fn dialog_id(&self) -> i64 {
-        match self.kind {
-            PeerKind::User { .. } => self.id,
-            PeerKind::Chat => -self.id,
-            PeerKind::Channel { .. } => -1_000_000_000_000 - self.id,
-        }
+        let id = match self.kind {
+            PeerKind::User { .. } => PeerId::User(self.id),
+            PeerKind::Chat => PeerId::Chat(self.id),
+            PeerKind::Channel { .. } => PeerId::Channel(self.id),
+        };
+        id.dialog_id()
     }
 }
 

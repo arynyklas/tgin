@@ -36,7 +36,25 @@ pub enum PeerId {
     Channel(i64),
 }
 
+/// The Bot API dialog id of the channel `channel`: `-100…`.
+#[must_use]
+pub const fn channel_dialog_id(channel: i64) -> i64 {
+    (-1_000_000_000_000_i64).saturating_sub(channel)
+}
+
 impl PeerId {
+    /// The Bot API dialog id: a user as it is, a basic group negated, a
+    /// channel or supergroup as `-100…`. The session's `peers` table is
+    /// keyed by the same ids ([`Peer::dialog_id`](crate::Peer::dialog_id)).
+    #[must_use]
+    pub fn dialog_id(self) -> i64 {
+        match self {
+            Self::User(id) => id,
+            Self::Chat(id) => id.saturating_neg(),
+            Self::Channel(id) => channel_dialog_id(id),
+        }
+    }
+
     fn user(self) -> Option<i64> {
         match self {
             Self::User(id) => Some(id),

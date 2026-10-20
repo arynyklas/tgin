@@ -12,17 +12,12 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use tgin_core::engine::Engine;
-use tgin_core::facts::Facts;
+use tgin_core::facts::{Facts, TEXT_CAP};
 use tgin_core::sink::{Admit, BatchUpdate};
 use tgin_mtproto::decode::PeerId;
 use tgin_mtproto::envelope::{self, Meta};
 use tgin_mtproto::schema::API;
 use tgin_mtproto::{Admission, Batch, BatchSink, IdsError, SessionStore, UpdateBytes, UpdateIds};
-
-/// The most text the rules see, in bytes, as for bot updates.
-const TEXT_CAP: usize = 4096;
-/// The Bot API's offset of a channel id (`-100…`).
-const CHANNEL_OFFSET: i64 = 1_000_000_000_000;
 
 /// The engine's ingest of one account.
 pub struct AccountIngest {
@@ -99,7 +94,7 @@ impl BatchUpdate for Item<'_> {
         let f = self.update.facts();
         Facts {
             update_type: f.constructor,
-            chat_id: f.peer.map(bot_api_id),
+            chat_id: f.peer.map(PeerId::dialog_id),
             chat_type: None,
             user_id: f.sender,
             text: f.text.map(|t| Cow::Borrowed(capped(t))),
@@ -153,16 +148,6 @@ impl BatchUpdate for Item<'_> {
         };
         self.rendered = Some(rendered.clone());
         rendered
-    }
-}
-
-/// A peer as the Bot API numbers chats: users as they are, basic groups
-/// negated, channels and supergroups as `-100…`.
-fn bot_api_id(peer: PeerId) -> i64 {
-    match peer {
-        PeerId::User(id) => id,
-        PeerId::Chat(id) => id.saturating_neg(),
-        PeerId::Channel(id) => CHANNEL_OFFSET.saturating_add(id).saturating_neg(),
     }
 }
 

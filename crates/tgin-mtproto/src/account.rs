@@ -95,8 +95,6 @@ const CHANNEL_DIFFERENCE_LIMIT: i32 = 100;
 /// `messages.affected*` pts waiting for the ingest; beyond it they are
 /// dropped, and the gap they leave is fetched.
 const AFFECTED_QUEUE: usize = 1024;
-/// The Bot API offset of a channel's dialog id (`-100…`).
-const CHANNEL_OFFSET: i64 = 1_000_000_000_000;
 
 /// What an account runs from.
 pub struct AccountSpec {
@@ -1411,7 +1409,7 @@ fn fetch_body(fetch: Fetch, store: &SessionStore) -> Result<Option<Bytes>, Sessi
         .to_bytes(),
         Fetch::GetChannelDifference { channel, pts } => {
             let Some(access_hash) = store
-                .peer(-CHANNEL_OFFSET - channel)?
+                .peer(crate::decode::channel_dialog_id(channel))?
                 .and_then(|peer| peer.access_hash)
             else {
                 return Ok(None);

@@ -622,3 +622,32 @@ fn difference_slices_match_typed() {
         cases,
     );
 }
+
+/// One Bot API dialog-id mapping: the facts' peers and the session's peer
+/// rows agree for every kind.
+#[test]
+fn peer_ids_and_peer_rows_share_one_mapping() {
+    use crate::{Peer, PeerKind};
+    for (id, kind) in [
+        (
+            PeerId::User(7),
+            PeerKind::User {
+                bot: None,
+                is_self: None,
+            },
+        ),
+        (PeerId::Chat(7), PeerKind::Chat),
+        (PeerId::Channel(7), PeerKind::Channel { kind: None }),
+    ] {
+        let row = Peer {
+            id: 7,
+            kind,
+            access_hash: None,
+        };
+        assert_eq!(id.dialog_id(), row.dialog_id(), "{id:?}");
+    }
+    assert_eq!(PeerId::User(7).dialog_id(), 7);
+    assert_eq!(PeerId::Chat(7).dialog_id(), -7);
+    assert_eq!(PeerId::Channel(7).dialog_id(), -1_000_000_000_007);
+    assert_eq!(channel_dialog_id(1_234_567_890), -1_001_234_567_890);
+}

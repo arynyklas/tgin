@@ -19,6 +19,9 @@ impl ChatType {
     }
 }
 
+/// The most text kept in [`Facts::text`], in bytes, for every source.
+pub const TEXT_CAP: usize = 4096;
+
 /// Facts the rules engine matches on. Borrowed from the payload where possible.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts<'a> {
@@ -27,7 +30,7 @@ pub struct Facts<'a> {
     pub chat_id: Option<i64>,
     pub chat_type: Option<ChatType>,
     pub user_id: Option<i64>,
-    /// Message text or caption, at most 4 KiB.
+    /// Message text or caption, at most [`TEXT_CAP`] bytes.
     pub text: Option<Cow<'a, str>>,
     pub callback_data: Option<Cow<'a, str>>,
     /// A leading bot command: the name without `/`, and the `@bot` suffix

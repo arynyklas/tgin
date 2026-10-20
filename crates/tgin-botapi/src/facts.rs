@@ -7,10 +7,7 @@ use std::ops::Range;
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::value::RawValue;
-use tgin_core::facts::{ChatType, Facts};
-
-/// The most text kept in [`Facts::text`], in bytes.
-const TEXT_CAP: usize = 4096;
+use tgin_core::facts::{ChatType, Facts, TEXT_CAP};
 
 /// Update types the Bot API sends. Escaped object keys cannot be borrowed
 /// from the payload, so an escaped key names the update type only when it
