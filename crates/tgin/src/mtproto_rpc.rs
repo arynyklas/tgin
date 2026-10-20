@@ -15,6 +15,9 @@
 //! and the `auth.*` methods that mint or move an authorization of the
 //! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
 //! account's authorizations. The owner may lift the second refusal.
+//! A call that sets `allow_paid_stars` (it agrees to pay a recipient's
+//! price in Stars) gets 403 `paid_stars_not_allowed` unless the client's
+//! `allow_paid_stars` is on.
 //!
 //! Each client has at most [`MAX_CLIENT_IN_FLIGHT`] requests in flight
 //! (else 429 `too_many_in_flight`). The account's [`AccountLimiter`]
@@ -23,8 +26,10 @@
 //! import.
 //!
 //! The pipeline: unwrap the call ([`tgin_mtproto::rpc::unwrap_request`]),
-//! the client's allowlist (deny wins; empty denies), the account's
-//! `max_rps` limiter, then [`tgin_mtproto::rpc::call`] on the account.
+//! the client's allowlist (deny wins; empty denies), its paid-Stars opt-in,
+//! the flood waits Telegram gave the account and that are not over (429
+//! with what is left, answered here), the account's `max_rps` limiter,
+//! then [`tgin_mtproto::rpc::call`] on the account.
 //!
 //! Answers:
 //! - Telegram's `rpc_result`: 200, its bytes as Telegram sent them.
@@ -498,6 +503,8 @@ struct Client {
     name: String,
     token: Secret<String>,
     acl: MethodAcl,
+    /// May set `allow_paid_stars`, which spends the account's Stars.
+    allow_paid_stars: bool,
     in_flight: Arc<Semaphore>,
     /// By [`Outcome`], once the endpoint serves the account.
     calls: Option<[Counter; Outcome::ALL.len()]>,
@@ -532,6 +539,7 @@ impl RpcAccount {
                     name: c.name.clone(),
                     token: c.token.clone(),
                     acl: c.acl.clone(),
+                    allow_paid_stars: c.allow_paid_stars,
                     in_flight: Arc::new(Semaphore::new(MAX_CLIENT_IN_FLIGHT)),
                     calls: None,
                 })
@@ -753,6 +761,13 @@ async fn serve(
             StatusCode::FORBIDDEN,
             "method_not_allowed",
             "the client's allowlist does not allow this method",
+        ));
+    }
+    if call.pays_stars && !client.allow_paid_stars {
+        return refused(tgin_error(
+            StatusCode::FORBIDDEN,
+            "paid_stars_not_allowed",
+            "the call sets allow_paid_stars, and the client may not spend the account's Stars",
         ));
     }
     // A flood wait Telegram gave this call earlier and that is not over:

@@ -118,6 +118,10 @@ fn rpc_config(max_rps: u32, acl: MethodAcl) -> Rpc {
     }
 }
 
+fn paying_client(rpc: &mut Rpc) {
+    rpc.clients[0].allow_paid_stars = true;
+}
+
 fn allow_all() -> MethodAcl {
     MethodAcl {
         allow: vec![MethodGlob::Any],
@@ -524,6 +528,47 @@ fn rate_limited_count(metrics: &Arc<RpcMetrics>) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+#[tokio::test]
+async fn paid_stars_need_the_clients_opt_in() {
+    let paid_send = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"hi","random_id":"1","allow_paid_stars":"5"}"#;
+    // Read from the schema: any function with the flag, not a list.
+    let paid_call = r#"{"_":"phone.sendGroupCallMessage","call":{"_":"inputGroupCall","id":"1","access_hash":"2"},"random_id":"3","message":{"_":"textWithEntities","text":"hi","entities":[]},"allow_paid_stars":"5"}"#;
+    let free_send = r#"{"_":"messages.sendMessage","peer":{"_":"inputPeerSelf"},"message":"hi","random_id":"1"}"#;
+    let acl = MethodAcl {
+        allow: vec![
+            MethodGlob::Any,
+            MethodGlob::Exact("phone.sendGroupCallMessage".to_owned()),
+        ],
+        deny: Vec::new(),
+    };
+    let account = FakeAccount::new([ok(NEAREST)]);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc_config(100, acl.clone()),
+    );
+    for body in [paid_send, paid_call] {
+        let answer = send(&app, tl(body)).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(answer.error(), "paid_stars_not_allowed");
+    }
+    assert!(account.calls().is_empty());
+    assert_eq!(send(&app, tl(free_send)).await.status, StatusCode::OK);
+
+    let account = FakeAccount::new([ok(NEAREST), ok(NEAREST)]);
+    let mut rpc = rpc_config(100, acl);
+    paying_client(&mut rpc);
+    let app = app_with(
+        Arc::clone(&account) as Arc<dyn AccountRpc>,
+        Arc::default(),
+        &rpc,
+    );
+    for body in [paid_send, paid_call] {
+        assert_eq!(send(&app, tl(body)).await.status, StatusCode::OK);
+    }
+    assert_eq!(account.calls().len(), 2);
 }
 
 #[tokio::test(start_paused = true)]

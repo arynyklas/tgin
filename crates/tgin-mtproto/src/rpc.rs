@@ -121,6 +121,10 @@ pub struct Call<'a> {
     /// The user, chat or channel the call targets (its `channel`,
     /// `parent_peer` or `peer`), if it names one.
     pub peer: Option<PeerId>,
+    /// The call sets its `allow_paid_stars` flag: it agrees to pay the
+    /// recipient's price in Stars. Read from the schema, for every function
+    /// that has the flag.
+    pub pays_stars: bool,
 }
 
 /// Leaves out the body: it is account content.
@@ -131,6 +135,7 @@ impl fmt::Debug for Call<'_> {
             .field("body", &format_args!("<{} bytes>", self.body.len()))
             .field("context", &self.context)
             .field("peer", &self.peer)
+            .field("pays_stars", &self.pays_stars)
             .finish()
     }
 }
@@ -208,13 +213,14 @@ pub fn unwrap_request(body: &[u8], layer: i32) -> Result<Call<'_>, Refused> {
                 return Err(Refused::AuthorizationMethod(name));
             }
             method => {
-                let (context, peer) = check_call(&mut r, ctor)?;
+                let checked = check_call(&mut r, ctor)?;
                 r.finish()?;
                 return Ok(Call {
                     method,
                     body: rest,
-                    context,
-                    peer,
+                    context: checked.context,
+                    peer: checked.peer,
+                    pays_stars: checked.pays_stars,
                 });
             }
         }
@@ -253,11 +259,9 @@ fn query_start(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<usize, TlError
 ///   dialog of the account's own Saved Messages;
 /// - any other call: the channel its `peer` names, else the common box.
 ///
-/// Also returns the peer that field names.
-fn check_call(
-    r: &mut Reader<'_>,
-    ctor: &'static Ctor,
-) -> Result<(BoxKind, Option<PeerId>), TlError> {
+/// Also returns the peer that field names, and whether the call sets
+/// `allow_paid_stars`.
+fn check_call(r: &mut Reader<'_>, ctor: &'static Ctor) -> Result<Checked, TlError> {
     let channels = ctor.name.starts_with("channels.");
     let has_parent = ctor.params.iter().any(|p| p.name == "parent_peer");
     let target = if channels {
@@ -268,6 +272,7 @@ fn check_call(
         "peer"
     };
     let mut peer = None;
+    let mut pays_stars = false;
     let mut words = [0u32; MAX_FLAG_WORDS];
     for p in ctor.params {
         match &p.kind {
@@ -276,6 +281,7 @@ fn check_call(
                 if !present(&words, *flag) {
                     continue;
                 }
+                pays_stars |= p.name == PAID_STARS_FIELD;
                 let start = r.pos;
                 API.skip_value(r, ty, 1)?;
                 if p.name == target {
@@ -289,7 +295,21 @@ fn check_call(
         _ if channels => BoxKind::None,
         _ => BoxKind::Common,
     };
-    Ok((context, peer))
+    Ok(Checked {
+        context,
+        peer,
+        pays_stars,
+    })
+}
+
+/// The field by which a call agrees to pay a recipient's price in Stars.
+const PAID_STARS_FIELD: &str = "allow_paid_stars";
+
+/// What [`check_call`] reads from a call's fields.
+struct Checked {
+    context: BoxKind,
+    peer: Option<PeerId>,
+    pays_stars: bool,
 }
 
 /// The peer an `InputPeer` or `InputChannel` names (already checked):
@@ -539,6 +559,7 @@ mod tests {
             body: &body,
             context: BoxKind::Common,
             peer: None,
+            pays_stars: false,
         };
         let call = format!("{call:?}");
         assert!(
