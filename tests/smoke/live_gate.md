@@ -168,16 +168,27 @@ docker run --rm -v tgin-soak-data:/data --entrypoint "" tgin-live-gate:chaos cat
 ```
 
 The private chat's ids are the account's own message ids, the same in
-every session of the account; the channel's are the channel's. A reference
-session of the same account sees the private chat through
-`updates.getDifference` from a cursor taken at the soak's start (for the
-soak started 2026-10-19T22:06:35Z: `pts 3268746, qts 0, date 1792447602`,
-taken at 22:06:42Z through the controller's own session); the
-channel's messages come through the channel's own history
-(`messages.getHistory` on `TGIN_GATE_CHANNEL` over the same 24 h), since a
-channel's posts are not in the common difference. The heartbeats are
-deleted once seen, so the reference must read updates (new and deleted
-messages), not only today's history. Compare ids only.
+every session of the account; the channel's are the channel's. Two
+references check them:
+
+1. **The bot's journal**, for both chats. `sent.csv` is written by the bot,
+   independently of the account's ingest, and `soak-report` matches every
+   heartbeat sent against `seen.csv` by its sequence number. For the
+   channel it is the only reference: a second session sees deleted posts
+   neither in the channel's history nor, through some clients, in its
+   difference.
+2. **A second session of the account**, for the private chat: run
+   `updates.getDifference` from a cursor recorded with `updates.getState`
+   when the soak starts. Keep that cursor with your own notes, never in the
+   repository. The heartbeats are deleted once seen, so they appear there
+   only among the deleted message ids. A client that caps
+   `pts_total_limit` gets `differenceTooLong` once the gap passes its cap:
+   record a fresh cursor before then, or compare over the last span the cap
+   allows. Every private id in `ids.csv` for that span must be among the
+   deleted ids. Other deleted ids belong to other chats' deletions, provided
+   every heartbeat sent in the span was seen.
+
+Compare ids only.
 
 ### Stop cleanly
 
