@@ -174,8 +174,8 @@ pub enum Refused {
     AuthorizationMethod(&'static str),
 }
 
-/// Refused whatever a client's allowlist says (the owner may
-/// overrule it): each mints or moves an authorization of the account, and
+/// Refused whatever a client's allowlist says, with no setting to lift it:
+/// each mints or moves an authorization of the account, and
 /// tgin owns the account's authorizations. `bots.exportBotToken` hands
 /// out, or with `revoke` rotates, the token of a bot the account manages,
 /// and `phone.getGroupCallStreamRtmpUrl` the RTMP stream key of a channel

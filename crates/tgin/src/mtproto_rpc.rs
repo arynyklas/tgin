@@ -14,7 +14,7 @@
 //! methods (`updates.getState`, `getDifference`, `getChannelDifference`)
 //! and the `auth.*` methods that mint or move an authorization of the
 //! account ([`tgin_mtproto::rpc::AUTHORIZATION_METHODS`]): tgin owns the
-//! account's authorizations. The owner may lift the second refusal.
+//! account's authorizations. No setting lifts either refusal.
 //! A call that spends the account's Stars or TON gets 403
 //! `paid_stars_not_allowed` unless the client's `allow_paid_stars` is on:
 //! one that sets `allow_paid_stars` (it agrees to pay a recipient's price)
