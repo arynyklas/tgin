@@ -87,8 +87,11 @@ checked before the kill.
 
 Channel box. The same, with the bot's posts in the test channel and the
 account's channel box (`getChannelDifference` at start for a channel the
-last run left behind). DOCS still marks channel boxes "to be confirmed", so
-the result is printed as a finding, whichever it is.
+last run left behind). DOCS says at least once for channel boxes too, but for
+one crash window (a push received before the marks of its call are durable);
+the kill here comes after those marks are written, outside that window, so a
+lost post contradicts the docs and fails the check. INCONCLUSIVE keeps its
+meaning.
 
 Throughout. Only the test bot sends test messages, all silent
 (`disable_notification`), at most `--max-bot-messages` (hard cap 30) per run,
@@ -1492,7 +1495,7 @@ class Run:
         say(f"{chat}: tgin killed with {held} of {len(texts)} messages leased and unacknowledged, the rest refused")
         return texts, before, window, undecoded0
 
-    def verify_replay(self, chat, texts, before, window, undecoded0, finding=False):
+    def verify_replay(self, chat, texts, before, window, undecoded0):
         missing, catching = self.wait_replay(texts, chat)
         after = {t for t in texts if len(self.ledger.seen(t)) > before[t]}
         twice = {t for t in after if before[t]}
@@ -1514,14 +1517,6 @@ class Run:
         if missing and unsettled:
             CHECK.unsettled(name, unsettled)
         say(f"{chat}: replayed after the restart {len(after)}; seen both before and after {len(twice)}")
-        if finding:
-            if unsettled:
-                verdict = f"INCONCLUSIVE ({unsettled})"
-            elif missing:
-                verdict = f"NOT at least once: {len(missing)} of {len(texts)} posts lost"
-            else:
-                verdict = "at least once held for every post across this kill"
-            say(f"FINDING (channel box, for the docs): {verdict}")
         decoded = all(s["decoded"] for t in texts for s in self.ledger.seen(t))
         CHECK(f"{chat}: every update of the phase decodes with Telethon (tl, users, chats)", decoded)
 
@@ -1544,7 +1539,7 @@ class Run:
         texts, before, window, undecoded0 = self.fill_and_kill("channel", "c")
         self.start("normal")
         self.wait_running()
-        self.verify_replay("channel", texts, before, window, undecoded0, finding=True)
+        self.verify_replay("channel", texts, before, window, undecoded0)
         self.drain(self.args.catch_up_wait)
         self.delete_sent()
 

@@ -93,9 +93,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
   takes bot updates or account updates, never both, and a reload that
   would switch one is refused.
 - tgin keeps each account's update state itself, with gap recovery by
-  `getDifference` and `getChannelDifference`: sequenced updates of the
-  common box reach `backpressure` consumers at least once while the
-  process lives (channel boxes: to be confirmed; see DOCS § Delivery),
+  `getDifference` and `getChannelDifference`: sequenced updates reach
+  `backpressure` consumers at least once while the process lives (for a
+  channel, but for one crash window; see DOCS § Delivery),
   a refused batch is fetched again after a backoff, and there is no
   dedup. Each account serves one layer, 230; a change of that layer ships
   only in a minor release, and the CHANGELOG says so.
