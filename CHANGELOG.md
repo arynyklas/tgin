@@ -349,6 +349,9 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 - A runtime endpoint is cleared by a reload that turns
   `accept_set_webhook` off, moves the consumer to another bot, or changes
   that bot's token.
+- rustls-webpki 0.103.16 and webpki-root-certs 1.0.10: certificate paths
+  through the distrusted emSign intermediates are rejected
+  (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
 
 ### Dependencies
 
