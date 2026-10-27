@@ -352,6 +352,8 @@ tgin 1.0: a new engine, config and HTTP surface. It began as a fork of
 - rustls-webpki 0.103.16 and webpki-root-certs 1.0.10: certificate paths
   through the distrusted emSign intermediates are rejected
   (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
+- crypto-bigint 0.7.10 and ctutils 0.4.6 include upstream constant-time
+  arithmetic fixes (RUSTSEC-2026-0387, RUSTSEC-2026-0385).
 
 ### Dependencies
 
